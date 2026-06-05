@@ -15,6 +15,7 @@
 //!    [`fleet_proto::agent_api::CoordinatorCommand`] (owned by fleet-proto) and
 //!    are **not** redefined here.
 
+use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
 use fleet_proto::lease::{LeaseGrant, LeaseRequest};
 use fleet_proto::{ChannelId, DataFrame, LeaseId};
 use serde::de::DeserializeOwned;
@@ -27,6 +28,35 @@ use crate::error::{CoordinatorError, Result};
 /// hostile or corrupt peer. Data-plane frames are small probe-rs chunks; 16 MiB
 /// is far above any legitimate control or data frame.
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
+/// A framed message from an agent up to the coordinator.
+///
+/// The agent control plane multiplexes shared `fleet-proto` control payloads
+/// ([`AgentReport`]) and opaque data-plane bytes ([`DataFrame`]) over one
+/// length-delimited stream. Wrapping them in this coordinator-local envelope
+/// gives the reader an unambiguous discriminator (the proto types themselves
+/// carry no tag distinguishing a report from a data frame), mirroring the
+/// symmetric sidecar plane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AgentToCoord {
+    /// A control-plane report.
+    Report(AgentReport),
+    /// Opaque data-plane bytes from a probe-rs session.
+    Data(DataFrame),
+}
+
+/// A framed message from the coordinator down to an agent.
+///
+/// The down-stream counterpart of [`AgentToCoord`]: it wraps a control command
+/// ([`CoordinatorCommand`]) or an opaque [`DataFrame`] with a discriminator so
+/// the agent can demultiplex the two unambiguously.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CoordToAgent {
+    /// A control-plane command.
+    Command(CoordinatorCommand),
+    /// Opaque data-plane bytes to splice onto an open session.
+    Data(DataFrame),
+}
 
 /// A message from a sidecar up to the coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,22 +226,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_api_messages_ride_the_same_codec() {
+    async fn agent_envelopes_roundtrip_and_demux() {
+        // Both directions wrap the shared proto types with a discriminator so
+        // control and data frames demultiplex unambiguously over one stream.
         let (mut a, mut b) = tokio::io::duplex(4096);
-        let cmd = CoordinatorCommand::OpenSession {
+        let cmd = CoordToAgent::Command(CoordinatorCommand::OpenSession {
             lease: LeaseId(1),
             board: BoardId("b1".to_owned()),
             token: vec![9, 9, 9],
             channel: ChannelId(2),
-        };
+        });
+        let data = CoordToAgent::Data(DataFrame {
+            channel: ChannelId(2),
+            bytes: vec![7, 7, 7],
+        });
         write_frame(&mut a, &cmd).await.unwrap();
-        let back: CoordinatorCommand = read_frame(&mut b).await.unwrap();
-        assert_eq!(back, cmd);
+        write_frame(&mut a, &data).await.unwrap();
+        assert_eq!(read_frame::<_, CoordToAgent>(&mut b).await.unwrap(), cmd);
+        assert_eq!(read_frame::<_, CoordToAgent>(&mut b).await.unwrap(), data);
 
-        let report = AgentReport::Heartbeat { uptime_secs: 123 };
+        let report = AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 123 });
+        let up = AgentToCoord::Data(DataFrame {
+            channel: ChannelId(2),
+            bytes: vec![1, 2],
+        });
         write_frame(&mut a, &report).await.unwrap();
-        let back: AgentReport = read_frame(&mut b).await.unwrap();
-        assert_eq!(back, report);
+        write_frame(&mut a, &up).await.unwrap();
+        assert_eq!(read_frame::<_, AgentToCoord>(&mut b).await.unwrap(), report);
+        assert_eq!(read_frame::<_, AgentToCoord>(&mut b).await.unwrap(), up);
     }
 
     #[tokio::test]

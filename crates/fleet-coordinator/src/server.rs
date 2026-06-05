@@ -24,13 +24,14 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use fleet_proto::agent_api::AgentReport;
 use fleet_proto::ids::{AgentId, Principal};
 use fleet_proto::PROTOCOL_VERSION;
 
 use crate::core::Coordinator;
 use crate::error::{CoordinatorError, Result};
-use crate::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+use crate::proto::{
+    read_frame, write_frame, AgentToCoord, CoordToAgent, CoordToSidecar, SidecarToCoord,
+};
 use crate::registry::{AgentHandle, AgentMessage};
 
 /// Run the TLS accept loop until the listener errors fatally.
@@ -89,8 +90,9 @@ async fn handle_connection(
     }
 }
 
-/// Drive an agent connection: register a writer task, then pump
-/// [`AgentReport`]s into the coordinator.
+/// Drive an agent connection: register a writer task, then pump framed
+/// [`AgentToCoord`] envelopes (reports + return-path data frames) into the
+/// coordinator.
 async fn handle_agent<S>(coord: Arc<Coordinator>, stream: S, agent_id: AgentId) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -102,14 +104,15 @@ where
         .insert(agent_id.clone(), AgentHandle::new(tx))
         .await;
 
-    // Writer task: serialise queued commands/data onto the stream.
+    // Writer task: serialise queued commands/data onto the stream as framed
+    // `CoordToAgent` envelopes so the agent can demultiplex control from data.
     let writer_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
-            let res = match msg {
-                AgentMessage::Command(cmd) => write_frame(&mut writer, &cmd).await,
-                AgentMessage::Data(frame) => write_frame(&mut writer, &frame).await,
+            let envelope = match msg {
+                AgentMessage::Command(cmd) => CoordToAgent::Command(cmd),
+                AgentMessage::Data(frame) => CoordToAgent::Data(frame),
             };
-            if res.is_err() {
+            if write_frame(&mut writer, &envelope).await.is_err() {
                 break;
             }
         }
@@ -131,8 +134,18 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        let report: AgentReport = read_frame(reader).await?;
-        coord.handle_agent_report(agent_id, report).await?;
+        match read_frame::<_, AgentToCoord>(reader).await? {
+            AgentToCoord::Report(report) => {
+                coord.handle_agent_report(agent_id, report).await?;
+            }
+            AgentToCoord::Data(frame) => {
+                // Return-path relay: forward opaque bytes from the agent to the
+                // sidecar that owns the channel. An unknown channel is dropped.
+                if let Err(e) = coord.relay_from_agent(frame).await {
+                    debug!(error = %e, "relay to sidecar failed");
+                }
+            }
+        }
     }
 }
 
@@ -205,3 +218,140 @@ where
         coord.handle_sidecar_message(principal, msg, tx).await?;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Ed25519Signer;
+    use crate::clock::SystemClock;
+    use crate::config::{CoordinatorConfig, SigningKeySource};
+    use crate::registry::{ChannelRoute, SidecarHandle};
+    use fleet_core::policy::Policy;
+    use fleet_core::scheduler::Scheduler;
+    use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
+    use fleet_proto::ids::LeaseId;
+    use fleet_proto::DataFrame;
+    use std::collections::HashMap;
+
+    const SEED: [u8; 32] = [5u8; 32];
+
+    fn config() -> CoordinatorConfig {
+        CoordinatorConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            tls_cert: "c".into(),
+            tls_key: "k".into(),
+            client_ca: "ca".into(),
+            sqlite_path: ":memory:".into(),
+            signing_key: SigningKeySource::Seed(SEED),
+            policy: Policy::default(),
+            pinned_agents: HashMap::new(),
+            sweep_interval_secs: 5,
+        }
+    }
+
+    async fn coordinator() -> Arc<Coordinator> {
+        let sched = Scheduler::new(Policy::default());
+        let db = crate::state::Db::connect_in_memory().await.unwrap();
+        Arc::new(Coordinator::new(
+            config(),
+            sched,
+            db,
+            Ed25519Signer::from_seed(&SEED),
+            Arc::new(SystemClock),
+        ))
+    }
+
+    /// End-to-end return-path relay: a `DataFrame` written by the agent peer
+    /// travels through the *real* `handle_agent` read loop and is relayed to
+    /// the owning sidecar's channel. Covers the agent→sidecar direction the
+    /// production server actually uses (not just the direct unit test).
+    #[tokio::test]
+    async fn agent_to_sidecar_relay_end_to_end() {
+        let coord = coordinator().await;
+        let agent_id = AgentId("agent-a".to_owned());
+
+        // Pre-register an open channel routed to a sidecar receiver.
+        let channel = coord.channels().allocate().await;
+        let (sidecar_tx, mut sidecar_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let route_tx: SidecarHandle = sidecar_tx;
+        coord
+            .channels()
+            .insert(
+                channel,
+                ChannelRoute {
+                    lease: LeaseId(1),
+                    agent: agent_id.clone(),
+                    sidecar: route_tx,
+                },
+            )
+            .await;
+
+        // Drive handle_agent over a duplex; `peer` is the agent's end.
+        let (server_side, mut peer) = tokio::io::duplex(4096);
+        let coord_clone = Arc::clone(&coord);
+        let agent_task = tokio::spawn(async move {
+            let _ = handle_agent(coord_clone, server_side, agent_id).await;
+        });
+
+        // Agent emits a control report (exercises the demux path) ...
+        write_frame(
+            &mut peer,
+            &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+        )
+        .await
+        .unwrap();
+        // ... then opaque data-plane bytes for the open channel.
+        let payload = DataFrame {
+            channel,
+            bytes: vec![0xCA, 0xFE, 0xBA, 0xBE],
+        };
+        write_frame(&mut peer, &AgentToCoord::Data(payload.clone()))
+            .await
+            .unwrap();
+
+        // The bytes arrive verbatim at the sidecar end.
+        match sidecar_rx.recv().await.unwrap() {
+            CoordToSidecar::Data(f) => assert_eq!(f, payload),
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        drop(peer);
+        let _ = agent_task.await;
+    }
+
+    /// End-to-end command path: a `CoordinatorCommand` pushed through the agent
+    /// registry is framed as a `CoordToAgent` envelope and read back off the
+    /// agent's wire.
+    #[tokio::test]
+    async fn coordinator_to_agent_command_end_to_end() {
+        let coord = coordinator().await;
+        let agent_id = AgentId("agent-a".to_owned());
+
+        let (server_side, mut peer) = tokio::io::duplex(4096);
+        let coord_clone = Arc::clone(&coord);
+        let agent_task = tokio::spawn(async move {
+            let _ = handle_agent(coord_clone, server_side, agent_id).await;
+        });
+
+        // Wait for handle_agent to register the connection, then push a command.
+        let handle = loop {
+            if let Some(h) = coord.agents().get(&AgentId("agent-a".to_owned())).await {
+                break h;
+            }
+            tokio::task::yield_now().await;
+        };
+        handle
+            .send_command(CoordinatorCommand::QueryState)
+            .await
+            .unwrap();
+
+        match read_frame::<_, CoordToAgent>(&mut peer).await.unwrap() {
+            CoordToAgent::Command(CoordinatorCommand::QueryState) => {}
+            other => panic!("expected QueryState command, got {other:?}"),
+        }
+
+        drop(peer);
+        let _ = agent_task.await;
+    }
+}
+
