@@ -35,7 +35,7 @@ fleet-sidecar = { path = "crates/fleet-sidecar" }
 
 # rpc / wire
 postcard-rpc = { version = "0.12", features = ["use-std"] }
-postcard = "1"
+postcard = { version = "1", features = ["use-std"] }
 postcard-schema = "0.2"
 serde = { version = "1", features = ["derive"] }
 
@@ -57,3 +57,13 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# crypto (capability tokens)
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = "0.6"
+
+# async traits (object-safe dyn impls)
+async-trait = "0.1"
+
+# gpio (Linux char-device line control; agent power control)
+tokio-gpiod = "0.3"

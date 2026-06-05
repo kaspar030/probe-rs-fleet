@@ -10,13 +10,22 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod ids;
+pub mod agent_api;
 pub mod board;
+pub mod ids;
 pub mod lease;
+pub mod token;
 
+pub use agent_api::{
+    AgentReport, BoardPresence, BoardStatus, CoordinatorCommand, DiscoveredProbe, LogLevel,
+    PowerAction, ProbeInventory,
+};
 pub use board::{Board, BoardState, PowerKind};
 pub use ids::{AgentId, BoardId, LeaseId, Principal};
 pub use lease::{Constraint, LeaseGrant, LeaseRequest};
+pub use token::{
+    AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner, TokenVerifier, SIGNATURE_LEN,
+};
 
 /// An opaque chunk of data-plane bytes (probe-rs postcard-rpc frames).
 ///
