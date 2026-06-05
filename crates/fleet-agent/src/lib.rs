@@ -24,6 +24,7 @@ pub mod config;
 pub mod connection;
 pub mod discovery;
 pub mod error;
+pub mod gdb;
 pub mod power;
 pub mod probers;
 pub mod token;

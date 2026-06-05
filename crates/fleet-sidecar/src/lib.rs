@@ -33,9 +33,13 @@
 //! * [`lease_cache`] — time-based lease sharing keyed by selector + principal.
 //! * [`proxy`] — the relay seam (lease / heartbeat / byte-splice). The live
 //!   mTLS transport is deferred to tasks 1709 / 1710 / 1711 behind traits.
+//! * [`gdb`] — the gdb-tunnel client side: a local TCP listener (default
+//!   `127.0.0.1:1337`) byte-spliced to the agent's `probe-rs gdb` stub over a
+//!   second relay channel (`probe-rs gdb` is not remote-capable in 0.31).
 //! * [`local`] — locate and exec the genuine probe-rs (local + remote env).
 
 pub mod cli;
+pub mod gdb;
 pub mod lease_cache;
 pub mod local;
 pub mod proxy;
@@ -60,6 +64,9 @@ pub enum RunError {
     /// The relay / lease transport failed.
     #[error(transparent)]
     Proxy(#[from] proxy::ProxyError),
+    /// The gdb tunnel failed.
+    #[error(transparent)]
+    Gdb(#[from] gdb::GdbError),
 }
 
 /// Parse `args` (a full process argv) and resolve what the sidecar should do,

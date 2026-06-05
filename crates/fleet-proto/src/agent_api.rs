@@ -87,6 +87,29 @@ pub enum PowerAction {
     Cycle,
 }
 
+/// What an opaque relay channel carries, and therefore how the agent sources /
+/// sinks its bytes.
+///
+/// Both kinds ride the *same* relay machinery: once open, a channel is a pure
+/// [`crate::DataFrame`] byte pump and the coordinator never inspects it. The
+/// kind only matters at channel-open time, where it tells the agent what to
+/// splice the channel onto:
+///
+/// * [`ChannelKind::Data`] — the board's `probe-rs serve` postcard-rpc stream
+///   (the regular data plane; architecture §4.2).
+/// * [`ChannelKind::Gdb`] — a freshly-spawned, board-local `probe-rs gdb` TCP
+///   stub. `probe-rs gdb` is not remote-capable in 0.31, so the agent runs it
+///   locally and tunnels its raw gdbremote TCP as a second opaque channel
+///   (architecture §4.2 gap note, §10 Q3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ChannelKind {
+    /// Opaque probe-rs `serve` postcard-rpc data plane (the default).
+    #[default]
+    Data,
+    /// Raw gdbremote TCP from a board-local `probe-rs gdb` stub.
+    Gdb,
+}
+
 /// Messages an agent sends *up* to the coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentReport {
@@ -141,6 +164,11 @@ pub enum AgentReport {
 pub enum CoordinatorCommand {
     /// Open a probe-rs session for `lease` on `board`, splicing its byte
     /// stream onto `channel`. The agent verifies `token` locally before acting.
+    ///
+    /// `kind` selects what the agent splices onto the channel: the board's
+    /// `probe-rs serve` data plane ([`ChannelKind::Data`]) or a board-local
+    /// `probe-rs gdb` TCP stub ([`ChannelKind::Gdb`]). Both relay identically
+    /// once open.
     OpenSession {
         /// The authorising lease.
         lease: LeaseId,
@@ -148,8 +176,11 @@ pub enum CoordinatorCommand {
         board: BoardId,
         /// The signed capability token (wire framing: see [`crate::token`]).
         token: Vec<u8>,
-        /// The data-plane channel to splice the session onto.
+        /// The relay channel to splice the session onto.
         channel: ChannelId,
+        /// What the channel carries (data plane vs. gdb tunnel).
+        #[serde(default)]
+        kind: ChannelKind,
     },
     /// Tear down a session by its channel.
     KillSession {
@@ -212,9 +243,28 @@ mod tests {
             board: BoardId("b1".to_owned()),
             token: vec![1, 2, 3, 4],
             channel: ChannelId(9),
+            kind: ChannelKind::Data,
         };
         let bytes = postcard::to_allocvec(&cmd).unwrap();
         let back: CoordinatorCommand = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(cmd, back);
+    }
+
+    #[test]
+    fn gdb_open_session_roundtrips_through_postcard() {
+        let cmd = CoordinatorCommand::OpenSession {
+            lease: LeaseId(7),
+            board: BoardId("b1".to_owned()),
+            token: vec![9, 9],
+            channel: ChannelId(3),
+            kind: ChannelKind::Gdb,
+        };
+        let bytes = postcard::to_allocvec(&cmd).unwrap();
+        let back: CoordinatorCommand = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(cmd, back);
+        let CoordinatorCommand::OpenSession { kind, .. } = back else {
+            panic!("expected OpenSession");
+        };
+        assert_eq!(kind, ChannelKind::Gdb);
     }
 }

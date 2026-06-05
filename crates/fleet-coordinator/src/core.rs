@@ -234,8 +234,8 @@ impl Coordinator {
                 let reply = self.release_lease(principal, lease).await?;
                 let _ = tx.send(reply).await;
             }
-            SidecarToCoord::OpenChannel { lease } => {
-                let reply = self.open_channel(principal, lease, tx.clone()).await?;
+            SidecarToCoord::OpenChannel { lease, kind } => {
+                let reply = self.open_channel(principal, lease, kind, tx.clone()).await?;
                 if let Some(reply) = reply {
                     let _ = tx.send(reply).await;
                 }
@@ -386,6 +386,7 @@ impl Coordinator {
         &self,
         _principal: &Principal,
         lease: LeaseId,
+        kind: fleet_proto::ChannelKind,
         sidecar_tx: mpsc::Sender<CoordToSidecar>,
     ) -> Result<Option<CoordToSidecar>> {
         // Find the board + agent for this lease from the scheduler's board set.
@@ -436,9 +437,12 @@ impl Coordinator {
             &agent,
             agent_id,
             sidecar_tx,
-            lease,
-            board.clone(),
-            wire,
+            relay::OpenRequest {
+                lease,
+                board: board.clone(),
+                token: wire,
+                kind,
+            },
         )
         .await?;
 

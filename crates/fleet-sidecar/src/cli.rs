@@ -72,11 +72,18 @@ pub enum ProbeRsInvocation {
         elf: Option<String>,
         extra: Vec<String>,
     },
-    /// `probe-rs gdb --chip <C>` — long-lived local gdb TCP server. Not
-    /// remote-capable in probe-rs 0.31; tunneling is a separate follow-up
-    /// task (see `proxy` module docs).
+    /// `probe-rs gdb --chip <C> [--gdb-connection-string <addr>]` — long-lived
+    /// local gdb TCP server. Not remote-capable in probe-rs 0.31, so the fleet
+    /// path tunnels raw gdbremote TCP as a second relay channel: the sidecar
+    /// opens a local listener (default `127.0.0.1:1337`, overridable via
+    /// `--gdb-connection-string`) the user's gdb client connects to (see the
+    /// `gdb` module).
     Gdb {
         chip: Option<String>,
+        /// The local address the sidecar should listen on for the user's gdb
+        /// client, parsed from `--gdb-connection-string`. `None` ⇒ default
+        /// `127.0.0.1:1337`.
+        connection_string: Option<String>,
         extra: Vec<String>,
     },
     /// Any invocation we do not individually model. Forwarded verbatim.
@@ -295,13 +302,52 @@ fn parse_attach(args: &[String]) -> ProbeRsInvocation {
 }
 
 fn parse_gdb(args: &[String]) -> ProbeRsInvocation {
-    let (scan, _) = scan(args, &[]);
+    // Pull `--gdb-connection-string <addr>` / `--gdb-connection-string=<addr>`
+    // out of the stream: in the fleet path it configures the sidecar's *local*
+    // listener and is NOT forwarded to the agent (the agent picks its own
+    // ephemeral loopback port). Everything else round-trips via the scanner.
+    let (connection_string, rest) = extract_value_flag(args, "--gdb-connection-string");
+    let (scan, _) = scan(&rest, &[]);
     let mut extra = scan.extra;
     extra.extend(scan.positionals);
     ProbeRsInvocation::Gdb {
         chip: scan.chip,
+        connection_string,
         extra,
     }
+}
+
+/// Extract a `--flag <value>` / `--flag=<value>` option from `args`, returning
+/// its value (if present) and the remaining args with the flag removed. The
+/// first occurrence wins; later occurrences are left in the remainder.
+fn extract_value_flag(args: &[String], flag: &str) -> (Option<String>, Vec<String>) {
+    let eq_prefix = format!("{flag}=");
+    let mut value = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if value.is_none() && arg == flag {
+            if let Some(v) = args.get(i + 1) {
+                value = Some(v.clone());
+                i += 2;
+                continue;
+            }
+            // Dangling flag with no value: drop it (no value to capture).
+            i += 1;
+            continue;
+        }
+        if value.is_none() {
+            if let Some(v) = arg.strip_prefix(&eq_prefix) {
+                value = Some(v.to_owned());
+                i += 1;
+                continue;
+            }
+        }
+        rest.push(arg.clone());
+        i += 1;
+    }
+    (value, rest)
 }
 
 /// Treat the ELF path as the positional that looks like a path (ends in an
@@ -456,10 +502,54 @@ mod tests {
             inv,
             ProbeRsInvocation::Gdb {
                 chip: Some("nrf52".to_owned()),
+                connection_string: None,
                 extra: vec![],
             }
         );
         assert!(inv.is_streaming());
+    }
+
+    #[test]
+    fn parses_gdb_connection_string_and_keeps_it_out_of_extra() {
+        let inv = parse_str(&[
+            "probe-rs",
+            "gdb",
+            "--chip",
+            "nrf52",
+            "--gdb-connection-string",
+            "127.0.0.1:3333",
+        ]);
+        let ProbeRsInvocation::Gdb {
+            chip,
+            connection_string,
+            extra,
+        } = inv
+        else {
+            panic!("expected Gdb");
+        };
+        assert_eq!(chip.as_deref(), Some("nrf52"));
+        assert_eq!(connection_string.as_deref(), Some("127.0.0.1:3333"));
+        // The flag is consumed, not forwarded as passthrough.
+        assert!(!extra.iter().any(|a| a == "--gdb-connection-string"));
+        assert!(!extra.iter().any(|a| a == "127.0.0.1:3333"));
+    }
+
+    #[test]
+    fn parses_gdb_connection_string_eq_form() {
+        let inv = parse_str(&[
+            "probe-rs",
+            "gdb",
+            "--chip",
+            "nrf52",
+            "--gdb-connection-string=0.0.0.0:1337",
+        ]);
+        let ProbeRsInvocation::Gdb {
+            connection_string, ..
+        } = inv
+        else {
+            panic!("expected Gdb");
+        };
+        assert_eq!(connection_string.as_deref(), Some("0.0.0.0:1337"));
     }
 
     #[test]

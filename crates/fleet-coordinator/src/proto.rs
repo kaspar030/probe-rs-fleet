@@ -78,10 +78,18 @@ pub enum SidecarToCoord {
         /// The lease to release.
         lease: LeaseId,
     },
-    /// Open a data-plane channel (probe-rs session) for a held lease.
+    /// Open a relay channel (probe-rs session) for a held lease.
+    ///
+    /// `kind` selects the channel plane: the regular data plane
+    /// ([`fleet_proto::ChannelKind::Data`], the default) or a gdb tunnel
+    /// ([`fleet_proto::ChannelKind::Gdb`], for `probe-rs gdb`). A lease may hold
+    /// both kinds concurrently.
     OpenChannel {
         /// The authorising lease.
         lease: LeaseId,
+        /// Which plane the channel carries.
+        #[serde(default)]
+        kind: fleet_proto::ChannelKind,
     },
     /// Opaque data-plane bytes destined for the owning agent.
     Data(DataFrame),
@@ -235,6 +243,7 @@ mod tests {
             board: BoardId("b1".to_owned()),
             token: vec![9, 9, 9],
             channel: ChannelId(2),
+            kind: fleet_proto::ChannelKind::Data,
         });
         let data = CoordToAgent::Data(DataFrame {
             channel: ChannelId(2),

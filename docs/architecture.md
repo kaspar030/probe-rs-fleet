@@ -152,12 +152,21 @@ Decided agent model (per #1710):
   in addition to the fleet lease layer.
 - **Embedding probe-rs as a library is unnecessary for v1** — the subprocess
   `serve` model is byte-compatible with any deployed probe-rs version.
-- **Gap: `probe-rs gdb`/`debug` are NOT remote-capable in 0.31.** gdb runs a
-  separate local TCP stub (default `127.0.0.1:1337`), not over postcard-rpc. To
-  support laze's `debug` task remotely we tunnel that raw gdbremote TCP as a
-  **second opaque channel** (agent runs `probe-rs gdb` locally). Tracked as a
-  follow-up task; optional upstream probe-rs feature request to make gdb
-  remote-capable.
+- **`probe-rs gdb` / `debug` are NOT remote-capable in 0.31; gdb is tunneled as
+  a second opaque channel.** gdb runs a separate local TCP stub (default
+  `127.0.0.1:1337`), not over postcard-rpc. So the fleet runs `probe-rs gdb`
+  **on the agent** (which has the physical probe) and tunnels its raw gdbremote
+  TCP as a **second relay channel** (`ChannelKind::Gdb`), structurally identical
+  to the data plane. On a gdb-kind `OpenSession` the agent spawns `probe-rs gdb
+  --chip <C> --probe <serial> --gdb-connection-string 127.0.0.1:<ephemeral>`
+  (the `gdb` subcommand, unlike `serve`, *does* take `--probe`/`--chip`), binds
+  it to an ephemeral loopback port (avoiding the fixed-1337 clash when several
+  boards run gdb on one Pi), connects, and byte-splices that TCP stream onto the
+  channel — zero gdbremote parsing. The gdb capability is gated by the same
+  capability token (`AllowedOp::Gdb`). `debug` (TUI) / `dap_server` are the same
+  gap class but out of scope for v1. An upstream probe-rs feature request to make
+  `gdb` drive a remote `Session` over postcard-rpc (which would obsolete this
+  tunnel) is an optional follow-up.
 
 Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
@@ -261,8 +270,14 @@ Observations that shape the sidecar:
   *not* reimplement the client, or we'd have to re-derive exit-code logic.)
 - **`gdb` is special (not remote-capable in probe-rs 0.31).** It is *not*
   expressed over postcard-rpc; the agent runs `probe-rs gdb` locally and the
-  fleet tunnels its raw gdbremote TCP (`127.0.0.1:1337`) as a **second opaque
-  channel** to a local listening socket on the workstation. Tracked separately.
+  fleet tunnels its raw gdbremote TCP as a **second opaque channel**
+  (`ChannelKind::Gdb`). The **sidecar** opens a local TCP listener (default
+  `127.0.0.1:1337`, honoring `--gdb-connection-string`) that the user's gdb
+  client connects to (`target remote :1337`) and byte-splices it onto the gdb
+  channel; the agent splices the other end to its board-local `probe-rs gdb`
+  stub. The sidecar does **not** exec the genuine `probe-rs gdb` and the
+  `--gdb-connection-string` flag is consumed locally (not forwarded to the
+  agent, which picks its own ephemeral port).
 
 Proposed selector convention (additive, no laze change required):
 
@@ -332,9 +347,21 @@ probe-rs-fleet/
    selection over the wire?** If yes, plain proxying is sufficient and the agent
    only manages process lifecycle + `--probe`. If not, file tasks against
    probe-rs (or myelin, per your offer). Needs a look at probe-rs's server impl.
-3. **gdb / TCP tunneling.** `probe-rs gdb` is a long-lived, latency-sensitive
-   TCP server. Confirm the two-hop relay (sidecar→coordinator→agent) carries it
-   acceptably; if not, gdb may need a lower-overhead path.
+3. **gdb / TCP tunneling.** *Resolved (v1):* `probe-rs gdb` is not
+   remote-capable in 0.31, so the agent runs `probe-rs gdb` locally and its raw
+   gdbremote TCP is tunneled as a **second relay channel** (`ChannelKind::Gdb`),
+   parallel to the postcard-rpc data plane (see §4.2, §7). Both planes share the
+   same opaque `DataFrame` byte-pump; the coordinator relays gdb frames
+   identically and a lease may hold a data channel and a gdb channel
+   concurrently. **Latency:** the splice sets `TCP_NODELAY` on both loopback
+   hops and flushes each chunk immediately (no Nagle batching), so gdb traffic
+   is not coalesced. gdb is request/response and tolerant of LAN-scale RTT; the
+   two mTLS relay hops add ~2×RTT per round-trip, which is acceptable for
+   interactive use. Revisit (e.g. a lower-overhead path) only if step-debugging
+   feels sluggish on a real deployment. *Optional follow-up:* an upstream
+   probe-rs feature request to make `gdb` drive a remote `Session` over
+   postcard-rpc would let gdb ride the existing data plane and drop this bespoke
+   tunnel.
 4. **probe-rs process lifecycle.** Decided-ish: **one server process per board**,
    possibly per lease for isolation. Confirm per-lease vs per-board-reused.
 5. **Sidecar install UX.** argv0 `probe-rs` shim on PATH vs explicit

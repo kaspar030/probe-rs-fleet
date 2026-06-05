@@ -282,6 +282,7 @@ mod tests {
                     lease: LeaseId(1),
                     agent: agent_id.clone(),
                     sidecar: route_tx,
+                    kind: fleet_proto::ChannelKind::Data,
                 },
             )
             .await;

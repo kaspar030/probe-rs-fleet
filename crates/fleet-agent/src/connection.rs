@@ -155,7 +155,11 @@ async fn connect_and_serve<B: ProbeRsBackend>(
     //   4. subscribes to the ToClient command topic and routes each decoded
     //      `CoordinatorCommand` through `dispatch_command(agent, cmd)`,
     //   5. drains `agent.take_reports()` to the ToServer report topic,
-    //   6. multiplexes the opaque data channel (DataFrame) alongside.
+    //   6. multiplexes the opaque data channel (DataFrame) alongside, splicing
+    //      each open data channel onto its board's `probe-rs serve` socket and
+    //      each open gdb channel onto its `probe-rs gdb` stub via
+    //      `crate::gdb::splice` (the gdb-tunnel pump is implemented and tested;
+    //      only the live relay wiring is gated here).
     // The topic/endpoint binding is co-owned with task 1711; the structure,
     // handlers, backoff, and TLS config above are complete and tested.
     let _ = (agent, config);

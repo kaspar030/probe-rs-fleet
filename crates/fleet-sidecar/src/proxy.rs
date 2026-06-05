@@ -39,9 +39,13 @@
 //! # gdb
 //!
 //! `probe-rs gdb` is **not** remote-capable in probe-rs 0.31 (it runs a local
-//! TCP gdb stub, not over postcard-rpc). Tunneling raw gdbremote bytes to an
-//! agent that runs `probe-rs gdb` locally is a separate follow-up task. This
-//! module leaves the seam ([`GdbTunnel`]) but does not implement it.
+//! TCP gdb stub, not over postcard-rpc). The fleet path therefore does not exec
+//! the genuine client for `gdb`; instead it tunnels raw gdbremote bytes to an
+//! agent that runs `probe-rs gdb` locally, as a **second relay channel**
+//! ([`fleet_proto::ChannelKind::Gdb`]). The workstation-side listener + byte
+//! splice live in [`crate::gdb`]; the [`GdbTunnel`] seam here is the transport
+//! hook that opens the gdb-kind channel once the live relay (tasks 1709 / 1711)
+//! is wired.
 
 use fleet_proto::lease::{LeaseGrant, LeaseRequest};
 
@@ -124,20 +128,23 @@ pub trait RelayChannel {
     fn write_all(&mut self, buf: &[u8]) -> Result<(), ProxyError>;
 }
 
-/// Seam for the (not-yet-implemented) gdb raw-TCP tunnel.
+/// Seam for the gdb raw-TCP tunnel transport.
 ///
-/// `probe-rs gdb` is not remote-capable in probe-rs 0.31; this is a separate
-/// follow-up task. The seam exists so the CLI driver can route a [`Gdb`]
-/// invocation to a clear "not yet supported" path rather than mis-proxy it.
+/// `probe-rs gdb` is not remote-capable in probe-rs 0.31, so the gdb path opens
+/// a [`fleet_proto::ChannelKind::Gdb`] relay channel and byte-splices the
+/// workstation listener (see [`crate::gdb`]) to the agent's local stub. This
+/// trait abstracts opening that channel over the live transport; until the
+/// mTLS relay (tasks 1709 / 1711) is wired it returns
+/// [`ProxyError::NotYetWired`].
 ///
 /// [`Gdb`]: crate::cli::ProbeRsInvocation::Gdb
 pub trait GdbTunnel {
-    /// Open a local gdb TCP listener and tunnel to the agent's local gdb stub.
+    /// Open a gdb-kind relay channel for the leased board.
     ///
     /// # Errors
     ///
-    /// Always returns [`ProxyError::Unsupported`] until the follow-up task
-    /// implements gdb tunneling.
+    /// Returns [`ProxyError::NotYetWired`] until the live relay transport
+    /// lands; thereafter, a [`ProxyError`] on a transport failure.
     fn tunnel(&self) -> Result<(), ProxyError>;
 }
 
@@ -176,16 +183,13 @@ impl RelayChannel for StubRelayChannel {
     }
 }
 
-/// A [`GdbTunnel`] that reports gdb tunneling is not yet supported.
+/// A [`GdbTunnel`] that reports the gdb relay transport is not yet wired.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StubGdbTunnel;
 
 impl GdbTunnel for StubGdbTunnel {
     fn tunnel(&self) -> Result<(), ProxyError> {
-        Err(ProxyError::Unsupported(
-            "gdb tunneling is a separate follow-up task (probe-rs gdb is not remote-capable in 0.31)"
-                .to_owned(),
-        ))
+        Err(ProxyError::NotYetWired)
     }
 }
 
@@ -231,8 +235,8 @@ mod tests {
     }
 
     #[test]
-    fn stub_gdb_tunnel_is_unsupported() {
+    fn stub_gdb_tunnel_reports_not_wired() {
         let g = StubGdbTunnel;
-        assert!(matches!(g.tunnel(), Err(ProxyError::Unsupported(_))));
+        assert_eq!(g.tunnel(), Err(ProxyError::NotYetWired));
     }
 }

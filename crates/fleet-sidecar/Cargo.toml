@@ -12,9 +12,11 @@ fleet-proto = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+fleet-agent = { workspace = true }
 
 [lints]
 workspace = true

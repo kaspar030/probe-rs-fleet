@@ -1,5 +1,11 @@
-//! Data-plane relay: opaque [`DataFrame`] forwarding between a sidecar and the
-//! owning agent (architecture §4.1, §6).
+//! Relay: opaque [`DataFrame`] forwarding between a sidecar and the owning
+//! agent (architecture §4.1, §6).
+//!
+//! The same machinery carries **both** planes — the probe-rs `serve` data plane
+//! and the gdb tunnel — distinguished only by the [`fleet_proto::ChannelKind`]
+//! recorded at open time (the coordinator relays the bytes identically either
+//! way). Channels are keyed purely by [`ChannelId`], so a single lease may hold
+//! several concurrent channels (e.g. a data channel and a gdb channel at once).
 //!
 //! The coordinator never parses probe-rs traffic. A relay channel is opened by
 //! an explicit control RPC (sidecar `OpenChannel` → coordinator allocates a
@@ -24,6 +30,21 @@ use crate::error::{CoordinatorError, Result};
 use crate::proto::CoordToSidecar;
 use crate::registry::{AgentHandle, ChannelRoute, ChannelTable, SidecarHandle};
 
+/// The parameters of a channel-open request that vary per lease/session.
+///
+/// Grouped into one struct so [`open_channel`] stays within a reasonable
+/// argument count and the lease/board/token/kind always travel together.
+pub struct OpenRequest {
+    /// The authorising lease.
+    pub lease: LeaseId,
+    /// The target board.
+    pub board: BoardId,
+    /// The signed capability token (wire framing: see `fleet_proto::token`).
+    pub token: Vec<u8>,
+    /// Which plane the channel carries (data vs. gdb tunnel).
+    pub kind: fleet_proto::ChannelKind,
+}
+
 /// Open a relay channel: allocate an id, register the route, and command the
 /// owning agent to open its side.
 ///
@@ -40,10 +61,14 @@ pub async fn open_channel(
     agent: &AgentHandle,
     agent_id: fleet_proto::ids::AgentId,
     sidecar: SidecarHandle,
-    lease: LeaseId,
-    board: BoardId,
-    token: Vec<u8>,
+    request: OpenRequest,
 ) -> Result<ChannelId> {
+    let OpenRequest {
+        lease,
+        board,
+        token,
+        kind,
+    } = request;
     let channel = table.allocate().await;
     table
         .insert(
@@ -52,6 +77,7 @@ pub async fn open_channel(
                 lease,
                 agent: agent_id,
                 sidecar,
+                kind,
             },
         )
         .await;
@@ -61,6 +87,7 @@ pub async fn open_channel(
             board,
             token,
             channel,
+            kind,
         })
         .await
         .map_err(|_| {
@@ -164,9 +191,12 @@ mod tests {
             &agent,
             AgentId("agent-a".to_owned()),
             sidecar_tx.clone(),
-            LeaseId(1),
-            BoardId("b1".to_owned()),
-            vec![0xde, 0xad],
+            OpenRequest {
+                lease: LeaseId(1),
+                board: BoardId("b1".to_owned()),
+                token: vec![0xde, 0xad],
+                kind: fleet_proto::ChannelKind::Data,
+            },
         )
         .await
         .unwrap();
@@ -179,11 +209,13 @@ mod tests {
                 board,
                 token,
                 channel: ch,
+                kind,
             }) => {
                 assert_eq!(lease, LeaseId(1));
                 assert_eq!(board, BoardId("b1".to_owned()));
                 assert_eq!(token, vec![0xde, 0xad]);
                 assert_eq!(ch, channel);
+                assert_eq!(kind, fleet_proto::ChannelKind::Data);
             }
             other => panic!("expected OpenSession, got {other:?}"),
         }
@@ -235,9 +267,12 @@ mod tests {
             &agent,
             AgentId("agent-a".to_owned()),
             sidecar_tx,
-            LeaseId(1),
-            BoardId("b1".to_owned()),
-            vec![],
+            OpenRequest {
+                lease: LeaseId(1),
+                board: BoardId("b1".to_owned()),
+                token: vec![],
+                kind: fleet_proto::ChannelKind::Data,
+            },
         )
         .await
         .unwrap();
@@ -293,6 +328,7 @@ mod tests {
                     lease: LeaseId(1),
                     agent: AgentId("agent-a".to_owned()),
                     sidecar: sidecar_tx,
+                    kind: fleet_proto::ChannelKind::Data,
                 },
             )
             .await;

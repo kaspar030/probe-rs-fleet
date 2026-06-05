@@ -17,8 +17,8 @@ pub mod lease;
 pub mod token;
 
 pub use agent_api::{
-    AgentReport, BoardPresence, BoardStatus, CoordinatorCommand, DiscoveredProbe, LogLevel,
-    PowerAction, ProbeInventory,
+    AgentReport, BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe,
+    LogLevel, PowerAction, ProbeInventory,
 };
 pub use board::{Board, BoardState, PowerKind};
 pub use ids::{AgentId, BoardId, LeaseId, Principal};
@@ -37,9 +37,11 @@ pub struct DataFrame {
     pub bytes: Vec<u8>,
 }
 
-/// Identifies one open data-plane session multiplexed over an agent's
-/// dial-out connection. Allocated by the coordinator when a lease opens a
-/// probe-rs session.
+/// Identifies one open relay session (data plane *or* gdb plane) multiplexed
+/// over an agent's dial-out connection. Allocated by the coordinator when a
+/// lease opens a probe-rs session. The byte stream a channel carries is opaque
+/// to the coordinator; what the bytes *mean* (and how the agent/sidecar source
+/// and sink them) is determined by the [`ChannelKind`] recorded at open time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelId(pub u64);
 

@@ -673,6 +673,7 @@ name = "fleet-sidecar"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fleet-agent",
  "fleet-proto",
  "thiserror 2.0.18",
  "tokio",

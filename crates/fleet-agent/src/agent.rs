@@ -18,12 +18,13 @@ use tokio::sync::Mutex;
 
 use fleet_proto::token::AllowedOp;
 use fleet_proto::{
-    AgentReport, BoardId, ChannelId, CoordinatorCommand, LeaseId, PowerAction, PowerKind,
-    ProbeInventory,
+    AgentReport, BoardId, ChannelId, ChannelKind, CoordinatorCommand, LeaseId, PowerAction,
+    PowerKind, ProbeInventory,
 };
 
 use crate::config::{AgentConfig, BoardSpec, BoardsConfig};
 use crate::error::{AgentError, Result};
+use crate::gdb::{GdbConnection, GdbStub, ProcessGdbStub};
 use crate::power::{self, PowerControl};
 use crate::probers::{ProbeRsBackend, Session};
 use crate::token::Ed25519Verifier;
@@ -33,6 +34,16 @@ struct ActiveSession {
     lease: LeaseId,
     board: BoardId,
     session: Box<dyn Session>,
+}
+
+/// An open gdb-tunnel session: a board-local `probe-rs gdb` stub whose TCP
+/// stream is spliced onto the relay channel. Tracked separately from
+/// [`ActiveSession`] because it owns a process + connection rather than a
+/// `probe-rs serve` [`Session`], but shares the same lease/board lifecycle.
+struct GdbSession {
+    lease: LeaseId,
+    board: BoardId,
+    connection: GdbConnection,
 }
 
 /// Factory that builds a power controller from a board's declared power kind.
@@ -48,8 +59,12 @@ pub struct Agent<B: ProbeRsBackend> {
     boards: BoardsConfig,
     verifier: Ed25519Verifier,
     backend: Arc<B>,
+    /// Spawns board-local `probe-rs gdb` stubs for gdb-tunnel channels.
+    gdb_stub: Arc<dyn GdbStub>,
     inventory: Mutex<ProbeInventory>,
     sessions: Mutex<HashMap<ChannelId, ActiveSession>>,
+    /// Open gdb-tunnel sessions, keyed by channel (parallel to `sessions`).
+    gdb_sessions: Mutex<HashMap<ChannelId, GdbSession>>,
     /// Reports the agent wants to emit upward (drained by the connection loop).
     outbox: Mutex<Vec<AgentReport>>,
     /// Builds power controllers (injectable for tests).
@@ -84,11 +99,13 @@ impl<B: ProbeRsBackend> Agent<B> {
             boards,
             verifier,
             backend,
+            gdb_stub: Arc::new(ProcessGdbStub::new()),
             inventory: Mutex::new(ProbeInventory {
                 boards: Vec::new(),
                 unknown: Vec::new(),
             }),
             sessions: Mutex::new(HashMap::new()),
+            gdb_sessions: Mutex::new(HashMap::new()),
             outbox: Mutex::new(Vec::new()),
             power_factory: Box::new(|k| power::from_power_kind(k)),
             now_fn: wall_clock_secs,
@@ -105,6 +122,12 @@ impl<B: ProbeRsBackend> Agent<B> {
     #[cfg(test)]
     fn set_power_factory(&mut self, factory: PowerFactory) {
         self.power_factory = factory;
+    }
+
+    /// Override the gdb-stub backend (tests).
+    #[cfg(test)]
+    fn set_gdb_stub(&mut self, stub: Arc<dyn GdbStub>) {
+        self.gdb_stub = stub;
     }
 
     /// Replace the current inventory snapshot (called after discovery).
@@ -146,7 +169,8 @@ impl<B: ProbeRsBackend> Agent<B> {
                 board,
                 token,
                 channel,
-            } => self.on_open_session(lease, &board, &token, channel).await,
+                kind,
+            } => self.on_open_session(lease, &board, &token, channel, kind).await,
             CoordinatorCommand::KillSession { channel } => self.on_kill_session(channel).await,
             CoordinatorCommand::ReleaseLease {
                 lease,
@@ -158,32 +182,45 @@ impl<B: ProbeRsBackend> Agent<B> {
         }
     }
 
-    /// Verify the token and open a probe-rs session.
+    /// Verify the token and open a session of the requested [`ChannelKind`].
     async fn on_open_session(
         &self,
         lease: LeaseId,
         board: &BoardId,
         token_wire: &[u8],
         channel: ChannelId,
+        kind: ChannelKind,
     ) -> Result<()> {
         // Board must be declared.
         let spec = self.board_spec(board)?.clone();
 
-        // Verify the capability token locally before doing anything else.
+        // Verify the capability token locally before doing anything else. The
+        // required capability depends on the channel kind: a gdb tunnel needs
+        // `Gdb`, the data plane needs `Attach`.
+        let required = match kind {
+            ChannelKind::Data => AllowedOp::Attach,
+            ChannelKind::Gdb => AllowedOp::Gdb,
+        };
         let now = (self.now_fn)();
-        crate::token::verify_wire(
-            &self.verifier,
-            token_wire,
-            lease,
-            board,
-            AllowedOp::Attach,
-            now,
-        )?;
+        crate::token::verify_wire(&self.verifier, token_wire, lease, board, required, now)?;
 
-        // Start the backend session and record it.
+        match kind {
+            ChannelKind::Data => self.open_data_session(lease, board, channel, &spec).await,
+            ChannelKind::Gdb => self.open_gdb_session(lease, board, channel, &spec).await,
+        }
+    }
+
+    /// Open a `probe-rs serve` data-plane session and record it.
+    async fn open_data_session(
+        &self,
+        lease: LeaseId,
+        board: &BoardId,
+        channel: ChannelId,
+        spec: &BoardSpec,
+    ) -> Result<()> {
         let session = self
             .backend
-            .open(&spec)
+            .open(spec)
             .await
             .map_err(AgentError::Probers)?;
         self.sessions.lock().await.insert(
@@ -203,7 +240,42 @@ impl<B: ProbeRsBackend> Agent<B> {
         Ok(())
     }
 
-    /// Kill the session on `channel`.
+    /// Spawn a board-local `probe-rs gdb` stub and record the gdb-tunnel
+    /// session. The connection's TCP stream is spliced onto `channel` by the
+    /// transport layer (see [`crate::gdb::splice`]); here we own its lifecycle.
+    async fn open_gdb_session(
+        &self,
+        lease: LeaseId,
+        board: &BoardId,
+        channel: ChannelId,
+        spec: &BoardSpec,
+    ) -> Result<()> {
+        let connection = self
+            .gdb_stub
+            .spawn(spec)
+            .await
+            .map_err(AgentError::Probers)?;
+        self.gdb_sessions.lock().await.insert(
+            channel,
+            GdbSession {
+                lease,
+                board: board.clone(),
+                connection,
+            },
+        );
+        self.emit(AgentReport::Log {
+            level: fleet_proto::LogLevel::Info,
+            board: Some(board.clone()),
+            message: format!(
+                "opened gdb tunnel on channel {} for lease {}",
+                channel.0, lease.0
+            ),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Kill the session on `channel` (data plane *or* gdb tunnel).
     async fn on_kill_session(&self, channel: ChannelId) -> Result<()> {
         let removed = self.sessions.lock().await.remove(&channel);
         if let Some(active) = removed {
@@ -212,6 +284,16 @@ impl<B: ProbeRsBackend> Agent<B> {
                 .kill()
                 .await
                 .map_err(AgentError::Probers)?;
+            self.emit(AgentReport::SessionClosed {
+                channel,
+                exit_code: None,
+            })
+            .await;
+        }
+        // A gdb tunnel may share the same channel-id space; tear it down too.
+        let gdb = self.gdb_sessions.lock().await.remove(&channel);
+        if let Some(session) = gdb {
+            session.connection.shutdown().await;
             self.emit(AgentReport::SessionClosed {
                 channel,
                 exit_code: None,
@@ -229,15 +311,8 @@ impl<B: ProbeRsBackend> Agent<B> {
         board: &BoardId,
         erase: bool,
     ) -> Result<()> {
-        // Kill any session(s) tied to this lease.
-        let channels: Vec<ChannelId> = {
-            let sessions = self.sessions.lock().await;
-            sessions
-                .iter()
-                .filter(|(_, s)| s.lease == lease)
-                .map(|(c, _)| *c)
-                .collect()
-        };
+        // Kill any session(s) tied to this lease (data plane and gdb tunnels).
+        let channels = self.channels_for_lease(lease).await;
         for channel in channels {
             self.on_kill_session(channel).await?;
         }
@@ -296,14 +371,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     ///
     /// Propagates power/backend errors.
     pub async fn fault_board(&self, board: &BoardId, reason: String) -> Result<()> {
-        let channels: Vec<ChannelId> = {
-            let sessions = self.sessions.lock().await;
-            sessions
-                .iter()
-                .filter(|(_, s)| &s.board == board)
-                .map(|(c, _)| *c)
-                .collect()
-        };
+        let channels = self.channels_for_board(board).await;
         for channel in channels {
             self.on_kill_session(channel).await?;
         }
@@ -317,9 +385,56 @@ impl<B: ProbeRsBackend> Agent<B> {
         Ok(())
     }
 
+    /// All channels (data plane + gdb tunnels) tied to `lease`.
+    async fn channels_for_lease(&self, lease: LeaseId) -> Vec<ChannelId> {
+        let mut channels: Vec<ChannelId> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, s)| s.lease == lease)
+            .map(|(c, _)| *c)
+            .collect();
+        channels.extend(
+            self.gdb_sessions
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, s)| s.lease == lease)
+                .map(|(c, _)| *c),
+        );
+        channels
+    }
+
+    /// All channels (data plane + gdb tunnels) tied to `board`.
+    async fn channels_for_board(&self, board: &BoardId) -> Vec<ChannelId> {
+        let mut channels: Vec<ChannelId> = self
+            .sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, s)| &s.board == board)
+            .map(|(c, _)| *c)
+            .collect();
+        channels.extend(
+            self.gdb_sessions
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, s)| &s.board == board)
+                .map(|(c, _)| *c),
+        );
+        channels
+    }
+
     /// Number of currently active sessions (for tests / introspection).
     pub async fn active_session_count(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// Number of currently open gdb-tunnel sessions (for tests).
+    pub async fn gdb_session_count(&self) -> usize {
+        self.gdb_sessions.lock().await.len()
     }
 
     /// The agent's configured id.
@@ -405,6 +520,8 @@ port = 2
         a.set_clock(|| 1_000);
         // Substitute no-op power control so tests don't shell out to uhubctl.
         a.set_power_factory(Box::new(|_| Box::new(crate::power::NoPower)));
+        // Substitute a mock gdb stub so tests don't spawn `probe-rs gdb`.
+        a.set_gdb_stub(Arc::new(crate::gdb::mock::MockGdbStub::new()));
         a
     }
 
@@ -419,6 +536,7 @@ port = 2
                 board: BoardId("b1".into()),
                 token,
                 channel: ChannelId(1),
+                kind: ChannelKind::Data,
             })
             .await
             .unwrap();
@@ -438,6 +556,7 @@ port = 2
                 board: BoardId("b1".into()),
                 token,
                 channel: ChannelId(1),
+                kind: ChannelKind::Data,
             })
             .await
             .unwrap_err();
@@ -457,6 +576,7 @@ port = 2
                 board: BoardId("b1".into()),
                 token,
                 channel: ChannelId(1),
+                kind: ChannelKind::Data,
             })
             .await
             .unwrap_err();
@@ -475,6 +595,7 @@ port = 2
                 board: BoardId("ghost".into()),
                 token,
                 channel: ChannelId(1),
+                kind: ChannelKind::Data,
             })
             .await
             .unwrap_err();
@@ -492,6 +613,7 @@ port = 2
                 board: BoardId("b1".into()),
                 token,
                 channel: ChannelId(1),
+                kind: ChannelKind::Data,
             })
             .await
             .unwrap();
@@ -572,6 +694,7 @@ port = 2
                 board: BoardId("b1".into()),
                 token,
                 channel: ChannelId(1),
+                kind: ChannelKind::Data,
             })
             .await
             .unwrap();
@@ -597,5 +720,131 @@ port = 2
             .await
             .unwrap();
         assert_eq!(agent.active_session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn open_gdb_channel_with_valid_token_spawns_stub() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        let token = signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000);
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                token,
+                channel: ChannelId(1),
+                kind: ChannelKind::Gdb,
+            })
+            .await
+            .unwrap();
+        // A gdb session was opened; no data-plane `serve` was started.
+        assert_eq!(agent.gdb_session_count().await, 1);
+        assert_eq!(agent.active_session_count().await, 0);
+        assert_eq!(backend.open_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn open_gdb_channel_rejects_token_without_gdb_op() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        // Token grants Attach but NOT Gdb.
+        let token = signed_token(7, "b1", vec![AllowedOp::Attach], 2_000);
+        let err = agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                token,
+                channel: ChannelId(1),
+                kind: ChannelKind::Gdb,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Token(_)));
+        assert_eq!(agent.gdb_session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn data_channel_rejects_token_without_attach_op() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        // Token grants Gdb but NOT Attach: a data-plane open must be rejected.
+        let token = signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000);
+        let err = agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                token,
+                channel: ChannelId(1),
+                kind: ChannelKind::Data,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Token(_)));
+        assert_eq!(agent.active_session_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn kill_gdb_channel_tears_down_session() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        let token = signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000);
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                token,
+                channel: ChannelId(1),
+                kind: ChannelKind::Gdb,
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.gdb_session_count().await, 1);
+        agent
+            .handle_command(CoordinatorCommand::KillSession {
+                channel: ChannelId(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.gdb_session_count().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_lease_tears_down_gdb_and_data_sessions() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        // A data-plane channel and a gdb channel for the same lease.
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                token: signed_token(7, "b1", vec![AllowedOp::Attach], 2_000),
+                channel: ChannelId(1),
+                kind: ChannelKind::Data,
+            })
+            .await
+            .unwrap();
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                token: signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000),
+                channel: ChannelId(2),
+                kind: ChannelKind::Gdb,
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.active_session_count().await, 1);
+        assert_eq!(agent.gdb_session_count().await, 1);
+
+        agent
+            .handle_command(CoordinatorCommand::ReleaseLease {
+                lease: LeaseId(7),
+                board: BoardId("b1".into()),
+                erase: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.active_session_count().await, 0);
+        assert_eq!(agent.gdb_session_count().await, 0);
     }
 }

@@ -121,6 +121,9 @@ pub struct ChannelRoute {
     pub agent: AgentId,
     /// Sender into the sidecar connection that opened the channel.
     pub sidecar: SidecarHandle,
+    /// Which plane this channel carries (data vs. gdb). The relay treats both
+    /// identically; this is bookkeeping for diagnostics and teardown.
+    pub kind: fleet_proto::ChannelKind,
 }
 
 /// Table of open relay channels, keyed by [`ChannelId`]. Also owns the monotonic
@@ -237,6 +240,7 @@ mod tests {
                     lease: LeaseId(1),
                     agent: AgentId("agent-a".to_owned()),
                     sidecar: tx,
+                    kind: fleet_proto::ChannelKind::Data,
                 },
             )
             .await;
