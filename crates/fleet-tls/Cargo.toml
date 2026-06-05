@@ -8,6 +8,20 @@ repository.workspace = true
 description = "TLS configuration and helpers for probe-rs-fleet."
 
 [dependencies]
+fleet-proto.workspace = true
+
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+sha2 = "0.10"
+x509-parser = "0.16"
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio = { workspace = true }
 
 [lints]
 workspace = true
