@@ -8,6 +8,13 @@ repository.workspace = true
 description = "Sidecar role implementation for probe-rs-fleet."
 
 [dependencies]
+fleet-proto = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [lints]
 workspace = true

@@ -433,6 +433,13 @@ dependencies = [
 [[package]]
 name = "fleet-sidecar"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fleet-proto",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "fleet-tls"
