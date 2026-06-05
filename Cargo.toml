@@ -67,3 +67,6 @@ async-trait = "0.1"
 
 # gpio (Linux char-device line control; agent power control)
 tokio-gpiod = "0.3"
+
+# dev / test helpers
+tempfile = "3"

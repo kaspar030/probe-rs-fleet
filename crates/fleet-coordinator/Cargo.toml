@@ -8,6 +8,28 @@ repository.workspace = true
 description = "Coordinator role implementation for probe-rs-fleet."
 
 [dependencies]
+fleet-proto.workspace = true
+fleet-core.workspace = true
+fleet-tls.workspace = true
+
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+
+postcard.workspace = true
+serde.workspace = true
+
+sqlx.workspace = true
+
+ed25519-dalek.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
