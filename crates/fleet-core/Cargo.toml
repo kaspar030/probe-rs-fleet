@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Core domain types and shared logic for probe-rs-fleet."
 
 [dependencies]
+fleet-proto.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

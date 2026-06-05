@@ -17,6 +17,10 @@ version = "0.1.0"
 [[package]]
 name = "fleet-core"
 version = "0.1.0"
+dependencies = [
+ "fleet-proto",
+ "serde",
+]
 
 [[package]]
 name = "fleet-proto"
