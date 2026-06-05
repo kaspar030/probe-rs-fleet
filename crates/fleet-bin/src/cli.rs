@@ -1,0 +1,369 @@
+//! Command-line surface and role dispatch.
+//!
+//! Two entry paths funnel into the same role handlers:
+//!
+//! 1. **argv0 dispatch** — when the binary is invoked as `probe-rs` (basename
+//!    of argv0, with an optional `.exe` suffix stripped), every following
+//!    argument is treated as a probe-rs argument and forwarded to the sidecar
+//!    shim *without* running clap. This makes a `probe-rs` symlink on `PATH`
+//!    route through the fleet transparently.
+//! 2. **explicit subcommands** — `probe-rs-fleet <coordinator|agent|sidecar|ctl>`
+//!    parsed with clap derive.
+
+use std::ffi::{OsStr, OsString};
+use std::path::Path;
+use std::process::ExitCode;
+
+use clap::{Args, Parser, Subcommand};
+
+use crate::roles;
+
+/// The single multi-role probe-rs-fleet binary.
+#[derive(Debug, Parser)]
+#[command(
+    name = "probe-rs-fleet",
+    version,
+    about = "probe-rs-fleet: coordinator, agent, sidecar, and admin CLI in one binary",
+    propagate_version = true
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+/// Top-level roles.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Run the fleet coordinator daemon (scheduler / leases / relay).
+    Coordinator(CoordinatorArgs),
+    /// Run the fleet agent: dials out to the coordinator and drives local probes.
+    Agent(AgentArgs),
+    /// Sidecar shim: forward a probe-rs invocation through the fleet.
+    ///
+    /// Usually reached via a `probe-rs` symlink, but also available explicitly:
+    /// `probe-rs-fleet sidecar -- <probe-rs args…>`.
+    Sidecar(SidecarArgs),
+    /// Admin / UX CLI: talk to the coordinator over mTLS.
+    Ctl(CtlArgs),
+}
+
+/// Arguments for the `coordinator` role.
+#[derive(Debug, Args)]
+pub struct CoordinatorArgs {
+    /// Path to the coordinator config (TOML).
+    #[arg(long, env = "PROBE_RS_FLEET_CONFIG")]
+    pub config: std::path::PathBuf,
+}
+
+/// Arguments for the `agent` role.
+#[derive(Debug, Args)]
+pub struct AgentArgs {
+    /// Path to the agent config (TOML).
+    #[arg(long, env = "PROBE_RS_FLEET_AGENT_CONFIG")]
+    pub config: std::path::PathBuf,
+}
+
+/// Arguments for the explicit `sidecar` subcommand.
+#[derive(Debug, Args)]
+pub struct SidecarArgs {
+    /// The probe-rs subcommand and its arguments, forwarded verbatim.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub probe_rs_args: Vec<OsString>,
+}
+
+/// Shared connection flags for the `ctl` client.
+#[derive(Debug, Args)]
+pub struct CtlClientArgs {
+    /// `host:port` of the coordinator to connect to.
+    #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR", global = true)]
+    pub coordinator: Option<String>,
+    /// Client certificate chain (PEM).
+    #[arg(long, env = "PROBE_RS_FLEET_CERT", global = true)]
+    pub cert: Option<std::path::PathBuf>,
+    /// Client private key (PEM).
+    #[arg(long, env = "PROBE_RS_FLEET_KEY", global = true)]
+    pub key: Option<std::path::PathBuf>,
+    /// CA used to verify the coordinator's server cert (PEM).
+    #[arg(long, env = "PROBE_RS_FLEET_CA", global = true)]
+    pub ca: Option<std::path::PathBuf>,
+}
+
+/// Arguments for the `ctl` role.
+#[derive(Debug, Args)]
+pub struct CtlArgs {
+    #[command(flatten)]
+    pub client: CtlClientArgs,
+    #[command(subcommand)]
+    pub command: CtlCommand,
+}
+
+/// `ctl` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CtlCommand {
+    /// List the fleet inventory (boards and their state).
+    List,
+    /// Lease a board by id or selector (`tag=…`, `chip=…`).
+    Lease {
+        /// Board id or selector: bare id, `tag=<t>` (repeatable), or `chip=<c>`.
+        selector: String,
+        /// Requested hold duration in seconds (0 = policy default).
+        #[arg(long, default_value_t = 0)]
+        duration: u64,
+    },
+    /// Release a held board.
+    Release {
+        /// Board id to release.
+        board: String,
+    },
+    /// Power-cycle a board.
+    PowerCycle {
+        /// Board id to power-cycle.
+        board: String,
+    },
+    /// Show who holds which boards.
+    Who,
+    /// Tail / fetch coordinator-side logs.
+    Logs {
+        /// Optional board id to scope the logs to.
+        board: Option<String>,
+        /// Follow the log stream.
+        #[arg(long)]
+        follow: bool,
+    },
+}
+
+/// What argv0 inspection decided the process should do.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Dispatch {
+    /// Behave as the sidecar shim, forwarding these probe-rs arguments.
+    Sidecar(Vec<OsString>),
+    /// Parse the remaining arguments with clap.
+    Clap,
+}
+
+/// Normalise an argv0 to its basename, stripping a trailing `.exe`.
+fn argv0_basename(argv0: &OsStr) -> Option<String> {
+    let name = Path::new(argv0).file_name()?.to_str()?;
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    Some(name.to_owned())
+}
+
+/// Decide, purely from argv0, whether to enter sidecar shim mode.
+///
+/// `rest` is `args[1..]` — everything after the program name. When the program
+/// was invoked as `probe-rs`, all of `rest` is forwarded to the sidecar.
+#[must_use]
+pub fn dispatch_from_argv0(argv0: &OsStr, rest: &[OsString]) -> Dispatch {
+    match argv0_basename(argv0).as_deref() {
+        Some("probe-rs") => Dispatch::Sidecar(rest.to_vec()),
+        _ => Dispatch::Clap,
+    }
+}
+
+/// Process entry point. Resolves the dispatch mode, sets up the runtime, and
+/// runs the selected role, mapping the result to an [`ExitCode`].
+#[must_use]
+pub fn main() -> ExitCode {
+    let argv: Vec<OsString> = std::env::args_os().collect();
+    let argv0 = argv.first().cloned().unwrap_or_default();
+    let rest = &argv[1.min(argv.len())..];
+
+    crate::logging::init();
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(error) => {
+            eprintln!("error: failed to start async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let dispatch = dispatch_from_argv0(&argv0, rest);
+    let result = runtime.block_on(run(dispatch, argv.clone()));
+
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            // Print the full error chain to stderr.
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the selected role and produce a process exit code.
+///
+/// `process_args` is the full process argv used when falling through to clap
+/// parsing.
+///
+/// # Errors
+///
+/// Propagates any error from a role handler.
+async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<ExitCode> {
+    match dispatch {
+        Dispatch::Sidecar(probe_rs_args) => roles::sidecar::run(probe_rs_args),
+        Dispatch::Clap => {
+            let cli = Cli::parse_from(process_args);
+            match cli.command {
+                Command::Coordinator(args) => {
+                    roles::coordinator::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Agent(args) => {
+                    roles::agent::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Sidecar(args) => roles::sidecar::run(args.probe_rs_args),
+                Command::Ctl(args) => {
+                    roles::ctl::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn os(v: &[&str]) -> Vec<OsString> {
+        v.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn clap_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn argv0_probe_rs_routes_to_sidecar() {
+        let rest = os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]);
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("probe-rs"), &rest),
+            Dispatch::Sidecar(rest.clone())
+        );
+    }
+
+    #[test]
+    fn argv0_probe_rs_with_path_and_exe_routes_to_sidecar() {
+        let rest = os(&["info"]);
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("/usr/local/bin/probe-rs"), &rest),
+            Dispatch::Sidecar(rest.clone())
+        );
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("/opt/tools/probe-rs.exe"), &rest),
+            Dispatch::Sidecar(rest)
+        );
+    }
+
+    #[test]
+    fn argv0_probe_rs_fleet_uses_clap() {
+        let rest = os(&["coordinator", "--config", "x.toml"]);
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("probe-rs-fleet"), &rest),
+            Dispatch::Clap
+        );
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("/opt/bin/probe-rs-fleet"), &rest),
+            Dispatch::Clap
+        );
+    }
+
+    #[test]
+    fn argv0_other_names_use_clap() {
+        let rest = os(&["ctl", "list"]);
+        assert_eq!(dispatch_from_argv0(OsStr::new("fleet"), &rest), Dispatch::Clap);
+        assert_eq!(dispatch_from_argv0(OsStr::new("probe-rsx"), &rest), Dispatch::Clap);
+        assert_eq!(dispatch_from_argv0(OsStr::new(""), &rest), Dispatch::Clap);
+    }
+
+    #[test]
+    fn parses_coordinator() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "--config", "c.toml"]));
+        match cli.command {
+            Command::Coordinator(a) => assert_eq!(a.config, Path::new("c.toml")),
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_agent() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "--config", "a.toml"]));
+        match cli.command {
+            Command::Agent(a) => assert_eq!(a.config, Path::new("a.toml")),
+            other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_subcommand_preserves_trailing_args_verbatim() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "sidecar",
+            "--",
+            "run",
+            "--chip",
+            "nRF52840_xxAA",
+            "app.elf",
+        ]));
+        match cli.command {
+            Command::Sidecar(a) => {
+                assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
+            }
+            other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ctl_subcommands() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "list"]));
+        assert!(matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List)));
+
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "ctl", "lease", "nrf52840-dk-3", "--duration", "600",
+        ]));
+        match cli.command {
+            Command::Ctl(a) => match a.command {
+                CtlCommand::Lease { selector, duration } => {
+                    assert_eq!(selector, "nrf52840-dk-3");
+                    assert_eq!(duration, 600);
+                }
+                other => panic!("expected lease, got {other:?}"),
+            },
+            other => panic!("expected ctl, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "power-cycle", "b1"]));
+        match cli.command {
+            Command::Ctl(a) => match a.command {
+                CtlCommand::PowerCycle { board } => assert_eq!(board, "b1"),
+                other => panic!("expected power-cycle, got {other:?}"),
+            },
+            other => panic!("expected ctl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctl_client_flags_parse() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "ctl",
+            "--coordinator", "coord.example:443",
+            "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+            "who",
+        ]));
+        match cli.command {
+            Command::Ctl(a) => {
+                assert_eq!(a.client.coordinator.as_deref(), Some("coord.example:443"));
+                assert_eq!(a.client.cert.as_deref(), Some(Path::new("c.pem")));
+                assert!(matches!(a.command, CtlCommand::Who));
+            }
+            other => panic!("expected ctl, got {other:?}"),
+        }
+    }
+}

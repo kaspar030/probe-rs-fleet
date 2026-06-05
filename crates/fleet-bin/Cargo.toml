@@ -8,10 +8,28 @@ repository.workspace = true
 description = "Single multi-role binary for probe-rs-fleet (coordinator, agent, sidecar, ctl)."
 
 [[bin]]
-name = "fleet"
+name = "probe-rs-fleet"
 path = "src/main.rs"
 
 [dependencies]
+fleet-proto = { workspace = true }
+fleet-core = { workspace = true }
+fleet-tls = { workspace = true }
+rustls = { workspace = true }
+fleet-agent = { workspace = true }
+fleet-coordinator = { workspace = true }
+fleet-sidecar = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
