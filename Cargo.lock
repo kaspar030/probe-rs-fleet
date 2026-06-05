@@ -3,11 +3,35 @@
 version = 4
 
 [[package]]
+name = "fleet-agent"
+version = "0.1.0"
+
+[[package]]
+name = "fleet-bin"
+version = "0.1.0"
+
+[[package]]
+name = "fleet-coordinator"
+version = "0.1.0"
+
+[[package]]
+name = "fleet-core"
+version = "0.1.0"
+
+[[package]]
 name = "fleet-proto"
 version = "0.1.0"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "fleet-sidecar"
+version = "0.1.0"
+
+[[package]]
+name = "fleet-tls"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"

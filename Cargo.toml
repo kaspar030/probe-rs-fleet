@@ -2,6 +2,12 @@
 resolver = "2"
 members = [
     "crates/fleet-proto",
+    "crates/fleet-core",
+    "crates/fleet-tls",
+    "crates/fleet-agent",
+    "crates/fleet-coordinator",
+    "crates/fleet-sidecar",
+    "crates/fleet-bin",
 ]
 
 [workspace.lints.rust]

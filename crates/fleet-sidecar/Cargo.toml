@@ -1,0 +1,13 @@
+[package]
+name = "fleet-sidecar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sidecar role implementation for probe-rs-fleet."
+
+[dependencies]
+
+[lints]
+workspace = true
