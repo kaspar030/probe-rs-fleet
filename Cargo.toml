@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fleet-proto",
+]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ariel-os/probe-rs-fleet"
+
+[workspace.dependencies]
+# internal
+fleet-proto = { path = "crates/fleet-proto" }
+fleet-core = { path = "crates/fleet-core" }
+fleet-tls = { path = "crates/fleet-tls" }
+fleet-agent = { path = "crates/fleet-agent" }
+fleet-coordinator = { path = "crates/fleet-coordinator" }
+fleet-sidecar = { path = "crates/fleet-sidecar" }
+
+# rpc / wire
+postcard-rpc = { version = "0.12", features = ["use-std"] }
+postcard = "1"
+postcard-schema = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+# async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal"] }
+
+# tls
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+
+# storage
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+
+# cli / config / errors / logging
+clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

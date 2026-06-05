@@ -1,0 +1,14 @@
+[package]
+name = "fleet-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared wire types and RPC service definitions for probe-rs-fleet (no I/O)."
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
