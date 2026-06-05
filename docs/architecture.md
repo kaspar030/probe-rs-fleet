@@ -131,18 +131,33 @@ Does **not** touch USB.
 ### 4.2 `agent` (Raspberry Pi)
 Owns local probes. Reconciles discovered probes against `boards.toml`.
 
-Two ways it can drive probe-rs — **we will support the proxy mode first** since
-it matches the decided architecture and tracks the probe-rs CLI exactly:
+> **Updated by investigation (task #1710, probe-rs 0.31.0):** The server is
+> `probe-rs serve`. It takes **no `--probe` / `--chip`** — it exposes *all*
+> local probes and the connecting client selects probe + chip **in-band** over
+> postcard-rpc (`SelectProbeEndpoint` / `AttachRequest`). So there is **no
+> CLI injection point** for the agent; the earlier "agent injects `--probe`"
+> model is dropped.
 
-- **(A) Proxy a real `probe-rs` server process (decided primary).** The agent
-  controls the lifecycle of `probe-rs`'s own server process and proxies the
-  regular probe-rs client/server protocol through to it. The agent owns:
-  process spawn/kill, `--probe <serial>` selection, USB power, fault recovery,
-  log capture. This keeps us byte-compatible with whatever probe-rs version is
-  deployed and lets the sidecar speak vanilla probe-rs.
-- **(B) Embed probe-rs as a library (future option).** Only if/when probe-rs
-  exposes the remote capabilities we need as a library API. Tighter control,
-  no subprocess, but couples us to a probe-rs version. Revisit later.
+Decided agent model (per #1710):
+
+- **Byte-proxy `probe-rs serve`, one server per board.** The agent spawns a
+  `probe-rs serve` per board over a **Unix socket** (loopback, no TLS/WS/auth
+  needed on that hop), each locked to its physical probe via a per-user
+  `ProbeAccess::Allow([serial])` + per-board token. The agent byte-splices the
+  raw `u32-LE length-prefixed postcard` stream through the relay — **zero
+  probe-rs parsing**. Per-board (reused across a holder's many invocations),
+  recycled on release for cleanup. This matches time-based sharing (§6).
+- **Isolation comes from us, not from `serve` flags.** `ProbeAccess` per-board
+  is the defense-in-depth fence so a leaseholder can only touch its own board,
+  in addition to the fleet lease layer.
+- **Embedding probe-rs as a library is unnecessary for v1** — the subprocess
+  `serve` model is byte-compatible with any deployed probe-rs version.
+- **Gap: `probe-rs gdb`/`debug` are NOT remote-capable in 0.31.** gdb runs a
+  separate local TCP stub (default `127.0.0.1:1337`), not over postcard-rpc. To
+  support laze's `debug` task remotely we tunnel that raw gdbremote TCP as a
+  **second opaque channel** (agent runs `probe-rs gdb` locally). Tracked as a
+  follow-up task; optional upstream probe-rs feature request to make gdb
+  remote-capable.
 
 Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
@@ -234,14 +249,20 @@ From `ariel-os/laze-project.yml`, the `probe-rs` module emits exactly these:
 
 Observations that shape the sidecar:
 
-- **`--chip` is the only board selector laze passes.** There is no
-  probe-serial in the recipe. So the sidecar gets the *board* from a fleet
-  selector (env/token), and the **agent** injects the real `--probe <serial>`
-  locally. `--chip` flows through untouched.
-- The sidecar must faithfully **stream stdout and propagate exit codes**, esp.
-  for `run` (embedded-test) and CI.
-- `gdb` needs a local listening TCP socket on the workstation that tunnels to
-  the agent's gdb server through the relay.
+- **`--chip` is the only board selector laze passes.** There is no probe-serial
+  in the recipe. The sidecar gets the *board* from a fleet selector (env/token)
+  and leases it; **probe + chip are then selected in-band** by the genuine
+  probe-rs client against the agent's per-board `serve` (no CLI injection — see
+  §4.2). `--chip` flows through untouched as part of the client's `AttachRequest`.
+- **The sidecar runs the genuine `probe-rs` client** (argv0 shim that sets
+  `PROBE_RS_REMOTE_HOST` / `PROBE_RS_REMOTE_TOKEN` to a local fleet endpoint).
+  Because the real client computes the **exit code** locally as a byproduct,
+  exit-code propagation is **free** — the relay only tunnels RPC frames. (Do
+  *not* reimplement the client, or we'd have to re-derive exit-code logic.)
+- **`gdb` is special (not remote-capable in probe-rs 0.31).** It is *not*
+  expressed over postcard-rpc; the agent runs `probe-rs gdb` locally and the
+  fleet tunnels its raw gdbremote TCP (`127.0.0.1:1337`) as a **second opaque
+  channel** to a local listening socket on the workstation. Tracked separately.
 
 Proposed selector convention (additive, no laze change required):
 
@@ -257,7 +278,7 @@ Declarative per-agent file mapping probe serials to board metadata.
 ```toml
 [[board]]
 id      = "nrf52840-dk-3"
-serial  = "001050257890"          # probe serial → real --probe selector
+serial  = "001050257890"          # physical probe serial → per-board `serve` ProbeAccess::Allow
 chip    = "nRF52840_xxAA"         # informational; --chip still comes from caller
 tags    = ["nrf52", "bluetooth"]
 exclusive = true
