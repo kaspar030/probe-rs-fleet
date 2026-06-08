@@ -638,6 +638,7 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "ed25519-dalek",
  "fleet-agent",
  "fleet-coordinator",
  "fleet-core",
@@ -647,6 +648,7 @@ dependencies = [
  "rand_core",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "tempfile",
  "tokio",
@@ -1654,6 +1656,7 @@ dependencies = [
  "ring",
  "rustls-pki-types",
  "time",
+ "x509-parser",
  "yasna",
 ]
 
@@ -2856,6 +2859,7 @@ dependencies = [
  "lazy_static",
  "nom",
  "oid-registry",
+ "ring",
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",

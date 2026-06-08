@@ -155,12 +155,70 @@ Keys are written `0600`. `init` refuses to overwrite existing files unless
 directories. Afterwards, `probe-rs-fleet coordinator` (no `--config`) loads the
 generated config and starts listening.
 
-To enroll an agent: issue it a client certificate from the generated CA,
-compute the cert's fingerprint — the **lowercase hex SHA-256 of the certificate
-DER, with no `sha256:` prefix and no colons** (exactly what
-`fleet_tls::cert_fingerprint` produces) — and add
-`"<fingerprint>" = "<agent-id>"` under `[pinned_agents]`. A fully-commented
-reference config lives at `examples/coordinator.toml`.
+To enroll an agent, ctl user, or sidecar, use the two-step issue + import flow
+(the coordinator is the CA / trust root, so the other roles cannot fully
+self-generate credentials — a cert must be issued by the CA):
+
+1. **`probe-rs-fleet coordinator enroll <principal-id> --kind agent|client`**
+   (run on the coordinator host, where the CA private key lives). This issues a
+   client keypair + cert signed by the coordinator's `client-ca.pem` with
+   **CN = `<principal-id>`** (which is exactly what `fleet_tls` derives the
+   Principal / AgentId from), computes the cert fingerprint, and emits a
+   transferable bundle under `--out` (default `./<principal-id>-bundle/`):
+   `cert.pem`, `key.pem` (0600), a copy of `client-ca.pem`, and a `bundle.toml`
+   manifest (kind, principal id, fingerprint, and — for agents — the
+   coordinator's ed25519 token public key derived from `signing.seed`).
+   - `--kind agent`: agents must be pinned, so `enroll` prints the
+     `[pinned_agents]` line `"<fingerprint>" = "<principal-id>"`; pass `--write`
+     to append it to `coordinator.toml` automatically. The bundle carries the
+     coordinator token pubkey so the agent config can populate
+     `coordinator_token_pubkey`.
+   - `--kind client` (ctl / sidecar users): no pinning needed (non-agent
+     principals are treated as sidecars), just issue.
+2. **Transfer the bundle** to the target host (e.g. `scp -r <bundle> host:~/`).
+3. **Import it** on the target host with `agent init` / `ctl init` (below).
+
+The fingerprint is the **lowercase hex SHA-256 of the certificate DER, with no
+`sha256:` prefix and no colons** (exactly what `fleet_tls::cert_fingerprint`
+produces). A fully-commented reference config lives at
+`examples/coordinator.toml`.
+
+#### End-to-end deployment flow
+
+A clean setup from scratch:
+
+```sh
+# 1. On the coordinator host: scaffold CA + signing seed + server cert + config.
+probe-rs-fleet coordinator init --hostname coordinator.example
+
+# 2a. Enroll an agent (pins it in coordinator.toml; bundle carries the token pubkey).
+probe-rs-fleet coordinator enroll rpi-lab-1 --kind agent --write
+#   → ./rpi-lab-1-bundle/{cert.pem,key.pem,client-ca.pem,bundle.toml}
+
+# 2b. Enroll a ctl / sidecar user (no pinning).
+probe-rs-fleet coordinator enroll alice --kind client
+#   → ./alice-bundle/{cert.pem,key.pem,client-ca.pem,bundle.toml}
+
+# 3. Start the coordinator.
+probe-rs-fleet coordinator
+
+# 4. Transfer each bundle to its target host, then import:
+
+#   On the agent (Raspberry Pi):
+scp -r rpi-lab-1-bundle pi@rpi-lab-1:~/
+probe-rs-fleet agent init --bundle ~/rpi-lab-1-bundle \
+    --coordinator coordinator.example:7000
+# edit ~/.config/probe-rs-fleet/boards.toml, then:
+probe-rs-fleet agent          # no --config needed
+
+#   On the workstation / CI host:
+scp -r alice-bundle alice@dev:~/
+probe-rs-fleet ctl init --bundle ~/alice-bundle \
+    --coordinator coordinator.example:7000
+probe-rs-fleet ctl list       # authenticates via client.toml
+# the `probe-rs` sidecar shim uses the same client.toml automatically.
+```
+
 
 ### 4.2 `agent` (Raspberry Pi)
 Owns local probes. Reconciles discovered probes against `boards.toml`.
@@ -206,6 +264,22 @@ Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
 and exposed explicitly via `ctl`.
 
+#### Config & scaffolding (`agent init`)
+
+The agent reads `agent.toml`, discovered at the XDG path
+`~/.config/probe-rs-fleet/agent.toml` (`PROBE_RS_FLEET_AGENT_CONFIG` overrides).
+`probe-rs-fleet agent init --bundle <dir> --coordinator host:port` imports the
+enrollment bundle from `coordinator enroll`: it copies `cert.pem` / `key.pem` /
+`client-ca.pem` into the data dir (key 0600), derives `agent_id` from the cert
+CN (so it matches the coordinator's pin), reads `coordinator_token_pubkey` from
+the bundle manifest, and writes a populated `agent.toml` plus a commented
+starter `boards.toml`. Explicit `--cert/--key/--ca` (and
+`--coordinator-token-pubkey`) override the bundle. `--force` is required to
+overwrite existing files. Afterwards `probe-rs-fleet agent` (no `--config`)
+connects. Fully-commented references live at `examples/agent.toml` and
+`examples/boards.toml`.
+
+
 ### 4.3 `sidecar` (workstation / CI)
 Presents a **vanilla probe-rs CLI surface** so laze runs unmodified. Installed
 as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
@@ -219,6 +293,27 @@ as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
 5. Streams stdout/stderr back and **propagates the exit code** (critical for
    `run` = embedded-test pass/fail and for CI).
 6. Heartbeats to renew the lease for long-lived sessions (`attach`, `gdb`).
+
+#### Config & scaffolding (`ctl init`, shared with the sidecar)
+
+ctl and the sidecar share the **same client credentials**. They discover them
+via env vars or, NEW, via a small `client.toml` at
+`~/.config/probe-rs-fleet/client.toml`. `probe-rs-fleet ctl init --bundle <dir>
+--coordinator host:port` imports the `--kind client` enrollment bundle into the
+data dir (key 0600) and writes `client.toml` (coordinator endpoint +
+cert/key/ca paths). A single `ctl init` configures **both** ctl and the
+`probe-rs` shim.
+
+Resolution precedence is **explicit flag / env var > `client.toml`**. Note the
+two roles read different env var names: `ctl` reads `PROBE_RS_FLEET_COORDINATOR`
+/ `_CERT` / `_KEY` / `_CA`, while the sidecar selector reads
+`PROBE_RS_FLEET_COORDINATOR` / `_CLIENT_CERT` / `_CLIENT_KEY` / `_CA`. The shim
+bridges this by injecting `client.toml` values into the sidecar's env var names
+for any key not already set. The sidecar still keys leases by selector +
+principal (unchanged); `client.toml` only adds endpoint / credential discovery,
+not a board selector (`_BOARD` / `_SELECT` still come from your environment). A
+fully-commented reference lives at `examples/client.toml`.
+
 
 ## 5. The dial-out connection (NAT traversal)
 

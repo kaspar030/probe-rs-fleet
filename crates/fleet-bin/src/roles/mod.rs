@@ -12,7 +12,10 @@
 //! [`crate::signal::shutdown`] for graceful termination.
 
 pub mod agent;
+pub mod agent_init;
 pub mod coordinator;
 pub mod ctl;
+pub mod ctl_init;
+pub mod enroll;
 pub mod init;
 pub mod sidecar;

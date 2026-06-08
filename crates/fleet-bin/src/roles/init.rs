@@ -9,7 +9,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use rand_core::{OsRng, RngCore};
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
@@ -18,6 +17,7 @@ use fleet_core::policy::Policy;
 
 use crate::cli::InitArgs;
 use crate::paths;
+use crate::secrets::{generate_seed_hex, toml_path, write_public, write_secret};
 
 /// Names of the files `init` writes, relative to the config / data dirs.
 const SIGNING_SEED_FILE: &str = "signing.seed";
@@ -134,19 +134,6 @@ pub fn run(args: InitArgs) -> Result<()> {
     Ok(())
 }
 
-/// Generate a 32-byte ed25519 seed as 64 lowercase hex chars.
-fn generate_seed_hex() -> String {
-    let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
-    let mut out = String::with_capacity(seed.len() * 2);
-    for byte in seed {
-        use std::fmt::Write as _;
-        // Infallible: writing to a String never fails.
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
 /// Generated TLS material: a client CA and a server cert signed by it.
 struct TlsMaterial {
     ca_cert: String,
@@ -261,11 +248,6 @@ signing_key_path = {signing_key_path}
     Ok(config)
 }
 
-/// Render a path as a TOML basic string literal.
-fn toml_path(path: &Path) -> String {
-    toml::Value::String(path.display().to_string()).to_string()
-}
-
 /// Print a summary of what was written and the next steps.
 fn print_summary(
     config_path: &Path,
@@ -299,36 +281,6 @@ fn print_summary(
         "       - add `\"<fingerprint>\" = \"<agent-id>\"` under [pinned_agents] in"
     );
     println!("         {}", config_path.display());
-}
-
-/// Write a file containing secret material, restricting it to `0600` on unix.
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be written or permissions cannot be set.
-fn write_secret(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    set_secret_perms(path)?;
-    Ok(())
-}
-
-/// Write a non-secret file (config / public cert) with default permissions.
-fn write_public(path: &Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
-}
-
-#[cfg(unix)]
-fn set_secret_perms(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, perms)
-        .with_context(|| format!("setting 0600 perms on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_secret_perms(_path: &Path) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

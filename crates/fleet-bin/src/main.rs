@@ -14,6 +14,7 @@ mod config;
 mod logging;
 mod paths;
 mod roles;
+mod secrets;
 mod signal;
 
 use std::process::ExitCode;

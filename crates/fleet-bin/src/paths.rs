@@ -68,6 +68,16 @@ pub fn agent_config_path() -> Result<PathBuf> {
     Ok(config_dir()?.join("agent.toml"))
 }
 
+/// Default client (ctl / sidecar) config path:
+/// `$XDG_CONFIG_HOME/probe-rs-fleet/client.toml`.
+///
+/// # Errors
+///
+/// Returns an error if no home directory can be determined.
+pub fn client_config_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("client.toml"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +113,10 @@ mod tests {
         assert_eq!(
             agent_config_path().unwrap(),
             PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/agent.toml")
+        );
+        assert_eq!(
+            client_config_path().unwrap(),
+            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/client.toml")
         );
 
         match prev_config {

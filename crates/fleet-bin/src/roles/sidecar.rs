@@ -22,6 +22,14 @@ use fleet_sidecar::selector::ProcessEnv;
 /// Returns an error on a parse failure, a partial fleet environment, a failure
 /// to locate / run the real probe-rs, or a relay transport error.
 pub fn run(probe_rs_args: Vec<OsString>) -> Result<ExitCode> {
+    // Discover coordinator endpoint + client credentials from `client.toml`
+    // (written by `ctl init`) and inject them into the process environment for
+    // any keys the user has NOT already set. This lets a single `ctl init`
+    // configure both `ctl` and this shim. The sidecar still keys leases by
+    // selector + principal (unchanged); selector env (`_BOARD` / `_SELECT`)
+    // continues to come from the user's environment.
+    inject_client_config_env();
+
     // Reconstruct a full argv: program name + the forwarded probe-rs args.
     let mut argv: Vec<OsString> = Vec::with_capacity(probe_rs_args.len() + 1);
     argv.push(OsString::from("probe-rs"));
@@ -29,6 +37,40 @@ pub fn run(probe_rs_args: Vec<OsString>) -> Result<ExitCode> {
 
     let code = fleet_sidecar::run(argv, &ProcessEnv)?;
     Ok(exit_code_from_i32(code))
+}
+
+/// Populate the sidecar's coordinator / credential env vars from `client.toml`
+/// for any key not already present in the environment.
+///
+/// `client.toml` is shared with `ctl`, but the sidecar selector reads a
+/// different set of env var names (`_CLIENT_CERT` / `_CLIENT_KEY`) than `ctl`
+/// (`_CERT` / `_KEY`); we map `client.toml` into the sidecar's names here.
+fn inject_client_config_env() {
+    let Ok(path) = crate::paths::client_config_path() else {
+        return;
+    };
+    if !path.exists() {
+        return;
+    }
+    let Ok(cfg) = crate::config::load_client_config(&path) else {
+        return;
+    };
+
+    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", &cfg.coordinator);
+    set_env_if_absent("PROBE_RS_FLEET_CLIENT_CERT", &cfg.cert.display().to_string());
+    set_env_if_absent("PROBE_RS_FLEET_CLIENT_KEY", &cfg.key.display().to_string());
+    set_env_if_absent("PROBE_RS_FLEET_CA", &cfg.ca.display().to_string());
+}
+
+/// Set an env var only if it is not already present (and non-empty).
+fn set_env_if_absent(key: &str, value: &str) {
+    let already = std::env::var_os(key).is_some_and(|v| !v.is_empty());
+    if !already {
+        // SAFETY of correctness (not memory): the sidecar shim is single-
+        // threaded at this point (no async runtime, no spawned threads), so no
+        // other thread can be reading the environment concurrently.
+        std::env::set_var(key, value);
+    }
 }
 
 /// Convert a probe-rs process exit code into an [`ExitCode`].
@@ -60,5 +102,24 @@ mod tests {
         assert!(u8::try_from(-1_i32).is_err());
         let _ = exit_code_from_i32(256);
         let _ = exit_code_from_i32(-1);
+    }
+
+    #[test]
+    fn set_env_if_absent_respects_existing_value() {
+        let key = "PROBE_RS_FLEET_TEST_INJECT_EXISTING";
+        // SAFETY of correctness: a unique key only this test touches.
+        std::env::set_var(key, "user-set");
+        set_env_if_absent(key, "injected");
+        assert_eq!(std::env::var(key).unwrap(), "user-set");
+        std::env::remove_var(key);
+    }
+
+    #[test]
+    fn set_env_if_absent_sets_when_unset() {
+        let key = "PROBE_RS_FLEET_TEST_INJECT_UNSET";
+        std::env::remove_var(key);
+        set_env_if_absent(key, "injected");
+        assert_eq!(std::env::var(key).unwrap(), "injected");
+        std::env::remove_var(key);
     }
 }

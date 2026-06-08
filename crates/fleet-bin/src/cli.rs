@@ -68,6 +68,9 @@ pub enum CoordinatorCommand {
     /// Scaffold a ready-to-run coordinator: generate signing seed, TLS
     /// material, and a populated config under the XDG paths.
     Init(InitArgs),
+    /// Issue a client keypair + cert (signed by the coordinator's client CA)
+    /// for a principal and emit a transferable enrollment bundle.
+    Enroll(EnrollArgs),
 }
 
 /// Arguments for `coordinator init`.
@@ -94,6 +97,43 @@ pub struct InitArgs {
     pub force: bool,
 }
 
+/// The kind of principal an enrollment bundle is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum EnrollKind {
+    /// An agent principal. Agents must be pinned, so `enroll` emits (and with
+    /// `--write` appends) the `[pinned_agents]` line and carries the
+    /// coordinator token pubkey in the bundle.
+    Agent,
+    /// A non-agent client principal (ctl / sidecar user). No pinning needed.
+    Client,
+}
+
+/// Arguments for `coordinator enroll`.
+#[derive(Debug, Args)]
+pub struct EnrollArgs {
+    /// Principal id to issue a cert for (becomes the cert CN and, for agents,
+    /// the agent id).
+    pub principal_id: String,
+    /// Whether this enrollment is for an agent or a generic client.
+    #[arg(long, value_enum, default_value_t = EnrollKind::Client)]
+    pub kind: EnrollKind,
+    /// Output directory for the bundle (default: `./<principal-id>-bundle/`).
+    #[arg(long)]
+    pub out: Option<std::path::PathBuf>,
+    /// For `--kind agent`: append the `[pinned_agents]` line to the
+    /// coordinator's `coordinator.toml` instead of only printing it.
+    #[arg(long)]
+    pub write: bool,
+    /// Override the config directory (default: XDG config dir). Used to locate
+    /// `coordinator.toml` for `--write`.
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+    /// Override the data directory (default: XDG data dir). Used to locate the
+    /// CA cert/key and signing seed.
+    #[arg(long)]
+    pub data_dir: Option<std::path::PathBuf>,
+}
+
 /// Arguments for the `agent` role.
 #[derive(Debug, Args)]
 pub struct AgentArgs {
@@ -103,7 +143,57 @@ pub struct AgentArgs {
     /// `$XDG_CONFIG_HOME/probe-rs-fleet/agent.toml`.
     #[arg(long, env = "PROBE_RS_FLEET_AGENT_CONFIG")]
     pub config: Option<std::path::PathBuf>,
+    /// Optional nested subcommand (e.g. `init`). When absent, the agent runs.
+    #[command(subcommand)]
+    pub command: Option<AgentCommand>,
 }
+
+/// `agent` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Import an enrollment bundle and scaffold a ready-to-run agent config
+    /// (`agent.toml` + `boards.toml`) under the XDG paths.
+    Init(AgentInitArgs),
+}
+
+/// Arguments for `agent init`.
+#[derive(Debug, Args)]
+pub struct AgentInitArgs {
+    /// Enrollment bundle directory produced by `coordinator enroll`
+    /// (contains `cert.pem`, `key.pem`, `client-ca.pem`, `bundle.toml`).
+    #[arg(long)]
+    pub bundle: Option<std::path::PathBuf>,
+    /// Explicit client certificate chain (PEM), overriding the bundle.
+    #[arg(long)]
+    pub cert: Option<std::path::PathBuf>,
+    /// Explicit client private key (PEM), overriding the bundle.
+    #[arg(long)]
+    pub key: Option<std::path::PathBuf>,
+    /// Explicit CA (PEM) to verify the coordinator's server cert, overriding
+    /// the bundle.
+    #[arg(long)]
+    pub ca: Option<std::path::PathBuf>,
+    /// Coordinator token public key (64 hex chars). Required when not using a
+    /// bundle (a bundle carries it in `bundle.toml`).
+    #[arg(long)]
+    pub coordinator_token_pubkey: Option<String>,
+    /// `host:port` of the coordinator to dial out to.
+    #[arg(long)]
+    pub coordinator: String,
+    /// Override the config directory (default: XDG config dir).
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+    /// Override the data directory for imported creds (default: XDG data dir).
+    #[arg(long)]
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Override where `boards.toml` is written (default: config dir).
+    #[arg(long)]
+    pub boards_path: Option<std::path::PathBuf>,
+    /// Overwrite existing files instead of refusing.
+    #[arg(long)]
+    pub force: bool,
+}
+
 
 /// Arguments for the explicit `sidecar` subcommand.
 #[derive(Debug, Args)]
@@ -142,6 +232,9 @@ pub struct CtlArgs {
 /// `ctl` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CtlCommand {
+    /// Import an enrollment bundle and write `client.toml` so both `ctl` and
+    /// the `probe-rs` sidecar shim discover the coordinator + credentials.
+    Init(CtlInitArgs),
     /// List the fleet inventory (boards and their state).
     List,
     /// Lease a board by id or selector (`tag=…`, `chip=…`).
@@ -173,6 +266,29 @@ pub enum CtlCommand {
         follow: bool,
     },
 }
+
+/// Arguments for `ctl init`.
+///
+/// The coordinator endpoint and explicit cert/key/CA overrides are taken from
+/// the shared global [`CtlClientArgs`] flags (`--coordinator`, `--cert`,
+/// `--key`, `--ca`); only the bundle import + scaffolding options live here.
+#[derive(Debug, Args)]
+pub struct CtlInitArgs {
+    /// Enrollment bundle directory produced by `coordinator enroll`
+    /// (contains `cert.pem`, `key.pem`, `client-ca.pem`).
+    #[arg(long)]
+    pub bundle: Option<std::path::PathBuf>,
+    /// Override the config directory (default: XDG config dir).
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+    /// Override the data directory for imported creds (default: XDG data dir).
+    #[arg(long)]
+    pub data_dir: Option<std::path::PathBuf>,
+    /// Overwrite existing files instead of refusing.
+    #[arg(long)]
+    pub force: bool,
+}
+
 
 /// What argv0 inspection decided the process should do.
 #[derive(Debug, PartialEq, Eq)]
@@ -255,19 +371,34 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         roles::init::run(init)?;
                         Ok(ExitCode::SUCCESS)
                     }
+                    Some(CoordinatorCommand::Enroll(enroll)) => {
+                        roles::enroll::run(enroll)?;
+                        Ok(ExitCode::SUCCESS)
+                    }
                     None => {
                         roles::coordinator::run(args).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                 },
-                Command::Agent(args) => {
-                    roles::agent::run(args).await?;
-                    Ok(ExitCode::SUCCESS)
-                }
+                Command::Agent(args) => match args.command {
+                    Some(AgentCommand::Init(init)) => {
+                        roles::agent_init::run(init)?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    None => {
+                        roles::agent::run(args).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                },
                 Command::Sidecar(args) => roles::sidecar::run(args.probe_rs_args),
                 Command::Ctl(args) => {
-                    roles::ctl::run(args).await?;
-                    Ok(ExitCode::SUCCESS)
+                    if let CtlCommand::Init(init) = args.command {
+                        roles::ctl_init::run(init, args.client)?;
+                        Ok(ExitCode::SUCCESS)
+                    } else {
+                        roles::ctl::run(args).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
                 }
             }
         }
@@ -384,8 +515,98 @@ mod tests {
     fn parses_agent() {
         let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "--config", "a.toml"]));
         match cli.command {
-            Command::Agent(a) => assert_eq!(a.config.as_deref(), Some(Path::new("a.toml"))),
+            Command::Agent(a) => {
+                assert_eq!(a.config.as_deref(), Some(Path::new("a.toml")));
+                assert!(a.command.is_none());
+            }
             other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_coordinator_enroll() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "coordinator",
+            "enroll",
+            "rpi-lab-1",
+            "--kind",
+            "agent",
+            "--write",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::Enroll(e)) => {
+                    assert_eq!(e.principal_id, "rpi-lab-1");
+                    assert_eq!(e.kind, EnrollKind::Agent);
+                    assert!(e.write);
+                }
+                other => panic!("expected enroll, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enroll_defaults_to_client_kind() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "enroll", "alice"]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::Enroll(e)) => {
+                    assert_eq!(e.kind, EnrollKind::Client);
+                    assert!(!e.write);
+                }
+                other => panic!("expected enroll, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_agent_init() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "agent",
+            "init",
+            "--bundle",
+            "rpi-lab-1-bundle",
+            "--coordinator",
+            "coord.example:7000",
+        ]));
+        match cli.command {
+            Command::Agent(a) => match a.command {
+                Some(AgentCommand::Init(init)) => {
+                    assert_eq!(init.bundle.as_deref(), Some(Path::new("rpi-lab-1-bundle")));
+                    assert_eq!(init.coordinator, "coord.example:7000");
+                }
+                other => panic!("expected agent init, got {other:?}"),
+            },
+            other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ctl_init() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "ctl",
+            "--coordinator",
+            "coord.example:7000",
+            "init",
+            "--bundle",
+            "alice-bundle",
+        ]));
+        match cli.command {
+            Command::Ctl(a) => {
+                assert_eq!(a.client.coordinator.as_deref(), Some("coord.example:7000"));
+                match a.command {
+                    CtlCommand::Init(init) => {
+                        assert_eq!(init.bundle.as_deref(), Some(Path::new("alice-bundle")));
+                    }
+                    other => panic!("expected ctl init, got {other:?}"),
+                }
+            }
+            other => panic!("expected ctl, got {other:?}"),
         }
     }
 

@@ -18,6 +18,7 @@ use fleet_proto::ids::BoardId;
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 use crate::cli::{CtlArgs, CtlClientArgs, CtlCommand};
+use crate::paths;
 
 /// Resolved connection configuration for the ctl client.
 #[derive(Debug, Clone)]
@@ -33,24 +34,44 @@ pub struct CtlConnection {
 }
 
 impl CtlConnection {
-    /// Resolve the connection config from the CLI/env flags, erroring with a
-    /// clear message if a required value is missing.
+    /// Resolve the connection config from the CLI/env flags, falling back to a
+    /// `client.toml` (at the XDG config path) for any field the flags / env
+    /// vars do not supply.
+    ///
+    /// Precedence: explicit flag / env var > `client.toml`. Errors only if a
+    /// required field is supplied by neither source.
     ///
     /// # Errors
     ///
-    /// Returns an error if `--coordinator`, `--cert`, `--key`, or `--ca`
-    /// (or their env equivalents) are not set.
+    /// Returns an error if `--coordinator`, `--cert`, `--key`, or `--ca` (or
+    /// their env / `client.toml` equivalents) cannot be resolved.
     pub fn from_args(args: CtlClientArgs) -> Result<Self> {
+        let fallback = load_client_fallback();
+        Self::resolve(args, fallback)
+    }
+
+    /// Resolve against an explicit (possibly absent) `client.toml` fallback.
+    fn resolve(args: CtlClientArgs, fallback: Option<crate::config::ClientConfig>) -> Result<Self> {
+        let (fb_coordinator, fb_cert, fb_key, fb_ca) = match fallback {
+            Some(c) => (Some(c.coordinator), Some(c.cert), Some(c.key), Some(c.ca)),
+            None => (None, None, None, None),
+        };
         let coordinator = args
             .coordinator
-            .context("--coordinator (or PROBE_RS_FLEET_COORDINATOR) is required")?;
+            .or(fb_coordinator)
+            .context("--coordinator (or PROBE_RS_FLEET_COORDINATOR / client.toml) is required")?;
         let cert = args
             .cert
-            .context("--cert (or PROBE_RS_FLEET_CERT) is required")?;
+            .or(fb_cert)
+            .context("--cert (or PROBE_RS_FLEET_CERT / client.toml) is required")?;
         let key = args
             .key
-            .context("--key (or PROBE_RS_FLEET_KEY) is required")?;
-        let ca = args.ca.context("--ca (or PROBE_RS_FLEET_CA) is required")?;
+            .or(fb_key)
+            .context("--key (or PROBE_RS_FLEET_KEY / client.toml) is required")?;
+        let ca = args
+            .ca
+            .or(fb_ca)
+            .context("--ca (or PROBE_RS_FLEET_CA / client.toml) is required")?;
         Ok(Self {
             coordinator,
             cert,
@@ -58,6 +79,18 @@ impl CtlConnection {
             ca,
         })
     }
+}
+
+/// Load the `client.toml` fallback from the XDG config path, if it exists.
+///
+/// A missing file (or unresolvable config path) is not an error here — it just
+/// means there is no fallback and the flags / env vars must supply everything.
+fn load_client_fallback() -> Option<crate::config::ClientConfig> {
+    let path = paths::client_config_path().ok()?;
+    if !path.exists() {
+        return None;
+    }
+    crate::config::load_client_config(&path).ok()
 }
 
 /// Parse a `lease`/board selector into a [`Constraint`].
@@ -180,6 +213,11 @@ pub async fn run(args: CtlArgs) -> Result<()> {
     let client = CtlClient::new(conn);
 
     match args.command {
+        CtlCommand::Init(_) => {
+            // `ctl init` is dispatched in cli.rs before a connection is built;
+            // reaching here would be a logic error.
+            anyhow::bail!("`ctl init` must be handled before connecting")
+        }
         CtlCommand::List => client.list(),
         CtlCommand::Lease { selector, duration } => {
             let request = LeaseRequest {
@@ -239,7 +277,7 @@ mod tests {
             key: None,
             ca: None,
         };
-        assert!(CtlConnection::from_args(args).is_err());
+        assert!(CtlConnection::resolve(args, None).is_err());
 
         let args = CtlClientArgs {
             coordinator: Some("c:1".to_owned()),
@@ -247,7 +285,7 @@ mod tests {
             key: Some("k.pem".into()),
             ca: None,
         };
-        assert!(CtlConnection::from_args(args).is_err());
+        assert!(CtlConnection::resolve(args, None).is_err());
     }
 
     #[test]
@@ -258,7 +296,45 @@ mod tests {
             key: Some("k.pem".into()),
             ca: Some("ca.pem".into()),
         };
-        let conn = CtlConnection::from_args(args).unwrap();
+        let conn = CtlConnection::resolve(args, None).unwrap();
         assert_eq!(conn.coordinator, "coord:443");
+    }
+
+    #[test]
+    fn connection_falls_back_to_client_toml() {
+        let args = CtlClientArgs {
+            coordinator: None,
+            cert: None,
+            key: None,
+            ca: None,
+        };
+        let fallback = crate::config::ClientConfig {
+            coordinator: "fb.example:7000".to_owned(),
+            cert: "fb-cert.pem".into(),
+            key: "fb-key.pem".into(),
+            ca: "fb-ca.pem".into(),
+        };
+        let conn = CtlConnection::resolve(args, Some(fallback)).unwrap();
+        assert_eq!(conn.coordinator, "fb.example:7000");
+        assert_eq!(conn.cert, std::path::PathBuf::from("fb-cert.pem"));
+    }
+
+    #[test]
+    fn explicit_flag_overrides_client_toml() {
+        let args = CtlClientArgs {
+            coordinator: Some("flag.example:443".to_owned()),
+            cert: Some("flag-cert.pem".into()),
+            key: Some("flag-key.pem".into()),
+            ca: Some("flag-ca.pem".into()),
+        };
+        let fallback = crate::config::ClientConfig {
+            coordinator: "fb.example:7000".to_owned(),
+            cert: "fb-cert.pem".into(),
+            key: "fb-key.pem".into(),
+            ca: "fb-ca.pem".into(),
+        };
+        let conn = CtlConnection::resolve(args, Some(fallback)).unwrap();
+        assert_eq!(conn.coordinator, "flag.example:443");
+        assert_eq!(conn.cert, std::path::PathBuf::from("flag-cert.pem"));
     }
 }

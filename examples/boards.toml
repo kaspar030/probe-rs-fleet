@@ -1,0 +1,49 @@
+# probe-rs-fleet — boards.toml reference (agent-local board inventory)
+#
+# Maps physical probe serials to leasable boards for ONE agent. The agent
+# reconciles discovered probes against these declarations. The path is set by
+# `boards_path` in agent.toml (default ~/.config/probe-rs-fleet/boards.toml).
+#
+# `probe-rs-fleet agent init` scaffolds a commented version of this file; edit
+# it to declare each board attached to the Pi.
+
+# Repeat one [[board]] table per attached board.
+
+[[board]]
+# Stable board id, unique across the whole fleet (referenced by `ctl lease`).
+id        = "nrf52840-dk-3"
+
+# Physical probe serial bound to this board. The agent locks each `probe-rs
+# serve` to this serial via ProbeAccess::Allow([serial]) for isolation.
+serial    = "001050257890"
+
+# probe-rs target/chip name (informational; the client still selects in-band).
+chip      = "nRF52840_xxAA"
+
+# Free-form selection tags (matched by `ctl lease tag=<t>`).
+tags      = ["nrf52", "bluetooth"]
+
+# Whether the board admits only one lease at a time. Default: true.
+exclusive = true
+
+# USB power control for post-lease cleanup / fault recovery.
+# kind = "uhubctl"  → per-port USB hub control (set `hub` + `port`)
+# kind = "gpio"     → GPIO relay (set `chip` + `line`)
+# kind = "none"     → no external power control
+[board.power]
+kind = "uhubctl"
+hub  = "1-1"
+port = 2
+
+# A second board, GPIO-powered, exclusive by default:
+#
+# [[board]]
+# id     = "stm32f4-disco-1"
+# serial = "066BFF555654827167161721"
+# chip   = "STM32F407VGTx"
+# tags   = ["stm32", "cortex-m4"]
+#
+# [board.power]
+# kind = "gpio"
+# chip = "gpiochip0"
+# line = 17

@@ -1,0 +1,32 @@
+# probe-rs-fleet — client reference config (ctl + sidecar)
+#
+# This is a fully-commented reference for the client config used by BOTH the
+# `ctl` admin CLI and the `probe-rs` sidecar shim. Both discover the coordinator
+# endpoint and client credentials here when the explicit flags / env vars are
+# absent. Discovered at the XDG default path
+#   $XDG_CONFIG_HOME/probe-rs-fleet/client.toml
+#   (i.e. ~/.config/probe-rs-fleet/client.toml).
+#
+# `probe-rs-fleet ctl init --bundle <dir> --coordinator host:port` generates a
+# populated version of this file, importing the enrollment bundle produced by
+# `probe-rs-fleet coordinator enroll <user> --kind client`.
+#
+# Precedence: explicit flag / env var > this file.
+#
+#   ctl     reads PROBE_RS_FLEET_COORDINATOR / _CERT / _KEY / _CA
+#   sidecar reads PROBE_RS_FLEET_COORDINATOR / _CLIENT_CERT / _CLIENT_KEY / _CA
+#
+# (The sidecar uses different cert/key env var names; the shim maps this file
+# into both naming schemes for keys you have not already set.)
+
+# `host:port` of the coordinator to connect to.
+coordinator = "coordinator.example:7000"
+
+# Client certificate chain (PEM), issued by `coordinator enroll`.
+cert = "/home/alice/.local/share/probe-rs-fleet/client-cert.pem"
+
+# Client private key (PEM). Keep this 0600.
+key = "/home/alice/.local/share/probe-rs-fleet/client-key.pem"
+
+# CA used to verify the coordinator's server certificate (PEM).
+ca = "/home/alice/.local/share/probe-rs-fleet/client-ca.pem"

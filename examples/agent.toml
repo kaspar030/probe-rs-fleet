@@ -1,0 +1,52 @@
+# probe-rs-fleet — agent reference config
+#
+# This is a fully-commented reference for the agent's TOML config. The agent
+# looks for this file at the XDG default path
+#   $XDG_CONFIG_HOME/probe-rs-fleet/agent.toml
+#   (i.e. ~/.config/probe-rs-fleet/agent.toml)
+# unless overridden with `--config` or the PROBE_RS_FLEET_AGENT_CONFIG env var.
+#
+# `probe-rs-fleet agent init --bundle <dir> --coordinator host:port` generates a
+# populated version of this file (importing the enrollment bundle produced by
+# `probe-rs-fleet coordinator enroll <agent-id> --kind agent`) and scaffolds a
+# starter boards.toml alongside it.
+
+# ---------------------------------------------------------------------------
+# Required keys
+# ---------------------------------------------------------------------------
+
+# This agent's id. MUST match the CN of the client certificate (the coordinator
+# derives the agent id from the cert CN and pins it by fingerprint).
+agent_id = "rpi-lab-1"
+
+# `host:port` of the coordinator to dial out to (the agent opens one persistent
+# mTLS connection out; the Pi needs no inbound ports).
+coordinator_endpoint = "coordinator.example:7000"
+
+# Client mTLS certificate chain (PEM), issued by `coordinator enroll`.
+tls_cert = "/home/pi/.local/share/probe-rs-fleet/agent-cert.pem"
+
+# Client mTLS private key (PEM). Keep this 0600.
+tls_key = "/home/pi/.local/share/probe-rs-fleet/agent-key.pem"
+
+# CA used to verify the coordinator's server certificate (PEM). This is a copy
+# of the coordinator's client-ca.pem carried in the enrollment bundle.
+tls_ca = "/home/pi/.local/share/probe-rs-fleet/client-ca.pem"
+
+# Hex-encoded (64 chars / 32 bytes) ed25519 public key of the coordinator's
+# capability-token signer. Carried in the enrollment bundle (bundle.toml);
+# used to verify the lease tokens the coordinator issues.
+coordinator_token_pubkey = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# Path to this agent's boards.toml inventory (see examples/boards.toml).
+boards_path = "/home/pi/.config/probe-rs-fleet/boards.toml"
+
+# ---------------------------------------------------------------------------
+# Optional keys
+# ---------------------------------------------------------------------------
+
+# Heartbeat interval, seconds. Default: 15.
+# heartbeat_secs = 15
+
+# Erase the target's flash on lease release. Default: false.
+# erase_on_release = false
