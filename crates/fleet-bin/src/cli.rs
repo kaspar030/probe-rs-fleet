@@ -51,16 +51,58 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct CoordinatorArgs {
     /// Path to the coordinator config (TOML).
+    ///
+    /// When unset, defaults to the XDG path
+    /// `$XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml`.
     #[arg(long, env = "PROBE_RS_FLEET_CONFIG")]
-    pub config: std::path::PathBuf,
+    pub config: Option<std::path::PathBuf>,
+    /// Optional nested subcommand (e.g. `init`). When absent, the coordinator
+    /// daemon runs.
+    #[command(subcommand)]
+    pub command: Option<CoordinatorCommand>,
+}
+
+/// `coordinator` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CoordinatorCommand {
+    /// Scaffold a ready-to-run coordinator: generate signing seed, TLS
+    /// material, and a populated config under the XDG paths.
+    Init(InitArgs),
+}
+
+/// Arguments for `coordinator init`.
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// Override the config directory (default: XDG config dir).
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+    /// Override the data directory for keys/seed/db (default: XDG data dir).
+    #[arg(long)]
+    pub data_dir: Option<std::path::PathBuf>,
+    /// DNS hostname(s) to place in the server cert SANs (repeatable).
+    ///
+    /// Defaults to `localhost` when none are given.
+    #[arg(long)]
+    pub hostname: Vec<String>,
+    /// IP address(es) to place in the server cert SANs (repeatable).
+    ///
+    /// Defaults to `127.0.0.1` when none are given.
+    #[arg(long)]
+    pub ip: Vec<std::net::IpAddr>,
+    /// Overwrite existing files instead of refusing.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// Arguments for the `agent` role.
 #[derive(Debug, Args)]
 pub struct AgentArgs {
     /// Path to the agent config (TOML).
+    ///
+    /// When unset, defaults to the XDG path
+    /// `$XDG_CONFIG_HOME/probe-rs-fleet/agent.toml`.
     #[arg(long, env = "PROBE_RS_FLEET_AGENT_CONFIG")]
-    pub config: std::path::PathBuf,
+    pub config: Option<std::path::PathBuf>,
 }
 
 /// Arguments for the explicit `sidecar` subcommand.
@@ -208,10 +250,16 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
         Dispatch::Clap => {
             let cli = Cli::parse_from(process_args);
             match cli.command {
-                Command::Coordinator(args) => {
-                    roles::coordinator::run(args).await?;
-                    Ok(ExitCode::SUCCESS)
-                }
+                Command::Coordinator(args) => match args.command {
+                    Some(CoordinatorCommand::Init(init)) => {
+                        roles::init::run(init)?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    None => {
+                        roles::coordinator::run(args).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                },
                 Command::Agent(args) => {
                     roles::agent::run(args).await?;
                     Ok(ExitCode::SUCCESS)
@@ -287,7 +335,47 @@ mod tests {
     fn parses_coordinator() {
         let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "--config", "c.toml"]));
         match cli.command {
-            Command::Coordinator(a) => assert_eq!(a.config, Path::new("c.toml")),
+            Command::Coordinator(a) => {
+                assert_eq!(a.config.as_deref(), Some(Path::new("c.toml")));
+                assert!(a.command.is_none());
+            }
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_coordinator_without_config() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator"]));
+        match cli.command {
+            Command::Coordinator(a) => {
+                assert!(a.config.is_none());
+                assert!(a.command.is_none());
+            }
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_coordinator_init() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "coordinator",
+            "init",
+            "--hostname",
+            "coord.example",
+            "--ip",
+            "10.0.0.1",
+            "--force",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::Init(init)) => {
+                    assert_eq!(init.hostname, vec!["coord.example".to_owned()]);
+                    assert_eq!(init.ip, vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
+                    assert!(init.force);
+                }
+                other => panic!("expected init, got {other:?}"),
+            },
             other => panic!("expected coordinator, got {other:?}"),
         }
     }
@@ -296,7 +384,7 @@ mod tests {
     fn parses_agent() {
         let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "--config", "a.toml"]));
         match cli.command {
-            Command::Agent(a) => assert_eq!(a.config, Path::new("a.toml")),
+            Command::Agent(a) => assert_eq!(a.config.as_deref(), Some(Path::new("a.toml"))),
             other => panic!("expected agent, got {other:?}"),
         }
     }

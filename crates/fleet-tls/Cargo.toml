@@ -20,7 +20,7 @@ sha2 = "0.10"
 x509-parser = "0.16"
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = { workspace = true }
 tokio = { workspace = true }
 
 [lints]

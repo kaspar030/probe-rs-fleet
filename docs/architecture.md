@@ -128,6 +128,40 @@ Central daemon, single node, sqlite (via `sqlx`) for state. Responsibilities:
 
 Does **not** touch USB.
 
+#### Config & scaffolding (`coordinator init`)
+
+The coordinator reads a TOML config. By default it is discovered at the XDG
+path `~/.config/probe-rs-fleet/coordinator.toml`
+(`$XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml`); `--config` /
+`PROBE_RS_FLEET_CONFIG` override it. Generated key/cert/seed material and the
+SQLite database default to the data dir `~/.local/share/probe-rs-fleet/`
+(`$XDG_DATA_HOME/probe-rs-fleet/`). The agent config follows the same scheme at
+`~/.config/probe-rs-fleet/agent.toml` (`PROBE_RS_FLEET_AGENT_CONFIG`).
+
+`probe-rs-fleet coordinator init` scaffolds a ready-to-run coordinator on a
+clean machine:
+
+- generates a fresh ed25519 capability-token signing seed
+  (`<data>/signing.seed`, 64 hex chars, `0600`);
+- generates a development client CA (`client-ca.pem` + `client-ca-key.pem`) and
+  a coordinator server cert/key (`coordinator-cert.pem` /
+  `coordinator-key.pem`) signed by it, with SANs from `--hostname` / `--ip`
+  (default `localhost` / `127.0.0.1`);
+- writes a populated `coordinator.toml` pointing at all of the above
+  (`listen_addr = "0.0.0.0:7000"`, default policy, empty `[pinned_agents]`).
+
+Keys are written `0600`. `init` refuses to overwrite existing files unless
+`--force` is passed; `--config-dir` / `--data-dir` override the target
+directories. Afterwards, `probe-rs-fleet coordinator` (no `--config`) loads the
+generated config and starts listening.
+
+To enroll an agent: issue it a client certificate from the generated CA,
+compute the cert's fingerprint — the **lowercase hex SHA-256 of the certificate
+DER, with no `sha256:` prefix and no colons** (exactly what
+`fleet_tls::cert_fingerprint` produces) — and add
+`"<fingerprint>" = "<agent-id>"` under `[pinned_agents]`. A fully-commented
+reference config lives at `examples/coordinator.toml`.
+
 ### 4.2 `agent` (Raspberry Pi)
 Owns local probes. Reconciles discovered probes against `boards.toml`.
 

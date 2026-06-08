@@ -14,4 +14,5 @@
 pub mod agent;
 pub mod coordinator;
 pub mod ctl;
+pub mod init;
 pub mod sidecar;

@@ -1,0 +1,75 @@
+# probe-rs-fleet — coordinator reference config
+#
+# This is a fully-commented reference for the coordinator's TOML config. The
+# coordinator looks for this file at the XDG default path
+#   $XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml
+#   (i.e. ~/.config/probe-rs-fleet/coordinator.toml)
+# unless overridden with `--config` or the PROBE_RS_FLEET_CONFIG env var.
+#
+# `probe-rs-fleet coordinator init` generates a populated version of this file
+# alongside fresh signing/TLS material under the data dir
+#   $XDG_DATA_HOME/probe-rs-fleet/  (i.e. ~/.local/share/probe-rs-fleet/).
+
+# ---------------------------------------------------------------------------
+# Required keys
+# ---------------------------------------------------------------------------
+
+# TCP address the coordinator listens on for inbound mTLS connections.
+listen_addr = "0.0.0.0:7000"
+
+# Coordinator's server certificate chain (PEM). Presented to agents/sidecars.
+tls_cert = "/var/lib/probe-rs-fleet/coordinator-cert.pem"
+
+# Coordinator's server private key (PEM). Keep this 0600.
+tls_key = "/var/lib/probe-rs-fleet/coordinator-key.pem"
+
+# CA used to verify client (agent / sidecar) certificates (PEM).
+client_ca = "/var/lib/probe-rs-fleet/client-ca.pem"
+
+# SQLite database file for fleet state (created on first run).
+sqlite_path = "/var/lib/probe-rs-fleet/coordinator.sqlite"
+
+# ---------------------------------------------------------------------------
+# Signing key — set EXACTLY ONE of the following.
+#
+# The capability-token signing key is a 32-byte ed25519 seed, encoded as 64
+# lowercase hex characters.
+# ---------------------------------------------------------------------------
+
+# Option A: path to a file holding the 64-hex-char seed (recommended; 0600).
+signing_key_path = "/var/lib/probe-rs-fleet/signing.seed"
+
+# Option B: inline the seed directly (mutually exclusive with the path form).
+# signing_key_hex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# ---------------------------------------------------------------------------
+# Optional keys
+# ---------------------------------------------------------------------------
+
+# How often (seconds) the lease-expiry sweep runs. Default: 5.
+# sweep_interval_secs = 5
+
+# Lease scheduling policy. Omit the whole block to accept all defaults (shown).
+[policy]
+# Maximum lease duration (seconds) for `soak` priority requests. Default: 86400.
+max_duration_soak = 86400
+# Maximum lease duration (seconds) for `ci` priority requests. Default: 3600.
+max_duration_ci = 3600
+# Maximum lease duration (seconds) for `interactive` requests. Default: 14400.
+max_duration_interactive = 14400
+# Maximum number of concurrently-held leases per principal. Default: 2.
+max_concurrent_per_principal = 2
+# Default TTL (seconds) applied when a request omits a duration. Default: 900.
+default_ttl_secs = 900
+
+# Pinned agents: map a client certificate fingerprint to the agent id it is
+# allowed to claim. The key is the LOWERCASE HEX SHA-256 of the agent
+# certificate's DER bytes — no `sha256:` prefix, no colons (exactly what
+# `fleet_tls::cert_fingerprint` produces). Reproduce it from a PEM with:
+#
+#   openssl x509 -in agent.pem -outform der | openssl dgst -sha256
+#
+# (or `openssl x509 -in agent.pem -noout -fingerprint -sha256`, then strip the
+# colons and lowercase). Example (64 hex chars):
+[pinned_agents]
+# "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" = "agent-01"

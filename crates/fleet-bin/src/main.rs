@@ -12,6 +12,7 @@
 mod cli;
 mod config;
 mod logging;
+mod paths;
 mod roles;
 mod signal;
 

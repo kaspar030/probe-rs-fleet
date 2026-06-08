@@ -10,6 +10,7 @@ use fleet_agent::connection;
 use fleet_agent::probers::ProcessBackend;
 
 use crate::cli::AgentArgs;
+use crate::paths;
 
 /// Load the agent + boards config, build the agent, and run its persistent
 /// dial-out connection loop until a shutdown signal or a fatal setup error.
@@ -19,8 +20,12 @@ use crate::cli::AgentArgs;
 /// Returns an error if either config file cannot be loaded, the agent cannot be
 /// constructed, or the connection loop fails with a non-retryable error.
 pub async fn run(args: AgentArgs) -> Result<()> {
-    let agent_config = AgentConfig::from_path(&args.config)
-        .with_context(|| format!("loading agent config {}", args.config.display()))?;
+    let config_path = match args.config {
+        Some(path) => path,
+        None => paths::agent_config_path()?,
+    };
+    let agent_config = AgentConfig::from_path(&config_path)
+        .with_context(|| format!("loading agent config {}", config_path.display()))?;
     let boards = BoardsConfig::from_path(&agent_config.boards_path)
         .with_context(|| format!("loading boards.toml {}", agent_config.boards_path))?;
 

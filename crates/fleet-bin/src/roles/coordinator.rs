@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 
 use crate::cli::CoordinatorArgs;
 use crate::config;
+use crate::paths;
 
 /// Load the coordinator config and run the daemon until a shutdown signal or a
 /// fatal error.
@@ -13,8 +14,12 @@ use crate::config;
 /// Returns an error if the config cannot be loaded or the coordinator exits
 /// with a fatal error.
 pub async fn run(args: CoordinatorArgs) -> Result<()> {
-    let cfg = config::load_coordinator_config(&args.config)
-        .with_context(|| format!("loading coordinator config {}", args.config.display()))?;
+    let config_path = match args.config {
+        Some(path) => path,
+        None => paths::coordinator_config_path()?,
+    };
+    let cfg = config::load_coordinator_config(&config_path)
+        .with_context(|| format!("loading coordinator config {}", config_path.display()))?;
 
     tracing::info!(listen = %cfg.listen_addr, "starting coordinator");
 
