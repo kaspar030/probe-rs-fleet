@@ -2,8 +2,9 @@
 //!
 //! Generates a fresh signing seed, a development client CA, a coordinator
 //! server cert/key signed by that CA, and a populated `coordinator.toml`
-//! pointing at all of it — under the XDG config/data directories (or explicit
-//! overrides). Secrets are written with `0600` permissions on unix.
+//! pointing at all of it — under the coordinator's per-role config/data subdir
+//! (`<config>/coordinator/`, `<data>/coordinator/`) or explicit overrides.
+//! Secrets are written with `0600` permissions on unix.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -37,11 +38,11 @@ const CONFIG_FILE: &str = "coordinator.toml";
 pub fn run(args: InitArgs) -> Result<()> {
     let config_dir = match args.config_dir {
         Some(dir) => dir,
-        None => paths::config_dir()?,
+        None => paths::coordinator_config_dir()?,
     };
     let data_dir = match args.data_dir {
         Some(dir) => dir,
-        None => paths::data_dir()?,
+        None => paths::coordinator_data_dir()?,
     };
 
     let hostnames = if args.hostname.is_empty() {
@@ -364,6 +365,73 @@ mod tests {
         init_into(tmp.path(), true).unwrap();
         let forced = std::fs::read_to_string(&seed_path).unwrap();
         assert_ne!(before, forced);
+    }
+
+    #[test]
+    fn defaults_to_coordinator_subdir_under_xdg() {
+        use std::sync::Mutex;
+
+        // Env vars are process-global; serialise the test that mutates them.
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prev_config = std::env::var_os("XDG_CONFIG_HOME");
+        let prev_data = std::env::var_os("XDG_DATA_HOME");
+        let prev_home = std::env::var_os("HOME");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_root = tmp.path().join("config");
+        let data_root = tmp.path().join("data");
+
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("XDG_CONFIG_HOME", &config_root);
+        std::env::set_var("XDG_DATA_HOME", &data_root);
+        std::env::set_var("HOME", tmp.path());
+
+        // No --config-dir / --data-dir: must default to the per-role subdir.
+        let result = run(InitArgs {
+            config_dir: None,
+            data_dir: None,
+            hostname: vec!["localhost".to_owned()],
+            ip: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            force: false,
+        });
+
+        // Restore env before asserting so a failure cannot leak overrides.
+        restore_env("XDG_CONFIG_HOME", prev_config);
+        restore_env("XDG_DATA_HOME", prev_data);
+        restore_env("HOME", prev_home);
+
+        result.unwrap();
+
+        let config = config_root.join("probe-rs-fleet").join("coordinator");
+        let data = data_root.join("probe-rs-fleet").join("coordinator");
+        assert!(
+            config.join(CONFIG_FILE).exists(),
+            "config must land under coordinator/ subdir: {}",
+            config.join(CONFIG_FILE).display()
+        );
+        for f in [
+            SIGNING_SEED_FILE,
+            CLIENT_CA_CERT_FILE,
+            CLIENT_CA_KEY_FILE,
+            SERVER_CERT_FILE,
+            SERVER_KEY_FILE,
+        ] {
+            assert!(
+                data.join(f).exists(),
+                "{f} must land under coordinator/ subdir: {}",
+                data.join(f).display()
+            );
+        }
+    }
+
+    fn restore_env(key: &str, prev: Option<std::ffi::OsString>) {
+        // SAFETY of correctness (not memory): callers hold ENV_LOCK.
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
