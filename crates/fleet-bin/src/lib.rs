@@ -11,3 +11,15 @@ pub mod paths;
 pub mod roles;
 pub mod secrets;
 pub mod signal;
+
+/// Test-only support shared across modules.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Mutex;
+
+    /// Process-wide lock for tests that mutate global env vars (`XDG_*_HOME`,
+    /// `HOME`, …). All such tests across the crate compile into one binary and
+    /// run multithreaded, so they must serialise on this single shared lock —
+    /// per-module locks would not mutually exclude.
+    pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
+}

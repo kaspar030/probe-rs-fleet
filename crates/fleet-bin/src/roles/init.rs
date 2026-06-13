@@ -369,10 +369,8 @@ mod tests {
 
     #[test]
     fn defaults_to_coordinator_subdir_under_xdg() {
-        use std::sync::Mutex;
+        use crate::test_support::ENV_LOCK;
 
-        // Env vars are process-global; serialise the test that mutates them.
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
         let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");

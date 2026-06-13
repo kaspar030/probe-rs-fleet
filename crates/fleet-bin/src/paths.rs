@@ -226,15 +226,11 @@ pub fn list_profiles(role: Role) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Env vars are process-global; serialise the tests that mutate them so the
-    /// multi-threaded test runner cannot interleave reads and writes.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_support::ENV_LOCK;
 
     #[test]
     fn resolves_xdg_overrides_per_role_and_profile() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");
         let prev_data = std::env::var_os("XDG_DATA_HOME");
