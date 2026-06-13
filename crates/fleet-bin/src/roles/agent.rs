@@ -22,7 +22,7 @@ use crate::paths;
 pub async fn run(args: AgentArgs) -> Result<()> {
     let config_path = match args.config {
         Some(path) => path,
-        None => paths::agent_config_path()?,
+        None => paths::agent_config_path(&args.profile)?,
     };
     let agent_config = AgentConfig::from_path(&config_path)
         .with_context(|| format!("loading agent config {}", config_path.display()))?;

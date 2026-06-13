@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
+use fleet_proto::enroll::EnrollRequest;
 use fleet_proto::ids::{AgentId, Principal};
 use fleet_proto::PROTOCOL_VERSION;
 
@@ -63,31 +64,85 @@ pub async fn serve(coord: Arc<Coordinator>, acceptor: TlsAcceptor) -> Result<()>
     }
 }
 
+/// Test-only entry point that drives a single accepted connection through the
+/// real dispatch path (handshake -> bootstrap or runtime). Exposed so
+/// integration tests can bind their own listener and observe the coordinator
+/// state directly.
+///
+/// # Errors
+///
+/// Propagates any per-connection error.
+#[doc(hidden)]
+pub async fn handle_connection_for_test(
+    coord: Arc<Coordinator>,
+    acceptor: TlsAcceptor,
+    sock: tokio::net::TcpStream,
+) -> Result<()> {
+    handle_connection(coord, acceptor, sock).await
+}
+
 /// Accept the TLS handshake, derive the peer identity, and dispatch by role.
+///
+/// A connection that presents **no** client certificate is treated as a
+/// bootstrap/enrollment connection: it may ONLY perform the enroll exchange and
+/// can never reach the runtime agent/sidecar dispatch. A connection that
+/// presents a verified client certificate routes to the existing runtime path
+/// (mTLS), consulting both the config pins and the DB-backed enrollment pins.
 async fn handle_connection(
     coord: Arc<Coordinator>,
     acceptor: TlsAcceptor,
     sock: tokio::net::TcpStream,
 ) -> Result<()> {
     let tls = acceptor.accept(sock).await?;
-    let (_, conn) = tls.get_ref();
-    let peer_certs = conn
-        .peer_certificates()
-        .ok_or_else(|| CoordinatorError::Protocol("peer presented no certificate".to_owned()))?;
-    let end_entity = peer_certs
-        .first()
-        .ok_or_else(|| CoordinatorError::Protocol("empty peer certificate chain".to_owned()))?;
+    let end_entity = {
+        let (_, conn) = tls.get_ref();
+        conn.peer_certificates()
+            .and_then(<[_]>::first)
+            .map(|c| c.clone().into_owned())
+    };
 
-    let fingerprint = fleet_tls::cert_fingerprint(end_entity);
-    let principal = fleet_tls::principal_from_cert(end_entity)?;
+    let Some(end_entity) = end_entity else {
+        // No client cert: bootstrap/enrollment only.
+        debug!("bootstrap (no client cert) connection");
+        return handle_bootstrap(coord, tls).await;
+    };
 
-    if let Some(agent_id) = coord.config().agent_for_fingerprint(&fingerprint).cloned() {
+    let fingerprint = fleet_tls::cert_fingerprint(&end_entity);
+    let principal = fleet_tls::principal_from_cert(&end_entity)?;
+
+    // An agent is identified by a cert fingerprint pinned either in the static
+    // config or in the DB (recorded automatically at enrollment time).
+    let agent_id = match coord.config().agent_for_fingerprint(&fingerprint).cloned() {
+        Some(id) => Some(id),
+        None => coord
+            .db()
+            .agent_pin_for_fingerprint(&fingerprint)
+            .await?
+            .map(AgentId),
+    };
+
+    if let Some(agent_id) = agent_id {
         info!(%agent_id, "agent connected");
         handle_agent(coord, tls, agent_id).await
     } else {
         debug!(%principal, "sidecar connected");
         handle_sidecar(coord, tls, principal).await
     }
+}
+
+/// Service a bootstrap/enrollment connection (no client cert).
+///
+/// Reads exactly one [`EnrollRequest`], runs the enrollment, writes the
+/// [`EnrollResponse`], and closes. No other message type is accepted.
+async fn handle_bootstrap<S>(coord: Arc<Coordinator>, stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let req: EnrollRequest = read_frame(&mut reader).await?;
+    let resp = crate::enroll::handle_enroll(&coord, req).await;
+    write_frame(&mut writer, &resp).await?;
+    Ok(())
 }
 
 /// Drive an agent connection: register a writer task, then pump framed
@@ -241,6 +296,7 @@ mod tests {
             tls_cert: "c".into(),
             tls_key: "k".into(),
             client_ca: "ca".into(),
+            client_ca_key: "ca-key".into(),
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(SEED),
             policy: Policy::default(),

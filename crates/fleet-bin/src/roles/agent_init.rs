@@ -1,12 +1,16 @@
-//! The `agent init` subcommand: import an enrollment bundle and scaffold a
-//! ready-to-run agent config (`agent.toml` + a starter `boards.toml`).
+//! The `agent init` subcommand: redeem an enrollment token for a CA-signed
+//! client cert and scaffold a ready-to-run agent config (`agent.toml` + a
+//! starter `boards.toml`) under the per-profile XDG paths.
 //!
 //! Run on the Raspberry Pi after `coordinator enroll <agent-id> --kind agent`
-//! has produced a bundle (transferred here). Imports the client cert/key/CA
-//! into the data dir, derives the `agent_id` from the cert CN (so it matches
-//! exactly what the coordinator pins), and writes a populated `agent.toml`.
+//! has printed a token. The token carries the coordinator address, a server-
+//! cert pin, and a one-time secret. `init` generates a keypair + CSR locally
+//! (the private key never leaves this host), redeems the secret over a pinned
+//! bootstrap TLS connection, writes the returned cert/key/CA into the profile
+//! data dir, derives `agent_id` from the issued cert CN (matching the pin the
+//! coordinator records automatically), and writes a populated `agent.toml`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use rustls::pki_types::CertificateDer;
@@ -15,44 +19,25 @@ use fleet_agent::config::AgentConfig;
 
 use crate::cli::AgentInitArgs;
 use crate::paths;
-use crate::secrets::{import_public, import_secret, toml_path, write_public};
+use crate::secrets::{toml_path, write_public, write_secret};
 
-/// Imported credential filenames under the data dir.
+/// Issued credential filenames under the profile data dir.
 const AGENT_CERT_FILE: &str = "agent-cert.pem";
 const AGENT_KEY_FILE: &str = "agent-key.pem";
 const CLIENT_CA_FILE: &str = "client-ca.pem";
 const AGENT_CONFIG_FILE: &str = "agent.toml";
 const BOARDS_FILE: &str = "boards.toml";
 
-/// Bundle filenames produced by `coordinator enroll`.
-const BUNDLE_CERT_FILE: &str = "cert.pem";
-const BUNDLE_KEY_FILE: &str = "key.pem";
-const BUNDLE_CA_FILE: &str = "client-ca.pem";
-const BUNDLE_MANIFEST_FILE: &str = "bundle.toml";
-
-/// Resolved credential source paths + token pubkey.
-struct Sources {
-    cert: PathBuf,
-    key: PathBuf,
-    ca: PathBuf,
-    token_pubkey: String,
-}
-
-/// Run `agent init`.
+/// Run `agent init` for the given profile.
 ///
 /// # Errors
 ///
-/// Returns an error if the bundle / explicit credentials cannot be resolved,
-/// any file cannot be imported, the cert CN cannot be derived, or (without
-/// `--force`) a target file already exists.
-pub fn run(args: AgentInitArgs) -> Result<()> {
+/// Returns an error if the token cannot be redeemed, any file cannot be
+/// written, the cert CN cannot be derived, or (without `--force`) a target file
+/// already exists.
+pub async fn run(args: AgentInitArgs, profile: String) -> Result<()> {
     let AgentInitArgs {
-        bundle,
-        cert,
-        key,
-        ca,
-        coordinator_token_pubkey,
-        coordinator,
+        token,
         config_dir,
         data_dir,
         boards_path,
@@ -61,14 +46,12 @@ pub fn run(args: AgentInitArgs) -> Result<()> {
 
     let config_dir = match config_dir {
         Some(dir) => dir,
-        None => paths::config_dir()?,
+        None => paths::agent_config_dir(&profile)?,
     };
     let data_dir = match data_dir {
         Some(dir) => dir,
-        None => paths::data_dir()?,
+        None => paths::agent_data_dir(&profile)?,
     };
-
-    let sources = resolve_sources(bundle.as_deref(), cert, key, ca, coordinator_token_pubkey)?;
 
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
@@ -102,25 +85,30 @@ pub fn run(args: AgentInitArgs) -> Result<()> {
         }
     }
 
-    // Import credentials.
-    import_public(&sources.cert, &cert_path)
-        .with_context(|| format!("importing agent cert from {}", sources.cert.display()))?;
-    import_secret(&sources.key, &key_path)
-        .with_context(|| format!("importing agent key from {}", sources.key.display()))?;
-    import_public(&sources.ca, &ca_path)
-        .with_context(|| format!("importing CA from {}", sources.ca.display()))?;
+    // Redeem the token: pinned bootstrap TLS -> local CSR -> CA-signed cert.
+    let enrolled = crate::roles::bootstrap::enroll(&token)
+        .await
+        .context("enrolling agent via bootstrap token")?;
 
-    // Derive agent_id from the imported cert's CN (source of truth).
+    // Write issued credentials (the key was generated locally).
+    write_public(&cert_path, enrolled.client_cert_pem.as_bytes())
+        .with_context(|| format!("writing agent cert {}", cert_path.display()))?;
+    write_secret(&key_path, enrolled.client_key_pem.as_bytes())
+        .with_context(|| format!("writing agent key {}", key_path.display()))?;
+    write_public(&ca_path, enrolled.ca_cert_pem.as_bytes())
+        .with_context(|| format!("writing CA {}", ca_path.display()))?;
+
+    // Derive agent_id from the issued cert's CN (source of truth, matches the
+    // coordinator's auto-pin).
     let agent_id = agent_id_from_cert_file(&cert_path)?;
 
-    // Write the populated agent config.
     let config_toml = render_agent_config(
         &agent_id,
-        &coordinator,
+        &enrolled.coordinator_addr,
         &cert_path,
         &key_path,
         &ca_path,
-        &sources.token_pubkey,
+        &enrolled.coordinator_token_pubkey,
         &boards_path,
     );
     write_public(&config_path, config_toml.as_bytes())
@@ -140,67 +128,7 @@ pub fn run(args: AgentInitArgs) -> Result<()> {
     Ok(())
 }
 
-/// Resolve cert/key/ca paths and the coordinator token pubkey from the bundle
-/// and/or explicit flags. Explicit flags override bundle files.
-fn resolve_sources(
-    bundle: Option<&Path>,
-    cert: Option<PathBuf>,
-    key: Option<PathBuf>,
-    ca: Option<PathBuf>,
-    coordinator_token_pubkey: Option<String>,
-) -> Result<Sources> {
-    let mut manifest_pubkey: Option<String> = None;
-
-    let (bundle_cert, bundle_key, bundle_ca) = if let Some(bundle) = bundle {
-        let manifest_path = bundle.join(BUNDLE_MANIFEST_FILE);
-        if manifest_path.exists() {
-            manifest_pubkey = read_manifest_pubkey(&manifest_path)?;
-        }
-        (
-            Some(bundle.join(BUNDLE_CERT_FILE)),
-            Some(bundle.join(BUNDLE_KEY_FILE)),
-            Some(bundle.join(BUNDLE_CA_FILE)),
-        )
-    } else {
-        (None, None, None)
-    };
-
-    let cert = cert
-        .or(bundle_cert)
-        .context("provide --bundle or an explicit --cert")?;
-    let key = key
-        .or(bundle_key)
-        .context("provide --bundle or an explicit --key")?;
-    let ca = ca
-        .or(bundle_ca)
-        .context("provide --bundle or an explicit --ca")?;
-
-    let token_pubkey = coordinator_token_pubkey.or(manifest_pubkey).context(
-        "coordinator token pubkey is required: use a --bundle from `coordinator enroll \
-         --kind agent` or pass --coordinator-token-pubkey",
-    )?;
-
-    Ok(Sources {
-        cert,
-        key,
-        ca,
-        token_pubkey,
-    })
-}
-
-/// Read `coordinator_token_pubkey` from a bundle manifest, if present.
-fn read_manifest_pubkey(path: &Path) -> Result<Option<String>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading bundle manifest {}", path.display()))?;
-    let value: toml::Value =
-        toml::from_str(&text).with_context(|| format!("parsing bundle manifest {}", path.display()))?;
-    Ok(value
-        .get("coordinator_token_pubkey")
-        .and_then(toml::Value::as_str)
-        .map(str::to_owned))
-}
-
-/// Derive the agent id (cert CN) from an imported cert PEM file.
+/// Derive the agent id (cert CN) from an issued cert PEM file.
 fn agent_id_from_cert_file(cert_path: &Path) -> Result<String> {
     let pem = std::fs::read(cert_path)
         .with_context(|| format!("reading cert {}", cert_path.display()))?;
@@ -234,25 +162,28 @@ fn render_agent_config(
         r"# probe-rs-fleet agent config
 #
 # Generated by `probe-rs-fleet agent init`. Paths are absolute and point at the
-# credentials imported from the enrollment bundle. The agent is discovered at
-# the XDG path ~/.config/probe-rs-fleet/agent.toml unless overridden with
-# --config / PROBE_RS_FLEET_AGENT_CONFIG.
+# credentials issued during bootstrap enrollment. The agent is discovered at
+# the per-profile XDG path
+#   ~/.config/probe-rs-fleet/agent/<profile>/agent.toml
+# unless overridden with --config / PROBE_RS_FLEET_AGENT_CONFIG.
 
-# This agent's id. Derived from the client cert CN, which the coordinator pins.
+# This agent's id. Derived from the issued client cert CN, which the
+# coordinator pins automatically.
 agent_id = {agent_id}
 
-# `host:port` of the coordinator to dial out to.
+# `host:port` of the coordinator to dial out to (runtime is mTLS).
 coordinator_endpoint = {coordinator}
 
-# Client mTLS certificate chain + private key (issued by `coordinator enroll`).
+# Client mTLS certificate chain + private key (issued via bootstrap enrollment;
+# the private key was generated locally and never left this host).
 tls_cert = {tls_cert}
 tls_key = {tls_key}
 
 # CA used to verify the coordinator's server certificate (PEM).
 tls_ca = {tls_ca}
 
-# Hex-encoded ed25519 public key of the coordinator's token signer. Carried in
-# the enrollment bundle; used to verify capability tokens.
+# Hex-encoded ed25519 public key of the coordinator's token signer. Returned by
+# enrollment; used to verify per-lease capability tokens.
 coordinator_token_pubkey = {token_pubkey}
 
 # Path to this agent's boards.toml inventory.
@@ -320,123 +251,6 @@ fn print_summary(
     println!();
     println!("Next steps:");
     println!("  1. Edit {} to declare your boards.", boards_path.display());
-    println!("  2. Start the agent (no --config needed):");
-    println!("       probe-rs-fleet agent");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::roles::enroll::issue_client_cert;
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
-    };
-
-    fn mint_ca() -> (String, String) {
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params
-            .distinguished_name
-            .push(DnType::CommonName, "probe-rs-fleet client CA");
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-        (ca_cert.pem(), ca_key.serialize_pem())
-    }
-
-    /// Write a minimal bundle dir for `agent_id`, return its path.
-    fn make_bundle(dir: &Path, agent_id: &str, token_pubkey: &str) {
-        let (ca_pem, ca_key_pem) = mint_ca();
-        let issued = issue_client_cert(agent_id, &ca_pem, &ca_key_pem).unwrap();
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(BUNDLE_CERT_FILE), issued.cert_pem).unwrap();
-        std::fs::write(dir.join(BUNDLE_KEY_FILE), issued.key_pem).unwrap();
-        std::fs::write(dir.join(BUNDLE_CA_FILE), ca_pem).unwrap();
-        std::fs::write(
-            dir.join(BUNDLE_MANIFEST_FILE),
-            format!(
-                "principal_id = \"{agent_id}\"\nkind = \"agent\"\nfingerprint = \"{}\"\ncoordinator_token_pubkey = \"{token_pubkey}\"\n",
-                "ab".repeat(32)
-            ),
-        )
-        .unwrap();
-    }
-
-    fn args_for(tmp: &Path, bundle: &Path) -> AgentInitArgs {
-        AgentInitArgs {
-            bundle: Some(bundle.to_path_buf()),
-            cert: None,
-            key: None,
-            ca: None,
-            coordinator_token_pubkey: None,
-            coordinator: "coord.example:7000".to_owned(),
-            config_dir: Some(tmp.join("config")),
-            data_dir: Some(tmp.join("data")),
-            boards_path: None,
-            force: false,
-        }
-    }
-
-    #[test]
-    fn writes_valid_agent_config_with_cn_agent_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("bundle");
-        let pubkey = "cd".repeat(32);
-        make_bundle(&bundle, "rpi-lab-1", &pubkey);
-
-        run(args_for(tmp.path(), &bundle)).unwrap();
-
-        let config_path = tmp.path().join("config").join(AGENT_CONFIG_FILE);
-        let cfg = AgentConfig::from_path(&config_path).unwrap();
-        assert_eq!(cfg.agent_id, "rpi-lab-1");
-        assert_eq!(cfg.coordinator_endpoint, "coord.example:7000");
-        assert_eq!(cfg.coordinator_token_pubkey, pubkey);
-
-        // boards.toml scaffolded and parseable.
-        let boards_path = tmp.path().join("config").join(BOARDS_FILE);
-        assert!(boards_path.exists());
-        fleet_agent::config::BoardsConfig::from_path(&boards_path).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn imported_key_is_0600() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("bundle");
-        make_bundle(&bundle, "rpi-lab-1", &"cd".repeat(32));
-        run(args_for(tmp.path(), &bundle)).unwrap();
-        let key = tmp.path().join("data").join(AGENT_KEY_FILE);
-        let mode = std::fs::metadata(&key).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-    }
-
-    #[test]
-    fn refuses_overwrite_without_force() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("bundle");
-        make_bundle(&bundle, "rpi-lab-1", &"cd".repeat(32));
-        run(args_for(tmp.path(), &bundle)).unwrap();
-        assert!(run(args_for(tmp.path(), &bundle)).is_err());
-
-        let mut forced = args_for(tmp.path(), &bundle);
-        forced.force = true;
-        run(forced).unwrap();
-    }
-
-    #[test]
-    fn errors_without_token_pubkey() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle = tmp.path().join("bundle");
-        // Bundle without a manifest pubkey.
-        let (ca_pem, ca_key_pem) = mint_ca();
-        let issued = issue_client_cert("rpi-lab-1", &ca_pem, &ca_key_pem).unwrap();
-        std::fs::create_dir_all(&bundle).unwrap();
-        std::fs::write(bundle.join(BUNDLE_CERT_FILE), issued.cert_pem).unwrap();
-        std::fs::write(bundle.join(BUNDLE_KEY_FILE), issued.key_pem).unwrap();
-        std::fs::write(bundle.join(BUNDLE_CA_FILE), ca_pem).unwrap();
-        // no bundle.toml
-
-        assert!(run(args_for(tmp.path(), &bundle)).is_err());
-    }
+    println!("  2. Start the agent:");
+    println!("       probe-rs-fleet agent --profile <name>");
 }

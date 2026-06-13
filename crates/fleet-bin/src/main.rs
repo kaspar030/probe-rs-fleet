@@ -9,16 +9,8 @@
 //! arguments verbatim. This lets `probe-rs <args>` route through the fleet
 //! without the caller knowing the difference.
 
-mod cli;
-mod config;
-mod logging;
-mod paths;
-mod roles;
-mod secrets;
-mod signal;
-
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    cli::main()
+    fleet_bin::cli::main()
 }

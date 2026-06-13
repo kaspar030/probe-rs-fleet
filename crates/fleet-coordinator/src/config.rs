@@ -32,6 +32,9 @@ pub struct CoordinatorConfig {
     pub tls_key: PathBuf,
     /// PEM file holding the CA used to verify client (agent/sidecar) certs.
     pub client_ca: PathBuf,
+    /// PEM file holding the client CA's private key, used to sign CSRs during
+    /// bootstrap enrollment.
+    pub client_ca_key: PathBuf,
     /// Path to the `SQLite` database file.
     pub sqlite_path: PathBuf,
     /// The capability-token signing key.
@@ -58,6 +61,7 @@ impl CoordinatorConfig {
             ("tls_cert", &self.tls_cert),
             ("tls_key", &self.tls_key),
             ("client_ca", &self.client_ca),
+            ("client_ca_key", &self.client_ca_key),
             ("sqlite_path", &self.sqlite_path),
         ] {
             if path.as_os_str().is_empty() {
@@ -89,6 +93,7 @@ mod tests {
             tls_cert: "cert.pem".into(),
             tls_key: "key.pem".into(),
             client_ca: "ca.pem".into(),
+            client_ca_key: "ca-key.pem".into(),
             sqlite_path: "coord.sqlite".into(),
             signing_key: SigningKeySource::Seed([0u8; 32]),
             policy: Policy::default(),

@@ -173,3 +173,49 @@ fn fingerprint_is_stable_lowercase_hex_sha256() {
     }
     assert_eq!(fp, expected_hex);
 }
+
+#[tokio::test]
+async fn bootstrap_pin_verifier_accepts_match_rejects_mismatch() {
+    use fleet_tls::bootstrap_client_config;
+
+    let (ca, ca_key) = make_ca();
+    let server = make_leaf("coordinator.fleet.test", "coordinator.fleet.test", &ca, &ca_key);
+
+    // Server requires no client auth for the bootstrap handshake; reuse the
+    // server cert as a leaf-only chain.
+    let server_ca = root_store_from_certs([ca.der().clone()]).unwrap();
+    let _ = server_ca; // not needed for the bootstrap server side
+
+    let s_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![server.cert_der.clone()], server.key_der)
+        .unwrap();
+
+    // Correct pin = SHA-256 of the server leaf DER.
+    let pin: [u8; 32] = Sha256::digest(server.cert_der.as_ref()).into();
+
+    // --- matching pin: handshake succeeds ---
+    {
+        let acceptor = TlsAcceptor::from(Arc::new(s_config.clone()));
+        let connector = TlsConnector::from(Arc::new(bootstrap_client_config(pin)));
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move { acceptor.accept(server_io).await.is_ok() });
+        let server_name = ServerName::try_from("coordinator.fleet.test").unwrap();
+        let client_ok = connector.connect(server_name, client_io).await.is_ok();
+        assert!(client_ok, "client with matching pin must connect");
+        let _ = server_task.await;
+    }
+
+    // --- wrong pin: handshake fails ---
+    {
+        let wrong = [0u8; 32];
+        let acceptor = TlsAcceptor::from(Arc::new(s_config));
+        let connector = TlsConnector::from(Arc::new(bootstrap_client_config(wrong)));
+        let (server_io, client_io) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move { acceptor.accept(server_io).await.is_ok() });
+        let server_name = ServerName::try_from("coordinator.fleet.test").unwrap();
+        let client_ok = connector.connect(server_name, client_io).await.is_ok();
+        assert!(!client_ok, "client with wrong pin must be rejected");
+        let _ = server_task.await;
+    }
+}

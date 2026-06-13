@@ -3,13 +3,18 @@
 # This is a fully-commented reference for the client config used by BOTH the
 # `ctl` admin CLI and the `probe-rs` sidecar shim. Both discover the coordinator
 # endpoint and client credentials here when the explicit flags / env vars are
-# absent. Discovered at the XDG default path
-#   $XDG_CONFIG_HOME/probe-rs-fleet/client.toml
-#   (i.e. ~/.config/probe-rs-fleet/client.toml).
+# absent. Discovered at the per-profile XDG default path
+#   $XDG_CONFIG_HOME/probe-rs-fleet/client/<profile>/client.toml
+#   (i.e. ~/.config/probe-rs-fleet/client/<profile>/client.toml).
+# Select a profile with `--profile <name>` or PROBE_RS_FLEET_PROFILE (default
+# `default`); selection precedence is `--config` > `--profile`/env > `default`.
 #
-# `probe-rs-fleet ctl init --bundle <dir> --coordinator host:port` generates a
-# populated version of this file, importing the enrollment bundle produced by
-# `probe-rs-fleet coordinator enroll <user> --kind client`.
+# Bootstrap enrollment (runtime auth stays mTLS; the token is bootstrap-only):
+#   coordinator:  coordinator enroll alice --kind client   (prints a token)
+#   client host:  ctl init --profile ci --token <token>
+#                 (server-cert-pinned bootstrap TLS -> local CSR -> CA-signed
+#                  client cert, written below)
+#   run:          ctl --profile ci list
 #
 # Precedence: explicit flag / env var > this file.
 #
@@ -22,11 +27,11 @@
 # `host:port` of the coordinator to connect to.
 coordinator = "coordinator.example:7000"
 
-# Client certificate chain (PEM), issued by `coordinator enroll`.
-cert = "/home/alice/.local/share/probe-rs-fleet/client-cert.pem"
+# Client certificate chain (PEM), issued via bootstrap enrollment.
+cert = "/home/alice/.local/share/probe-rs-fleet/client/ci/client-cert.pem"
 
-# Client private key (PEM). Keep this 0600.
-key = "/home/alice/.local/share/probe-rs-fleet/client-key.pem"
+# Client private key (PEM). Generated locally during enrollment. Keep this 0600.
+key = "/home/alice/.local/share/probe-rs-fleet/client/ci/client-key.pem"
 
 # CA used to verify the coordinator's server certificate (PEM).
-ca = "/home/alice/.local/share/probe-rs-fleet/client-ca.pem"
+ca = "/home/alice/.local/share/probe-rs-fleet/client/ci/client-ca.pem"

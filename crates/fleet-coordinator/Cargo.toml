@@ -15,11 +15,15 @@ fleet-tls.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
+rustls-pemfile.workspace = true
 
 postcard.workspace = true
 serde.workspace = true
 
 sqlx.workspace = true
+
+rcgen.workspace = true
+sha2.workspace = true
 
 ed25519-dalek.workspace = true
 
@@ -30,6 +34,9 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+fleet-tls.workspace = true
+rustls-pemfile.workspace = true
+fleet-core.workspace = true
 
 [lints]
 workspace = true

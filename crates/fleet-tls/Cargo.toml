@@ -16,7 +16,7 @@ rustls-pemfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
-sha2 = "0.10"
+sha2 = { workspace = true }
 x509-parser = "0.16"
 
 [dev-dependencies]

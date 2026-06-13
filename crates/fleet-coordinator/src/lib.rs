@@ -33,6 +33,7 @@ pub mod auth;
 pub mod clock;
 pub mod config;
 pub mod core;
+pub mod enroll;
 pub mod error;
 pub mod proto;
 pub mod registry;

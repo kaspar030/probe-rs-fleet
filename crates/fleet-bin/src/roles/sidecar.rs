@@ -21,14 +21,14 @@ use fleet_sidecar::selector::ProcessEnv;
 ///
 /// Returns an error on a parse failure, a partial fleet environment, a failure
 /// to locate / run the real probe-rs, or a relay transport error.
-pub fn run(probe_rs_args: Vec<OsString>) -> Result<ExitCode> {
+pub fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode> {
     // Discover coordinator endpoint + client credentials from `client.toml`
     // (written by `ctl init`) and inject them into the process environment for
     // any keys the user has NOT already set. This lets a single `ctl init`
     // configure both `ctl` and this shim. The sidecar still keys leases by
     // selector + principal (unchanged); selector env (`_BOARD` / `_SELECT`)
     // continues to come from the user's environment.
-    inject_client_config_env();
+    inject_client_config_env(profile);
 
     // Reconstruct a full argv: program name + the forwarded probe-rs args.
     let mut argv: Vec<OsString> = Vec::with_capacity(probe_rs_args.len() + 1);
@@ -45,8 +45,8 @@ pub fn run(probe_rs_args: Vec<OsString>) -> Result<ExitCode> {
 /// `client.toml` is shared with `ctl`, but the sidecar selector reads a
 /// different set of env var names (`_CLIENT_CERT` / `_CLIENT_KEY`) than `ctl`
 /// (`_CERT` / `_KEY`); we map `client.toml` into the sidecar's names here.
-fn inject_client_config_env() {
-    let Ok(path) = crate::paths::client_config_path() else {
+fn inject_client_config_env(profile: &str) {
+    let Ok(path) = crate::paths::client_config_path(profile) else {
         return;
     };
     if !path.exists() {

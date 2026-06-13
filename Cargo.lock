@@ -638,7 +638,6 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
- "ed25519-dalek",
  "fleet-agent",
  "fleet-coordinator",
  "fleet-core",
@@ -650,8 +649,10 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "sha2",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -667,8 +668,11 @@ dependencies = [
  "fleet-proto",
  "fleet-tls",
  "postcard",
+ "rcgen",
  "rustls",
+ "rustls-pemfile",
  "serde",
+ "sha2",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -689,6 +693,7 @@ dependencies = [
 name = "fleet-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "postcard",
  "serde",
  "thiserror 2.0.18",

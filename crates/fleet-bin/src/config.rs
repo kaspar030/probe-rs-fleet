@@ -34,6 +34,9 @@ struct CoordinatorConfigToml {
     tls_key: PathBuf,
     /// PEM file holding the CA used to verify client (agent/sidecar) certs.
     client_ca: PathBuf,
+    /// PEM file holding the client CA's private key (used to sign CSRs during
+    /// bootstrap enrollment).
+    client_ca_key: PathBuf,
     /// Path to the `SQLite` database file.
     sqlite_path: PathBuf,
     /// 64-hex-char (32-byte) ed25519 signing seed, inline.
@@ -94,6 +97,7 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         tls_cert: raw.tls_cert,
         tls_key: raw.tls_key,
         client_ca: raw.client_ca,
+        client_ca_key: raw.client_ca_key,
         sqlite_path: raw.sqlite_path,
         signing_key: SigningKeySource::Seed(seed),
         policy: raw.policy,
@@ -254,6 +258,7 @@ listen_addr = "127.0.0.1:7000"
 tls_cert = "cert.pem"
 tls_key = "key.pem"
 client_ca = "ca.pem"
+client_ca_key = "ca-key.pem"
 sqlite_path = "coord.sqlite"
 signing_key_hex = "{seed}"
 sweep_interval_secs = 9
@@ -282,6 +287,7 @@ listen_addr = "0.0.0.0:443"
 tls_cert = "c.pem"
 tls_key = "k.pem"
 client_ca = "ca.pem"
+client_ca_key = "ca-key.pem"
 sqlite_path = "db.sqlite"
 signing_key_hex = "{seed}"
 "#
@@ -300,6 +306,7 @@ listen_addr = "127.0.0.1:1"
 tls_cert = "c.pem"
 tls_key = "k.pem"
 client_ca = "ca.pem"
+client_ca_key = "ca-key.pem"
 sqlite_path = "db.sqlite"
 "#;
         let f = write_tmp(toml);

@@ -114,6 +114,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         &server_cert_path,
         &server_key_path,
         &ca_cert_path,
+        &ca_key_path,
         &sqlite_path,
         &seed_path,
         &Policy::default(),
@@ -186,6 +187,7 @@ fn render_coordinator_config(
     tls_cert: &Path,
     tls_key: &Path,
     client_ca: &Path,
+    client_ca_key: &Path,
     sqlite_path: &Path,
     signing_key_path: &Path,
     policy: &Policy,
@@ -213,6 +215,11 @@ tls_key = {tls_key}
 # CA used to verify client (agent / sidecar) certificates (PEM).
 client_ca = {client_ca}
 
+# Client CA private key (PEM). Used to sign CSRs during bootstrap enrollment
+# (`coordinator enroll` issues a one-time token; `agent/ctl init` redeem it for
+# a CA-signed client cert). Keep this 0600.
+client_ca_key = {client_ca_key}
+
 # SQLite database file (created on first run).
 sqlite_path = {sqlite_path}
 
@@ -227,9 +234,12 @@ signing_key_path = {signing_key_path}
 [policy]
 {policy_block}
 # Pinned agents: map a client certificate fingerprint to the agent id it is
-# allowed to claim. The key is the LOWERCASE HEX SHA-256 of the agent
-# certificate's DER bytes — no `sha256:` prefix, no colons (exactly what
-# `fleet_tls::cert_fingerprint` produces). Reproduce it from a PEM with:
+# allowed to claim. NOTE: enrollment now records agent pins automatically in
+# the database (`coordinator enroll <id> --kind agent` -> `agent init` issues a
+# CA-signed cert whose fingerprint is auto-pinned), so this section is
+# OPTIONAL — use it only to pre-seed pins by hand. The key is the LOWERCASE HEX
+# SHA-256 of the agent certificate's DER bytes — no `sha256:` prefix, no colons
+# (exactly what `fleet_tls::cert_fingerprint` produces). Reproduce it with:
 #
 #   openssl x509 -in agent.pem -outform der | openssl dgst -sha256
 #
@@ -242,6 +252,7 @@ signing_key_path = {signing_key_path}
         tls_cert = toml_path(tls_cert),
         tls_key = toml_path(tls_key),
         client_ca = toml_path(client_ca),
+        client_ca_key = toml_path(client_ca_key),
         sqlite_path = toml_path(sqlite_path),
         signing_key_path = toml_path(signing_key_path),
     );
@@ -270,17 +281,12 @@ fn print_summary(
     println!("Next steps:");
     println!("  1. Start the coordinator (no --config needed):");
     println!("       probe-rs-fleet coordinator");
-    println!("  2. Enroll an agent by issuing it a client cert from the CA above");
-    println!("     ({}), then pin it:", ca_cert_path.display());
-    println!("       - compute the cert fingerprint (lowercase hex SHA-256 of the");
-    println!("         DER, no `sha256:` prefix, no colons):");
-    println!(
-        "           openssl x509 -in agent.pem -outform der | openssl dgst -sha256"
-    );
-    println!(
-        "       - add `\"<fingerprint>\" = \"<agent-id>\"` under [pinned_agents] in"
-    );
-    println!("         {}", config_path.display());
+    println!("  2. Issue a one-time enrollment token for an agent or client:");
+    println!("       probe-rs-fleet coordinator enroll <id> --kind agent");
+    println!("       probe-rs-fleet coordinator enroll <user> --kind client");
+    println!("     The token is bootstrap-only; runtime auth stays mTLS. Redeem it");
+    println!("     on the target host with `agent init`/`ctl init` (the issued");
+    println!("     agent cert is auto-pinned in the coordinator database).");
 }
 
 #[cfg(test)]

@@ -183,10 +183,16 @@ pub fn root_store_from_certs(
 
 /// Build a mutual-TLS [`ServerConfig`] for the coordinator (the only listener).
 ///
-/// Presents `server_cert_chain` + `server_key` and **requires** every client
-/// to present a certificate verifiable against `client_ca`. A peer that does
-/// not present a valid client certificate is rejected during the handshake
-/// (mandatory client auth via [`WebPkiClientVerifier`]).
+/// Presents `server_cert_chain` + `server_key` and verifies any client
+/// certificate against `client_ca`. Client authentication is **optional**: a
+/// peer that presents a valid client certificate is authenticated (runtime
+/// mTLS), while a peer that presents *no* certificate is allowed to complete
+/// the handshake so it can reach the bootstrap/enrollment path. The
+/// application layer (the coordinator) branches on client-cert presence: a
+/// connection with no client cert may ONLY perform bootstrap enrollment; the
+/// runtime agent/sidecar dispatch is reachable only with a verified client
+/// cert. A client cert that is present but *not* verifiable against
+/// `client_ca` is still rejected during the handshake.
 ///
 /// # Errors
 ///
@@ -198,6 +204,7 @@ pub fn server_config(
     client_ca: RootCertStore,
 ) -> Result<ServerConfig, TlsError> {
     let verifier = WebPkiClientVerifier::builder(Arc::new(client_ca))
+        .allow_unauthenticated()
         .build()
         .map_err(TlsError::Verifier)?;
 
@@ -227,6 +234,108 @@ pub fn client_config(
 
     Ok(config)
 }
+
+/// Compute the raw SHA-256 digest of a certificate's DER bytes.
+fn cert_sha256(cert: &CertificateDer<'_>) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(cert.as_ref()).into()
+}
+
+/// A [`rustls::client::danger::ServerCertVerifier`] that accepts a server leaf
+/// **iff** its DER SHA-256 equals a pinned hash.
+///
+/// This is used ONLY for the one-time bootstrap/enrollment handshake, where the
+/// client does not yet trust the coordinator's CA but carries the server-cert
+/// hash inside its enrollment token (our improvement over a blind
+/// trust-on-first-use verifier). It accepts self-signed / leaf-only chains and
+/// ignores the server name and intermediates; the pin is the sole check. It is
+/// never used for runtime traffic, which stays full mTLS.
+#[derive(Debug)]
+pub struct PinnedServerCertVerifier {
+    pin: [u8; 32],
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl PinnedServerCertVerifier {
+    /// Build a verifier that accepts the server leaf whose DER SHA-256 is
+    /// `pin`.
+    #[must_use]
+    pub fn new(pin: [u8; 32]) -> Self {
+        Self {
+            pin,
+            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if cert_sha256(end_entity) == self.pin {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::General(
+                "bootstrap server certificate does not match the pinned hash".to_owned(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build a bootstrap [`ClientConfig`] that pins the coordinator's server
+/// certificate by its DER SHA-256 (`pin`) and presents no client certificate.
+///
+/// Used ONLY for the one-time enrollment handshake (`agent init` / `ctl init`):
+/// the server cert is verified against the pin carried in the enrollment token,
+/// then the client sends an `fleet_proto::enroll::EnrollRequest`. Runtime
+/// traffic uses [`client_config`] (full mTLS) instead.
+#[must_use]
+pub fn bootstrap_client_config(pin: [u8; 32]) -> ClientConfig {
+    ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(pin)))
+        .with_no_client_auth()
+}
+
 
 /// Compute the lowercase-hex SHA-256 fingerprint of a certificate's DER bytes.
 ///

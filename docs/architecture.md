@@ -135,53 +135,85 @@ path `~/.config/probe-rs-fleet/coordinator.toml`
 (`$XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml`); `--config` /
 `PROBE_RS_FLEET_CONFIG` override it. Generated key/cert/seed material and the
 SQLite database default to the data dir `~/.local/share/probe-rs-fleet/`
-(`$XDG_DATA_HOME/probe-rs-fleet/`). The agent config follows the same scheme at
-`~/.config/probe-rs-fleet/agent.toml` (`PROBE_RS_FLEET_AGENT_CONFIG`).
+(`$XDG_DATA_HOME/probe-rs-fleet/`).
+
+#### Per-role + per-profile layout
+
+Config and data are organised **per role** so several roles can coexist on one
+host without colliding, and the agent + client roles are additionally **per
+profile** so one host can target several coordinators:
+
+- coordinator → `<config>/coordinator/coordinator.toml`, data
+  `<data>/coordinator/…` (NOT profiled);
+- agent → `<config>/agent/<profile>/agent.toml`, data `<data>/agent/<profile>/`;
+- client (shared by `ctl` + the `probe-rs` sidecar) →
+  `<config>/client/<profile>/client.toml`, data `<data>/client/<profile>/`.
+
+The default profile is `default`. `--profile <name>` (env
+`PROBE_RS_FLEET_PROFILE`) selects a profile for `agent`, `ctl`, the `sidecar`
+subcommand, and the `init` subcommands; the coordinator is not profiled.
+**Selection precedence:** an explicit `--config` / `--data-dir` wins, then
+`--profile` / `PROBE_RS_FLEET_PROFILE`, then the `default` profile. `agent
+profiles` / `ctl profiles` list the profiles that have a config.
 
 `probe-rs-fleet coordinator init` scaffolds a ready-to-run coordinator on a
 clean machine:
 
 - generates a fresh ed25519 capability-token signing seed
-  (`<data>/signing.seed`, 64 hex chars, `0600`);
+  (`<data>/coordinator/signing.seed`, 64 hex chars, `0600`);
 - generates a development client CA (`client-ca.pem` + `client-ca-key.pem`) and
   a coordinator server cert/key (`coordinator-cert.pem` /
   `coordinator-key.pem`) signed by it, with SANs from `--hostname` / `--ip`
   (default `localhost` / `127.0.0.1`);
 - writes a populated `coordinator.toml` pointing at all of the above
-  (`listen_addr = "0.0.0.0:7000"`, default policy, empty `[pinned_agents]`).
+  (`listen_addr = "0.0.0.0:7000"`, `client_ca_key` for CSR signing, default
+  policy, optional `[pinned_agents]`).
 
 Keys are written `0600`. `init` refuses to overwrite existing files unless
 `--force` is passed; `--config-dir` / `--data-dir` override the target
 directories. Afterwards, `probe-rs-fleet coordinator` (no `--config`) loads the
 generated config and starts listening.
 
-To enroll an agent, ctl user, or sidecar, use the two-step issue + import flow
-(the coordinator is the CA / trust root, so the other roles cannot fully
-self-generate credentials — a cert must be issued by the CA):
+To enroll an agent, ctl user, or sidecar, use the **bootstrap-token** flow. The
+token is a one-time *bootstrap* credential; **runtime authentication stays mTLS,
+unchanged** — the token only buys the client a CA-signed client certificate.
 
-1. **`probe-rs-fleet coordinator enroll <principal-id> --kind agent|client`**
-   (run on the coordinator host, where the CA private key lives). This issues a
-   client keypair + cert signed by the coordinator's `client-ca.pem` with
-   **CN = `<principal-id>`** (which is exactly what `fleet_tls` derives the
-   Principal / AgentId from), computes the cert fingerprint, and emits a
-   transferable bundle under `--out` (default `./<principal-id>-bundle/`):
-   `cert.pem`, `key.pem` (0600), a copy of `client-ca.pem`, and a `bundle.toml`
-   manifest (kind, principal id, fingerprint, and — for agents — the
-   coordinator's ed25519 token public key derived from `signing.seed`).
-   - `--kind agent`: agents must be pinned, so `enroll` prints the
-     `[pinned_agents]` line `"<fingerprint>" = "<principal-id>"`; pass `--write`
-     to append it to `coordinator.toml` automatically. The bundle carries the
-     coordinator token pubkey so the agent config can populate
-     `coordinator_token_pubkey`.
+1. **`probe-rs-fleet coordinator enroll <principal-id> --kind agent|client
+   [--ttl <secs>]`** (run on the coordinator host). This mints a random
+   single-use secret, stores only its SHA-256 hash in the coordinator database
+   (`enroll_tokens`, single-use + TTL'd), and prints **one opaque,
+   copy-pasteable token string** plus a ready-to-paste `agent init` / `ctl
+   init` command. The token encodes three things:
+   1. the coordinator address (`host:port`),
+   2. the SHA-256 of the coordinator's server certificate (for bootstrap
+      server-cert pinning — see below), and
+   3. the random single-use secret (the credential).
+   The token is a transport blob, not signed; the secret IS the credential,
+   validated server-side by hash lookup.
+   - `--kind agent`: the issued cert's fingerprint is **auto-pinned** in the
+     coordinator database (`agent_pins`) on enrollment, so the manual
+     `[pinned_agents]` edit is unnecessary.
    - `--kind client` (ctl / sidecar users): no pinning needed (non-agent
-     principals are treated as sidecars), just issue.
-2. **Transfer the bundle** to the target host (e.g. `scp -r <bundle> host:~/`).
-3. **Import it** on the target host with `agent init` / `ctl init` (below).
+     principals are treated as sidecars).
+2. **Redeem the token** on the target host with `agent init` / `ctl init
+   --token <t> --profile <p>` (below). The client opens a bootstrap TLS
+   connection to the coordinator (verifying the server leaf against the token's
+   hash via a custom pinning verifier — **not** blind trust-on-first-use),
+   generates a keypair + CSR **locally** (the private key never leaves the
+   host), sends an `EnrollRequest { secret, csr_pem }`, and receives back
+   `{ client_cert_pem, ca_cert_pem, coordinator_token_pubkey }`.
 
-The fingerprint is the **lowercase hex SHA-256 of the certificate DER, with no
-`sha256:` prefix and no colons** (exactly what `fleet_tls::cert_fingerprint`
-produces). A fully-commented reference config lives at
-`examples/coordinator.toml`.
+The coordinator's TLS listener allows **optional** client auth: a connection
+that presents **no** client cert may ONLY perform the enroll exchange (it can
+never reach the runtime agent/sidecar dispatch); a connection with a verified
+client cert routes to the existing runtime mTLS path. This mirrors hydra's
+branch on client-cert presence on a single listener — no separate bootstrap
+port.
+
+The issued-cert fingerprint is the **lowercase hex SHA-256 of the certificate
+DER, with no `sha256:` prefix and no colons** (exactly what
+`fleet_tls::cert_fingerprint` produces). A fully-commented reference config
+lives at `examples/coordinator.toml`.
 
 #### End-to-end deployment flow
 
@@ -191,32 +223,29 @@ A clean setup from scratch:
 # 1. On the coordinator host: scaffold CA + signing seed + server cert + config.
 probe-rs-fleet coordinator init --hostname coordinator.example
 
-# 2a. Enroll an agent (pins it in coordinator.toml; bundle carries the token pubkey).
-probe-rs-fleet coordinator enroll rpi-lab-1 --kind agent --write
-#   → ./rpi-lab-1-bundle/{cert.pem,key.pem,client-ca.pem,bundle.toml}
-
-# 2b. Enroll a ctl / sidecar user (no pinning).
-probe-rs-fleet coordinator enroll alice --kind client
-#   → ./alice-bundle/{cert.pem,key.pem,client-ca.pem,bundle.toml}
-
-# 3. Start the coordinator.
+# 2. Start the coordinator.
 probe-rs-fleet coordinator
 
-# 4. Transfer each bundle to its target host, then import:
+# 3a. Mint a one-time bootstrap token for an agent (auto-pinned on enrollment).
+probe-rs-fleet coordinator enroll rpi-lab-1 --kind agent
+#   → prints: prffe1_…  (addr + server-cert hash + single-use secret)
 
-#   On the agent (Raspberry Pi):
-scp -r rpi-lab-1-bundle pi@rpi-lab-1:~/
-probe-rs-fleet agent init --bundle ~/rpi-lab-1-bundle \
-    --coordinator coordinator.example:7000
-# edit ~/.config/probe-rs-fleet/boards.toml, then:
-probe-rs-fleet agent          # no --config needed
+# 3b. Mint a one-time bootstrap token for a ctl / sidecar user.
+probe-rs-fleet coordinator enroll alice --kind client
+#   → prints: prffe1_…
+
+# 4. Redeem each token on its target host (runtime stays mTLS):
+
+#   On the agent (Raspberry Pi): pinned bootstrap TLS → local CSR → CA-signed cert.
+probe-rs-fleet agent init --profile lab1 --token prffe1_…
+# edit ~/.config/probe-rs-fleet/agent/lab1/boards.toml, then:
+probe-rs-fleet agent --profile lab1     # connects via mTLS with the issued cert
 
 #   On the workstation / CI host:
-scp -r alice-bundle alice@dev:~/
-probe-rs-fleet ctl init --bundle ~/alice-bundle \
-    --coordinator coordinator.example:7000
-probe-rs-fleet ctl list       # authenticates via client.toml
-# the `probe-rs` sidecar shim uses the same client.toml automatically.
+probe-rs-fleet ctl init --profile ci --token prffe1_…
+probe-rs-fleet ctl --profile ci list    # authenticates via client.toml (mTLS)
+# the `probe-rs` sidecar shim uses the same per-profile client.toml automatically
+# (select the profile with PROBE_RS_FLEET_PROFILE).
 ```
 
 
@@ -266,18 +295,21 @@ and exposed explicitly via `ctl`.
 
 #### Config & scaffolding (`agent init`)
 
-The agent reads `agent.toml`, discovered at the XDG path
-`~/.config/probe-rs-fleet/agent.toml` (`PROBE_RS_FLEET_AGENT_CONFIG` overrides).
-`probe-rs-fleet agent init --bundle <dir> --coordinator host:port` imports the
-enrollment bundle from `coordinator enroll`: it copies `cert.pem` / `key.pem` /
-`client-ca.pem` into the data dir (key 0600), derives `agent_id` from the cert
-CN (so it matches the coordinator's pin), reads `coordinator_token_pubkey` from
-the bundle manifest, and writes a populated `agent.toml` plus a commented
-starter `boards.toml`. Explicit `--cert/--key/--ca` (and
-`--coordinator-token-pubkey`) override the bundle. `--force` is required to
-overwrite existing files. Afterwards `probe-rs-fleet agent` (no `--config`)
-connects. Fully-commented references live at `examples/agent.toml` and
-`examples/boards.toml`.
+The agent reads `agent.toml`, discovered at the per-profile XDG path
+`~/.config/probe-rs-fleet/agent/<profile>/agent.toml`
+(`PROBE_RS_FLEET_AGENT_CONFIG` / `--config` override the path,
+`PROBE_RS_FLEET_PROFILE` / `--profile` select the profile).
+`probe-rs-fleet agent init --profile <p> --token <t>` redeems a bootstrap
+enrollment token: it opens a server-cert-pinned bootstrap TLS connection to the
+coordinator, generates a keypair + CSR locally (the private key never leaves
+the Pi), receives a CA-signed client cert, writes `agent-cert.pem` /
+`agent-key.pem` (0600) / `client-ca.pem` into the profile data dir, derives
+`agent_id` from the issued cert CN (matching the coordinator's auto-pin), and
+writes a populated `agent.toml` (populating `coordinator_token_pubkey` from the
+enrollment response) plus a commented starter `boards.toml`. `--force` is
+required to overwrite existing files. Afterwards `probe-rs-fleet agent
+--profile <p>` connects via **mTLS** with the issued cert. Fully-commented
+references live at `examples/agent.toml` and `examples/boards.toml`.
 
 
 ### 4.3 `sidecar` (workstation / CI)
@@ -297,12 +329,14 @@ as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
 #### Config & scaffolding (`ctl init`, shared with the sidecar)
 
 ctl and the sidecar share the **same client credentials**. They discover them
-via env vars or, NEW, via a small `client.toml` at
-`~/.config/probe-rs-fleet/client.toml`. `probe-rs-fleet ctl init --bundle <dir>
---coordinator host:port` imports the `--kind client` enrollment bundle into the
-data dir (key 0600) and writes `client.toml` (coordinator endpoint +
-cert/key/ca paths). A single `ctl init` configures **both** ctl and the
-`probe-rs` shim.
+via env vars or via a small per-profile `client.toml` at
+`~/.config/probe-rs-fleet/client/<profile>/client.toml`. `probe-rs-fleet ctl
+init --profile <p> --token <t>` redeems a `--kind client` bootstrap enrollment
+token (server-cert-pinned bootstrap TLS → local CSR → CA-signed client cert),
+writes `client-cert.pem` / `client-key.pem` (0600) / `client-ca.pem` into the
+profile data dir, and writes `client.toml` (coordinator endpoint + cert/key/ca
+paths). A single `ctl init` configures **both** ctl and the `probe-rs` shim
+for that profile (the shim selects the profile via `PROBE_RS_FLEET_PROFILE`).
 
 Resolution precedence is **explicit flag / env var > `client.toml`**. Note the
 two roles read different env var names: `ctl` reads `PROBE_RS_FLEET_COORDINATOR`
@@ -342,11 +376,24 @@ only the control-plane ergonomics differ.
 
 ## 6. Auth & leases
 
-- **Connection auth:** mTLS client cert → principal (agent id, or user/service
-  account).
+- **Bootstrap enrollment (one-time):** `coordinator enroll` mints a single-use
+  token (coordinator addr + server-cert SHA-256 pin + random secret; the secret
+  hash is stored in SQLite, single-use + TTL'd). `agent init` / `ctl init`
+  redeem it over a **server-cert-pinned** bootstrap TLS connection (no client
+  cert, verified against the pin — not blind TOFU), generate a keypair + CSR
+  locally, and receive a CA-signed client cert. This is **bootstrap-only**: the
+  token is never used at runtime, and the private key never leaves the client.
+  For agents, the issued cert's fingerprint is auto-pinned in the coordinator
+  database.
+- **Connection auth (runtime):** **mTLS** client cert → principal (agent id, or
+  user/service account), exactly as before. The coordinator's listener allows
+  optional client auth so an enroll connection (no cert) can complete the
+  handshake to reach the bootstrap handler; runtime dispatch requires a verified
+  client cert. The bootstrap token does **not** replace mTLS.
 - **Capability token:** coordinator issues a signed, short-TTL token scoped to
-  `{lease_id, board_id, allowed_ops}`. The agent verifies the token's signature
-  locally; it does not need to call back to the coordinator per operation.
+  `{lease_id, board_id, allowed_ops}` (unchanged). The agent verifies the
+  token's signature locally; it does not need to call back to the coordinator
+  per operation.
 - **Lease lifecycle:** `request{constraints, duration, priority}` →
   `Leased{board, agent, channel, token, expires}` or `Queued`. Heartbeat
   renews; missed heartbeats free the board and trigger agent cleanup.

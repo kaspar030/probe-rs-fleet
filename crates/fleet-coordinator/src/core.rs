@@ -559,6 +559,7 @@ mod tests {
             tls_cert: "c".into(),
             tls_key: "k".into(),
             client_ca: "ca".into(),
+            client_ca_key: "ca-key".into(),
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(TEST_SEED),
             policy: Policy::default(),

@@ -8,7 +8,17 @@
 #
 # `probe-rs-fleet coordinator init` generates a populated version of this file
 # alongside fresh signing/TLS material under the data dir
-#   $XDG_DATA_HOME/probe-rs-fleet/  (i.e. ~/.local/share/probe-rs-fleet/).
+#   $XDG_DATA_HOME/probe-rs-fleet/coordinator/  (i.e.
+#   ~/.local/share/probe-rs-fleet/coordinator/).
+#
+# Enrollment flow (runtime auth stays mTLS; the token is bootstrap-only):
+#   1. coordinator init
+#   2. coordinator enroll <id>   --kind agent   [--ttl <secs>]   (prints a token)
+#      coordinator enroll <user> --kind client  [--ttl <secs>]   (prints a token)
+#   3. on the target host: agent init / ctl init --profile <p> --token <token>
+#      (opens a server-cert-pinned bootstrap TLS connection, generates a local
+#       keypair + CSR, and receives a CA-signed client cert)
+#   4. agent --profile <p>  /  ctl --profile <p> …   (full mTLS at runtime)
 
 # ---------------------------------------------------------------------------
 # Required keys
@@ -18,16 +28,20 @@
 listen_addr = "0.0.0.0:7000"
 
 # Coordinator's server certificate chain (PEM). Presented to agents/sidecars.
-tls_cert = "/var/lib/probe-rs-fleet/coordinator-cert.pem"
+tls_cert = "/var/lib/probe-rs-fleet/coordinator/coordinator-cert.pem"
 
 # Coordinator's server private key (PEM). Keep this 0600.
-tls_key = "/var/lib/probe-rs-fleet/coordinator-key.pem"
+tls_key = "/var/lib/probe-rs-fleet/coordinator/coordinator-key.pem"
 
 # CA used to verify client (agent / sidecar) certificates (PEM).
-client_ca = "/var/lib/probe-rs-fleet/client-ca.pem"
+client_ca = "/var/lib/probe-rs-fleet/coordinator/client-ca.pem"
+
+# Client CA private key (PEM). Used to sign CSRs during bootstrap enrollment
+# (`coordinator enroll` -> `agent/ctl init`). Keep this 0600.
+client_ca_key = "/var/lib/probe-rs-fleet/coordinator/client-ca-key.pem"
 
 # SQLite database file for fleet state (created on first run).
-sqlite_path = "/var/lib/probe-rs-fleet/coordinator.sqlite"
+sqlite_path = "/var/lib/probe-rs-fleet/coordinator/coordinator.sqlite"
 
 # ---------------------------------------------------------------------------
 # Signing key — set EXACTLY ONE of the following.
@@ -37,7 +51,7 @@ sqlite_path = "/var/lib/probe-rs-fleet/coordinator.sqlite"
 # ---------------------------------------------------------------------------
 
 # Option A: path to a file holding the 64-hex-char seed (recommended; 0600).
-signing_key_path = "/var/lib/probe-rs-fleet/signing.seed"
+signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 
 # Option B: inline the seed directly (mutually exclusive with the path form).
 # signing_key_hex = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -63,7 +77,10 @@ max_concurrent_per_principal = 2
 default_ttl_secs = 900
 
 # Pinned agents: map a client certificate fingerprint to the agent id it is
-# allowed to claim. The key is the LOWERCASE HEX SHA-256 of the agent
+# allowed to claim. NOTE: bootstrap enrollment records agent pins AUTOMATICALLY
+# in the coordinator database (the issued agent cert's fingerprint is pinned to
+# its agent id on enrollment), so this section is OPTIONAL — use it only to
+# pre-seed pins by hand. The key is the LOWERCASE HEX SHA-256 of the agent
 # certificate's DER bytes — no `sha256:` prefix, no colons (exactly what
 # `fleet_tls::cert_fingerprint` produces). Reproduce it from a PEM with:
 #

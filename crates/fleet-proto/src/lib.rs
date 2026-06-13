@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent_api;
 pub mod board;
+pub mod enroll;
 pub mod ids;
 pub mod lease;
 pub mod token;
@@ -21,6 +22,7 @@ pub use agent_api::{
     LogLevel, PowerAction, ProbeInventory,
 };
 pub use board::{Board, BoardState, PowerKind};
+pub use enroll::{EnrollRequest, EnrollResponse, EnrollTokenError, EnrollmentToken};
 pub use ids::{AgentId, BoardId, LeaseId, Principal};
 pub use lease::{Constraint, LeaseGrant, LeaseRequest};
 pub use token::{

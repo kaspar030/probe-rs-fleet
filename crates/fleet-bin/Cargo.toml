@@ -17,6 +17,7 @@ fleet-core = { workspace = true }
 fleet-tls = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 fleet-agent = { workspace = true }
 fleet-coordinator = { workspace = true }
 fleet-sidecar = { workspace = true }
@@ -30,7 +31,7 @@ toml = { workspace = true }
 serde = { workspace = true }
 directories = { workspace = true }
 rcgen = { workspace = true }
-ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 
 [dev-dependencies]

@@ -46,7 +46,7 @@ impl CtlConnection {
     /// Returns an error if `--coordinator`, `--cert`, `--key`, or `--ca` (or
     /// their env / `client.toml` equivalents) cannot be resolved.
     pub fn from_args(args: CtlClientArgs) -> Result<Self> {
-        let fallback = load_client_fallback();
+        let fallback = load_client_fallback(&args.profile);
         Self::resolve(args, fallback)
     }
 
@@ -85,8 +85,8 @@ impl CtlConnection {
 ///
 /// A missing file (or unresolvable config path) is not an error here — it just
 /// means there is no fallback and the flags / env vars must supply everything.
-fn load_client_fallback() -> Option<crate::config::ClientConfig> {
-    let path = paths::client_config_path().ok()?;
+fn load_client_fallback(profile: &str) -> Option<crate::config::ClientConfig> {
+    let path = paths::client_config_path(profile).ok()?;
     if !path.exists() {
         return None;
     }
@@ -213,10 +213,10 @@ pub async fn run(args: CtlArgs) -> Result<()> {
     let client = CtlClient::new(conn);
 
     match args.command {
-        CtlCommand::Init(_) => {
-            // `ctl init` is dispatched in cli.rs before a connection is built;
-            // reaching here would be a logic error.
-            anyhow::bail!("`ctl init` must be handled before connecting")
+        CtlCommand::Init(_) | CtlCommand::Profiles => {
+            // `ctl init` / `ctl profiles` are dispatched in cli.rs before a
+            // connection is built; reaching here would be a logic error.
+            anyhow::bail!("`ctl init`/`ctl profiles` must be handled before connecting")
         }
         CtlCommand::List => client.list(),
         CtlCommand::Lease { selector, duration } => {
@@ -276,6 +276,7 @@ mod tests {
             cert: None,
             key: None,
             ca: None,
+            profile: "default".to_owned(),
         };
         assert!(CtlConnection::resolve(args, None).is_err());
 
@@ -284,6 +285,7 @@ mod tests {
             cert: Some("c.pem".into()),
             key: Some("k.pem".into()),
             ca: None,
+            profile: "default".to_owned(),
         };
         assert!(CtlConnection::resolve(args, None).is_err());
     }
@@ -295,6 +297,7 @@ mod tests {
             cert: Some("c.pem".into()),
             key: Some("k.pem".into()),
             ca: Some("ca.pem".into()),
+            profile: "default".to_owned(),
         };
         let conn = CtlConnection::resolve(args, None).unwrap();
         assert_eq!(conn.coordinator, "coord:443");
@@ -307,6 +310,7 @@ mod tests {
             cert: None,
             key: None,
             ca: None,
+            profile: "default".to_owned(),
         };
         let fallback = crate::config::ClientConfig {
             coordinator: "fb.example:7000".to_owned(),
@@ -326,6 +330,7 @@ mod tests {
             cert: Some("flag-cert.pem".into()),
             key: Some("flag-key.pem".into()),
             ca: Some("flag-ca.pem".into()),
+            profile: "default".to_owned(),
         };
         let fallback = crate::config::ClientConfig {
             coordinator: "fb.example:7000".to_owned(),

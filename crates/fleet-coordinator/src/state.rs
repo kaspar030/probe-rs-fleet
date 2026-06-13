@@ -214,6 +214,98 @@ impl Db {
             .await?;
         Ok(row.0)
     }
+
+    /// Insert a one-time bootstrap enrollment secret (stored by hash).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn insert_enroll_token(
+        &self,
+        secret_hash: &str,
+        principal: &str,
+        kind: &str,
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO enroll_tokens (secret_hash, principal, kind, created_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(secret_hash)
+        .bind(principal)
+        .bind(kind)
+        .bind(created_at)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically consume a bootstrap enrollment secret: single-use + TTL.
+    ///
+    /// Marks the matching, not-yet-consumed, not-yet-expired secret as consumed
+    /// at `now` and returns its `(principal, kind)`. Returns `None` when the
+    /// secret is unknown, already consumed (reuse), or expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn consume_enroll_token(
+        &self,
+        secret_hash: &str,
+        now: i64,
+    ) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "UPDATE enroll_tokens SET consumed_at = ?2
+             WHERE secret_hash = ?1 AND consumed_at IS NULL AND expires_at > ?2
+             RETURNING principal, kind",
+        )
+        .bind(secret_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Record an agent pin (issued-cert fingerprint -> agent id).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn insert_agent_pin(
+        &self,
+        fingerprint: &str,
+        agent_id: &str,
+        created_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO agent_pins (fingerprint, agent_id, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(fingerprint) DO UPDATE SET agent_id = excluded.agent_id",
+        )
+        .bind(fingerprint)
+        .bind(agent_id)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up the agent id pinned to a given cert fingerprint, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn agent_pin_for_fingerprint(&self, fingerprint: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT agent_id FROM agent_pins WHERE fingerprint = ?1")
+                .bind(fingerprint)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
+
 }
 
 /// One audit-log entry to append.
@@ -259,6 +351,43 @@ mod tests {
             state: BoardState::Idle,
         }
     }
+
+    #[tokio::test]
+    async fn enroll_token_consume_single_use_and_ttl() {
+        let db = Db::connect_in_memory().await.unwrap();
+        // valid -> consumed once
+        db.insert_enroll_token("hash-a", "rpi-1", "agent", 1000, 2000)
+            .await
+            .unwrap();
+        let first = db.consume_enroll_token("hash-a", 1500).await.unwrap();
+        assert_eq!(
+            first,
+            Some(("rpi-1".to_owned(), "agent".to_owned()))
+        );
+        // reuse rejected
+        assert!(db.consume_enroll_token("hash-a", 1600).await.unwrap().is_none());
+
+        // expired rejected
+        db.insert_enroll_token("hash-b", "alice", "client", 1000, 2000)
+            .await
+            .unwrap();
+        assert!(db.consume_enroll_token("hash-b", 3000).await.unwrap().is_none());
+
+        // unknown rejected
+        assert!(db.consume_enroll_token("nope", 1500).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_pin_round_trip() {
+        let db = Db::connect_in_memory().await.unwrap();
+        assert!(db.agent_pin_for_fingerprint("fp1").await.unwrap().is_none());
+        db.insert_agent_pin("fp1", "rpi-1", 1000).await.unwrap();
+        assert_eq!(
+            db.agent_pin_for_fingerprint("fp1").await.unwrap(),
+            Some("rpi-1".to_owned())
+        );
+    }
+
 
     #[tokio::test]
     async fn migrate_and_record_board() {
