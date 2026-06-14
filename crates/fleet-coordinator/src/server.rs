@@ -83,7 +83,6 @@ fn is_clean_disconnect(e: &CoordinatorError) -> bool {
     )
 }
 
-
 /// Test-only entry point that drives a single accepted connection through the
 /// real dispatch path (handshake -> bootstrap or runtime). Exposed so
 /// integration tests can bind their own listener and observe the coordinator
