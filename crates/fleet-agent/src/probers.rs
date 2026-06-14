@@ -2,7 +2,7 @@
 //!
 //! Decided model: the agent runs **one `probe-rs serve` per board** listening
 //! on a loopback **TCP** port, each locked to its physical probe via a per-board
-//! user with `ProbeAccess::Allow([serial])` + a per-board token. `probe-rs serve`
+//! user with `ProbeAccess::Allow(["vid:pid:serial"])` + a per-board token. `probe-rs serve`
 //! (0.31) speaks **WebSocket** at route `/worker`; the agent then
 //! **byte-splices** the raw TCP stream (the bytes of that WebSocket connection)
 //! between serve's port and the coordinator-relayed data channel — *zero*
@@ -14,7 +14,7 @@
 //! file searched in cwd → exe dir → home, and the connecting client selects
 //! probe + chip in-band over the WebSocket. So the agent spawns serve with a
 //! per-board `current_dir` containing a generated `.probe-rs.toml`; isolation is
-//! the per-board `ProbeAccess::Allow([serial])` fence under that config's
+//! the per-board `ProbeAccess::Allow(["vid:pid:serial"])` fence under that config's
 //! `[server]` table.
 
 
@@ -39,8 +39,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> SpliceIo for T {}
 pub struct ServeSpec {
     /// Board id (for logging / lookup).
     pub board: String,
-    /// The probe serial this server is locked to (`ProbeAccess::Allow`).
+    /// The probe serial this server is locked to (part of the canonical
+    /// `vid:pid:serial` `ProbeAccess::Allow` selector).
     pub serial: String,
+    /// USB vendor id of the bound probe (canonical allow selector). Sourced
+    /// from runtime USB discovery via [`BoardSpec`].
+    pub vid: u16,
+    /// USB product id of the bound probe (canonical allow selector).
+    pub pid: u16,
     /// Loopback address `probe-rs serve` binds (`[server].address`).
     pub address: String,
     /// Loopback TCP port `probe-rs serve` binds (`[server].port`). Allocated
@@ -65,6 +71,8 @@ impl ServeSpec {
         Ok(Self {
             board: board.id.clone(),
             serial: board.serial.clone(),
+            vid: board.vid,
+            pid: board.pid,
             address: "127.0.0.1".to_owned(),
             port,
         })
@@ -98,10 +106,12 @@ impl ServeSpec {
              [[server.users]]\n\
              name = \"fleet\"\n\
              token = \"{token}\"\n\
-             access = {{ allow = [\"{serial}\"] }}\n",
+             access = {{ allow = [\"{vid:04x}:{pid:04x}:{serial}\"] }}\n",
             address = self.address,
             port = self.port,
             token = serve_token,
+            vid = self.vid,
+            pid = self.pid,
             serial = self.serial,
         )
     }
@@ -477,7 +487,7 @@ mod tests {
     use crate::config::BoardsConfig;
 
     fn board() -> BoardSpec {
-        BoardsConfig::from_str(
+        let mut board = BoardsConfig::from_str(
             r#"
 [[board]]
 id = "nrf52840-dk-3"
@@ -487,7 +497,13 @@ chip = "nRF52840_xxAA"
         )
         .unwrap()
         .boards
-        .remove(0)
+        .remove(0);
+        // vid/pid aren't declared in boards.toml; they are stamped at runtime
+        // from USB discovery (see `enrich_boards_with_discovery`). The real
+        // J-Link OB on the nRF52840-DK reports vid 0x1366 / pid 0x1015.
+        board.vid = 0x1366;
+        board.pid = 0x1015;
+        board
     }
 
     #[test]
@@ -509,7 +525,12 @@ chip = "nRF52840_xxAA"
         assert!(cfg.contains("[[server.users]]"));
         assert!(cfg.contains("name = \"fleet\""));
         assert!(cfg.contains("token = \"deadbeef\""));
-        assert!(cfg.contains("access = { allow = [\"001050257890\"] }"));
+        // Canonical `vid:pid:serial` selector — the only form probe-rs 0.31's
+        // allow-list matcher accepts. A bare serial silently filters out every
+        // probe.
+        assert!(cfg.contains("access = { allow = [\"1366:1015:001050257890\"] }"));
+        // The bare-serial form (which never matches) must be gone.
+        assert!(!cfg.contains("allow = [\"001050257890\"]"));
         // Stale 0.31-incompatible keys must be gone.
         assert!(!cfg.contains("socket://"));
         assert!(!cfg.contains("probe_access"));

@@ -68,6 +68,29 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
     }
 }
 
+/// Stamp each declared board with the USB `vid`/`pid` of its physically present
+/// probe, matched by serial against live discovery.
+///
+/// `boards.toml` keys boards by serial only; the canonical probe selector
+/// probe-rs 0.31 requires (`vid:pid:serial`, see
+/// [`crate::probers::ServeSpec::render_server_config`]) needs the USB ids, which
+/// are only known at runtime from enumeration. Call this after each discovery
+/// pass so that the [`BoardSpec`](crate::config::BoardSpec) handed to
+/// `probe-rs serve` carries the real vid/pid and the rendered allow entry
+/// actually matches the attached probe.
+///
+/// Boards whose probe is absent are left untouched (their vid/pid stay at their
+/// previous value); they cannot be served anyway.
+pub fn enrich_boards_with_discovery(boards: &mut BoardsConfig, discovered: &[DiscoveredProbe]) {
+    for board in &mut boards.boards {
+        if let Some(probe) = discovered.iter().find(|p| p.serial == board.serial) {
+            board.vid = probe.vid;
+            board.pid = probe.pid;
+        }
+    }
+}
+
+
 /// Whether `board` is leasable given an inventory snapshot (present + declared).
 #[must_use]
 pub fn is_leasable(inventory: &ProbeInventory, board: &BoardId) -> bool {
@@ -137,4 +160,28 @@ chip = "c2"
         assert!(!is_leasable(&inv, &BoardId("b2".into())));
         assert!(!is_leasable(&inv, &BoardId("nope".into())));
     }
+
+    fn probe_ids(serial: &str, vid: u16, pid: u16) -> DiscoveredProbe {
+        DiscoveredProbe {
+            serial: serial.to_owned(),
+            vid,
+            pid,
+            product: Some("probe".to_owned()),
+        }
+    }
+
+    #[test]
+    fn enrich_stamps_vid_pid_onto_matched_boards() {
+        let mut boards = boards();
+        enrich_boards_with_discovery(
+            &mut boards,
+            &[probe_ids("AAA", 0x1366, 0x1015), probe_ids("ZZZ", 0xdead, 0xbeef)],
+        );
+        let b1 = boards.boards.iter().find(|b| b.id == "b1").unwrap();
+        assert_eq!((b1.vid, b1.pid), (0x1366, 0x1015));
+        // b2's probe ("BBB") is absent from discovery: left at default 0/0.
+        let b2 = boards.boards.iter().find(|b| b.id == "b2").unwrap();
+        assert_eq!((b2.vid, b2.pid), (0, 0));
+    }
+
 }

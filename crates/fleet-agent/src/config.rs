@@ -102,8 +102,18 @@ pub struct BoardSpec {
     /// Stable board id (unique across the fleet).
     pub id: String,
     /// Physical probe serial bound to this board (→ `serve`
-    /// `ProbeAccess::Allow([serial])`).
+    /// `ProbeAccess::Allow(["<vid>:<pid>:<serial>"])`).
     pub serial: String,
+    /// USB vendor id of the bound probe. Not declared in `boards.toml`; filled
+    /// in at runtime from USB discovery (see [`crate::discovery`]) so the serve
+    /// config can emit the canonical `vid:pid:serial` allow selector that
+    /// probe-rs 0.31's allow-list matcher accepts.
+    #[serde(skip)]
+    pub vid: u16,
+    /// USB product id of the bound probe. Filled in at runtime from USB
+    /// discovery (see [`vid`](Self::vid)).
+    #[serde(skip)]
+    pub pid: u16,
     /// probe-rs target/chip name (informational; the caller still passes
     /// `--chip` in-band).
     pub chip: String,

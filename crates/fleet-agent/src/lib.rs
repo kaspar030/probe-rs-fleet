@@ -32,7 +32,7 @@ pub mod token;
 pub use agent::Agent;
 pub use config::{AgentConfig, BoardSpec, BoardsConfig, ConfigError, PowerSpec};
 pub use connection::Backoff;
-pub use discovery::{reconcile, ProbeLister};
+pub use discovery::{enrich_boards_with_discovery, reconcile, ProbeLister};
 pub use error::{AgentError, Result};
 pub use power::{CommandRunner, PowerControl, PowerError};
 pub use probers::{ProbeRsBackend, ProcessBackend, Session, SpliceIo};
