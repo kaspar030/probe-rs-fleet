@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use fleet_proto::enroll::EnrollRequest;
 use fleet_proto::ids::{AgentId, Principal};
@@ -58,11 +58,31 @@ pub async fn serve(coord: Arc<Coordinator>, acceptor: TlsAcceptor) -> Result<()>
         let coord = Arc::clone(&coord);
         tokio::spawn(async move {
             if let Err(e) = handle_connection(coord, acceptor, sock).await {
-                debug!(%peer, error = %e, "connection closed");
+                if is_clean_disconnect(&e) {
+                    // Short-lived clients (ctl/sidecar) exit right after their RPC
+                    // and close the socket without a graceful TLS close_notify.
+                    // rustls surfaces this as an UnexpectedEof; it is benign.
+                    trace!(%peer, "connection closed by peer without close_notify");
+                } else {
+                    debug!(%peer, error = %e, "connection closed");
+                }
             }
         });
     }
 }
+
+/// Returns `true` if the error is a benign peer-initiated disconnect: the
+/// remote closed the TCP connection without sending a graceful TLS
+/// `close_notify`. Short-lived clients (ctl/sidecar) exit immediately after
+/// their RPC, so this is expected rather than a transport fault. rustls
+/// surfaces it as [`std::io::ErrorKind::UnexpectedEof`].
+fn is_clean_disconnect(e: &CoordinatorError) -> bool {
+    matches!(
+        e,
+        CoordinatorError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof
+    )
+}
+
 
 /// Test-only entry point that drives a single accepted connection through the
 /// real dispatch path (handshake -> bootstrap or runtime). Exposed so
