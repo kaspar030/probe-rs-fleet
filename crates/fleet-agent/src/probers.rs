@@ -17,13 +17,14 @@
 //! the per-board `ProbeAccess::Allow(["vid:pid:serial"])` fence under that config's
 //! `[server]` table.
 
-
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::BoardSpec;
+use crate::discovery::{enrich_boards_with_discovery, ProbeLister, ProbeRsListLister};
 
 /// A byte stream the agent splices onto a relay data channel: the connected
 /// TCP transport to a board's `probe-rs serve` WebSocket port (or, in tests, an
@@ -186,39 +187,94 @@ pub trait ProbeRsBackend: Send + Sync {
 /// Spawns `probe-rs serve` per board with a generated `.probe-rs.toml` Figment
 /// config in a per-board `current_dir`, then byte-splices serve's loopback TCP
 /// stream (the bytes of its `/worker` WebSocket) onto the relay.
-#[derive(Debug, Clone)]
 pub struct ProcessBackend {
     /// Directory under which per-board working dirs and config files are written.
     runtime_dir: PathBuf,
     /// The `probe-rs` binary to invoke.
     program: String,
+    /// Enumerates attached probes so each board's USB vid/pid can be resolved at
+    /// spawn time (the serve config's allow entry needs the canonical
+    /// `vid:pid:serial` selector). Defaults to a real `probe-rs list` shell-out;
+    /// injectable for tests.
+    lister: Arc<dyn ProbeLister>,
+}
+
+impl std::fmt::Debug for ProcessBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessBackend")
+            .field("runtime_dir", &self.runtime_dir)
+            .field("program", &self.program)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ProcessBackend {
     /// Build a process backend writing per-board working dirs under `runtime_dir`.
+    ///
+    /// Uses a real `probe-rs list` enumerator (the same `probe-rs` binary used
+    /// for `serve`) to resolve probe vid/pid at spawn time.
     #[must_use]
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
             runtime_dir,
             program: "probe-rs".to_owned(),
+            lister: Arc::new(ProbeRsListLister::default()),
         }
     }
 
     /// Override the `probe-rs` binary path (e.g. for tests / non-default
-    /// install).
+    /// install). Also re-points the probe enumerator at the same binary.
     #[must_use]
     pub fn with_program(mut self, program: String) -> Self {
-        self.program = program;
+        self.program.clone_from(&program);
+        self.lister = Arc::new(ProbeRsListLister::new(program));
         self
     }
 
-    /// The serve spec this backend would use for `board`.
+    /// Override the probe enumerator (tests inject a mock so spawn-time vid/pid
+    /// resolution is exercised without real hardware).
+    #[must_use]
+    pub fn with_lister(mut self, lister: Arc<dyn ProbeLister>) -> Self {
+        self.lister = lister;
+        self
+    }
+
+    /// The serve spec this backend would use for `board`, with the probe's
+    /// USB vid/pid resolved from live enumeration.
     ///
     /// # Errors
     ///
-    /// Returns an error string if an ephemeral port could not be allocated.
-    pub fn serve_spec(&self, board: &BoardSpec) -> Result<ServeSpec, String> {
-        ServeSpec::for_board(board)
+    /// Returns an error string if an ephemeral port could not be allocated, if
+    /// probe enumeration fails, or if the board's serial is not found among the
+    /// attached probes (so we never render an unmatchable `0000:0000:<serial>`
+    /// allow entry).
+    pub async fn serve_spec(&self, board: &BoardSpec) -> Result<ServeSpec, String> {
+        let enriched = self.resolve_board_ids(board).await?;
+        ServeSpec::for_board(&enriched)
+    }
+
+    /// Stamp `board`'s USB vid/pid from a fresh `probe-rs list` enumeration,
+    /// matched by serial. Errors loudly if the board's probe is not present or
+    /// the discovered vid/pid are unusable (zero), since rendering
+    /// `0000:0000:<serial>` would silently no-op every remote attach.
+    async fn resolve_board_ids(&self, board: &BoardSpec) -> Result<BoardSpec, String> {
+        let discovered = self.lister.list_probes().await?;
+        let mut boards = crate::config::BoardsConfig {
+            boards: vec![board.clone()],
+        };
+        enrich_boards_with_discovery(&mut boards, &discovered);
+        let enriched = boards.boards.remove(0);
+        if enriched.vid == 0 && enriched.pid == 0 {
+            return Err(format!(
+                "probe with serial {} not found among {} attached probe(s); \
+                 cannot render canonical vid:pid:serial allow entry (refusing to \
+                 emit unmatchable 0000:0000:{})",
+                board.serial,
+                discovered.len(),
+                board.serial,
+            ));
+        }
+        Ok(enriched)
     }
 }
 
@@ -283,7 +339,7 @@ impl ProbeRsBackend for ProcessBackend {
         board: &BoardSpec,
         serve_token: &str,
     ) -> Result<Box<dyn Session>, String> {
-        let spec = self.serve_spec(board)?;
+        let spec = self.serve_spec(board).await?;
 
         // 1. Create a per-board working dir and write `.probe-rs.toml` into it
         //    (Figment searches cwd for this filename). The config locks the
@@ -485,6 +541,29 @@ pub(crate) mod mock {
 mod tests {
     use super::*;
     use crate::config::BoardsConfig;
+    use crate::discovery::ProbeLister;
+    use fleet_proto::DiscoveredProbe;
+
+    /// A stub [`ProbeLister`] returning a fixed probe set (no hardware / no
+    /// `probe-rs` binary needed), so the spawn-time vid/pid resolution path is
+    /// exercised in tests.
+    struct StubLister(Vec<DiscoveredProbe>);
+
+    #[async_trait]
+    impl ProbeLister for StubLister {
+        async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn discovered(serial: &str, vid: u16, pid: u16) -> DiscoveredProbe {
+        DiscoveredProbe {
+            serial: serial.to_owned(),
+            vid,
+            pid,
+            product: Some("J-Link".to_owned()),
+        }
+    }
 
     fn board() -> BoardSpec {
         let mut board = BoardsConfig::from_str(
@@ -504,6 +583,23 @@ chip = "nRF52840_xxAA"
         board.vid = 0x1366;
         board.pid = 0x1015;
         board
+    }
+
+    /// A board exactly as parsed from `boards.toml`: vid/pid default to 0 until
+    /// runtime discovery stamps them. Used to prove the spawn path enriches
+    /// them from live enumeration (not the pre-stamped `board()` fixture).
+    fn undiscovered_board() -> BoardSpec {
+        BoardsConfig::from_str(
+            r#"
+[[board]]
+id = "nrf52840-dk-3"
+serial = "001050257890"
+chip = "nRF52840_xxAA"
+"#,
+        )
+        .unwrap()
+        .boards
+        .remove(0)
     }
 
     #[test]
@@ -538,13 +634,61 @@ chip = "nRF52840_xxAA"
     }
 
     #[tokio::test]
+    async fn serve_spec_enriches_vid_pid_from_discovery() {
+        // A board with default 0/0 vid/pid (as parsed from boards.toml) must end
+        // up rendering the *discovered* canonical selector, NOT `0000:0000:`.
+        let board = undiscovered_board();
+        assert_eq!((board.vid, board.pid), (0, 0));
+        let dir = std::env::temp_dir().join(format!("frs-enrich-test-{}", std::process::id()));
+        let be = ProcessBackend::new(dir).with_lister(Arc::new(StubLister(vec![discovered(
+            "001050257890",
+            0x1366,
+            0x1015,
+        )])));
+        let spec = be.serve_spec(&board).await.unwrap();
+        assert_eq!((spec.vid, spec.pid), (0x1366, 0x1015));
+        let cfg = spec.render_server_config("deadbeef");
+        assert!(
+            cfg.contains("access = { allow = [\"1366:1015:001050257890\"] }"),
+            "unexpected config: {cfg}"
+        );
+        // The unmatchable defaulted form must never be rendered.
+        assert!(!cfg.contains("0000:0000:"));
+    }
+
+    #[tokio::test]
+    async fn serve_spec_errors_when_probe_absent_rather_than_rendering_zeros() {
+        // If the board's serial isn't among discovered probes, we must fail
+        // loudly instead of emitting an unmatchable `0000:0000:<serial>` entry
+        // (which silently no-ops every remote attach — the bug being fixed).
+        let dir = std::env::temp_dir().join(format!("frs-absent-test-{}", std::process::id()));
+        let be = ProcessBackend::new(dir).with_lister(Arc::new(StubLister(vec![discovered(
+            "SOME-OTHER-SERIAL",
+            0x1366,
+            0x1015,
+        )])));
+        let Err(err) = be.serve_spec(&undiscovered_board()).await else {
+            panic!("expected an error when the board's probe is absent");
+        };
+        assert!(err.contains("not found"), "unexpected error: {err}");
+        assert!(err.contains("001050257890"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
     async fn process_backend_open_fails_without_probe_rs() {
-        // With a bogus program name the spawn fails fast; the backend surfaces
-        // a real error instead of the old not-yet-wired stub.
+        // With a bogus program name the serve spawn fails fast; the backend
+        // surfaces a real error instead of the old not-yet-wired stub. A stub
+        // lister provides the probe so we get past vid/pid resolution and reach
+        // the spawn.
         let dir = std::env::temp_dir().join(format!("frs-serve-test-{}", std::process::id()));
         let be = ProcessBackend::new(dir.clone())
-            .with_program("definitely-not-a-real-probe-rs-binary".to_owned());
-        let result = be.open(&board(), "deadbeef").await;
+            .with_program("definitely-not-a-real-probe-rs-binary".to_owned())
+            .with_lister(Arc::new(StubLister(vec![discovered(
+                "001050257890",
+                0x1366,
+                0x1015,
+            )])));
+        let result = be.open(&undiscovered_board(), "deadbeef").await;
         std::fs::remove_dir_all(&dir).ok();
         let Err(err) = result else {
             panic!("expected spawn error")

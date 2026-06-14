@@ -48,10 +48,11 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
     // Seed the agent's inventory from `boards.toml` so the boards are advertised
     // to the coordinator on registration and become leasable. (A concrete probe
-    // enumerator can later refine presence via `Agent::set_inventory`, and must
-    // also call `fleet_agent::enrich_boards_with_discovery` to stamp each
-    // board's USB vid/pid so `probe-rs serve` renders the canonical
-    // `vid:pid:serial` allow selector that 0.31's matcher requires.)
+    // enumerator can later refine presence via `Agent::set_inventory`.) The
+    // serve-config's canonical `vid:pid:serial` allow entry does NOT depend on
+    // this: `ProcessBackend` resolves each board's USB vid/pid from a live
+    // `probe-rs list` enumeration at session-open time (see
+    // `ProcessBackend::serve_spec`).
     agent.seed_inventory_from_boards().await;
 
     // `connection::run` owns the connect / serve / reconnect-with-backoff
