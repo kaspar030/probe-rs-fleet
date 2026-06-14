@@ -60,6 +60,7 @@ impl ProbeRsBackend for EchoBackend {
     async fn open(
         &self,
         board: &fleet_agent::config::BoardSpec,
+        _serve_token: &str,
     ) -> Result<Box<dyn Session>, String> {
         let (agent_side, mut peer) = tokio::io::duplex(4096);
         // Echo task: bounce every byte the agent writes back to it.

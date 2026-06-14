@@ -548,6 +548,7 @@ kind = "none"
         async fn open(
             &self,
             board: &crate::config::BoardSpec,
+            _serve_token: &str,
         ) -> std::result::Result<Box<dyn Session>, String> {
             let (session, peer) = MockSession::with_io(board.id.clone());
             *self.peer.lock().await = Some(peer);

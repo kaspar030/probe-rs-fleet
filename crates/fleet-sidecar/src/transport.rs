@@ -1,10 +1,10 @@
-//! The live mTLS + postcard relay transport for the sidecar's fleet path.
+//! The live mTLS + byte-opaque relay transport for the sidecar's fleet path.
 //!
 //! This is the concrete implementation of the relay seam described in
 //! [`crate::proxy`]: it dials the coordinator over mTLS, leases a board, opens a
 //! relay data (or gdb) channel, exposes a local endpoint the genuine probe-rs
 //! client connects to, and byte-splices the two verbatim. The sidecar never
-//! parses the postcard frames — it is a pure byte pipe.
+//! parses the relayed frames (WebSocket-over-TCP) — it is a pure byte pipe.
 //!
 //! The control plane and the data plane share one TLS connection, multiplexed
 //! by the [`fleet_wire`] envelopes. A single reader task demultiplexes
@@ -352,8 +352,9 @@ pub fn find_real_probe_rs() -> Result<std::path::PathBuf, TransportError> {
         .map_err(|e| TransportError::Io(format!("locating probe-rs: {e}")))
 }
 
-/// Run the genuine probe-rs (async) pointed at `remote_host` with the lease
-/// `token`, propagating its exit code.
+/// Run the genuine probe-rs (async) pointed at `remote_host` (a `ws://` base
+/// URL like `ws://127.0.0.1:<port>`) with the lease `token`, propagating its
+/// exit code.
 ///
 /// # Errors
 ///

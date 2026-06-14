@@ -54,21 +54,22 @@ are all point-to-point (`raw_nusb`, `serial`, `webusb`), but
 `HostClient::new_with_wire(tx, rx, spawn)` accepts *any* wire impl. This is the
 seam we build on. It splits the problem cleanly into two planes:
 
-### Data plane — opaque postcard-rpc tunnel
+### Data plane — opaque WebSocket-over-TCP tunnel
 
-The sidecar speaks **vanilla probe-rs**. probe-rs's postcard-rpc frames are
-length-delimited postcard messages over a byte stream. We do **not** parse or
-re-implement them — we tunnel the raw frames:
+The sidecar speaks **vanilla probe-rs**. In probe-rs 0.31 the client/server
+link is a **WebSocket** (route `/worker`) over TCP (see §4.2 / corrected by
+#1965). We do **not** parse or re-implement it — we tunnel the raw bytes of that
+connection:
 
 ```
-  sidecar's probe-rs client  ──postcard-rpc frames──▶  [ mTLS to coordinator ]
-      ──relay──▶  [ mTLS to agent ]  ──▶  agent's probe-rs server
+  sidecar's probe-rs client  ──WebSocket/TCP bytes──▶  [ mTLS to coordinator ]
+      ──relay──▶  [ mTLS to agent ]  ──▶  agent's `probe-rs serve`
 ```
 
 The coordinator forwards opaque bytes on a leased channel; it never decodes
-probe-rs traffic. Whether the sidecar plugs in at the `WireTx`/`WireRx` level
-(a custom postcard-rpc wire that points at the relay) or simply byte-splices a
-local socket is an implementation detail — both carry the same frames.
+probe-rs traffic. The sidecar exposes a local TCP endpoint (advertised to the
+genuine client as `PROBE_RS_REMOTE_HOST=ws://127.0.0.1:<port>`) and byte-splices
+its accepted connection onto the relay — the same bytes flow through verbatim.
 
 ### Control plane — leases, inventory, auth, power, heartbeats
 
@@ -269,22 +270,49 @@ probe-rs-fleet ctl --profile ci list    # authenticates via client.toml (mTLS)
 ### 4.2 `agent` (Raspberry Pi)
 Owns local probes. Reconciles discovered probes against `boards.toml`.
 
-> **Updated by investigation (task #1710, probe-rs 0.31.0):** The server is
-> `probe-rs serve`. It takes **no `--probe` / `--chip`** — it exposes *all*
-> local probes and the connecting client selects probe + chip **in-band** over
-> postcard-rpc (`SelectProbeEndpoint` / `AttachRequest`). So there is **no
-> CLI injection point** for the agent; the earlier "agent injects `--probe`"
-> model is dropped.
+> **Updated by investigation (tasks #1710, #1965 — verified against the real
+> probe-rs 0.31.0 source):** The server is `probe-rs serve`. It takes **no
+> `--probe` / `--chip`** — it exposes *all* local probes and the connecting
+> client selects probe + chip **in-band**. So there is **no CLI injection
+> point** for the agent; the earlier "agent injects `--probe`" model is dropped.
+>
+> **Correction (#1965):** the #1710 model of `serve` as a *Unix-socket, raw
+> `u32-LE postcard`, `address="socket://…"`, server config via `--config`*
+> transport was **inaccurate** for probe-rs 0.31. The genuine `probe-rs serve`:
+>
+> - **Binds TCP**, default `0.0.0.0:3000` (`TcpListener::bind`); there is **no
+>   `socket://` address scheme**.
+> - **Speaks WebSocket** at route `/worker` (axum), with **challenge/token**
+>   auth (`Probe-Rs-Challenge` header; client replies `sha512(challenge||token)`).
+> - Has **no `--config` flag**. `ServerConfig` is the `server` field of the
+>   top-level config loaded via **Figment** from `.probe-rs.{toml,json,yaml,yml}`
+>   searched in **cwd → exe dir → home**. So config lives under a **`[server]`**
+>   table (`#[serde(deny_unknown_fields)]`), with `[[server.users]]` entries
+>   requiring `name`, `token`, and `access` (NOT `probe_access`).
+> - The client honours `PROBE_RS_REMOTE_HOST` (a **`ws://` base URL** — the
+>   client appends `/worker`) and `PROBE_RS_REMOTE_TOKEN`.
 
-Decided agent model (per #1710):
+Decided agent model (per #1710, corrected by #1965):
 
 - **Byte-proxy `probe-rs serve`, one server per board.** The agent spawns a
-  `probe-rs serve` per board over a **Unix socket** (loopback, no TLS/WS/auth
-  needed on that hop), each locked to its physical probe via a per-user
-  `ProbeAccess::Allow([serial])` + per-board token. The agent byte-splices the
-  raw `u32-LE length-prefixed postcard` stream through the relay — **zero
-  probe-rs parsing**. Per-board (reused across a holder's many invocations),
-  recycled on release for cleanup. This matches time-based sharing (§6).
+  `probe-rs serve` per board listening on a **loopback TCP port** (ephemeral,
+  allocated per-board so boards never collide on serve's default `3000`), each
+  locked to its physical probe via a per-user `ProbeAccess::Allow([serial])`
+  under the config's `[server.users]`. The agent generates a `.probe-rs.toml`
+  (Figment filename) in a per-board `current_dir` and spawns `probe-rs serve`
+  there (**no `--config`**). It then byte-splices the raw **TCP stream of
+  serve's `/worker` WebSocket** through the relay — **zero probe-rs / WebSocket
+  parsing** (the relay stays byte-opaque; it just carries WS-over-TCP bytes).
+  Per-board (reused across a holder's many invocations), recycled on release
+  for cleanup. This matches time-based sharing (§6).
+  - **Token wiring (end-to-end, zero protocol change):** the per-board serve
+    user `token` in `.probe-rs.toml` is the **hex of the fleet capability
+    token**. The sidecar already sets `PROBE_RS_REMOTE_TOKEN = hex(grant.token)`
+    and the agent receives those exact bytes as `token_wire` on `OpenSession`,
+    so the two ends authenticate against the same value with no new wire field.
+  - **Figment caveat:** a `.probe-rs.toml` in the agent's home dir would, by
+    Figment merge order (later wins), override the per-board cwd config. The
+    agent runs in a controlled environment without one.
 - **Isolation comes from us, not from `serve` flags.** `ProbeAccess` per-board
   is the defense-in-depth fence so a leaseholder can only touch its own board,
   in addition to the fleet lease layer.

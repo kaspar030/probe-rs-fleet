@@ -1,19 +1,24 @@
-//! probe-rs `serve` lifecycle + byte-proxy (architecture §4.2, per task #1710).
+//! probe-rs `serve` lifecycle + byte-proxy (architecture §4.2).
 //!
-//! Decided model: the agent runs **one `probe-rs serve` per board** over a
-//! loopback **Unix socket**, each locked to its physical probe via a per-board
-//! user with `ProbeAccess::Allow([serial])` + a per-board token. The agent then
-//! **byte-splices** the raw `u32-LE length-prefixed postcard` stream between
-//! that socket and the coordinator-relayed data channel — *zero* probe-rs
-//! parsing. The server is reused across a holder's many invocations (matching
-//! time-based sharing, §6) and recycled on board release for cleanup.
+//! Decided model: the agent runs **one `probe-rs serve` per board** listening
+//! on a loopback **TCP** port, each locked to its physical probe via a per-board
+//! user with `ProbeAccess::Allow([serial])` + a per-board token. `probe-rs serve`
+//! (0.31) speaks **WebSocket** at route `/worker`; the agent then
+//! **byte-splices** the raw TCP stream (the bytes of that WebSocket connection)
+//! between serve's port and the coordinator-relayed data channel — *zero*
+//! probe-rs / WebSocket parsing. The server is reused across a holder's many
+//! invocations (matching time-based sharing, §6) and recycled on board release.
 //!
-//! `probe-rs serve` takes **no** `--probe`/`--chip` — the connecting client
-//! selects probe + chip in-band over postcard-rpc — so there is no CLI
-//! injection point; isolation is the per-board `ProbeAccess` fence we write
-//! into the server's config file.
+//! `probe-rs serve` 0.31 takes **no** `--config`, `--probe` or `--chip`: its
+//! `ServerConfig` is loaded via **Figment** from a `.probe-rs.{toml,json,yaml}`
+//! file searched in cwd → exe dir → home, and the connecting client selects
+//! probe + chip in-band over the WebSocket. So the agent spawns serve with a
+//! per-board `current_dir` containing a generated `.probe-rs.toml`; isolation is
+//! the per-board `ProbeAccess::Allow([serial])` fence under that config's
+//! `[server]` table.
 
-use std::path::{Path, PathBuf};
+
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -21,63 +26,97 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::config::BoardSpec;
 
 /// A byte stream the agent splices onto a relay data channel: the connected
-/// transport to a board's `probe-rs serve` Unix socket (or, in tests, an
-/// in-memory duplex). Object-safe so the concrete transport (Unix socket vs.
+/// TCP transport to a board's `probe-rs serve` WebSocket port (or, in tests, an
+/// in-memory duplex). Object-safe so the concrete transport (TCP socket vs.
 /// mock) is hidden behind the [`Session`] trait.
 pub trait SpliceIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> SpliceIo for T {}
 
 /// Where a board's `probe-rs serve` instance listens, and the config that
 /// pins it to a single probe. This is the input the real process backend turns
-/// into a spawned `probe-rs serve` + its `ServerConfig` file.
+/// into a spawned `probe-rs serve` + its `.probe-rs.toml` Figment config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServeSpec {
     /// Board id (for logging / lookup).
     pub board: String,
     /// The probe serial this server is locked to (`ProbeAccess::Allow`).
     pub serial: String,
-    /// Unix socket path the server binds (`address = "socket://<path>"`).
-    pub socket_path: PathBuf,
-    /// Per-board token the agent's local proxy presents to `serve` (the inner
-    /// loopback hop; the fleet's own mTLS + capability token guard the network
-    /// legs).
-    pub local_token: String,
+    /// Loopback address `probe-rs serve` binds (`[server].address`).
+    pub address: String,
+    /// Loopback TCP port `probe-rs serve` binds (`[server].port`). Allocated
+    /// per-board (ephemeral) so multiple boards never collide on serve's
+    /// default `3000`.
+    pub port: u16,
 }
 
 impl ServeSpec {
-    /// Derive a serve spec for `board`, placing its socket under `runtime_dir`.
-    #[must_use]
-    pub fn for_board(board: &BoardSpec, runtime_dir: &std::path::Path) -> Self {
-        let socket_path = runtime_dir.join(format!("serve-{}.sock", board.id));
-        Self {
+    /// Derive a serve spec for `board`, allocating an ephemeral loopback port.
+    ///
+    /// The port is obtained by binding `127.0.0.1:0`, reading the assigned
+    /// port, then dropping the listener so `probe-rs serve` can bind it. There
+    /// is a tiny bind/close race window; the connect-retry loop in
+    /// [`connect_serve_tcp`] tolerates it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if an ephemeral port could not be allocated.
+    pub fn for_board(board: &BoardSpec) -> Result<Self, String> {
+        let port = alloc_ephemeral_port()?;
+        Ok(Self {
             board: board.id.clone(),
             serial: board.serial.clone(),
-            socket_path,
-            // A per-board random-ish token; the real backend regenerates this
-            // on each (re)spawn. Stable derivation here keeps it testable.
-            local_token: format!("local-{}", board.serial),
-        }
+            address: "127.0.0.1".to_owned(),
+            port,
+        })
     }
 
-    /// Render the `probe-rs serve` TOML config that locks the server to this
-    /// board's probe over its Unix socket.
-    ///
-    /// Shape per #1710: `ServerConfig { users, address = "socket://<path>",
-    /// cycle_power }`, with one user whose `ProbeAccess::Allow([serial])`.
+    /// The loopback `host:port` `probe-rs serve` listens on.
     #[must_use]
-    pub fn render_server_config(&self) -> String {
-        let socket = self.socket_path.display();
+    pub fn socket_addr(&self) -> String {
+        format!("{}:{}", self.address, self.port)
+    }
+
+    /// Render the `probe-rs serve` Figment (`.probe-rs.toml`) config that locks
+    /// the server to this board's probe over its loopback TCP port.
+    ///
+    /// Shape (probe-rs 0.31, `Config { server: ServerConfig }` with
+    /// `#[serde(deny_unknown_fields)]`): a `[server]` table carrying
+    /// `address`/`port` and one `[[server.users]]` with a required `name`, the
+    /// per-board `token`, and `access = { allow = ["<serial>"] }`
+    /// (`ProbeAccess::Allow`).
+    ///
+    /// `serve_token` is the per-board token the connecting client must present
+    /// (the fleet capability token, hex-encoded, threaded through end-to-end so
+    /// the sidecar's `PROBE_RS_REMOTE_TOKEN` matches).
+    #[must_use]
+    pub fn render_server_config(&self, serve_token: &str) -> String {
         format!(
-            "address = \"socket://{socket}\"\n\
-             cycle_power = false\n\
+            "[server]\n\
+             address = \"{address}\"\n\
+             port = {port}\n\
              \n\
-             [[users]]\n\
+             [[server.users]]\n\
+             name = \"fleet\"\n\
              token = \"{token}\"\n\
-             probe_access = {{ allow = [\"{serial}\"] }}\n",
-            token = self.local_token,
+             access = {{ allow = [\"{serial}\"] }}\n",
+            address = self.address,
+            port = self.port,
+            token = serve_token,
             serial = self.serial,
         )
     }
+}
+
+/// Allocate an ephemeral loopback TCP port by binding `127.0.0.1:0` and
+/// immediately releasing it, returning the kernel-assigned port number.
+fn alloc_ephemeral_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| format!("allocating ephemeral serve port: {e}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("reading ephemeral serve port: {e}"))?
+        .port();
+    Ok(port)
 }
 
 /// How a session ended.
@@ -120,29 +159,33 @@ pub trait Session: Send + Sync {
 /// with a mock backend; the real [`ProcessBackend`] spawns processes.
 #[async_trait]
 pub trait ProbeRsBackend: Send + Sync {
-    /// Open a session for `board`. The returned [`Session`] owns the process
-    /// and the splice to the relay channel.
+    /// Open a session for `board`, locking serve to `serve_token` (the hex of
+    /// the fleet capability token, written into the per-board `.probe-rs.toml`
+    /// user so it matches the client's `PROBE_RS_REMOTE_TOKEN`). The returned
+    /// [`Session`] owns the process and the splice to the relay channel.
     ///
     /// # Errors
     ///
     /// Returns an error string if the server could not be started.
-    async fn open(&self, board: &BoardSpec) -> Result<Box<dyn Session>, String>;
+    async fn open(&self, board: &BoardSpec, serve_token: &str)
+        -> Result<Box<dyn Session>, String>;
 }
 
 /// The real, process-spawning backend.
 ///
-/// Spawns `probe-rs serve --config <generated>` per board over a Unix socket
-/// and byte-splices its `u32-LE length-prefixed postcard` stream onto the relay.
+/// Spawns `probe-rs serve` per board with a generated `.probe-rs.toml` Figment
+/// config in a per-board `current_dir`, then byte-splices serve's loopback TCP
+/// stream (the bytes of its `/worker` WebSocket) onto the relay.
 #[derive(Debug, Clone)]
 pub struct ProcessBackend {
-    /// Directory under which per-board sockets and config files are written.
+    /// Directory under which per-board working dirs and config files are written.
     runtime_dir: PathBuf,
     /// The `probe-rs` binary to invoke.
     program: String,
 }
 
 impl ProcessBackend {
-    /// Build a process backend writing sockets/configs under `runtime_dir`.
+    /// Build a process backend writing per-board working dirs under `runtime_dir`.
     #[must_use]
     pub fn new(runtime_dir: PathBuf) -> Self {
         Self {
@@ -160,24 +203,28 @@ impl ProcessBackend {
     }
 
     /// The serve spec this backend would use for `board`.
-    #[must_use]
-    pub fn serve_spec(&self, board: &BoardSpec) -> ServeSpec {
-        ServeSpec::for_board(board, &self.runtime_dir)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if an ephemeral port could not be allocated.
+    pub fn serve_spec(&self, board: &BoardSpec) -> Result<ServeSpec, String> {
+        ServeSpec::for_board(board)
     }
 }
 
-/// Time to wait for a freshly-spawned `probe-rs serve` to bind its Unix socket.
+/// Time to wait for a freshly-spawned `probe-rs serve` to start listening.
 const SERVE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Poll interval while waiting for the serve socket to appear.
+/// Poll interval while retry-connecting to the serve TCP port.
 const SERVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// A live `probe-rs serve` session: a running child process and a connected
-/// Unix-socket stream the agent splices onto a relay data channel.
+/// loopback TCP stream (the bytes of serve's `/worker` WebSocket) the agent
+/// splices onto a relay data channel.
 struct ProcessSession {
     board: String,
     child: tokio::sync::Mutex<tokio::process::Child>,
-    /// The connected socket stream, taken once by the connection layer.
-    io: tokio::sync::Mutex<Option<tokio::net::UnixStream>>,
+    /// The connected TCP stream, taken once by the connection layer.
+    io: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     killed: std::sync::atomic::AtomicBool,
 }
 
@@ -221,32 +268,33 @@ impl Session for ProcessSession {
 
 #[async_trait]
 impl ProbeRsBackend for ProcessBackend {
-    async fn open(&self, board: &BoardSpec) -> Result<Box<dyn Session>, String> {
-        let spec = self.serve_spec(board);
+    async fn open(
+        &self,
+        board: &BoardSpec,
+        serve_token: &str,
+    ) -> Result<Box<dyn Session>, String> {
+        let spec = self.serve_spec(board)?;
 
-        // 1. Render and write the per-board server config (locks the server to
-        //    this board's probe via `ProbeAccess::Allow([serial])`).
-        let runtime_dir = spec
-            .socket_path
-            .parent()
-            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-        tokio::fs::create_dir_all(&runtime_dir)
+        // 1. Create a per-board working dir and write `.probe-rs.toml` into it
+        //    (Figment searches cwd for this filename). The config locks the
+        //    server to this board's probe via `ProbeAccess::Allow([serial])`
+        //    and pins its loopback port.
+        let work_dir = self.runtime_dir.join(format!("serve-{}", spec.board));
+        tokio::fs::create_dir_all(&work_dir)
             .await
-            .map_err(|e| format!("creating runtime dir {}: {e}", runtime_dir.display()))?;
-        // A stale socket from a previous run would make `serve` fail to bind.
-        let _ = tokio::fs::remove_file(&spec.socket_path).await;
-        let config_path = runtime_dir.join(format!("serve-{}.toml", spec.board));
-        tokio::fs::write(&config_path, spec.render_server_config())
+            .map_err(|e| format!("creating serve work dir {}: {e}", work_dir.display()))?;
+        let config_path = work_dir.join(".probe-rs.toml");
+        tokio::fs::write(&config_path, spec.render_server_config(serve_token))
             .await
             .map_err(|e| format!("writing serve config {}: {e}", config_path.display()))?;
 
-        // 2. Spawn `probe-rs serve --config <file>`. It takes no `--probe` /
-        //    `--chip` (the client selects them in-band over postcard-rpc);
-        //    isolation is the `ProbeAccess` fence in the config.
+        // 2. Spawn `probe-rs serve` with no `--config`/`--probe`/`--chip`: its
+        //    `ServerConfig` is loaded via Figment from the `.probe-rs.toml` in
+        //    `current_dir`, and the client selects probe + chip in-band over
+        //    the WebSocket. Isolation is the `ProbeAccess` fence in the config.
         let child = tokio::process::Command::new(&self.program)
             .arg("serve")
-            .arg("--config")
-            .arg(&config_path)
+            .current_dir(&work_dir)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
@@ -257,8 +305,8 @@ impl ProbeRsBackend for ProcessBackend {
                 )
             })?;
 
-        // 3. Wait for the Unix socket to appear and connect to it.
-        let io = match connect_serve_socket(&spec.socket_path).await {
+        // 3. Retry-connect to serve's loopback TCP port until it is listening.
+        let io = match connect_serve_tcp(&spec.socket_addr()).await {
             Ok(stream) => stream,
             Err(e) => {
                 // Tear the half-started process down before surfacing the error.
@@ -278,18 +326,20 @@ impl ProbeRsBackend for ProcessBackend {
     }
 }
 
-/// Poll-connect to a `probe-rs serve` Unix socket until it is reachable or the
-/// ready timeout elapses.
-async fn connect_serve_socket(path: &Path) -> Result<tokio::net::UnixStream, String> {
+/// Retry-connect to a `probe-rs serve` loopback TCP port until it is listening
+/// or the ready timeout elapses. Sets `TCP_NODELAY` on the established stream.
+async fn connect_serve_tcp(addr: &str) -> Result<tokio::net::TcpStream, String> {
     let deadline = tokio::time::Instant::now() + SERVE_READY_TIMEOUT;
     loop {
-        match tokio::net::UnixStream::connect(path).await {
-            Ok(stream) => return Ok(stream),
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                return Ok(stream);
+            }
             Err(e) => {
                 if tokio::time::Instant::now() >= deadline {
                     return Err(format!(
-                        "`probe-rs serve` socket {} never became reachable: {e}",
-                        path.display()
+                        "`probe-rs serve` port {addr} never became reachable: {e}"
                     ));
                 }
                 tokio::time::sleep(SERVE_POLL_INTERVAL).await;
@@ -407,7 +457,11 @@ pub(crate) mod mock {
 
     #[async_trait]
     impl ProbeRsBackend for MockBackend {
-        async fn open(&self, board: &BoardSpec) -> Result<Box<dyn Session>, String> {
+        async fn open(
+            &self,
+            board: &BoardSpec,
+            _serve_token: &str,
+        ) -> Result<Box<dyn Session>, String> {
             self.opens.fetch_add(1, Ordering::SeqCst);
             if self.fail.load(Ordering::SeqCst) {
                 return Err("mock backend forced failure".to_owned());
@@ -438,23 +492,28 @@ chip = "nRF52840_xxAA"
 
     #[test]
     fn serve_spec_locks_to_probe_serial() {
-        let dir = std::path::Path::new("/run/fleet");
-        let spec = ServeSpec::for_board(&board(), dir);
+        let spec = ServeSpec::for_board(&board()).unwrap();
         assert_eq!(spec.serial, "001050257890");
-        assert!(spec
-            .socket_path
-            .to_string_lossy()
-            .ends_with("serve-nrf52840-dk-3.sock"));
+        assert_eq!(spec.address, "127.0.0.1");
+        assert!(spec.port != 0);
+        assert_eq!(spec.socket_addr(), format!("127.0.0.1:{}", spec.port));
     }
 
     #[test]
-    fn rendered_config_has_socket_and_probe_access() {
-        let dir = std::path::Path::new("/run/fleet");
-        let spec = ServeSpec::for_board(&board(), dir);
-        let cfg = spec.render_server_config();
-        assert!(cfg.contains("address = \"socket:///run/fleet/serve-nrf52840-dk-3.sock\""));
-        assert!(cfg.contains("allow = [\"001050257890\"]"));
-        assert!(cfg.contains("[[users]]"));
+    fn rendered_config_is_server_table_with_access() {
+        let spec = ServeSpec::for_board(&board()).unwrap();
+        let cfg = spec.render_server_config("deadbeef");
+        assert!(cfg.contains("[server]"));
+        assert!(cfg.contains("address = \"127.0.0.1\""));
+        assert!(cfg.contains(&format!("port = {}", spec.port)));
+        assert!(cfg.contains("[[server.users]]"));
+        assert!(cfg.contains("name = \"fleet\""));
+        assert!(cfg.contains("token = \"deadbeef\""));
+        assert!(cfg.contains("access = { allow = [\"001050257890\"] }"));
+        // Stale 0.31-incompatible keys must be gone.
+        assert!(!cfg.contains("socket://"));
+        assert!(!cfg.contains("probe_access"));
+        assert!(!cfg.contains("cycle_power"));
     }
 
     #[tokio::test]
@@ -464,7 +523,7 @@ chip = "nRF52840_xxAA"
         let dir = std::env::temp_dir().join(format!("frs-serve-test-{}", std::process::id()));
         let be = ProcessBackend::new(dir.clone())
             .with_program("definitely-not-a-real-probe-rs-binary".to_owned());
-        let result = be.open(&board()).await;
+        let result = be.open(&board(), "deadbeef").await;
         std::fs::remove_dir_all(&dir).ok();
         let Err(err) = result else {
             panic!("expected spawn error")

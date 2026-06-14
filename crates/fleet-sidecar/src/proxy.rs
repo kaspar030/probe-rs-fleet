@@ -1,23 +1,25 @@
 //! The relay seam: leasing a board and splicing the genuine probe-rs client's
 //! byte stream to the agent through the coordinator.
 //!
-//! # How the sidecar proxies (resolved by investigation #1710)
+//! # How the sidecar proxies
 //!
 //! The sidecar does **not** re-implement the probe-rs client. probe-rs 0.31's
 //! own client honours `PROBE_RS_REMOTE_HOST` / `PROBE_RS_REMOTE_TOKEN` (and the
-//! `--host` / `--token` flags): it dials a "remote host" and speaks its normal
-//! `u32-LE length-prefixed postcard` framing over that socket, doing probe + chip
-//! selection in-band (`AttachRequest`) and computing the exit code itself.
+//! `--host` / `--token` flags): it builds `{host}/worker` and dials it as a
+//! **WebSocket** (so `host` must be a `ws://` base URL), doing probe + chip
+//! selection in-band and computing the exit code itself.
 //!
 //! So the sidecar:
 //!
 //! 1. resolves the fleet selector and leases a board from the coordinator;
-//! 2. opens a **local** endpoint — `127.0.0.1:<port>` — that the genuine
-//!    probe-rs client will treat as its remote host;
+//! 2. opens a **local** TCP endpoint — `127.0.0.1:<port>`, advertised to the
+//!    client as `ws://127.0.0.1:<port>` — that the genuine probe-rs client will
+//!    treat as its remote host;
 //! 3. for each client connection, opens a relay channel to the coordinator
 //!    (which relays to the agent's per-board `serve`) and **byte-splices** the
-//!    two directions verbatim. It is a pure byte pipe — the sidecar never parses
-//!    the postcard frames.
+//!    two directions verbatim. It is a pure byte pipe carrying the bytes of a
+//!    WebSocket-over-TCP connection — the sidecar never parses WebSocket or
+//!    probe-rs frames.
 //! 4. sets `PROBE_RS_REMOTE_HOST` / `PROBE_RS_REMOTE_TOKEN` in the child's
 //!    environment to point at the local endpoint and the lease token, then
 //!    execs the real probe-rs with the original argv (see the `local` module).
@@ -28,7 +30,7 @@
 //!
 //! # Status
 //!
-//! The concrete mTLS + postcard transport that implements all of the above is
+//! The concrete mTLS + byte-opaque relay transport that implements all of the
 //! [`crate::transport`] ([`crate::transport::CoordSession`] +
 //! [`crate::transport::splice_client`]), driven from the fleet arm of
 //! [`crate::run`]. This module retains the error type and the trait *seam*
@@ -38,7 +40,7 @@
 //! # gdb
 //!
 //! `probe-rs gdb` is **not** remote-capable in probe-rs 0.31 (it runs a local
-//! TCP gdb stub, not over postcard-rpc). The fleet path therefore does not exec
+//! TCP gdb stub, not over the remote WebSocket). The fleet path therefore does not exec
 //! the genuine client for `gdb`; instead it tunnels raw gdbremote bytes to an
 //! agent that runs `probe-rs gdb` locally, as a **second relay channel**
 //! ([`fleet_proto::ChannelKind::Gdb`]). The workstation-side listener + byte
@@ -92,7 +94,9 @@ pub trait LeaseClient {
 
 /// A local endpoint the genuine probe-rs client connects to as its remote host.
 pub trait LocalEndpoint {
-    /// The address to set as `PROBE_RS_REMOTE_HOST` (e.g. `127.0.0.1:51001`).
+    /// The `ws://` base URL to set as `PROBE_RS_REMOTE_HOST` (e.g.
+    /// `ws://127.0.0.1:51001`); the client appends `/worker` and dials it as a
+    /// WebSocket.
     fn remote_host(&self) -> String;
 }
 

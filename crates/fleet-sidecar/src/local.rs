@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 /// Environment variable names the genuine probe-rs client honours for remote
 /// operation (probe-rs 0.31).
 pub mod remote_env {
-    /// Host (`host:port`) the probe-rs client connects to as its remote.
+    /// Remote host the probe-rs client connects to as its remote. Must be a
+    /// `ws://`/`wss://` base URL (the client appends `/worker` and dials it as
+    /// a WebSocket), e.g. `ws://127.0.0.1:51001`.
     pub const HOST: &str = "PROBE_RS_REMOTE_HOST";
     /// Bearer token the probe-rs client presents to the remote.
     pub const TOKEN: &str = "PROBE_RS_REMOTE_TOKEN";
@@ -107,8 +109,8 @@ fn is_executable_file(path: &Path) -> bool {
 /// the sidecar's local relay endpoint.
 ///
 /// Returns the `(key, value)` pairs to set on the child process: the remote
-/// host (the sidecar's local endpoint, e.g. `127.0.0.1:51001`) and, if a lease
-/// token is present, the remote token.
+/// host (the sidecar's local endpoint as a `ws://` base URL, e.g.
+/// `ws://127.0.0.1:51001`) and, if a lease token is present, the remote token.
 #[must_use]
 pub fn build_remote_env(remote_host: &str, token: Option<&str>) -> Vec<(String, String)> {
     let mut env = vec![(remote_env::HOST.to_owned(), remote_host.to_owned())];

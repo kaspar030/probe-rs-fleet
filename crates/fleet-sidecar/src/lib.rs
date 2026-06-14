@@ -32,7 +32,7 @@
 //!   a clean no-selector → local fallback.
 //! * [`lease_cache`] — time-based lease sharing keyed by selector + principal.
 //! * [`proxy`] — the documented relay seam (lease / byte-splice contract).
-//! * [`transport`] — the live mTLS + postcard relay client: lease a board, open
+//! * [`transport`] — the live mTLS + byte-opaque relay client: lease a board, open
 //!   a relay channel, splice the genuine probe-rs client's bytes verbatim.
 //! * [`gdb`] — the gdb-tunnel client side: a local TCP listener (default
 //!   `127.0.0.1:1337`) byte-spliced to the agent's `probe-rs gdb` stub over a
@@ -224,13 +224,15 @@ async fn run_fleet_data(
     let channel = session.open_channel(grant.lease, ChannelKind::Data).await?;
 
     // Bind a loopback listener the probe-rs client treats as its remote host.
+    // The client builds `{host}/worker` and dials it as a WebSocket, so `host`
+    // must already carry the `ws://` scheme.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|e| transport::TransportError::Io(format!("binding local endpoint: {e}")))?;
     let local_addr = listener
         .local_addr()
         .map_err(|e| transport::TransportError::Io(format!("reading local endpoint: {e}")))?;
-    let remote_host = local_addr.to_string();
+    let remote_host = format!("ws://{local_addr}");
     let token = transport::hex_encode(&grant.token);
 
     // Accept the single probe-rs client connection and splice it in a task that

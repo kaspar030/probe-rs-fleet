@@ -79,6 +79,16 @@ fn wall_clock_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Lowercase-hex encode a byte slice (used to render the serve user token).
+fn hex_encode(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 impl<B: ProbeRsBackend> Agent<B> {
     /// Build an agent from parsed config, boards, a token verifier, and a
     /// probe-rs backend.
@@ -242,7 +252,10 @@ impl<B: ProbeRsBackend> Agent<B> {
         crate::token::verify_wire(&self.verifier, token_wire, lease, board, required, now)?;
 
         match kind {
-            ChannelKind::Data => self.open_data_session(lease, board, channel, &spec).await,
+            ChannelKind::Data => {
+                self.open_data_session(lease, board, token_wire, channel, &spec)
+                    .await
+            }
             ChannelKind::Gdb => self.open_gdb_session(lease, board, channel, &spec).await,
         }
     }
@@ -252,12 +265,18 @@ impl<B: ProbeRsBackend> Agent<B> {
         &self,
         lease: LeaseId,
         board: &BoardId,
+        token_wire: &[u8],
         channel: ChannelId,
         spec: &BoardSpec,
     ) -> Result<()> {
+        // The serve user token is the hex of the fleet capability token. The
+        // sidecar sets `PROBE_RS_REMOTE_TOKEN = hex(grant.token)` and the agent
+        // receives those exact bytes as `token_wire`, so writing the same hex
+        // into `.probe-rs.toml` makes the two ends match end-to-end.
+        let serve_token = hex_encode(token_wire);
         let session = self
             .backend
-            .open(spec)
+            .open(spec, &serve_token)
             .await
             .map_err(AgentError::Probers)?;
         self.sessions.lock().await.insert(
