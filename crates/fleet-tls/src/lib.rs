@@ -263,7 +263,7 @@ impl PinnedServerCertVerifier {
     pub fn new(pin: [u8; 32]) -> Self {
         Self {
             pin,
-            provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
         }
     }
 }

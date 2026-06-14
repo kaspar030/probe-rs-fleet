@@ -43,11 +43,13 @@ base64 = "0.22"
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal"] }
 
-# tls
-tokio-rustls = "0.26"
-rustls = "0.23"
+# tls — use the pure-Rust `ring` crypto provider (not aws-lc-rs) so the agent
+# cross-compiles cleanly to ARM/musl targets (Raspberry Pi). aws-lc-rs pulls in
+# a C crypto build that fails to cross-compile to armv7-musl.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen = { version = "0.13", default-features = false, features = ["x509-parser", "ring", "pem"] }
 sha2 = "0.10"
 
 # storage
