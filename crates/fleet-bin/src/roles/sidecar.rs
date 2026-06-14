@@ -3,8 +3,9 @@
 //! Reached two ways (both funnel here): a `probe-rs` symlink (argv0 dispatch)
 //! or `probe-rs-fleet sidecar -- <args…>`. In both cases `probe_rs_args` holds
 //! only the probe-rs arguments *after* the program name; we prepend a synthetic
-//! `probe-rs` program token to form the full argv that [`fleet_sidecar::run`]
-//! expects (its parser treats `argv[0]` as the program name).
+//! `probe-rs` program token to form the full argv that
+//! [`fleet_sidecar::run_async`] expects (its parser treats `argv[0]` as the
+//! program name).
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -15,13 +16,18 @@ use fleet_sidecar::selector::ProcessEnv;
 
 /// Run the sidecar shim, returning the probe-rs exit code to propagate.
 ///
+/// `async` so the fleet data/gdb path runs on the binary's existing tokio
+/// runtime via [`fleet_sidecar::run_async`] instead of building a nested
+/// runtime (which would panic with "Cannot start a runtime from within a
+/// runtime").
+///
 /// `probe_rs_args` are the probe-rs arguments (no program name).
 ///
 /// # Errors
 ///
 /// Returns an error on a parse failure, a partial fleet environment, a failure
 /// to locate / run the real probe-rs, or a relay transport error.
-pub fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode> {
+pub async fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode> {
     // Discover coordinator endpoint + client credentials from `client.toml`
     // (written by `ctl init`) and inject them into the process environment for
     // any keys the user has NOT already set. This lets a single `ctl init`
@@ -35,7 +41,7 @@ pub fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode> {
     argv.push(OsString::from("probe-rs"));
     argv.extend(probe_rs_args);
 
-    let code = fleet_sidecar::run(argv, &ProcessEnv)?;
+    let code = fleet_sidecar::run_async(argv, &ProcessEnv).await?;
     Ok(exit_code_from_i32(code))
 }
 
@@ -66,9 +72,11 @@ fn inject_client_config_env(profile: &str) {
 fn set_env_if_absent(key: &str, value: &str) {
     let already = std::env::var_os(key).is_some_and(|v| !v.is_empty());
     if !already {
-        // SAFETY of correctness (not memory): the sidecar shim is single-
-        // threaded at this point (no async runtime, no spawned threads), so no
-        // other thread can be reading the environment concurrently.
+        // SAFETY of correctness (not memory): although an outer tokio runtime
+        // now exists, this env injection runs synchronously at the very top of
+        // the sidecar role — before the first `.await` and before any sidecar
+        // code reads these vars — so no other task or thread is reading the
+        // environment concurrently.
         std::env::set_var(key, value);
     }
 }

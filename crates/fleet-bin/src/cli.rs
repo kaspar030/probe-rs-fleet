@@ -377,7 +377,7 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 .ok()
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| crate::paths::DEFAULT_PROFILE.to_owned());
-            roles::sidecar::run(probe_rs_args, &profile)
+            roles::sidecar::run(probe_rs_args, &profile).await
         }
         Dispatch::Clap => {
             let cli = Cli::parse_from(process_args);
@@ -410,7 +410,7 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         Ok(ExitCode::SUCCESS)
                     }
                 },
-                Command::Sidecar(args) => roles::sidecar::run(args.probe_rs_args, &args.profile),
+                Command::Sidecar(args) => roles::sidecar::run(args.probe_rs_args, &args.profile).await,
                 Command::Ctl(args) => match args.command {
                     CtlCommand::Init(init) => {
                         roles::ctl_init::run(init, args.client.profile).await?;

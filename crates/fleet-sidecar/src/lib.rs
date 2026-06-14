@@ -127,15 +127,55 @@ where
             Ok(code)
         }
         Resolution::Fleet(cfg) => {
-            // The fleet path leases a board, exposes a local relay endpoint, and
-            // execs the genuine probe-rs (or, for gdb, byte-tunnels the local
-            // gdb client) pointed at it over the live mTLS+postcard relay.
+            // The fleet path needs an async runtime. Build a fresh one here for
+            // the SYNC entry point (used by library callers / unit tests that
+            // are not already inside a runtime). Binaries running inside an
+            // existing tokio runtime must use [`run_async`] instead — building
+            // a runtime from within a runtime panics.
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| transport::TransportError::Io(format!("building runtime: {e}")))?;
             let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
             rt.block_on(run_fleet(cfg, invocation, original_argv))
+        }
+    }
+}
+
+/// Async entry point: parse the probe-rs argv, resolve the environment, and
+/// either transparently exec the local probe-rs or proxy the session through
+/// the fleet, returning the process exit code to propagate.
+///
+/// Unlike the sync [`run`], this drives the fleet path on the *caller's*
+/// runtime (`run_fleet(...).await`) instead of building a nested one, so it can
+/// be `.await`ed from inside an existing tokio runtime without panicking. The
+/// local fallback path (`exec_local`) is synchronous and `execvp`-replaces the
+/// process, so it never returns on success.
+///
+/// # Errors
+///
+/// Returns [`RunError`] on a parse error, a partial fleet environment, a
+/// failure to locate / run the real probe-rs, or a relay transport error.
+pub async fn run_async<I, S>(args: I, env: &impl EnvSource) -> Result<i32, RunError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<OsString>,
+{
+    let tokens: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let invocation = cli::parse(tokens.clone())?;
+    let resolution = selector::resolve(env)?;
+
+    match resolution {
+        Resolution::Local => {
+            // Transparent local fallback: forward the original argv (after
+            // argv[0]) to the real probe-rs and propagate its exit code.
+            let code = local::exec_local(tokens.into_iter().skip(1))?;
+            Ok(code)
+        }
+        Resolution::Fleet(cfg) => {
+            // Drive the fleet path directly on the caller's runtime.
+            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            run_fleet(cfg, invocation, original_argv).await
         }
     }
 }
@@ -289,6 +329,51 @@ mod tests {
         .unwrap();
         assert!(matches!(res, Resolution::Fleet(_)));
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_async_fleet_path_does_not_nest_runtime() {
+        // Regression for the "Cannot start a runtime from within a runtime"
+        // panic: when the binary drives the sidecar from inside the outer
+        // tokio runtime, the Fleet arm must run on the caller's runtime rather
+        // than building a nested one. Before the fix, calling the sync `run`
+        // here panicked while building the inner runtime; `run_async` drives
+        // `run_fleet` directly and instead surfaces the mandatory-mTLS
+        // transport error (proving we reached the relay code, not a panic).
+        let env = MapEnv::new(&[
+            (selector::env::BOARD, "nrf52840-dk-3"),
+            (selector::env::COORDINATOR, "c:4443"),
+            (selector::env::TOKEN, "t"),
+        ]);
+        let err = run_async(
+            ["probe-rs", "reset", "--chip", "nrf52"].map(String::from),
+            &env,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            RunError::Transport(transport::TransportError::Tls(_))
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_async_propagates_selector_error_within_runtime() {
+        // The async entry point still parses + resolves like the sync one;
+        // a partial fleet environment surfaces as a selector error without
+        // touching any runtime machinery.
+        let env = MapEnv::new(&[
+            (selector::env::COORDINATOR, "c:4443"),
+            (selector::env::TOKEN, "t"),
+        ]);
+        let err = run_async(["probe-rs", "reset"].map(String::from), &env)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RunError::Selector(selector::SelectorError::MissingSelector)
+        ));
+    }
+
 
     #[test]
     fn run_fleet_path_requires_mtls() {
