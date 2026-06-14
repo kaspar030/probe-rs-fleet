@@ -184,12 +184,23 @@ unchanged** — the token only buys the client a CA-signed client certificate.
    (`enroll_tokens`, single-use + TTL'd), and prints **one opaque,
    copy-pasteable token string** plus a ready-to-paste `agent init` / `ctl
    init` command. The token encodes three things:
-   1. the coordinator address (`host:port`),
+   1. the coordinator address (`host:port`) clients should **dial**,
    2. the SHA-256 of the coordinator's server certificate (for bootstrap
       server-cert pinning — see below), and
    3. the random single-use secret (the credential).
    The token is a transport blob, not signed; the secret IS the credential,
    validated server-side by hash lookup.
+   - **Advertised address.** The embedded `host:port` is the address agents /
+     clients dial, which is often *not* the `listen_addr` (typically the
+     wildcard `0.0.0.0:7000` / `[::]:7000`, which is not routable from another
+     host). `enroll` resolves the embedded address as: `--coordinator-addr
+     <host:port>` override > `advertise_addr` in `coordinator.toml` >
+     `listen_addr` fallback. If the resolved address is a wildcard /
+     unspecified IP it is **rejected with a hard error** rather than silently
+     embedding an undialable `0.0.0.0` — set `advertise_addr` or pass
+     `--coordinator-addr` with the coordinator's LAN / public address. (A
+     hostname is always accepted; only `0.0.0.0` / `::` are treated as
+     wildcards.)
    - `--kind agent`: the issued cert's fingerprint is **auto-pinned** in the
      coordinator database (`agent_pins`) on enrollment, so the manual
      `[pinned_agents]` edit is unnecessary.
@@ -221,17 +232,23 @@ A clean setup from scratch:
 
 ```sh
 # 1. On the coordinator host: scaffold CA + signing seed + server cert + config.
-probe-rs-fleet coordinator init --hostname coordinator.example
+#    Use --hostname / --ip so the server cert SANs cover the address clients
+#    will dial; set `advertise_addr` in coordinator.toml (or pass
+#    --coordinator-addr to `enroll`) to that same dialable address.
+probe-rs-fleet coordinator init --hostname coordinator.example --ip 192.168.1.10
 
 # 2. Start the coordinator.
 probe-rs-fleet coordinator
 
 # 3a. Mint a one-time bootstrap token for an agent (auto-pinned on enrollment).
-probe-rs-fleet coordinator enroll rpi-lab-1 --kind agent
+#     The embedded address must be DIALABLE: because listen_addr defaults to the
+#     wildcard 0.0.0.0:7000, pass --coordinator-addr (or set advertise_addr in
+#     coordinator.toml) — otherwise `enroll` errors instead of embedding 0.0.0.0.
+probe-rs-fleet coordinator enroll rpi-lab-1 --kind agent --coordinator-addr 192.168.1.10:7000
 #   → prints: prffe1_…  (addr + server-cert hash + single-use secret)
 
 # 3b. Mint a one-time bootstrap token for a ctl / sidecar user.
-probe-rs-fleet coordinator enroll alice --kind client
+probe-rs-fleet coordinator enroll alice --kind client --coordinator-addr 192.168.1.10:7000
 #   → prints: prffe1_…
 
 # 4. Redeem each token on its target host (runtime stays mTLS):

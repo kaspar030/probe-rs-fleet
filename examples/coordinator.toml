@@ -60,6 +60,14 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # Optional keys
 # ---------------------------------------------------------------------------
 
+# Address (`host:port`) that agents / clients should DIAL to reach this
+# coordinator. Embedded into enrollment tokens by `coordinator enroll`.
+#
+# Must be ROUTABLE — not the wildcard `0.0.0.0` / `::` used above for
+# `listen_addr`. When unset, `enroll` falls back to `listen_addr` and errors if
+# that is a wildcard. Override per-invocation with `enroll --coordinator-addr`.
+# advertise_addr = "192.168.1.10:7000"
+
 # How often (seconds) the lease-expiry sweep runs. Default: 5.
 # sweep_interval_secs = 5
 

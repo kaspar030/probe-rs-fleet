@@ -82,6 +82,7 @@ async fn start_coordinator(
 
     let config = CoordinatorConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
+        advertise_addr: None,
         tls_cert: server_cert,
         tls_key: server_key,
         client_ca: ca_cert,

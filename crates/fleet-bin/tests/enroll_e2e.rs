@@ -77,19 +77,15 @@ async fn enroll_e2e_agent_and_client_mtls() {
     let addr = format!("127.0.0.1:{port}");
 
     // 2. enroll an agent and a client, capturing their tokens.
-    let agent_token = roles::enroll::mint_token(
-        "rpi-1",
-        EnrollKind::Agent,
-        3600,
-        &config_path,
-        &coord_data,
-    )
-    .await
-    .unwrap();
+    let agent_token =
+        roles::enroll::mint_token("rpi-1", EnrollKind::Agent, 3600, None, &config_path, &coord_data)
+            .await
+            .unwrap();
     let client_token = roles::enroll::mint_token(
         "alice",
         EnrollKind::Client,
         3600,
+        None,
         &config_path,
         &coord_data,
     )
@@ -114,6 +110,7 @@ async fn enroll_e2e_agent_and_client_mtls() {
                 "rpi-1",
                 EnrollKind::Agent,
                 3600,
+                None,
                 &config_path,
                 &coord_data,
             )

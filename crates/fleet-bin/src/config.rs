@@ -28,6 +28,11 @@ use fleet_proto::ids::AgentId;
 struct CoordinatorConfigToml {
     /// TCP address to listen on for inbound mTLS connections.
     listen_addr: SocketAddr,
+    /// Address (`host:port`) clients/agents should dial to reach this
+    /// coordinator, embedded into enrollment tokens. Defaults to `listen_addr`
+    /// (with a wildcard rejected at enroll time).
+    #[serde(default)]
+    advertise_addr: Option<String>,
     /// PEM file holding the coordinator's server certificate chain.
     tls_cert: PathBuf,
     /// PEM file holding the coordinator's server private key.
@@ -94,6 +99,7 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
 
     Ok(CoordinatorConfig {
         listen_addr: raw.listen_addr,
+        advertise_addr: raw.advertise_addr,
         tls_cert: raw.tls_cert,
         tls_key: raw.tls_key,
         client_ca: raw.client_ca,
@@ -311,6 +317,45 @@ sqlite_path = "db.sqlite"
 "#;
         let f = write_tmp(toml);
         assert!(load_coordinator_config(f.path()).is_err());
+    }
+
+    #[test]
+    fn coordinator_config_parses_advertise_addr() {
+        let seed = "cd".repeat(32);
+        let toml = format!(
+            r#"
+listen_addr = "0.0.0.0:7000"
+advertise_addr = "192.168.1.10:7000"
+tls_cert = "c.pem"
+tls_key = "k.pem"
+client_ca = "ca.pem"
+client_ca_key = "ca-key.pem"
+sqlite_path = "db.sqlite"
+signing_key_hex = "{seed}"
+"#
+        );
+        let f = write_tmp(&toml);
+        let cfg = load_coordinator_config(f.path()).unwrap();
+        assert_eq!(cfg.advertise_addr.as_deref(), Some("192.168.1.10:7000"));
+    }
+
+    #[test]
+    fn coordinator_config_advertise_addr_defaults_none() {
+        let seed = "01".repeat(32);
+        let toml = format!(
+            r#"
+listen_addr = "0.0.0.0:443"
+tls_cert = "c.pem"
+tls_key = "k.pem"
+client_ca = "ca.pem"
+client_ca_key = "ca-key.pem"
+sqlite_path = "db.sqlite"
+signing_key_hex = "{seed}"
+"#
+        );
+        let f = write_tmp(&toml);
+        let cfg = load_coordinator_config(f.path()).unwrap();
+        assert!(cfg.advertise_addr.is_none());
     }
 
     #[test]

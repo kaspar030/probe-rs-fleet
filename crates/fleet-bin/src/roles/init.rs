@@ -209,6 +209,15 @@ fn render_coordinator_config(
 # TCP address the coordinator listens on for inbound mTLS connections.
 listen_addr = "0.0.0.0:7000"
 
+# Address (`host:port`) that agents / clients should DIAL to reach this
+# coordinator. This is embedded into enrollment tokens by `coordinator enroll`.
+#
+# It MUST be a routable address — NOT the wildcard `0.0.0.0` / `::` that
+# `listen_addr` typically uses. When unset, `coordinator enroll` falls back to
+# `listen_addr` and ERRORS if that is a wildcard. Set this to the coordinator's
+# LAN / public address (or pass `--coordinator-addr <host:port>` to `enroll`).
+# advertise_addr = "192.168.1.10:7000"
+
 # Coordinator server certificate chain + private key (PEM).
 tls_cert = {tls_cert}
 tls_key = {tls_key}

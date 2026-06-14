@@ -124,6 +124,14 @@ pub struct EnrollArgs {
     /// Time-to-live of the bootstrap token, in seconds (default 3600).
     #[arg(long, default_value_t = 3600)]
     pub ttl: u64,
+    /// Advertised coordinator address (`host:port`) to embed into the token.
+    ///
+    /// Overrides `advertise_addr` from `coordinator.toml` and the
+    /// `listen_addr` fallback. REQUIRED when the coordinator's `listen_addr`
+    /// is a wildcard (`0.0.0.0` / `::`), since clients cannot dial a wildcard
+    /// address. Example: `--coordinator-addr 192.168.1.163:7000`.
+    #[arg(long)]
+    pub coordinator_addr: Option<String>,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
     #[arg(long)]

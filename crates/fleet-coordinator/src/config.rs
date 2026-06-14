@@ -26,6 +26,14 @@ pub enum SigningKeySource {
 pub struct CoordinatorConfig {
     /// The TCP address to listen on for inbound mTLS connections.
     pub listen_addr: SocketAddr,
+    /// The address (`host:port`) that clients/agents should dial to reach this
+    /// coordinator, embedded into enrollment tokens.
+    ///
+    /// This is distinct from [`listen_addr`](Self::listen_addr): the listen
+    /// address is frequently a wildcard (`0.0.0.0` / `::`) which is not
+    /// routable from another host. When unset, `coordinator enroll` falls back
+    /// to `listen_addr` but errors if that is a wildcard.
+    pub advertise_addr: Option<String>,
     /// PEM file holding the coordinator's server certificate chain.
     pub tls_cert: PathBuf,
     /// PEM file holding the coordinator's server private key.
@@ -90,6 +98,7 @@ mod tests {
     fn cfg() -> CoordinatorConfig {
         CoordinatorConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
+            advertise_addr: None,
             tls_cert: "cert.pem".into(),
             tls_key: "key.pem".into(),
             client_ca: "ca.pem".into(),

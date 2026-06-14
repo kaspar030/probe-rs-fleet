@@ -293,6 +293,7 @@ mod tests {
     fn config() -> CoordinatorConfig {
         CoordinatorConfig {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
+            advertise_addr: None,
             tls_cert: "c".into(),
             tls_key: "k".into(),
             client_ca: "ca".into(),
