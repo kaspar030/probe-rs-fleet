@@ -129,17 +129,23 @@ impl Coordinator {
                     .await?;
             }
             AgentReport::Inventory(inv) => {
-                // The agent's inventory is reconciled into the scheduler's board
-                // set. We translate presence to a coarse board view; the agent
-                // owns the authoritative board metadata via its boards.toml,
-                // which arrives separately (future work) — for v1 we record
-                // presence in the audit log and refresh `last_seen`.
+                // Reconcile the agent's inventory into the scheduler's board set
+                // so the boards become leasable and `open_channel` can resolve
+                // board -> owning agent. Each present (online) declared board is
+                // upserted as a `Board` owned by this agent; the agent is
+                // authoritative for its board metadata via `boards.toml`. The
+                // scheduler preserves any live lease state on re-report
+                // (see `Scheduler::upsert_board`).
+                let online = self.reconcile_inventory(agent_id, &inv).await;
                 self.audit(
                     "agent.inventory",
                     None,
                     None,
                     None,
-                    Some(&format!("{} boards", inv.boards.len())),
+                    Some(&format!(
+                        "{} boards ({online} online)",
+                        inv.boards.len()
+                    )),
                 )
                 .await?;
             }
@@ -185,6 +191,62 @@ impl Coordinator {
         }
         Ok(())
     }
+
+    /// Reconcile an agent inventory snapshot into the scheduler's board set.
+    ///
+    /// Online declared boards are upserted (and persisted to the board table)
+    /// as `Board`s owned by `agent_id`; offline boards are removed from the
+    /// scheduler unless they currently hold a live lease. Returns the number of
+    /// online boards.
+    async fn reconcile_inventory(
+        &self,
+        agent_id: &AgentId,
+        inv: &fleet_proto::agent_api::ProbeInventory,
+    ) -> usize {
+        use fleet_proto::agent_api::BoardPresence;
+
+        let now = self.now_i64();
+        let mut online = 0usize;
+        let mut boards_to_record: Vec<Board> = Vec::new();
+        {
+            let mut sched = self.scheduler.lock().await;
+            for status in &inv.boards {
+                if status.presence == BoardPresence::Online {
+                    online += 1;
+                    let board = Board {
+                        id: status.board.clone(),
+                        agent: agent_id.clone(),
+                        chip: status.chip.clone(),
+                        tags: status.tags.clone(),
+                        exclusive: status.exclusive,
+                        power: status.power.clone(),
+                        state: BoardState::Idle,
+                    };
+                    sched.upsert_board(board.clone());
+                    boards_to_record.push(board);
+                } else {
+                    // An offline board is dropped from the scheduler unless it
+                    // is currently leased (an in-flight lease is preserved).
+                    let leased = matches!(
+                        sched.board(&status.board).map(|b| &b.state),
+                        Some(BoardState::Leased { .. })
+                    );
+                    if !leased {
+                        sched.remove_board(&status.board);
+                    }
+                }
+            }
+        }
+        // Persist the board rows (best-effort; a DB error is logged, not fatal
+        // — the scheduler is the source of truth for leasing).
+        for board in &boards_to_record {
+            if let Err(e) = self.db.record_board(board, now).await {
+                warn!(board = %board.id, error = %e, "failed to record board");
+            }
+        }
+        online
+    }
+
 
     /// Mark a board as faulted in the scheduler (best-effort).
     async fn fault_board(&self, board: &BoardId, reason: &str) {
@@ -251,8 +313,129 @@ impl Coordinator {
                 };
                 relay::close_channel(&self.channels, agent.as_ref(), channel).await;
             }
+            SidecarToCoord::ListBoards => {
+                let reply = self.list_boards().await;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::Who => {
+                let reply = self.who().await;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::Logs { board, follow } => {
+                let reply = self.logs(board.as_ref(), follow).await?;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::PowerCycle { board } => {
+                let reply = self.operator_power_cycle(principal, &board).await?;
+                let _ = tx.send(reply).await;
+            }
         }
         Ok(())
+    }
+
+    /// Build the operator board-inventory reply (`ctl list`).
+    async fn list_boards(&self) -> CoordToSidecar {
+        use fleet_proto::admin::{BoardAvailability, BoardSummary};
+        let sched = self.scheduler.lock().await;
+        let boards = sched
+            .boards()
+            .map(|b| {
+                let (availability, holder, lease, expires) = match &b.state {
+                    BoardState::Idle => (BoardAvailability::Available, None, None, None),
+                    BoardState::Leased { lease, by, expires } => (
+                        BoardAvailability::Leased,
+                        Some(by.clone()),
+                        Some(*lease),
+                        Some(*expires),
+                    ),
+                    BoardState::Faulted { .. } => (BoardAvailability::Faulted, None, None, None),
+                    BoardState::Disabled => (BoardAvailability::Disabled, None, None, None),
+                };
+                BoardSummary {
+                    board: b.id.clone(),
+                    agent: b.agent.clone(),
+                    chip: b.chip.clone(),
+                    tags: b.tags.clone(),
+                    exclusive: b.exclusive,
+                    power: b.power.clone(),
+                    availability,
+                    holder,
+                    lease,
+                    expires,
+                }
+            })
+            .collect();
+        CoordToSidecar::BoardList(boards)
+    }
+
+    /// Build the operator lease-holder reply (`ctl who`).
+    async fn who(&self) -> CoordToSidecar {
+        use fleet_proto::admin::LeaseHolderSummary;
+        let sched = self.scheduler.lock().await;
+        let holders = sched
+            .boards()
+            .filter_map(|b| match &b.state {
+                BoardState::Leased { lease, by, expires } => Some(LeaseHolderSummary {
+                    lease: *lease,
+                    board: b.id.clone(),
+                    holder: by.clone(),
+                    expires: *expires,
+                }),
+                _ => None,
+            })
+            .collect();
+        CoordToSidecar::LeaseTable(holders)
+    }
+
+    /// Build the operator logs reply (`ctl logs`).
+    async fn logs(&self, board: Option<&BoardId>, _follow: bool) -> Result<CoordToSidecar> {
+        let board = board.map(|b| b.0.as_str());
+        let lines = self.db.recent_audit(board, 200).await?;
+        Ok(CoordToSidecar::LogLines(lines))
+    }
+
+    /// Operator power-cycle: command the owning agent to power-cycle the board.
+    async fn operator_power_cycle(
+        &self,
+        principal: &Principal,
+        board: &BoardId,
+    ) -> Result<CoordToSidecar> {
+        let agent_id = {
+            let sched = self.scheduler.lock().await;
+            sched.board(board).map(|b| b.agent.clone())
+        };
+        let Some(agent_id) = agent_id else {
+            return Ok(CoordToSidecar::Error {
+                message: format!("unknown board {board}"),
+            });
+        };
+        let Some(agent) = self.agents.get(&agent_id).await else {
+            return Ok(CoordToSidecar::Error {
+                message: format!("agent {agent_id} for board {board} is not connected"),
+            });
+        };
+        if agent
+            .send_command(fleet_proto::CoordinatorCommand::PowerCycle {
+                board: board.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return Ok(CoordToSidecar::Error {
+                message: format!("agent {agent_id} connection closed"),
+            });
+        }
+        self.audit(
+            "board.power-cycle",
+            Some(&principal.0),
+            Some(&board.0),
+            None,
+            Some("operator request"),
+        )
+        .await?;
+        Ok(CoordToSidecar::PowerCycled {
+            board: board.clone(),
+        })
     }
 
     /// Process a lease request: ask the scheduler, mint + persist a grant.
@@ -717,5 +900,82 @@ mod tests {
             rx.recv().await.unwrap(),
             CoordToSidecar::Error { .. }
         ));
+    }
+
+    /// Inventory reconciliation: a registered agent's online board enters the
+    /// scheduler (becomes leasable + appears in `list`), and an offline board
+    /// is dropped. This is the gap that blocked acceptance.
+    #[tokio::test]
+    async fn inventory_populates_scheduler_and_list() {
+        use fleet_proto::agent_api::{
+            BoardPresence, BoardStatus, ProbeInventory,
+        };
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        // Fresh coordinator with NO pre-seeded boards.
+        let sched = Scheduler::new(Policy::default());
+        let db = Db::connect_in_memory().await.unwrap();
+        let signer = Ed25519Signer::from_seed(&TEST_SEED);
+        let coord = Coordinator::new(config(), sched, db, signer, clock);
+        let agent_id = AgentId("agent-a".to_owned());
+
+        let inv = ProbeInventory {
+            boards: vec![
+                BoardStatus {
+                    board: BoardId("online-1".to_owned()),
+                    serial: "S-ON".to_owned(),
+                    presence: BoardPresence::Online,
+                    chip: "nRF52840_xxAA".to_owned(),
+                    tags: vec!["nrf52".to_owned()],
+                    exclusive: true,
+                    power: PowerKind::None,
+                },
+                BoardStatus {
+                    board: BoardId("offline-1".to_owned()),
+                    serial: "S-OFF".to_owned(),
+                    presence: BoardPresence::Offline,
+                    chip: "STM32F4".to_owned(),
+                    tags: vec![],
+                    exclusive: true,
+                    power: PowerKind::None,
+                },
+            ],
+            unknown: vec![],
+        };
+        coord
+            .handle_agent_report(&agent_id, AgentReport::Inventory(inv))
+            .await
+            .unwrap();
+
+        // The online board is in the scheduler, owned by the agent; the offline
+        // one is not.
+        {
+            let sched = coord.scheduler().lock().await;
+            let board = sched.board(&BoardId("online-1".to_owned())).unwrap();
+            assert_eq!(board.agent, agent_id);
+            assert_eq!(board.chip, "nRF52840_xxAA");
+            assert!(sched.board(&BoardId("offline-1".to_owned())).is_none());
+        }
+
+        // `ctl list` (ListBoards) returns the online board as available.
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &Principal("op".to_owned()),
+                SidecarToCoord::ListBoards,
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::BoardList(boards) => {
+                assert_eq!(boards.len(), 1);
+                assert_eq!(boards[0].board, BoardId("online-1".to_owned()));
+                assert_eq!(
+                    boards[0].availability,
+                    fleet_proto::admin::BoardAvailability::Available
+                );
+            }
+            other => panic!("expected BoardList, got {other:?}"),
+        }
     }
 }

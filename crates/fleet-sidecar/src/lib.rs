@@ -31,8 +31,9 @@
 //! * [`selector`] — resolve the fleet configuration from the environment, with
 //!   a clean no-selector → local fallback.
 //! * [`lease_cache`] — time-based lease sharing keyed by selector + principal.
-//! * [`proxy`] — the relay seam (lease / heartbeat / byte-splice). The live
-//!   mTLS transport is deferred to tasks 1709 / 1710 / 1711 behind traits.
+//! * [`proxy`] — the documented relay seam (lease / byte-splice contract).
+//! * [`transport`] — the live mTLS + postcard relay client: lease a board, open
+//!   a relay channel, splice the genuine probe-rs client's bytes verbatim.
 //! * [`gdb`] — the gdb-tunnel client side: a local TCP listener (default
 //!   `127.0.0.1:1337`) byte-spliced to the agent's `probe-rs gdb` stub over a
 //!   second relay channel (`probe-rs gdb` is not remote-capable in 0.31).
@@ -44,6 +45,7 @@ pub mod lease_cache;
 pub mod local;
 pub mod proxy;
 pub mod selector;
+pub mod transport;
 
 use std::ffi::OsString;
 
@@ -67,6 +69,9 @@ pub enum RunError {
     /// The gdb tunnel failed.
     #[error(transparent)]
     Gdb(#[from] gdb::GdbError),
+    /// The live relay transport failed.
+    #[error(transparent)]
+    Transport(#[from] transport::TransportError),
 }
 
 /// Parse `args` (a full process argv) and resolve what the sidecar should do,
@@ -97,9 +102,9 @@ where
 /// transparently exec the local probe-rs or proxy the session through the
 /// fleet, returning the process exit code to propagate.
 ///
-/// The fleet path is gated on the relay transport (tasks 1709 / 1710 / 1711):
-/// until that lands it returns [`proxy::ProxyError::NotYetWired`]. The local
-/// fallback path is fully functional today.
+/// The fleet path leases a board over mTLS, opens a relay channel, exposes a
+/// local endpoint, and execs the genuine probe-rs (or tunnels gdb) against it
+/// via [`transport`]. The local fallback path execs probe-rs directly.
 ///
 /// # Errors
 ///
@@ -121,14 +126,117 @@ where
             let code = local::exec_local(tokens.into_iter().skip(1))?;
             Ok(code)
         }
-        Resolution::Fleet(_cfg) => {
-            // The fleet path leases a board, exposes a local relay endpoint,
-            // and execs the genuine probe-rs pointed at it. The live transport
-            // is deferred behind the proxy seam (tasks 1709/1710/1711).
-            let _ = &invocation;
-            Err(proxy::ProxyError::NotYetWired.into())
+        Resolution::Fleet(cfg) => {
+            // The fleet path leases a board, exposes a local relay endpoint, and
+            // execs the genuine probe-rs (or, for gdb, byte-tunnels the local
+            // gdb client) pointed at it over the live mTLS+postcard relay.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| transport::TransportError::Io(format!("building runtime: {e}")))?;
+            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            rt.block_on(run_fleet(cfg, invocation, original_argv))
         }
     }
+}
+
+/// Drive the fleet path: lease a board, open a relay channel, expose a local
+/// endpoint, and either exec the genuine probe-rs against it (data plane) or
+/// tunnel the local gdb client (gdb plane).
+async fn run_fleet(
+    cfg: selector::FleetConfig,
+    invocation: cli::ProbeRsInvocation,
+    original_argv: Vec<String>,
+) -> Result<i32, RunError> {
+    use fleet_proto::lease::{LeaseRequest, Priority};
+
+    let session = transport::CoordSession::connect(&cfg).await?;
+    let request = LeaseRequest {
+        select: cfg.select.clone(),
+        duration_secs: 3600,
+        priority: Priority::Interactive,
+    };
+    let grant = session.lease(&request).await?;
+    tracing::info!(board = %grant.board, lease = ?grant.lease, "leased board");
+
+    let result = match &invocation {
+        cli::ProbeRsInvocation::Gdb {
+            connection_string, ..
+        } => run_fleet_gdb(&session, &grant, connection_string.as_deref()).await,
+        _ => run_fleet_data(&session, &grant, &original_argv).await,
+    };
+
+    // Always release the lease before returning (best-effort).
+    session.release(grant.lease).await;
+    result
+}
+
+/// Data-plane fleet path: open a data channel, bind a loopback endpoint the
+/// genuine probe-rs client dials as its remote host, splice it onto the relay,
+/// and exec the real probe-rs.
+async fn run_fleet_data(
+    session: &transport::CoordSession,
+    grant: &fleet_proto::lease::LeaseGrant,
+    original_argv: &[String],
+) -> Result<i32, RunError> {
+    use fleet_proto::ChannelKind;
+
+    let channel = session.open_channel(grant.lease, ChannelKind::Data).await?;
+
+    // Bind a loopback listener the probe-rs client treats as its remote host.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|e| transport::TransportError::Io(format!("binding local endpoint: {e}")))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|e| transport::TransportError::Io(format!("reading local endpoint: {e}")))?;
+    let remote_host = local_addr.to_string();
+    let token = transport::hex_encode(&grant.token);
+
+    // Accept the single probe-rs client connection and splice it in a task that
+    // borrows the session for the duration of the child process.
+    let real = transport::find_real_probe_rs()?;
+    let args: Vec<String> = original_argv.iter().skip(1).cloned().collect();
+
+    // Run the splice acceptor concurrently with the probe-rs child.
+    let splice = async {
+        if let Ok((client, _peer)) = listener.accept().await {
+            let _ = client.set_nodelay(true);
+            let _ = transport::splice_client(session, channel, client).await;
+        }
+    };
+    let child = transport::exec_remote_probe_rs(&real, &args, &remote_host, &token);
+
+    // The child drives the session; when it exits we stop accepting/splicing.
+    tokio::pin!(splice);
+    tokio::pin!(child);
+    let mut splice_done = false;
+    loop {
+        tokio::select! {
+            () = &mut splice, if !splice_done => { splice_done = true; }
+            code = &mut child => {
+                return Ok(code?);
+            }
+        }
+    }
+}
+
+/// gdb-plane fleet path: open a gdb channel, bind the local gdb listener the
+/// user's gdb client connects to, and byte-splice it onto the relay.
+async fn run_fleet_gdb(
+    session: &transport::CoordSession,
+    grant: &fleet_proto::lease::LeaseGrant,
+    connection_string: Option<&str>,
+) -> Result<i32, RunError> {
+    use fleet_proto::ChannelKind;
+
+    let channel = session.open_channel(grant.lease, ChannelKind::Gdb).await?;
+    let addr = gdb::resolve_listen_addr(connection_string)?;
+    let listener = gdb::bind(addr).await?;
+    tracing::info!(%addr, "gdb tunnel listening; point your gdb client here");
+    let client = gdb::accept(&listener).await?;
+    transport::splice_client(session, channel, client).await?;
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -183,7 +291,9 @@ mod tests {
     }
 
     #[test]
-    fn run_fleet_path_reports_not_yet_wired() {
+    fn run_fleet_path_requires_mtls() {
+        // Token-only auth is rejected for runtime traffic (mTLS is mandatory);
+        // the fleet path surfaces a transport error rather than connecting.
         let env = MapEnv::new(&[
             (selector::env::BOARD, "nrf52840-dk-3"),
             (selector::env::COORDINATOR, "c:4443"),
@@ -196,7 +306,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            RunError::Proxy(proxy::ProxyError::NotYetWired)
+            RunError::Transport(transport::TransportError::Tls(_))
         ));
     }
 

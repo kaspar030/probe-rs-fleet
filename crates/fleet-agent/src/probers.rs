@@ -13,11 +13,19 @@
 //! injection point; isolation is the per-board `ProbeAccess` fence we write
 //! into the server's config file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::BoardSpec;
+
+/// A byte stream the agent splices onto a relay data channel: the connected
+/// transport to a board's `probe-rs serve` Unix socket (or, in tests, an
+/// in-memory duplex). Object-safe so the concrete transport (Unix socket vs.
+/// mock) is hidden behind the [`Session`] trait.
+pub trait SpliceIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> SpliceIo for T {}
 
 /// Where a board's `probe-rs serve` instance listens, and the config that
 /// pins it to a single probe. This is the input the real process backend turns
@@ -88,6 +96,13 @@ pub trait Session: Send + Sync {
     /// The board this session serves.
     fn board(&self) -> &str;
 
+    /// Take the spliceable byte stream for this session, exactly once.
+    ///
+    /// The connection layer calls this to obtain the connected `probe-rs serve`
+    /// transport and byte-splice it onto the relay data channel. Returns `None`
+    /// on the second and later calls (the stream was already taken).
+    async fn take_io(&self) -> Option<Box<dyn SpliceIo>>;
+
     /// Kill the session: terminate the process and stop the splice.
     ///
     /// # Errors
@@ -151,30 +166,135 @@ impl ProcessBackend {
     }
 }
 
+/// Time to wait for a freshly-spawned `probe-rs serve` to bind its Unix socket.
+const SERVE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Poll interval while waiting for the serve socket to appear.
+const SERVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// A live `probe-rs serve` session: a running child process and a connected
+/// Unix-socket stream the agent splices onto a relay data channel.
+struct ProcessSession {
+    board: String,
+    child: tokio::sync::Mutex<tokio::process::Child>,
+    /// The connected socket stream, taken once by the connection layer.
+    io: tokio::sync::Mutex<Option<tokio::net::UnixStream>>,
+    killed: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl Session for ProcessSession {
+    fn board(&self) -> &str {
+        &self.board
+    }
+
+    async fn take_io(&self) -> Option<Box<dyn SpliceIo>> {
+        self.io
+            .lock()
+            .await
+            .take()
+            .map(|s| Box::new(s) as Box<dyn SpliceIo>)
+    }
+
+    async fn kill(&self) -> Result<(), String> {
+        self.killed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut child = self.child.lock().await;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        Ok(())
+    }
+
+    async fn wait(&self) -> SessionExit {
+        let mut child = self.child.lock().await;
+        match child.wait().await {
+            Ok(status) => {
+                if self.killed.load(std::sync::atomic::Ordering::SeqCst) {
+                    SessionExit::Killed
+                } else {
+                    SessionExit::Exited(status.code().unwrap_or(-1))
+                }
+            }
+            Err(_) => SessionExit::Killed,
+        }
+    }
+}
+
 #[async_trait]
 impl ProbeRsBackend for ProcessBackend {
     async fn open(&self, board: &BoardSpec) -> Result<Box<dyn Session>, String> {
         let spec = self.serve_spec(board);
-        // RESOLVE(1713 relay): the actual byte-splice connects this socket to
-        // the coordinator-relayed `DataFrame` channel. The data plane is opaque
-        // (u32-LE length-prefixed postcard frames) — we copy bytes both ways
-        // with no parsing. Wiring the concrete relay endpoint is the sidecar /
-        // coordinator integration (tasks 1711/1713); here we establish the
-        // process + socket and expose the splice seam.
-        //
-        // Steps the real impl performs:
-        //   1. write `spec.render_server_config()` to a temp config file,
-        //   2. spawn `{program} serve --config <file>` (tokio::process),
-        //   3. wait for the Unix socket to appear / connect to it,
-        //   4. spawn two copy loops splicing socket<->relay channel bytes,
-        //   5. capture stdout/stderr -> Log events, propagate exit code.
-        Err(format!(
-            "RESOLVE(1713): real probe-rs serve splice not yet wired \
-             (would spawn `{} serve` for board {} on {})",
-            self.program,
-            spec.board,
-            spec.socket_path.display()
-        ))
+
+        // 1. Render and write the per-board server config (locks the server to
+        //    this board's probe via `ProbeAccess::Allow([serial])`).
+        let runtime_dir = spec
+            .socket_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        tokio::fs::create_dir_all(&runtime_dir)
+            .await
+            .map_err(|e| format!("creating runtime dir {}: {e}", runtime_dir.display()))?;
+        // A stale socket from a previous run would make `serve` fail to bind.
+        let _ = tokio::fs::remove_file(&spec.socket_path).await;
+        let config_path = runtime_dir.join(format!("serve-{}.toml", spec.board));
+        tokio::fs::write(&config_path, spec.render_server_config())
+            .await
+            .map_err(|e| format!("writing serve config {}: {e}", config_path.display()))?;
+
+        // 2. Spawn `probe-rs serve --config <file>`. It takes no `--probe` /
+        //    `--chip` (the client selects them in-band over postcard-rpc);
+        //    isolation is the `ProbeAccess` fence in the config.
+        let child = tokio::process::Command::new(&self.program)
+            .arg("serve")
+            .arg("--config")
+            .arg(&config_path)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| {
+                format!(
+                    "failed to spawn `{} serve` for board {}: {e}",
+                    self.program, spec.board
+                )
+            })?;
+
+        // 3. Wait for the Unix socket to appear and connect to it.
+        let io = match connect_serve_socket(&spec.socket_path).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                // Tear the half-started process down before surfacing the error.
+                let mut child = child;
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(e);
+            }
+        };
+
+        Ok(Box::new(ProcessSession {
+            board: spec.board.clone(),
+            child: tokio::sync::Mutex::new(child),
+            io: tokio::sync::Mutex::new(Some(io)),
+            killed: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+}
+
+/// Poll-connect to a `probe-rs serve` Unix socket until it is reachable or the
+/// ready timeout elapses.
+async fn connect_serve_socket(path: &Path) -> Result<tokio::net::UnixStream, String> {
+    let deadline = tokio::time::Instant::now() + SERVE_READY_TIMEOUT;
+    loop {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "`probe-rs serve` socket {} never became reachable: {e}",
+                        path.display()
+                    ));
+                }
+                tokio::time::sleep(SERVE_POLL_INTERVAL).await;
+            }
+        }
     }
 }
 
@@ -185,7 +305,7 @@ pub(crate) mod mock {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use super::{ProbeRsBackend, Session, SessionExit};
+    use super::{ProbeRsBackend, Session, SessionExit, SpliceIo};
     use crate::config::BoardSpec;
     use async_trait::async_trait;
     use tokio::sync::Notify;
@@ -196,6 +316,9 @@ pub(crate) mod mock {
         killed: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         exit: Arc<std::sync::Mutex<Option<SessionExit>>>,
+        /// The agent-side half of an in-memory duplex, taken once by `take_io`.
+        /// Tests drive the peer half to emulate `probe-rs serve`.
+        io: tokio::sync::Mutex<Option<tokio::io::DuplexStream>>,
     }
 
     impl MockSession {
@@ -206,7 +329,18 @@ pub(crate) mod mock {
                 killed: Arc::new(AtomicBool::new(false)),
                 exit_notify: Arc::new(Notify::new()),
                 exit: Arc::new(std::sync::Mutex::new(None)),
+                io: tokio::sync::Mutex::new(None),
             }
+        }
+
+        /// Build a mock session with an in-memory duplex, returning the peer
+        /// half the test drives to emulate `probe-rs serve`.
+        #[must_use]
+        pub fn with_io(board: String) -> (Self, tokio::io::DuplexStream) {
+            let (agent_side, peer) = tokio::io::duplex(4096);
+            let mut s = Self::new(board);
+            s.io = tokio::sync::Mutex::new(Some(agent_side));
+            (s, peer)
         }
 
         #[must_use]
@@ -219,6 +353,14 @@ pub(crate) mod mock {
     impl Session for MockSession {
         fn board(&self) -> &str {
             &self.board
+        }
+
+        async fn take_io(&self) -> Option<Box<dyn SpliceIo>> {
+            self.io
+                .lock()
+                .await
+                .take()
+                .map(|s| Box::new(s) as Box<dyn SpliceIo>)
         }
 
         async fn kill(&self) -> Result<(), String> {
@@ -316,13 +458,18 @@ chip = "nRF52840_xxAA"
     }
 
     #[tokio::test]
-    async fn process_backend_open_is_gated_pending_relay() {
-        let be = ProcessBackend::new(PathBuf::from("/run/fleet"));
+    async fn process_backend_open_fails_without_probe_rs() {
+        // With a bogus program name the spawn fails fast; the backend surfaces
+        // a real error instead of the old not-yet-wired stub.
+        let dir = std::env::temp_dir().join(format!("frs-serve-test-{}", std::process::id()));
+        let be = ProcessBackend::new(dir.clone())
+            .with_program("definitely-not-a-real-probe-rs-binary".to_owned());
         let result = be.open(&board()).await;
+        std::fs::remove_dir_all(&dir).ok();
         let Err(err) = result else {
-            panic!("expected gated error")
+            panic!("expected spawn error")
         };
-        assert!(err.contains("RESOLVE(1713)"));
+        assert!(err.contains("failed to spawn"), "unexpected error: {err}");
     }
 
     #[tokio::test]

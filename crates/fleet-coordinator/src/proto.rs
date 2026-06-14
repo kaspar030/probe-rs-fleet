@@ -1,149 +1,30 @@
 //! Wire framing for the coordinator's TLS streams.
 //!
-//! Two things live here:
-//!
-//! 1. A **length-delimited postcard codec** ([`read_frame`] / [`write_frame`])
-//!    over any `AsyncRead`/`AsyncWrite`. Each frame is a `u32` little-endian
-//!    length prefix followed by that many postcard bytes. This carries the
-//!    control-plane messages of *either* plane plus opaque [`DataFrame`]s. It is
-//!    structured to be swappable for a postcard-rpc `WireTx`/`WireRx` later
-//!    without disturbing the scheduler/relay/auth core (architecture §3).
-//!
-//! 2. The **sidecar-direction** control envelopes ([`SidecarToCoord`] /
-//!    [`CoordToSidecar`]). The *agent*-direction messages are
-//!    [`fleet_proto::agent_api::AgentReport`] /
-//!    [`fleet_proto::agent_api::CoordinatorCommand`] (owned by fleet-proto) and
-//!    are **not** redefined here.
+//! The length-delimited postcard codec and the control-plane envelopes now live
+//! in the shared [`fleet_wire`] crate (so agents and sidecars can speak the wire
+//! without depending on the coordinator's storage/TLS stack). This module
+//! re-exports them and provides thin [`read_frame`] / [`write_frame`] wrappers
+//! that surface the coordinator's own [`CoordinatorError`] for ergonomic use in
+//! the server/relay code, preserving the historical `fleet_coordinator::proto`
+//! API (e.g. used by the bootstrap-enrollment client).
 
-use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
-use fleet_proto::lease::{LeaseGrant, LeaseRequest};
-use fleet_proto::{ChannelId, DataFrame, LeaseId};
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
+
+pub use fleet_wire::{
+    AgentToCoord, CoordToAgent, CoordToSidecar, SidecarToCoord, WireError, MAX_FRAME_LEN,
+};
 
 use crate::error::{CoordinatorError, Result};
 
-/// Maximum frame body length the codec will accept, to bound memory on a
-/// hostile or corrupt peer. Data-plane frames are small probe-rs chunks; 16 MiB
-/// is far above any legitimate control or data frame.
-pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
-
-/// A framed message from an agent up to the coordinator.
-///
-/// The agent control plane multiplexes shared `fleet-proto` control payloads
-/// ([`AgentReport`]) and opaque data-plane bytes ([`DataFrame`]) over one
-/// length-delimited stream. Wrapping them in this coordinator-local envelope
-/// gives the reader an unambiguous discriminator (the proto types themselves
-/// carry no tag distinguishing a report from a data frame), mirroring the
-/// symmetric sidecar plane.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AgentToCoord {
-    /// A control-plane report.
-    Report(AgentReport),
-    /// Opaque data-plane bytes from a probe-rs session.
-    Data(DataFrame),
-}
-
-/// A framed message from the coordinator down to an agent.
-///
-/// The down-stream counterpart of [`AgentToCoord`]: it wraps a control command
-/// ([`CoordinatorCommand`]) or an opaque [`DataFrame`] with a discriminator so
-/// the agent can demultiplex the two unambiguously.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CoordToAgent {
-    /// A control-plane command.
-    Command(CoordinatorCommand),
-    /// Opaque data-plane bytes to splice onto an open session.
-    Data(DataFrame),
-}
-
-/// A message from a sidecar up to the coordinator.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SidecarToCoord {
-    /// First message; announces the wire protocol version.
-    Hello {
-        /// The protocol version the sidecar speaks.
-        protocol_version: u32,
-    },
-    /// Request a lease on a board.
-    Lease(LeaseRequest),
-    /// Extend an existing lease's expiry.
-    Extend {
-        /// The lease to extend.
-        lease: LeaseId,
-    },
-    /// Release a held lease.
-    Release {
-        /// The lease to release.
-        lease: LeaseId,
-    },
-    /// Open a relay channel (probe-rs session) for a held lease.
-    ///
-    /// `kind` selects the channel plane: the regular data plane
-    /// ([`fleet_proto::ChannelKind::Data`], the default) or a gdb tunnel
-    /// ([`fleet_proto::ChannelKind::Gdb`], for `probe-rs gdb`). A lease may hold
-    /// both kinds concurrently.
-    OpenChannel {
-        /// The authorising lease.
-        lease: LeaseId,
-        /// Which plane the channel carries.
-        #[serde(default)]
-        kind: fleet_proto::ChannelKind,
-    },
-    /// Opaque data-plane bytes destined for the owning agent.
-    Data(DataFrame),
-    /// Close a previously opened channel.
-    CloseChannel {
-        /// The channel to close.
-        channel: ChannelId,
-    },
-}
-
-/// A message from the coordinator down to a sidecar.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CoordToSidecar {
-    /// Welcome reply; echoes the coordinator's protocol version.
-    Welcome {
-        /// The protocol version the coordinator speaks.
-        protocol_version: u32,
-    },
-    /// The outcome of a [`SidecarToCoord::Lease`] request.
-    Lease(LeaseGrant),
-    /// The request was queued; position is 0-based.
-    Queued {
-        /// 0-based position among waiters for the same constraint.
-        position: u32,
-    },
-    /// A lease was extended; carries the new expiry (epoch seconds).
-    Extended {
-        /// The lease that was extended.
-        lease: LeaseId,
-        /// The new expiry, epoch seconds.
-        expires: u64,
-    },
-    /// A lease was released.
-    Released {
-        /// The lease that was released.
-        lease: LeaseId,
-    },
-    /// A channel was opened and is ready for data.
-    ChannelOpened {
-        /// The allocated channel id.
-        channel: ChannelId,
-    },
-    /// A channel was closed (by request, agent, or lease expiry).
-    ChannelClosed {
-        /// The channel that closed.
-        channel: ChannelId,
-    },
-    /// Opaque data-plane bytes relayed from the owning agent.
-    Data(DataFrame),
-    /// An error in response to a sidecar request.
-    Error {
-        /// Human-readable error description.
-        message: String,
-    },
+impl From<WireError> for CoordinatorError {
+    fn from(e: WireError) -> Self {
+        match e {
+            WireError::Io(io) => CoordinatorError::Io(io),
+            WireError::Protocol(m) => CoordinatorError::Protocol(m),
+        }
+    }
 }
 
 /// Encode `value` as a single length-delimited postcard frame.
@@ -157,20 +38,7 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let body = postcard::to_allocvec(value)
-        .map_err(|e| CoordinatorError::Protocol(format!("encode: {e}")))?;
-    if body.len() > MAX_FRAME_LEN {
-        return Err(CoordinatorError::Protocol(format!(
-            "frame too large: {} > {MAX_FRAME_LEN}",
-            body.len()
-        )));
-    }
-    // `body.len() <= MAX_FRAME_LEN` (16 MiB) so the cast cannot truncate.
-    let len = u32::try_from(body.len())
-        .map_err(|_| CoordinatorError::Protocol("frame length overflow".to_owned()))?;
-    writer.write_all(&len.to_le_bytes()).await?;
-    writer.write_all(&body).await?;
-    writer.flush().await?;
+    fleet_wire::write_frame(writer, value).await?;
     Ok(())
 }
 
@@ -186,17 +54,7 @@ where
     R: AsyncRead + Unpin,
     T: DeserializeOwned,
 {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-    if len > MAX_FRAME_LEN {
-        return Err(CoordinatorError::Protocol(format!(
-            "frame too large: {len} > {MAX_FRAME_LEN}"
-        )));
-    }
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).await?;
-    postcard::from_bytes(&body).map_err(|e| CoordinatorError::Protocol(format!("decode: {e}")))
+    Ok(fleet_wire::read_frame(reader).await?)
 }
 
 #[cfg(test)]
@@ -204,7 +62,9 @@ mod tests {
     use super::*;
     use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
     use fleet_proto::ids::BoardId;
-    use fleet_proto::lease::{Constraint, Priority};
+    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use fleet_proto::{ChannelId, DataFrame, LeaseId};
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn sidecar_envelope_roundtrip() {

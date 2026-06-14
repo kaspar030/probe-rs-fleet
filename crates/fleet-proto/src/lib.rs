@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod admin;
 pub mod agent_api;
 pub mod board;
 pub mod enroll;
@@ -17,6 +18,7 @@ pub mod ids;
 pub mod lease;
 pub mod token;
 
+pub use admin::{BoardAvailability, BoardSummary, LeaseHolderSummary, LogLine};
 pub use agent_api::{
     AgentReport, BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe,
     LogLevel, PowerAction, ProbeInventory,
@@ -50,4 +52,4 @@ pub struct ChannelId(pub u64);
 /// Wire protocol version. Bumped on any incompatible change to the control
 /// plane message set. Peers exchange this at connection setup and refuse
 /// mismatches.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

@@ -47,6 +47,10 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
             } else {
                 BoardPresence::Offline
             },
+            chip: board.chip.clone(),
+            tags: board.tags.clone(),
+            exclusive: board.exclusive,
+            power: board.power.to_power_kind(),
         });
     }
 

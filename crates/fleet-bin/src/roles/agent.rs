@@ -46,6 +46,11 @@ pub async fn run(args: AgentArgs) -> Result<()> {
             .context("constructing agent")?,
     );
 
+    // Seed the agent's inventory from `boards.toml` so the boards are advertised
+    // to the coordinator on registration and become leasable. (A concrete probe
+    // enumerator can later refine presence via `Agent::set_inventory`.)
+    agent.seed_inventory_from_boards().await;
+
     // `connection::run` owns the connect / serve / reconnect-with-backoff
     // lifecycle (task 1712); race it against shutdown for clean termination.
     tokio::select! {

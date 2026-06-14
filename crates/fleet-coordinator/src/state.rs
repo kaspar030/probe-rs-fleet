@@ -215,6 +215,45 @@ impl Db {
         Ok(row.0)
     }
 
+    /// Fetch the most recent audit-log lines, newest first, optionally filtered
+    /// to a single board, capped at `limit` rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn recent_audit(
+        &self,
+        board: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<fleet_proto::admin::LogLine>> {
+        let rows: Vec<(i64, String, Option<String>, Option<String>)> = match board {
+            Some(b) => sqlx::query_as(
+                "SELECT ts, action, board, detail FROM audit_log
+                 WHERE board = ?1 ORDER BY id DESC LIMIT ?2",
+            )
+            .bind(b)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?,
+            None => sqlx::query_as(
+                "SELECT ts, action, board, detail FROM audit_log
+                 ORDER BY id DESC LIMIT ?1",
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?,
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(ts, action, board, detail)| fleet_proto::admin::LogLine {
+                ts,
+                action,
+                board,
+                detail,
+            })
+            .collect())
+    }
+
     /// Insert a one-time bootstrap enrollment secret (stored by hash).
     ///
     /// # Errors

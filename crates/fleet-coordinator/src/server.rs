@@ -81,6 +81,43 @@ pub async fn handle_connection_for_test(
     handle_connection(coord, acceptor, sock).await
 }
 
+/// Test-only entry point: drive the agent-side read/writer pumps over an
+/// arbitrary stream (no TLS), as the given `agent_id`. Exposed so integration
+/// tests can wire an agent and a coordinator over an in-memory duplex.
+///
+/// # Errors
+///
+/// Propagates any per-connection error.
+#[doc(hidden)]
+pub async fn handle_agent_for_test<S>(
+    coord: Arc<Coordinator>,
+    stream: S,
+    agent_id: AgentId,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_agent(coord, stream, agent_id).await
+}
+
+/// Test-only entry point: drive the sidecar-side handshake + read/writer pumps
+/// over an arbitrary stream (no TLS), as the given `principal`.
+///
+/// # Errors
+///
+/// Propagates any per-connection error.
+#[doc(hidden)]
+pub async fn handle_sidecar_for_test<S>(
+    coord: Arc<Coordinator>,
+    stream: S,
+    principal: Principal,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_sidecar(coord, stream, principal).await
+}
+
 /// Accept the TLS handshake, derive the peer identity, and dispatch by role.
 ///
 /// A connection that presents **no** client certificate is treated as a

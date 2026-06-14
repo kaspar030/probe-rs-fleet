@@ -1,0 +1,22 @@
+[package]
+name = "fleet-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Length-delimited postcard framing + control-plane envelopes for probe-rs-fleet."
+
+[dependencies]
+fleet-proto.workspace = true
+
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+
+[lints]
+workspace = true

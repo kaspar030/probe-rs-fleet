@@ -35,5 +35,5 @@ pub use connection::Backoff;
 pub use discovery::{reconcile, ProbeLister};
 pub use error::{AgentError, Result};
 pub use power::{CommandRunner, PowerControl, PowerError};
-pub use probers::{ProbeRsBackend, ProcessBackend, Session};
+pub use probers::{ProbeRsBackend, ProcessBackend, Session, SpliceIo};
 pub use token::Ed25519Verifier;

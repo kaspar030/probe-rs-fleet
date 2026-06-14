@@ -60,8 +60,9 @@ const STUB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// [`GdbConnection::shutdown`]s it (killing the process) on channel close /
 /// lease release / fault.
 pub struct GdbConnection {
-    /// The connected TCP stream to the stub's gdbremote listener.
-    pub stream: TcpStream,
+    /// The connected TCP stream to the stub's gdbremote listener, taken once by
+    /// the connection layer for splicing.
+    pub stream: Option<TcpStream>,
     /// Kills the underlying `probe-rs gdb` process on shutdown.
     killer: Box<dyn GdbKill>,
 }
@@ -70,7 +71,15 @@ impl GdbConnection {
     /// Wrap a connected stream and its process killer.
     #[must_use]
     pub fn new(stream: TcpStream, killer: Box<dyn GdbKill>) -> Self {
-        Self { stream, killer }
+        Self {
+            stream: Some(stream),
+            killer,
+        }
+    }
+
+    /// Take the connected gdbremote TCP stream for splicing, exactly once.
+    pub fn take_stream(&mut self) -> Option<TcpStream> {
+        self.stream.take()
     }
 
     /// Kill the underlying `probe-rs gdb` process. Idempotent / best-effort.
@@ -464,7 +473,7 @@ chip = "nRF52840_xxAA"
         let conn = stub.spawn(&board()).await.unwrap();
         assert_eq!(stub.spawn_count(), 1);
         // The returned stream is connected (peer addr resolves).
-        assert!(conn.stream.peer_addr().is_ok());
+        assert!(conn.stream.as_ref().unwrap().peer_addr().is_ok());
         conn.shutdown().await;
     }
 }

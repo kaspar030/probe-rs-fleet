@@ -135,6 +135,43 @@ impl<B: ProbeRsBackend> Agent<B> {
         *self.inventory.lock().await = inventory;
     }
 
+    /// A clone of the current inventory snapshot.
+    pub async fn current_inventory(&self) -> ProbeInventory {
+        self.inventory.lock().await.clone()
+    }
+
+    /// Seed the inventory from `boards.toml`, marking every declared board
+    /// online with its full metadata.
+    ///
+    /// Used on the live dial-out path where a concrete probe enumerator is not
+    /// yet wired: declared boards are advertised as present so they become
+    /// leasable, and a session-open will surface a real error if the probe is
+    /// in fact absent. When a [`crate::discovery::ProbeLister`] is wired, call
+    /// [`set_inventory`] with the reconciled result instead.
+    ///
+    /// [`set_inventory`]: Agent::set_inventory
+    pub async fn seed_inventory_from_boards(&self) {
+        use fleet_proto::{BoardPresence, BoardStatus};
+        let boards = self
+            .boards
+            .boards
+            .iter()
+            .map(|b| BoardStatus {
+                board: BoardId(b.id.clone()),
+                serial: b.serial.clone(),
+                presence: BoardPresence::Online,
+                chip: b.chip.clone(),
+                tags: b.tags.clone(),
+                exclusive: b.exclusive,
+                power: b.power.to_power_kind(),
+            })
+            .collect();
+        *self.inventory.lock().await = ProbeInventory {
+            boards,
+            unknown: Vec::new(),
+        };
+    }
+
     /// Drain queued upward reports.
     pub async fn take_reports(&self) -> Vec<AgentReport> {
         std::mem::take(&mut *self.outbox.lock().await)
@@ -430,6 +467,26 @@ impl<B: ProbeRsBackend> Agent<B> {
     /// Number of currently active sessions (for tests / introspection).
     pub async fn active_session_count(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// Take the spliceable byte stream for an open data-plane session, so the
+    /// connection layer can byte-splice it onto the relay channel. Returns
+    /// `None` if no session is open on `channel` or its stream was already
+    /// taken.
+    pub async fn take_data_io(&self, channel: ChannelId) -> Option<Box<dyn crate::probers::SpliceIo>> {
+        let sessions = self.sessions.lock().await;
+        let active = sessions.get(&channel)?;
+        active.session.take_io().await
+    }
+
+    /// Take the spliceable gdb TCP stream for an open gdb-tunnel session, so the
+    /// connection layer can byte-splice it onto the relay channel. Returns
+    /// `None` if no gdb session is open on `channel` or its stream was already
+    /// taken.
+    pub async fn take_gdb_io(&self, channel: ChannelId) -> Option<tokio::net::TcpStream> {
+        let mut sessions = self.gdb_sessions.lock().await;
+        let gdb = sessions.get_mut(&channel)?;
+        gdb.connection.take_stream()
     }
 
     /// Number of currently open gdb-tunnel sessions (for tests).

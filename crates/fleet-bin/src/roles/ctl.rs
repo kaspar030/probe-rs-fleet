@@ -1,16 +1,12 @@
 //! The `ctl` role: admin / UX CLI talking to the coordinator over mTLS.
 //!
 //! The command surface (parsing, selector grammar, output formatting) is fully
-//! implemented and unit-tested here. The *transport* — an mTLS client of the
-//! coordinator — is built from the shared connection flags via [`fleet_tls`].
-//!
-//! The coordinator's admin RPC surface (fleet inventory `list`, `who`, `logs`,
-//! `power-cycle`, plus the `lease`/`release` admin path) is not yet exposed on
-//! its control plane (task 1711 wires the sidecar lease envelopes but no
-//! operator/admin endpoints). Until that lands, [`CtlClient`] resolves its
-//! connection config but each command returns a clear "not yet available"
-//! error rather than silently doing nothing. Wiring each command to a
-//! coordinator request is then a localised change at the marked seam.
+//! implemented and unit-tested here. The *transport* is an mTLS client of the
+//! coordinator: each command opens a TLS stream (built from the shared
+//! connection flags via [`fleet_tls`]), performs the sidecar-plane Hello
+//! handshake, issues the matching operator request
+//! ([`fleet_coordinator::proto::SidecarToCoord`]) — `list` / `who` / `logs` /
+//! `power-cycle` plus `lease` / `release` — and renders the typed reply.
 
 use anyhow::{Context, Result};
 
@@ -146,68 +142,234 @@ impl CtlClient {
         Ok(config)
     }
 
-    /// The integration seam: all admin commands route through this until the
-    /// coordinator exposes an operator RPC (task 1711). It validates the TLS
-    /// material (failing fast on misconfiguration) and then reports the
-    /// not-yet-wired condition.
-    fn admin_rpc(&self, command: &str) -> Result<()> {
-        // Eagerly validate connection material so operators get a real error
-        // for bad cert paths even before the RPC lands.
-        let _tls = self.tls_config()?;
-        // RESOLVE(1711 admin RPC): open the mTLS stream to
-        // `self.conn.coordinator`, send the operator request for `command`,
-        // and print the typed response. The lease/release envelopes already
-        // exist on the sidecar plane; the operator-facing list/who/logs/
-        // power-cycle endpoints are co-owned with task 1711.
-        anyhow::bail!(
-            "ctl {command}: coordinator admin RPC not yet available (blocked on task 1711); \
-             connection to {} is configured and TLS material validated",
-            self.conn.coordinator
+    /// Open an mTLS stream to the coordinator and complete the Hello/Welcome
+    /// handshake, returning the connected, split stream halves.
+    async fn connect(
+        &self,
+    ) -> Result<(
+        tokio::io::ReadHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+        tokio::io::WriteHalf<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    )> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        use fleet_proto::PROTOCOL_VERSION;
+        use tokio_rustls::TlsConnector;
+
+        let tls = self.tls_config()?;
+        let connector = TlsConnector::from(std::sync::Arc::new(tls));
+        let tcp = tokio::net::TcpStream::connect(&self.conn.coordinator)
+            .await
+            .with_context(|| format!("connecting to coordinator {}", self.conn.coordinator))?;
+        let _ = tcp.set_nodelay(true);
+        let name = server_name(&self.conn.coordinator)?;
+        let stream = connector
+            .connect(name, tcp)
+            .await
+            .context("TLS handshake (server cert / CA mismatch?)")?;
+        let (mut reader, mut writer) = tokio::io::split(stream);
+
+        write_frame(
+            &mut writer,
+            &SidecarToCoord::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
         )
+        .await
+        .context("sending Hello")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader)
+            .await
+            .context("reading Welcome")?
+        {
+            CoordToSidecar::Welcome { protocol_version } if protocol_version == PROTOCOL_VERSION => {}
+            CoordToSidecar::Welcome { protocol_version } => {
+                anyhow::bail!(
+                    "protocol mismatch: coordinator={protocol_version} ctl={PROTOCOL_VERSION}"
+                );
+            }
+            other => anyhow::bail!("expected Welcome, got {other:?}"),
+        }
+        Ok((reader, writer))
     }
 
     /// `ctl list` — fleet inventory.
-    fn list(&self) -> Result<()> {
-        self.admin_rpc("list")
+    async fn list(&self) -> Result<()> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        let (mut reader, mut writer) = self.connect().await?;
+        write_frame(&mut writer, &SidecarToCoord::ListBoards)
+            .await
+            .context("sending list request")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::BoardList(boards) => {
+                if boards.is_empty() {
+                    println!("no boards in the fleet");
+                } else {
+                    println!("{:<24} {:<16} {:<16} {:<12} HOLDER", "BOARD", "AGENT", "CHIP", "STATE");
+                    for b in boards {
+                        let state = format!("{:?}", b.availability);
+                        let holder = b.holder.map_or_else(String::new, |h| h.0);
+                        println!(
+                            "{:<24} {:<16} {:<16} {:<12} {}",
+                            b.board.0, b.agent.0, b.chip, state, holder
+                        );
+                    }
+                }
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
     }
 
     /// `ctl lease <selector> [--duration]`.
-    fn lease(&self, request: &LeaseRequest) -> Result<()> {
-        tracing::debug!(?request, "lease request prepared");
-        self.admin_rpc("lease")
+    async fn lease(&self, request: &LeaseRequest) -> Result<()> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        let (mut reader, mut writer) = self.connect().await?;
+        write_frame(&mut writer, &SidecarToCoord::Lease(request.clone()))
+            .await
+            .context("sending lease request")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::Lease(grant) => {
+                println!(
+                    "leased {} (lease {}) on agent {} until {} (epoch)",
+                    grant.board.0, grant.lease.0, grant.agent.0, grant.expires
+                );
+                Ok(())
+            }
+            CoordToSidecar::Queued { position } => {
+                println!("queued at position {position}");
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
     }
 
     /// `ctl release <board>`.
-    fn release(&self, board: &BoardId) -> Result<()> {
-        tracing::debug!(%board, "release request prepared");
-        self.admin_rpc("release")
+    async fn release(&self, board: &BoardId) -> Result<()> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        // Resolve the lease holding `board` via the board list, then release it.
+        let (mut reader, mut writer) = self.connect().await?;
+        write_frame(&mut writer, &SidecarToCoord::ListBoards)
+            .await
+            .context("sending list request")?;
+        let lease = match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::BoardList(boards) => boards
+                .into_iter()
+                .find(|b| &b.board == board)
+                .and_then(|b| b.lease),
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        };
+        let Some(lease) = lease else {
+            anyhow::bail!("board {} is not currently leased", board.0);
+        };
+        write_frame(&mut writer, &SidecarToCoord::Release { lease })
+            .await
+            .context("sending release request")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::Released { lease } => {
+                println!("released lease {} on {}", lease.0, board.0);
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
     }
 
     /// `ctl power-cycle <board>`.
-    fn power_cycle(&self, board: &BoardId) -> Result<()> {
-        tracing::debug!(%board, "power-cycle request prepared");
-        self.admin_rpc("power-cycle")
+    async fn power_cycle(&self, board: &BoardId) -> Result<()> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        let (mut reader, mut writer) = self.connect().await?;
+        write_frame(
+            &mut writer,
+            &SidecarToCoord::PowerCycle {
+                board: board.clone(),
+            },
+        )
+        .await
+        .context("sending power-cycle request")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::PowerCycled { board } => {
+                println!("power-cycled {}", board.0);
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
     }
 
     /// `ctl who` — current lease holders.
-    fn who(&self) -> Result<()> {
-        self.admin_rpc("who")
+    async fn who(&self) -> Result<()> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        let (mut reader, mut writer) = self.connect().await?;
+        write_frame(&mut writer, &SidecarToCoord::Who)
+            .await
+            .context("sending who request")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::LeaseTable(holders) => {
+                if holders.is_empty() {
+                    println!("no active leases");
+                } else {
+                    println!("{:<8} {:<24} {:<16} EXPIRES", "LEASE", "BOARD", "HOLDER");
+                    for h in holders {
+                        println!(
+                            "{:<8} {:<24} {:<16} {}",
+                            h.lease.0, h.board.0, h.holder.0, h.expires
+                        );
+                    }
+                }
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
     }
 
     /// `ctl logs [board] [--follow]`.
-    fn logs(&self, board: Option<&BoardId>, follow: bool) -> Result<()> {
-        tracing::debug!(?board, follow, "logs request prepared");
-        self.admin_rpc("logs")
+    async fn logs(&self, board: Option<&BoardId>, follow: bool) -> Result<()> {
+        use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+        let (mut reader, mut writer) = self.connect().await?;
+        write_frame(
+            &mut writer,
+            &SidecarToCoord::Logs {
+                board: board.cloned(),
+                follow,
+            },
+        )
+        .await
+        .context("sending logs request")?;
+        match read_frame::<_, CoordToSidecar>(&mut reader).await? {
+            CoordToSidecar::LogLines(lines) => {
+                // The coordinator returns newest-first; print oldest-first.
+                for line in lines.into_iter().rev() {
+                    let board = line.board.unwrap_or_default();
+                    let detail = line.detail.unwrap_or_default();
+                    println!("{:>12}  {:<18} {:<24} {}", line.ts, line.action, board, detail);
+                }
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
     }
+}
+
+/// Derive a TLS `ServerName` from a `host:port` address (IP or DNS).
+fn server_name(addr: &str) -> Result<rustls::pki_types::ServerName<'static>> {
+    use rustls::pki_types::ServerName;
+    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(host.to_owned())
+        .map_err(|e| anyhow::anyhow!("invalid server name '{host}': {e}"))
 }
 
 /// Run a `ctl` command.
 ///
 /// # Errors
 ///
-/// Returns an error if the connection config is incomplete or the (currently
-/// unwired) coordinator RPC fails.
-#[allow(clippy::unused_async)] // async to match the uniform role-handler signature; awaits once 1711 lands
+/// Returns an error if the connection config is incomplete or the coordinator
+/// RPC fails.
 pub async fn run(args: CtlArgs) -> Result<()> {
     let conn = CtlConnection::from_args(args.client)?;
     let client = CtlClient::new(conn);
@@ -218,20 +380,20 @@ pub async fn run(args: CtlArgs) -> Result<()> {
             // connection is built; reaching here would be a logic error.
             anyhow::bail!("`ctl init`/`ctl profiles` must be handled before connecting")
         }
-        CtlCommand::List => client.list(),
+        CtlCommand::List => client.list().await,
         CtlCommand::Lease { selector, duration } => {
             let request = LeaseRequest {
                 select: parse_selector(&selector),
                 duration_secs: duration,
                 priority: Priority::Interactive,
             };
-            client.lease(&request)
+            client.lease(&request).await
         }
-        CtlCommand::Release { board } => client.release(&BoardId(board)),
-        CtlCommand::PowerCycle { board } => client.power_cycle(&BoardId(board)),
-        CtlCommand::Who => client.who(),
+        CtlCommand::Release { board } => client.release(&BoardId(board)).await,
+        CtlCommand::PowerCycle { board } => client.power_cycle(&BoardId(board)).await,
+        CtlCommand::Who => client.who().await,
         CtlCommand::Logs { board, follow } => {
-            client.logs(board.map(BoardId).as_ref(), follow)
+            client.logs(board.map(BoardId).as_ref(), follow).await
         }
     }
 }

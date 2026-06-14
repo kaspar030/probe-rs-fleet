@@ -42,6 +42,13 @@ pub enum BoardPresence {
 }
 
 /// Per-board reconciliation status reported to the coordinator.
+///
+/// Carries the full leasable-board metadata declared in the agent's
+/// `boards.toml` (chip / tags / exclusivity / power capability) in addition to
+/// the live presence, so the coordinator can reconstruct a
+/// [`fleet_proto::board::Board`] for its scheduler without a second message.
+/// The board's owning [`AgentId`] is known from the authenticated connection
+/// (it is not repeated on the wire) and its lease state defaults to available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardStatus {
     /// The board id from `boards.toml`.
@@ -50,6 +57,15 @@ pub struct BoardStatus {
     pub serial: String,
     /// Whether the probe is currently present.
     pub presence: BoardPresence,
+    /// probe-rs target/chip name (informational; the caller still passes
+    /// `--chip` in-band).
+    pub chip: String,
+    /// Free-form selection tags, e.g. `["nrf52", "bluetooth"]`.
+    pub tags: Vec<String>,
+    /// Whether the board admits only one lease at a time.
+    pub exclusive: bool,
+    /// How the agent can cut/restore power to this board.
+    pub power: BoardPower,
 }
 
 /// A full inventory snapshot: which declared boards are present, plus any
@@ -223,6 +239,10 @@ mod tests {
                 board: BoardId("b1".to_owned()),
                 serial: "001050257890".to_owned(),
                 presence: BoardPresence::Online,
+                chip: "nRF52840_xxAA".to_owned(),
+                tags: vec!["nrf52".to_owned()],
+                exclusive: true,
+                power: PowerKind::None,
             }],
             unknown: vec![DiscoveredProbe {
                 serial: "deadbeef".to_owned(),

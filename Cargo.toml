@@ -4,6 +4,7 @@ members = [
     "crates/fleet-proto",
     "crates/fleet-core",
     "crates/fleet-tls",
+    "crates/fleet-wire",
     "crates/fleet-agent",
     "crates/fleet-coordinator",
     "crates/fleet-sidecar",
@@ -29,6 +30,7 @@ repository = "https://github.com/ariel-os/probe-rs-fleet"
 fleet-proto = { path = "crates/fleet-proto" }
 fleet-core = { path = "crates/fleet-core" }
 fleet-tls = { path = "crates/fleet-tls" }
+fleet-wire = { path = "crates/fleet-wire" }
 fleet-agent = { path = "crates/fleet-agent" }
 fleet-coordinator = { path = "crates/fleet-coordinator" }
 fleet-sidecar = { path = "crates/fleet-sidecar" }

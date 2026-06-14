@@ -580,6 +580,7 @@ dependencies = [
  "ed25519-dalek",
  "fleet-proto",
  "fleet-tls",
+ "fleet-wire",
  "postcard",
  "postcard-rpc",
  "rand_core",
@@ -588,6 +589,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-gpiod",
+ "tokio-rustls",
  "toml",
  "tracing",
 ]
@@ -624,10 +626,14 @@ name = "fleet-coordinator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ed25519-dalek",
+ "fleet-agent",
  "fleet-core",
  "fleet-proto",
+ "fleet-sidecar",
  "fleet-tls",
+ "fleet-wire",
  "postcard",
  "rcgen",
  "rustls",
@@ -667,8 +673,12 @@ dependencies = [
  "anyhow",
  "fleet-agent",
  "fleet-proto",
+ "fleet-tls",
+ "fleet-wire",
+ "rustls",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 
@@ -686,6 +696,17 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "x509-parser",
+]
+
+[[package]]
+name = "fleet-wire"
+version = "0.1.0"
+dependencies = [
+ "fleet-proto",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]

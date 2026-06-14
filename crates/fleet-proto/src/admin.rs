@@ -1,0 +1,80 @@
+//! Operator / admin control-plane payloads (`ctl list` / `who` / `logs`).
+//!
+//! These ride the same sidecar-direction transport as the lease envelopes (a
+//! `ctl` connects with a sidecar-class client certificate), but describe the
+//! fleet-wide *operator* surface rather than a single principal's lease. They
+//! are pure data so both the coordinator (which produces them) and `fleet-bin`'s
+//! `ctl` role (which renders them) share one definition.
+
+use serde::{Deserialize, Serialize};
+
+use crate::board::PowerKind;
+use crate::ids::{AgentId, BoardId, LeaseId, Principal};
+
+/// A coarse, operator-facing lifecycle label for a board in `ctl list`.
+///
+/// Mirrors [`crate::board::BoardState`] without the inline lease detail (which,
+/// when present, is reported separately via the optional `holder` fields on
+/// [`BoardSummary`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BoardAvailability {
+    /// Idle and leasable.
+    Available,
+    /// Currently leased.
+    Leased,
+    /// Quarantined after a fault.
+    Faulted,
+    /// Administratively disabled.
+    Disabled,
+}
+
+/// One row of the `ctl list` fleet inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoardSummary {
+    /// The board id.
+    pub board: BoardId,
+    /// The agent that owns the board.
+    pub agent: AgentId,
+    /// probe-rs target/chip name.
+    pub chip: String,
+    /// Free-form selection tags.
+    pub tags: Vec<String>,
+    /// Whether the board admits only one lease at a time.
+    pub exclusive: bool,
+    /// USB power-control capability.
+    pub power: PowerKind,
+    /// Coarse availability.
+    pub availability: BoardAvailability,
+    /// If leased, the current holder.
+    pub holder: Option<Principal>,
+    /// If leased, the lease id.
+    pub lease: Option<LeaseId>,
+    /// If leased, the expiry (epoch seconds).
+    pub expires: Option<u64>,
+}
+
+/// One row of the `ctl who` lease table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseHolderSummary {
+    /// The lease id.
+    pub lease: LeaseId,
+    /// The board held.
+    pub board: BoardId,
+    /// The principal holding it.
+    pub holder: Principal,
+    /// Expiry as epoch seconds.
+    pub expires: u64,
+}
+
+/// One audit/log line returned by `ctl logs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogLine {
+    /// Timestamp (epoch seconds).
+    pub ts: i64,
+    /// The action / event name.
+    pub action: String,
+    /// The board this line concerns, if any.
+    pub board: Option<String>,
+    /// Free-form detail.
+    pub detail: Option<String>,
+}
