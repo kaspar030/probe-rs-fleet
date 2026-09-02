@@ -70,9 +70,9 @@ the **same** musl toolchain. probe-rs uses `nusb` (pure-Rust USB — no libusb C
 dep); `hidapi` (C) is only pulled by the `cmsisdap_v1` feature, which we omit:
 
 ```sh
-curl -sSLO https://github.com/probe-rs/probe-rs/archive/refs/tags/v0.31.0.tar.gz
-tar xzf v0.31.0.tar.gz && cd probe-rs-0.31.0
-rustup target add armv7-unknown-linux-musleabihf   # probe-rs pins a toolchain via rust-toolchain.toml
+curl -sSLO https://github.com/probe-rs/probe-rs/archive/refs/tags/v0.32.0.tar.gz
+tar xzf v0.32.0.tar.gz && cd probe-rs-0.32.0
+rustup target add armv7-unknown-linux-musleabihf   # probe-rs pins a toolchain via rust-toolchain.toml (1.97.1 at v0.32.0)
 # same CC_/LINKER/RUSTFLAGS env as the TL;DR above
 cargo build --release -p probe-rs-tools --bin probe-rs \
   --no-default-features --features remote \
@@ -81,6 +81,10 @@ cargo build --release -p probe-rs-tools --bin probe-rs \
 
 `--features remote` enables `probe-rs serve` (the client/server mode the agent
 proxies). The result is a static `probe-rs` that runs on the Pi.
+
+> The `remote` feature is still **opt-in** at v0.32.0 (`default = []`), so the
+> flag above is required. Post-0.32 master flips `remote` on by default, at
+> which point this flag becomes unnecessary — see issue #298.
 
 ## Pi-side runtime notes (Alpine)
 

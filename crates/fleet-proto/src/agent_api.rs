@@ -30,6 +30,15 @@ pub struct DiscoveredProbe {
     pub pid: u16,
     /// Human-readable product string, if the probe reports one.
     pub product: Option<String>,
+    /// The probe is present but `probe-rs` cannot open it: probe-rs 0.32's
+    /// `probe-rs list` appends `" (inaccessible)"` to such a probe's line
+    /// (`Accessibility::PermissionDenied` — an `access(2)` check on the probe's
+    /// USB device node, so in practice a udev/permissions problem, **not** a
+    /// busy probe).
+    ///
+    /// Such a probe is still reported (so the condition is diagnosable) but is
+    /// never advertised as an online, leasable board.
+    pub inaccessible: bool,
 }
 
 /// How a declared board reconciles against live probe discovery.
@@ -114,7 +123,7 @@ pub enum PowerAction {
 /// * [`ChannelKind::Data`] — the board's `probe-rs serve` postcard-rpc stream
 ///   (the regular data plane; architecture §4.2).
 /// * [`ChannelKind::Gdb`] — a freshly-spawned, board-local `probe-rs gdb` TCP
-///   stub. `probe-rs gdb` is not remote-capable in 0.31, so the agent runs it
+///   stub. `probe-rs gdb` is not remote-capable in 0.32, so the agent runs it
 ///   locally and tunnels its raw gdbremote TCP as a second opaque channel
 ///   (architecture §4.2 gap note, §10 Q3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -244,12 +253,22 @@ mod tests {
                 exclusive: true,
                 power: PowerKind::None,
             }],
-            unknown: vec![DiscoveredProbe {
-                serial: "deadbeef".to_owned(),
-                vid: 0x1366,
-                pid: 0x1015,
-                product: Some("J-Link".to_owned()),
-            }],
+            unknown: vec![
+                DiscoveredProbe {
+                    serial: "deadbeef".to_owned(),
+                    vid: 0x1366,
+                    pid: 0x1015,
+                    product: Some("J-Link".to_owned()),
+                    inaccessible: false,
+                },
+                DiscoveredProbe {
+                    serial: "cafebabe".to_owned(),
+                    vid: 0x0d28,
+                    pid: 0x0204,
+                    product: Some("CMSIS-DAP".to_owned()),
+                    inaccessible: true,
+                },
+            ],
         });
         let bytes = postcard::to_allocvec(&report).unwrap();
         let back: AgentReport = postcard::from_bytes(&bytes).unwrap();

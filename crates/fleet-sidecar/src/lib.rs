@@ -36,7 +36,7 @@
 //!   a relay channel, splice the genuine probe-rs client's bytes verbatim.
 //! * [`gdb`] — the gdb-tunnel client side: a local TCP listener (default
 //!   `127.0.0.1:1337`) byte-spliced to the agent's `probe-rs gdb` stub over a
-//!   second relay channel (`probe-rs gdb` is not remote-capable in 0.31).
+//!   second relay channel (`probe-rs gdb` is not remote-capable in 0.32).
 //! * [`local`] — locate and exec the genuine probe-rs (local + remote env).
 
 pub mod cli;

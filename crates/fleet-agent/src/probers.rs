@@ -3,13 +3,13 @@
 //! Decided model: the agent runs **one `probe-rs serve` per board** listening
 //! on a loopback **TCP** port, each locked to its physical probe via a per-board
 //! user with `ProbeAccess::Allow(["vid:pid:serial"])` + a per-board token. `probe-rs serve`
-//! (0.31) speaks **WebSocket** at route `/worker`; the agent then
+//! (0.32) speaks **WebSocket** at route `/worker`; the agent then
 //! **byte-splices** the raw TCP stream (the bytes of that WebSocket connection)
 //! between serve's port and the coordinator-relayed data channel — *zero*
 //! probe-rs / WebSocket parsing. The server is reused across a holder's many
 //! invocations (matching time-based sharing, §6) and recycled on board release.
 //!
-//! `probe-rs serve` 0.31 takes **no** `--config`, `--probe` or `--chip`: its
+//! `probe-rs serve` 0.32 takes **no** `--config`, `--probe` or `--chip`: its
 //! `ServerConfig` is loaded via **Figment** from a `.probe-rs.{toml,json,yaml}`
 //! file searched in cwd → exe dir → home, and the connecting client selects
 //! probe + chip in-band over the WebSocket. So the agent spawns serve with a
@@ -88,7 +88,7 @@ impl ServeSpec {
     /// Render the `probe-rs serve` Figment (`.probe-rs.toml`) config that locks
     /// the server to this board's probe over its loopback TCP port.
     ///
-    /// Shape (probe-rs 0.31, `Config { server: ServerConfig }` with
+    /// Shape (probe-rs 0.32, `Config { server: ServerConfig }` with
     /// `#[serde(deny_unknown_fields)]`): a `[server]` table carrying
     /// `address`/`port` and one `[[server.users]]` with a required `name`, the
     /// per-board `token`, and `access = { allow = ["<serial>"] }`
@@ -245,20 +245,36 @@ impl ProcessBackend {
     /// # Errors
     ///
     /// Returns an error string if an ephemeral port could not be allocated, if
-    /// probe enumeration fails, or if the board's serial is not found among the
+    /// probe enumeration fails, if the board's serial is not found among the
     /// attached probes (so we never render an unmatchable `0000:0000:<serial>`
-    /// allow entry).
+    /// allow entry), or if the matched probe is present but **inaccessible**
+    /// (probe-rs 0.32 cannot open it — see [`DiscoveredProbe::inaccessible`]),
+    /// in which case spawning `serve` would only fail later and less legibly.
     pub async fn serve_spec(&self, board: &BoardSpec) -> Result<ServeSpec, String> {
         let enriched = self.resolve_board_ids(board).await?;
         ServeSpec::for_board(&enriched)
     }
 
     /// Stamp `board`'s USB vid/pid from a fresh `probe-rs list` enumeration,
-    /// matched by serial. Errors loudly if the board's probe is not present or
-    /// the discovered vid/pid are unusable (zero), since rendering
-    /// `0000:0000:<serial>` would silently no-op every remote attach.
+    /// matched by serial. Errors loudly if the board's probe is not present,
+    /// is present but inaccessible, or the discovered vid/pid are unusable
+    /// (zero), since rendering `0000:0000:<serial>` would silently no-op every
+    /// remote attach.
     async fn resolve_board_ids(&self, board: &BoardSpec) -> Result<BoardSpec, String> {
         let discovered = self.lister.list_probes().await?;
+        // Refuse a probe probe-rs 0.32 reported as `(inaccessible)`: `serve`
+        // would start but never be able to open the probe. Fail here, naming
+        // the likely cause, rather than at attach time.
+        if let Some(p) = discovered.iter().find(|p| p.serial == board.serial) {
+            if p.inaccessible {
+                return Err(format!(
+                    "probe with serial {} is attached but inaccessible to probe-rs \
+                     (`probe-rs list` marks it `(inaccessible)`); check USB device-node \
+                     permissions (udev rule / group membership) for this user",
+                    board.serial,
+                ));
+            }
+        }
         let mut boards = crate::config::BoardsConfig {
             boards: vec![board.clone()],
         };
@@ -562,6 +578,7 @@ mod tests {
             vid,
             pid,
             product: Some("J-Link".to_owned()),
+            inaccessible: false,
         }
     }
 
@@ -621,13 +638,17 @@ chip = "nRF52840_xxAA"
         assert!(cfg.contains("[[server.users]]"));
         assert!(cfg.contains("name = \"fleet\""));
         assert!(cfg.contains("token = \"deadbeef\""));
-        // Canonical `vid:pid:serial` selector — the only form probe-rs 0.31's
+        // Canonical `vid:pid:serial` selector — the only form probe-rs 0.32's
         // allow-list matcher accepts. A bare serial silently filters out every
         // probe.
         assert!(cfg.contains("access = { allow = [\"1366:1015:001050257890\"] }"));
         // The bare-serial form (which never matches) must be gone.
         assert!(!cfg.contains("allow = [\"001050257890\"]"));
-        // Stale 0.31-incompatible keys must be gone.
+        // Keys we must never emit. `probe_access` is a stale, never-valid name
+        // (the field is `access`). `socket://` (Unix-socket serve) and
+        // `cycle_power` are *real* 0.32 `ServerConfig` features we deliberately
+        // do not use: we keep the loopback-TCP model, whose token fence
+        // `run_unix` does not implement (issue #297).
         assert!(!cfg.contains("socket://"));
         assert!(!cfg.contains("probe_access"));
         assert!(!cfg.contains("cycle_power"));
@@ -672,6 +693,25 @@ chip = "nRF52840_xxAA"
         };
         assert!(err.contains("not found"), "unexpected error: {err}");
         assert!(err.contains("001050257890"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn serve_spec_rejects_inaccessible_probe() {
+        // probe-rs 0.32 marks probes it cannot open `(inaccessible)`. Spawning
+        // `serve` against one would start a server that can never attach, so we
+        // fail up front and name the permissions cause.
+        let dir = std::env::temp_dir().join(format!("frs-inacc-test-{}", std::process::id()));
+        let probe = DiscoveredProbe {
+            inaccessible: true,
+            ..discovered("001050257890", 0x1366, 0x1015)
+        };
+        let be = ProcessBackend::new(dir).with_lister(Arc::new(StubLister(vec![probe])));
+        let Err(err) = be.serve_spec(&undiscovered_board()).await else {
+            panic!("expected an error when the board's probe is inaccessible");
+        };
+        assert!(err.contains("inaccessible"), "unexpected error: {err}");
+        assert!(err.contains("001050257890"), "unexpected error: {err}");
+        assert!(err.contains("permissions"), "unexpected error: {err}");
     }
 
     #[tokio::test]

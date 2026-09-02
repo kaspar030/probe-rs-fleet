@@ -1,7 +1,8 @@
 //! gdb-channel support: tunnel a board-local `probe-rs gdb` TCP stub as a
 //! second opaque relay channel (architecture §4.2 gap note, §10 Q3).
 //!
-//! `probe-rs gdb` is **not** remote-capable in probe-rs 0.31: it ignores any
+//! `probe-rs gdb` is **not** remote-capable in probe-rs 0.32 (re-verified at
+//! the v0.32.0 tag): it ignores any
 //! RPC client and binds a local gdbremote TCP stub (default `127.0.0.1:1337`,
 //! `--gdb-connection-string` overridable), entirely outside postcard-rpc. So it
 //! cannot ride the data plane. Instead, on a [`ChannelKind::Gdb`] open the agent

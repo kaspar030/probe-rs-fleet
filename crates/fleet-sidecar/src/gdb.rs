@@ -2,7 +2,7 @@
 //! user's gdb client connects to, byte-spliced to the agent's board-local
 //! `probe-rs gdb` stub through the relay (architecture §4.2 gap note, §10 Q3).
 //!
-//! `probe-rs gdb` is not remote-capable in probe-rs 0.31 (it runs a local TCP
+//! `probe-rs gdb` is not remote-capable in probe-rs 0.32 (it runs a local TCP
 //! gdb stub, not over postcard-rpc). So the fleet path does **not** exec the
 //! genuine `probe-rs gdb` here. Instead:
 //!

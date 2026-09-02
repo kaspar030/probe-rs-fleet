@@ -107,7 +107,7 @@ pub struct BoardSpec {
     /// USB vendor id of the bound probe. Not declared in `boards.toml`; filled
     /// in at runtime from USB discovery (see [`crate::discovery`]) so the serve
     /// config can emit the canonical `vid:pid:serial` allow selector that
-    /// probe-rs 0.31's allow-list matcher accepts.
+    /// probe-rs 0.32's allow-list matcher accepts.
     #[serde(skip)]
     pub vid: u16,
     /// USB product id of the bound probe. Filled in at runtime from USB

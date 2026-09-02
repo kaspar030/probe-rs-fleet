@@ -35,7 +35,37 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
     let mut matched_serials: Vec<&str> = Vec::new();
 
     for board in &boards.boards {
-        let present = discovered.iter().any(|p| p.serial == board.serial);
+        // An inaccessible probe (probe-rs 0.32 `" (inaccessible)"` marker) is
+        // physically attached but cannot be opened, so it must NOT count as
+        // present: advertising the board Online would only make every lease on
+        // it fail at `probe-rs serve` spawn time.
+        //
+        // This cannot flap a *leased* board: `inaccessible` is
+        // `Accessibility::PermissionDenied`, which probe-rs derives from an
+        // `access(2)` R_OK|W_OK check on the probe's `/dev/bus/usb/...` node
+        // (Linux-only; always accessible elsewhere). It is a pure permissions
+        // check and explicitly not a busy check — a probe held open by our own
+        // `probe-rs serve` still lists as accessible.
+        //
+        // Operational note: on a misconfigured host (agent user lacking usbfs
+        // permissions) *every* board now reports Offline instead of going
+        // Online and failing at serve time. That is the intent; the warn below
+        // is what makes it diagnosable.
+        let present = discovered
+            .iter()
+            .any(|p| p.serial == board.serial && !p.inaccessible);
+        if !present
+            && discovered
+                .iter()
+                .any(|p| p.serial == board.serial && p.inaccessible)
+        {
+            tracing::warn!(
+                serial = %board.serial,
+                board = %board.id,
+                "probe present but inaccessible (USB device-node permissions?); \
+                 board reported offline"
+            );
+        }
         if present {
             matched_serials.push(&board.serial);
         }
@@ -72,7 +102,7 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
 /// probe, matched by serial against live discovery.
 ///
 /// `boards.toml` keys boards by serial only; the canonical probe selector
-/// probe-rs 0.31 requires (`vid:pid:serial`, see
+/// probe-rs 0.32 requires (`vid:pid:serial`, see
 /// [`crate::probers::ServeSpec::render_server_config`]) needs the USB ids, which
 /// are only known at runtime from enumeration.
 ///
@@ -84,6 +114,11 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
 ///
 /// Boards whose probe is absent are left untouched (their vid/pid stay at their
 /// previous value); they cannot be served anyway.
+///
+/// Probes flagged `inaccessible` are deliberately *not* filtered here: stamping
+/// the real vid/pid off an unopenable probe is harmless and keeps diagnostics
+/// truthful. The serve path refuses inaccessible probes explicitly (see
+/// [`ProcessBackend::serve_spec`](crate::probers::ProcessBackend::serve_spec)).
 pub fn enrich_boards_with_discovery(boards: &mut BoardsConfig, discovered: &[DiscoveredProbe]) {
     for board in &mut boards.boards {
         if let Some(probe) = discovered.iter().find(|p| p.serial == board.serial) {
@@ -96,11 +131,13 @@ pub fn enrich_boards_with_discovery(boards: &mut BoardsConfig, discovered: &[Dis
 /// Parse one line of `probe-rs list` human-readable output into a
 /// [`DiscoveredProbe`], or `None` if the line is not a probe entry.
 ///
-/// probe-rs 0.31 prints each probe as (see `cmd/list.rs` +
-/// `impl Display for DebugProbeInfo`, probe-rs 0.31.0):
+/// probe-rs 0.32 prints each probe as (see `cmd/list.rs`, which formats
+/// `DebugProbeEntry` from `rpc/functions/probe.rs` — character-for-character
+/// the same shape as `impl Display for DebugProbeInfo`, unchanged since 0.31):
 ///
 /// ```text
 /// [0]: J-Link -- 1366:0101:000776543210 (J-Link)
+/// [1]: J-Link -- 1366:0101:000776543211 (J-Link) (inaccessible)
 /// ```
 ///
 /// The token after `" -- "` is `{vid:04x}:{pid:04x}[-{interface}]:{serial} (…)`.
@@ -108,8 +145,16 @@ pub fn enrich_boards_with_discovery(boards: &mut BoardsConfig, discovered: &[Dis
 /// pid) and a missing serial (empty between the last `:` and ` (`) are both
 /// tolerated. Header / "No debug probes" lines and anything without the
 /// `" -- "` / hex-vid:pid shape return `None`.
+///
+/// New in 0.32: the trailing `" (inaccessible)"` marker, appended *after* the
+/// `" (<probe type>)"` descriptor when probe-rs cannot open the probe. It is
+/// captured into [`DiscoveredProbe::inaccessible`]; because the id parse stops
+/// at the *first* `" ("`, the marker does not disturb vid/pid/serial.
 #[must_use]
 pub fn parse_probe_list_line(line: &str) -> Option<DiscoveredProbe> {
+    // 0.32 marker, appended after the probe-type descriptor. Match the leading
+    // space too, so a probe type ending in that token cannot false-positive.
+    let inaccessible = line.trim_end().ends_with(" (inaccessible)");
     // Everything after the first " -- " is the `vid:pid[-iface]:serial (type)` tail.
     let tail = line.split_once(" -- ")?.1;
     // Strip the trailing " (type)" descriptor, if present.
@@ -129,6 +174,7 @@ pub fn parse_probe_list_line(line: &str) -> Option<DiscoveredProbe> {
         vid,
         pid,
         product: None,
+        inaccessible,
     })
 }
 
@@ -163,6 +209,12 @@ impl ProbeLister for ProbeRsListLister {
     async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
         let output = tokio::process::Command::new(&self.program)
             .arg("list")
+            // probe-rs 0.32 prints multi-line USB-permission setup hints
+            // whenever a probe is inaccessible or none are found. They go to
+            // stderr (we only parse stdout), but the agent shells out on every
+            // discovery pass, so silence the noise. The gate is a bare
+            // `env::var(..).is_ok()`, so any value suppresses.
+            .env("PROBE_RS_DISABLE_SETUP_HINTS", "1")
             .stdin(std::process::Stdio::null())
             .output()
             .await
@@ -199,6 +251,14 @@ mod tests {
             vid: 0x1366,
             pid: 0x1015,
             product: Some("probe".to_owned()),
+            inaccessible: false,
+        }
+    }
+
+    fn inaccessible_probe(serial: &str) -> DiscoveredProbe {
+        DiscoveredProbe {
+            inaccessible: true,
+            ..probe(serial)
         }
     }
 
@@ -256,7 +316,34 @@ chip = "c2"
             vid,
             pid,
             product: Some("probe".to_owned()),
+            inaccessible: false,
         }
+    }
+
+    #[test]
+    fn inaccessible_probe_does_not_make_board_online() {
+        // probe-rs 0.32 reports a present-but-unopenable probe; the board must
+        // stay Offline rather than being leased and failing at serve time.
+        let inv = reconcile(&boards(), &[inaccessible_probe("AAA")]);
+        let b1 = inv.boards.iter().find(|b| b.board.0 == "b1").unwrap();
+        assert_eq!(b1.presence, BoardPresence::Offline);
+        assert!(!is_leasable(&inv, &BoardId("b1".into())));
+    }
+
+    #[test]
+    fn accessible_duplicate_still_brings_board_online() {
+        // Same serial listed twice (e.g. two interfaces), one openable: Online.
+        let inv = reconcile(&boards(), &[inaccessible_probe("AAA"), probe("AAA")]);
+        let b1 = inv.boards.iter().find(|b| b.board.0 == "b1").unwrap();
+        assert_eq!(b1.presence, BoardPresence::Online);
+    }
+
+    #[test]
+    fn inaccessible_undeclared_probe_is_reported_as_unknown_with_flag() {
+        let inv = reconcile(&boards(), &[probe("AAA"), inaccessible_probe("ZZZ")]);
+        assert_eq!(inv.unknown.len(), 1);
+        assert_eq!(inv.unknown[0].serial, "ZZZ");
+        assert!(inv.unknown[0].inaccessible);
     }
 
     #[test]
@@ -278,11 +365,31 @@ chip = "c2"
         // J-Link with serial (the nRF52840-DK's onboard J-Link OB).
         let p = parse_probe_list_line("[0]: J-Link -- 1366:0101:000776543210 (J-Link)").unwrap();
         assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "000776543210"));
+        assert!(!p.inaccessible);
 
         // CMSIS-DAP with serial.
         let p = parse_probe_list_line("[1]: Foo CMSIS-DAP -- 0d28:0204:0123ABCD (CMSIS-DAP)")
             .unwrap();
         assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x0d28, 0x0204, "0123ABCD"));
+        assert!(!p.inaccessible);
+    }
+
+    #[test]
+    fn parses_inaccessible_probe_line() {
+        // probe-rs 0.32 appends the marker *after* the " (<type>)" descriptor.
+        let p =
+            parse_probe_list_line("[0]: J-Link -- 1366:0101:000776543210 (J-Link) (inaccessible)")
+                .unwrap();
+        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "000776543210"));
+        assert!(p.inaccessible);
+
+        // Same, with the interface-index suffix on the pid.
+        let p = parse_probe_list_line(
+            "[0]: HID Probe -- 1366:0101-0:001050257890 (J-Link) (inaccessible)",
+        )
+        .unwrap();
+        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "001050257890"));
+        assert!(p.inaccessible);
     }
 
     #[test]
@@ -291,6 +398,7 @@ chip = "c2"
         let p = parse_probe_list_line("[0]: HID Probe -- 1366:0101-0:001050257890 (J-Link)")
             .unwrap();
         assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "001050257890"));
+        assert!(!p.inaccessible);
 
         // No serial reported: empty between the last `:` and ` (`.
         let p = parse_probe_list_line("[0]: Nameless -- 1366:0101: (J-Link)").unwrap();

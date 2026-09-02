@@ -73,7 +73,7 @@ pub enum ProbeRsInvocation {
         extra: Vec<String>,
     },
     /// `probe-rs gdb --chip <C> [--gdb-connection-string <addr>]` — long-lived
-    /// local gdb TCP server. Not remote-capable in probe-rs 0.31, so the fleet
+    /// local gdb TCP server. Not remote-capable in probe-rs 0.32, so the fleet
     /// path tunnels raw gdbremote TCP as a second relay channel: the sidecar
     /// opens a local listener (default `127.0.0.1:1337`, overridable via
     /// `--gdb-connection-string`) the user's gdb client connects to (see the

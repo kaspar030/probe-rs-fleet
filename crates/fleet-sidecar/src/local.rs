@@ -24,7 +24,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Environment variable names the genuine probe-rs client honours for remote
-/// operation (probe-rs 0.31).
+/// operation (probe-rs 0.32).
 pub mod remote_env {
     /// Remote host the probe-rs client connects to as its remote. Must be a
     /// `ws://`/`wss://` base URL (the client appends `/worker` and dials it as

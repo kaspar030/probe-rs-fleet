@@ -56,9 +56,10 @@ seam we build on. It splits the problem cleanly into two planes:
 
 ### Data plane — opaque WebSocket-over-TCP tunnel
 
-The sidecar speaks **vanilla probe-rs**. In probe-rs 0.31 the client/server
+The sidecar speaks **vanilla probe-rs**. In probe-rs 0.31/0.32 the client/server
 link is a **WebSocket** (route `/worker`) over TCP (see §4.2 / corrected by
-#1965). We do **not** parse or re-implement it — we tunnel the raw bytes of that
+#1965, re-verified against v0.32.0 by #3322). We do **not** parse or re-implement
+it — we tunnel the raw bytes of that
 connection:
 
 ```
@@ -271,17 +272,25 @@ probe-rs-fleet ctl --profile ci list    # authenticates via client.toml (mTLS)
 Owns local probes. Reconciles discovered probes against `boards.toml`.
 
 > **Updated by investigation (tasks #1710, #1965 — verified against the real
-> probe-rs 0.31.0 source):** The server is `probe-rs serve`. It takes **no
-> `--probe` / `--chip`** — it exposes *all* local probes and the connecting
-> client selects probe + chip **in-band**. So there is **no CLI injection
-> point** for the agent; the earlier "agent injects `--probe`" model is dropped.
+> probe-rs 0.31.0 source; re-verified line-by-line against v0.32.0 by #3322,
+> which found no change to any of it):** The server is `probe-rs serve`. It
+> takes **no `--probe` / `--chip`** — it exposes *all* local probes and the
+> connecting client selects probe + chip **in-band**. So there is **no CLI
+> injection point** for the agent; the earlier "agent injects `--probe`" model
+> is dropped.
 >
 > **Correction (#1965):** the #1710 model of `serve` as a *Unix-socket, raw
 > `u32-LE postcard`, `address="socket://…"`, server config via `--config`*
-> transport was **inaccurate** for probe-rs 0.31. The genuine `probe-rs serve`:
+> transport was **inaccurate** for probe-rs 0.31 (and still is for 0.32). The
+> genuine `probe-rs serve`:
 >
-> - **Binds TCP**, default `0.0.0.0:3000` (`TcpListener::bind`); there is **no
->   `socket://` address scheme**.
+> - **Binds TCP**, default `0.0.0.0:3000` (`TcpListener::bind`). *(0.32 update:
+>   an `address = "socket://<path>"` Unix-socket scheme **does** now exist, so
+>   the "no `socket://` scheme" wording above was true for 0.31 only. We
+>   deliberately keep the loopback-TCP model: 0.32's `run_unix()` ignores
+>   `config.users` entirely — no challenge/token auth at all, only `0o660` fs
+>   permissions — so adopting it would silently remove our per-board
+>   `ProbeAccess::Allow` fence. Tracked as issue #297.)*
 > - **Speaks WebSocket** at route `/worker` (axum), with **challenge/token**
 >   auth (`Probe-Rs-Challenge` header; client replies `sha512(challenge||token)`).
 > - Has **no `--config` flag**. `ServerConfig` is the `server` field of the
@@ -318,9 +327,9 @@ Decided agent model (per #1710, corrected by #1965):
   in addition to the fleet lease layer.
 - **Embedding probe-rs as a library is unnecessary for v1** — the subprocess
   `serve` model is byte-compatible with any deployed probe-rs version.
-- **`probe-rs gdb` / `debug` are NOT remote-capable in 0.31; gdb is tunneled as
-  a second opaque channel.** gdb runs a separate local TCP stub (default
-  `127.0.0.1:1337`), not over postcard-rpc. So the fleet runs `probe-rs gdb`
+- **`probe-rs gdb` / `debug` are NOT remote-capable in 0.31 or 0.32; gdb is
+  tunneled as a second opaque channel.** gdb runs a separate local TCP stub
+  (default `127.0.0.1:1337`), not over postcard-rpc. So the fleet runs `probe-rs gdb`
   **on the agent** (which has the physical probe) and tunnels its raw gdbremote
   TCP as a **second relay channel** (`ChannelKind::Gdb`), structurally identical
   to the data plane. On a gdb-kind `OpenSession` the agent spawns `probe-rs gdb
@@ -332,7 +341,9 @@ Decided agent model (per #1710, corrected by #1965):
   capability token (`AllowedOp::Gdb`). `debug` (TUI) / `dap_server` are the same
   gap class but out of scope for v1. An upstream probe-rs feature request to make
   `gdb` drive a remote `Session` over postcard-rpc (which would obsolete this
-  tunnel) is an optional follow-up.
+  tunnel) is an optional follow-up. *(Post-0.32 master has since made `probe-rs
+  gdb` attach through the RPC client, so this tunnel can likely be retired once
+  0.33 ships — unreleased, so nothing changes yet; tracked as issue #298.)*
 
 Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
@@ -489,7 +500,7 @@ Observations that shape the sidecar:
   Because the real client computes the **exit code** locally as a byproduct,
   exit-code propagation is **free** — the relay only tunnels RPC frames. (Do
   *not* reimplement the client, or we'd have to re-derive exit-code logic.)
-- **`gdb` is special (not remote-capable in probe-rs 0.31).** It is *not*
+- **`gdb` is special (not remote-capable in probe-rs 0.31 or 0.32).** It is *not*
   expressed over postcard-rpc; the agent runs `probe-rs gdb` locally and the
   fleet tunnels its raw gdbremote TCP as a **second opaque channel**
   (`ChannelKind::Gdb`). The **sidecar** opens a local TCP listener (default
@@ -569,8 +580,8 @@ probe-rs-fleet/
    only manages process lifecycle + `--probe`. If not, file tasks against
    probe-rs (or myelin, per your offer). Needs a look at probe-rs's server impl.
 3. **gdb / TCP tunneling.** *Resolved (v1):* `probe-rs gdb` is not
-   remote-capable in 0.31, so the agent runs `probe-rs gdb` locally and its raw
-   gdbremote TCP is tunneled as a **second relay channel** (`ChannelKind::Gdb`),
+   remote-capable in 0.31 or 0.32, so the agent runs `probe-rs gdb` locally and
+   its raw gdbremote TCP is tunneled as a **second relay channel** (`ChannelKind::Gdb`),
    parallel to the postcard-rpc data plane (see §4.2, §7). Both planes share the
    same opaque `DataFrame` byte-pump; the coordinator relays gdb frames
    identically and a lease may hold a data channel and a gdb channel

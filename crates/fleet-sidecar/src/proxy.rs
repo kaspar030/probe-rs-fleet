@@ -3,7 +3,7 @@
 //!
 //! # How the sidecar proxies
 //!
-//! The sidecar does **not** re-implement the probe-rs client. probe-rs 0.31's
+//! The sidecar does **not** re-implement the probe-rs client. probe-rs 0.32's
 //! own client honours `PROBE_RS_REMOTE_HOST` / `PROBE_RS_REMOTE_TOKEN` (and the
 //! `--host` / `--token` flags): it builds `{host}/worker` and dials it as a
 //! **WebSocket** (so `host` must be a `ws://` base URL), doing probe + chip
@@ -39,7 +39,7 @@
 //!
 //! # gdb
 //!
-//! `probe-rs gdb` is **not** remote-capable in probe-rs 0.31 (it runs a local
+//! `probe-rs gdb` is **not** remote-capable in probe-rs 0.32 (it runs a local
 //! TCP gdb stub, not over the remote WebSocket). The fleet path therefore does not exec
 //! the genuine client for `gdb`; instead it tunnels raw gdbremote bytes to an
 //! agent that runs `probe-rs gdb` locally, as a **second relay channel**

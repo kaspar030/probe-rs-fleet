@@ -52,4 +52,13 @@ pub struct ChannelId(pub u64);
 /// Wire protocol version. Bumped on any incompatible change to the control
 /// plane message set. Peers exchange this at connection setup and refuse
 /// mismatches.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// A bump forces a **lockstep** upgrade of agent + coordinator + sidecar + ctl.
+/// All four roles ship from the single `fleet-bin` binary, so that is cheap in
+/// practice, but a half-upgraded fleet will refuse to connect (by design).
+///
+/// * 2 → 3: [`DiscoveredProbe`] gained `inaccessible` (probe-rs 0.32 `probe-rs
+///   list` reports probes it cannot open). postcard is positional, so adding a
+///   field changes the encoding of every `AgentReport::Inventory`; `#[serde(default)]`
+///   would not have saved it.
+pub const PROTOCOL_VERSION: u32 = 3;
