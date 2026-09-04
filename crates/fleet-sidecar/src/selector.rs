@@ -4,25 +4,29 @@
 //! probe serial. The fleet *board* is selected out-of-band via environment
 //! variables (additive; no laze change required):
 //!
-//! | variable                     | meaning                                              |
-//! |------------------------------|------------------------------------------------------|
-//! | `PROBE_RS_FLEET_BOARD`       | explicit board id (e.g. `nrf52840-dk-3`)             |
-//! | `PROBE_RS_FLEET_SELECT`      | constraint expression (e.g. `tag=nrf52 && bluetooth`)|
-//! | `PROBE_RS_FLEET_COORDINATOR` | coordinator endpoint (`host:port`)                   |
-//! | `PROBE_RS_FLEET_TOKEN`       | bearer token for coordinator auth                    |
-//! | `PROBE_RS_FLEET_CLIENT_CERT` | path to client mTLS cert chain (PEM)                 |
-//! | `PROBE_RS_FLEET_CLIENT_KEY`  | path to client mTLS private key (PEM)                |
-//! | `PROBE_RS_FLEET_CA`          | path to the CA root the coordinator is pinned to     |
-//! | `PROBE_RS_FLEET_SUBJECT_ID`  | optional subject-id override (else derived from cert) |
+//! | variable                          | meaning                                              |
+//! |-----------------------------------|------------------------------------------------------|
+//! | `PROBE_RS_FLEET_BOARD`            | explicit board id (e.g. `nrf52840-dk-3`)             |
+//! | `PROBE_RS_FLEET_SELECT`           | constraint expression (e.g. `tag=nrf52 && bluetooth`)|
+//! | `PROBE_RS_FLEET_COORDINATOR`      | coordinator URL (`https://fleet.example`, or `host:port`) |
+//! | `PROBE_RS_FLEET_TOKEN`            | the bearer session token                             |
+//! | `PROBE_RS_FLEET_SERVER_CERT_SHA256` | optional pinned server-cert hash (self-hosted)     |
 //!
 //! Resolution rules:
 //!
 //! * If **no** fleet variable is set ⇒ [`Resolution::Local`]: invoke the real
 //!   local `probe-rs` transparently. Local developer experience is unchanged.
 //! * If a board/select selector is set ⇒ [`Resolution::Fleet`], provided the
-//!   coordinator endpoint and *some* form of auth (token, or cert+key) are
-//!   present. A partial configuration (selector but no coordinator, or
-//!   coordinator but no auth) is a hard [`SelectorError`] — we refuse to guess.
+//!   coordinator URL and a token are both present. A partial configuration
+//!   (selector but no coordinator, or coordinator but no token) is a hard
+//!   [`SelectorError`] — we refuse to guess.
+//!
+//! # What is deliberately *not* here any more
+//!
+//! Revision 2 deleted `PROBE_RS_FLEET_CLIENT_CERT` / `_CLIENT_KEY` / `_CA` with
+//! the private CA, and `PROBE_RS_FLEET_SUBJECT_ID` with them. That last one was
+//! not merely dead config: it let a client assert its own identity to the
+//! coordinator. The subject now comes from the token and from nowhere else.
 //!
 //! The environment is read through an injectable [`EnvSource`] so tests never
 //! touch the real process environment.
@@ -36,19 +40,13 @@ pub mod env {
     pub const BOARD: &str = "PROBE_RS_FLEET_BOARD";
     /// Constraint-expression selector.
     pub const SELECT: &str = "PROBE_RS_FLEET_SELECT";
-    /// Coordinator endpoint (`host:port`).
+    /// Coordinator base URL (`https://host[:port]`, or a bare `host:port`).
     pub const COORDINATOR: &str = "PROBE_RS_FLEET_COORDINATOR";
-    /// Bearer token for coordinator auth.
+    /// The bearer session token.
     pub const TOKEN: &str = "PROBE_RS_FLEET_TOKEN";
-    /// Path to the client mTLS certificate chain (PEM).
-    pub const CLIENT_CERT: &str = "PROBE_RS_FLEET_CLIENT_CERT";
-    /// Path to the client mTLS private key (PEM).
-    pub const CLIENT_KEY: &str = "PROBE_RS_FLEET_CLIENT_KEY";
-    /// Path to the pinned CA root (PEM).
-    pub const CA: &str = "PROBE_RS_FLEET_CA";
-    /// Optional subject-id override (the org is always the coordinator's to
-    /// decide).
-    pub const SUBJECT_ID: &str = "PROBE_RS_FLEET_SUBJECT_ID";
+    /// Optional pinned coordinator server-certificate SHA-256 (64 hex chars),
+    /// for a self-hosted deployment with no publicly trusted certificate.
+    pub const SERVER_CERT_SHA256: &str = "PROBE_RS_FLEET_SERVER_CERT_SHA256";
 }
 
 /// A source of environment variables. Implemented for the real process
@@ -77,36 +75,33 @@ where
     }
 }
 
-/// Authentication material for the coordinator connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Auth {
-    /// A bearer token (`PROBE_RS_FLEET_TOKEN`).
-    Token(String),
-    /// Mutual-TLS client identity: cert chain + key paths, plus the pinned CA.
-    Mtls {
-        client_cert: String,
-        client_key: String,
-        ca: Option<String>,
-    },
-}
-
 /// A fully-resolved fleet configuration: where to lease, how to authenticate,
 /// and which board to claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetConfig {
-    /// Coordinator endpoint (`host:port`).
+    /// Coordinator base URL.
     pub coordinator: String,
-    /// How to authenticate to the coordinator.
-    pub auth: Auth,
+    /// The bearer token presented on the `WebSocket` upgrade.
+    ///
+    /// One credential, whatever the principal is: a user session token, or (in
+    /// a later task) a workload token exchanged per CI job. The coordinator
+    /// resolves it to a `Subject`; the client has no say in who it is.
+    pub token: String,
     /// Which board to lease.
     pub select: Constraint,
-    /// The calling subject **id**, if explicitly overridden. Otherwise the
-    /// coordinator derives it from the client cert at connect time.
-    ///
-    /// Only the id: a sidecar cannot know or choose its org. The coordinator
-    /// assigns the org when it resolves the connection to a `Subject`, which
-    /// is what keeps a client from asserting its way into another tenant.
-    pub subject_id: Option<String>,
+    /// Optional pinned coordinator server-certificate SHA-256, as 64 lowercase
+    /// hex characters.
+    pub server_cert_sha256: Option<String>,
+}
+
+impl FleetConfig {
+    /// The pinned server-certificate hash, decoded.
+    #[must_use]
+    pub fn server_pin(&self) -> Option<[u8; 32]> {
+        self.server_cert_sha256
+            .as_deref()
+            .and_then(fleet_tls::parse_fingerprint)
+    }
 }
 
 /// The outcome of [`resolve`].
@@ -127,13 +122,8 @@ pub enum SelectorError {
         env::COORDINATOR
     )]
     MissingCoordinator,
-    /// A coordinator/selector is configured but no usable auth was provided.
-    #[error(
-        "no coordinator auth: set {} or both {} and {}",
-        env::TOKEN,
-        env::CLIENT_CERT,
-        env::CLIENT_KEY
-    )]
+    /// A coordinator/selector is configured but no bearer token was provided.
+    #[error("no coordinator credential: set {}", env::TOKEN)]
     MissingAuth,
     /// Both `PROBE_RS_FLEET_BOARD` and `PROBE_RS_FLEET_SELECT` were set.
     #[error(
@@ -152,13 +142,12 @@ pub enum SelectorError {
     /// The constraint expression in `PROBE_RS_FLEET_SELECT` was malformed.
     #[error("invalid {} expression: {reason}", env::SELECT)]
     InvalidSelect { reason: String },
-    /// Only one of the mTLS cert/key pair was provided.
-    #[error(
-        "incomplete mTLS identity: set both {} and {}",
-        env::CLIENT_CERT,
-        env::CLIENT_KEY
-    )]
-    IncompleteMtls,
+    /// The pinned server-certificate hash was not 64 hex characters.
+    ///
+    /// Rejected rather than ignored: silently dropping a malformed pin would
+    /// downgrade a deliberately pinned deployment to WebPKI verification.
+    #[error("invalid {}: expected 64 hex characters", env::SERVER_CERT_SHA256)]
+    InvalidPin,
 }
 
 /// Resolve the fleet configuration from an [`EnvSource`].
@@ -173,21 +162,12 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     let select = env.get(env::SELECT).filter(|s| !s.is_empty());
     let coordinator = env.get(env::COORDINATOR).filter(|s| !s.is_empty());
     let token = env.get(env::TOKEN).filter(|s| !s.is_empty());
-    let client_cert = env.get(env::CLIENT_CERT).filter(|s| !s.is_empty());
-    let client_key = env.get(env::CLIENT_KEY).filter(|s| !s.is_empty());
-    let ca = env.get(env::CA).filter(|s| !s.is_empty());
-    let subject_id = env
-        .get(env::SUBJECT_ID)
+    let pin = env
+        .get(env::SERVER_CERT_SHA256)
         .filter(|s| !s.is_empty());
 
-    let any_fleet = board.is_some()
-        || select.is_some()
-        || coordinator.is_some()
-        || token.is_some()
-        || client_cert.is_some()
-        || client_key.is_some()
-        || ca.is_some()
-        || subject_id.is_some();
+    let any_fleet =
+        board.is_some() || select.is_some() || coordinator.is_some() || token.is_some() || pin.is_some();
 
     // No fleet variables at all → transparent local fallback.
     if !any_fleet {
@@ -203,26 +183,19 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     };
 
     let coordinator = coordinator.ok_or(SelectorError::MissingCoordinator)?;
+    let token = token.ok_or(SelectorError::MissingAuth)?;
 
-    // Resolve auth: prefer an explicit token, else an mTLS identity.
-    let auth = match (token, client_cert, client_key) {
-        (Some(t), _, _) => Auth::Token(t),
-        (None, Some(cert), Some(key)) => Auth::Mtls {
-            client_cert: cert,
-            client_key: key,
-            ca,
-        },
-        (None, Some(_), None) | (None, None, Some(_)) => {
-            return Err(SelectorError::IncompleteMtls)
+    if let Some(pin) = &pin {
+        if fleet_tls::parse_fingerprint(pin).is_none() {
+            return Err(SelectorError::InvalidPin);
         }
-        (None, None, None) => return Err(SelectorError::MissingAuth),
-    };
+    }
 
     Ok(Resolution::Fleet(FleetConfig {
         coordinator,
-        auth,
+        token,
         select: constraint,
-        subject_id,
+        server_cert_sha256: pin,
     }))
 }
 
@@ -333,19 +306,18 @@ mod tests {
         };
         assert_eq!(cfg.coordinator, "coord.example:4443");
         assert_eq!(cfg.select, Constraint::Board(BoardName("nrf52840-dk-3".to_owned())));
-        assert_eq!(cfg.auth, Auth::Token("secret".to_owned()));
-        assert_eq!(cfg.subject_id, None);
+        assert_eq!(cfg.token, "secret");
+        assert!(cfg.server_pin().is_none());
     }
 
     #[test]
-    fn select_expr_with_mtls() {
+    fn select_expr_with_pin() {
+        let pin = "ab".repeat(32);
         let env = MapEnv::new(&[
             (env::SELECT, "tag=nrf52 && bluetooth"),
-            (env::COORDINATOR, "coord:4443"),
-            (env::CLIENT_CERT, "/c/cert.pem"),
-            (env::CLIENT_KEY, "/c/key.pem"),
-            (env::CA, "/c/ca.pem"),
-            (env::SUBJECT_ID, "ci-bot"),
+            (env::COORDINATOR, "https://coord.example"),
+            (env::TOKEN, "prfs1_secret"),
+            (env::SERVER_CERT_SHA256, &pin),
         ]);
         let Resolution::Fleet(cfg) = resolve(&env).unwrap() else {
             panic!("expected Fleet");
@@ -354,15 +326,21 @@ mod tests {
             cfg.select,
             Constraint::Tags(vec!["nrf52".to_owned(), "bluetooth".to_owned()])
         );
-        assert_eq!(
-            cfg.auth,
-            Auth::Mtls {
-                client_cert: "/c/cert.pem".to_owned(),
-                client_key: "/c/key.pem".to_owned(),
-                ca: Some("/c/ca.pem".to_owned()),
-            }
-        );
-        assert_eq!(cfg.subject_id, Some("ci-bot".to_owned()));
+        assert_eq!(cfg.token, "prfs1_secret");
+        assert_eq!(cfg.server_pin(), Some([0xabu8; 32]));
+    }
+
+    /// A malformed pin is an error, not a shrug: ignoring it would quietly
+    /// downgrade a pinned self-hosted deployment to WebPKI verification.
+    #[test]
+    fn malformed_pin_is_an_error() {
+        let env = MapEnv::new(&[
+            (env::BOARD, "b"),
+            (env::COORDINATOR, "c:1"),
+            (env::TOKEN, "t"),
+            (env::SERVER_CERT_SHA256, "not-a-hash"),
+        ]);
+        assert_eq!(resolve(&env), Err(SelectorError::InvalidPin));
     }
 
     #[test]
@@ -391,16 +369,6 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_mtls_is_error() {
-        let env = MapEnv::new(&[
-            (env::BOARD, "b"),
-            (env::COORDINATOR, "c:1"),
-            (env::CLIENT_CERT, "/c/cert.pem"),
-        ]);
-        assert_eq!(resolve(&env), Err(SelectorError::IncompleteMtls));
-    }
-
-    #[test]
     fn ambiguous_selector_is_error() {
         let env = MapEnv::new(&[
             (env::BOARD, "b"),
@@ -418,19 +386,26 @@ mod tests {
         assert_eq!(resolve(&env), Err(SelectorError::MissingSelector));
     }
 
+    /// The deleted `PROBE_RS_FLEET_SUBJECT_ID` let a client assert its own
+    /// identity. Setting it now must have no effect whatsoever — in particular
+    /// it must not trip fleet mode on its own, which would be a confusing way to
+    /// discover the variable is gone.
     #[test]
-    fn token_preferred_over_mtls() {
+    fn the_deleted_subject_id_override_has_no_effect() {
+        let env = MapEnv::new(&[("PROBE_RS_FLEET_SUBJECT_ID", "root")]);
+        assert_eq!(resolve(&env).unwrap(), Resolution::Local);
+
         let env = MapEnv::new(&[
             (env::BOARD, "b"),
             (env::COORDINATOR, "c:1"),
             (env::TOKEN, "t"),
-            (env::CLIENT_CERT, "/c/cert.pem"),
-            (env::CLIENT_KEY, "/c/key.pem"),
+            ("PROBE_RS_FLEET_SUBJECT_ID", "root"),
         ]);
         let Resolution::Fleet(cfg) = resolve(&env).unwrap() else {
             panic!("expected Fleet");
         };
-        assert_eq!(cfg.auth, Auth::Token("t".to_owned()));
+        // The struct has no place to put it; identity comes from the token.
+        assert_eq!(cfg.token, "t");
     }
 
     #[test]

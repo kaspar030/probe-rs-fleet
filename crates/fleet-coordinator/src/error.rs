@@ -9,9 +9,21 @@ pub enum CoordinatorError {
     #[error("tls error: {0}")]
     Tls(#[from] fleet_tls::TlsError),
 
-    /// Failed to derive a peer identity from its certificate.
-    #[error("identity error: {0}")]
-    Identity(#[from] fleet_tls::IdentityError),
+    /// A transport-layer failure on a `WebSocket` connection.
+    ///
+    /// Kept distinct from [`CoordinatorError::Io`] so a benign peer close can
+    /// be recognised (see [`CoordinatorError::as_wire`]) and logged as the
+    /// normal end of a short-lived `ctl` session rather than as a fault.
+    #[error("wire error: {0}")]
+    Wire(fleet_wire::WireError),
+
+    /// A bearer-credential failure.
+    #[error("auth error: {0}")]
+    Auth(#[from] fleet_auth::AuthError),
+
+    /// An HTTP-layer failure (listener, upgrade, or serving).
+    #[error("http error: {0}")]
+    Http(String),
 
     /// An I/O failure on a socket or file.
     #[error("io error: {0}")]
@@ -53,6 +65,31 @@ pub enum CoordinatorError {
     /// A configuration value was invalid.
     #[error("configuration error: {0}")]
     Config(String),
+}
+
+impl CoordinatorError {
+    /// View this error as a [`fleet_wire::WireError`], for benign-close
+    /// classification.
+    ///
+    /// `ctl` runs one request and exits, so a peer close is the expected end of
+    /// such a connection. Without this, every `ctl list` would log a transport
+    /// warning on the coordinator.
+    #[must_use]
+    pub fn as_wire(&self) -> fleet_wire::WireError {
+        match self {
+            CoordinatorError::Wire(w) => match w {
+                fleet_wire::WireError::Closed => fleet_wire::WireError::Closed,
+                fleet_wire::WireError::Protocol(m) => fleet_wire::WireError::Protocol(m.clone()),
+                fleet_wire::WireError::Io(io) => {
+                    fleet_wire::WireError::Io(std::io::Error::new(io.kind(), io.to_string()))
+                }
+            },
+            CoordinatorError::Io(io) => {
+                fleet_wire::WireError::Io(std::io::Error::new(io.kind(), io.to_string()))
+            }
+            other => fleet_wire::WireError::Protocol(other.to_string()),
+        }
+    }
 }
 
 /// Convenience result alias for coordinator operations.

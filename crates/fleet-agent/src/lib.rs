@@ -2,7 +2,8 @@
 //!
 //! The agent owns the locally attached probes. It reconciles discovered probes
 //! against an agent-local `boards.toml` (architecture §8), dials **out** to the
-//! coordinator over mTLS and holds a persistent connection (§5), and on command
+//! coordinator over a `WebSocket` — presenting its bearer node token on the
+//! upgrade — and holds that connection open (§5, §3.5), and on command
 //! drives the lifecycle of per-board `probe-rs serve` processes whose byte
 //! streams it splices onto coordinator-relayed data channels (§4.2, per the
 //! task #1710 protocol findings). It also owns USB power control for cleanup

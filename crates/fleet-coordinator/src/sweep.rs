@@ -116,6 +116,16 @@ pub async fn sweep_once(coord: &Coordinator) {
             })
             .await;
     }
+
+    // Expired user sessions are dead credentials; deleting them keeps the table
+    // from growing without bound and makes "how many live sessions are there"
+    // an answerable question. Expiry is *enforced* at verification time
+    // regardless — this is hygiene, not the security boundary.
+    match coord.db().delete_expired_sessions(now_i64).await {
+        Ok(0) => {}
+        Ok(n) => debug!(count = n, "expired sessions swept"),
+        Err(e) => warn!(error = %e, "failed to sweep expired sessions"),
+    }
 }
 
 #[cfg(test)]

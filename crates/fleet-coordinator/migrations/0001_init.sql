@@ -55,21 +55,28 @@ CREATE TABLE member (
 -- Inventory
 -- ---------------------------------------------------------------------------
 
--- A machine offering probes to the fleet. `token_hash` and `adopt_policy` are
--- placeholders for the bearer-auth and adoption tasks respectively; nothing
--- writes them yet.
+-- A machine offering probes to the fleet.
+--
+-- `token_hash` is the lowercase-hex SHA-256 of the node's bearer token: the
+-- secret itself is never stored. Revoking a node is deleting its row, which is
+-- what makes revocation trivially auditable. `token_issued_at` drives the
+-- rotation policy in `fleet-auth`.
 CREATE TABLE node (
-    id            TEXT    NOT NULL PRIMARY KEY,
-    org_id        TEXT    NOT NULL REFERENCES org(id),
-    owner_user_id TEXT    REFERENCES user(id),
-    name          TEXT    NOT NULL,
-    tags          TEXT    NOT NULL DEFAULT '', -- newline-joined
-    token_hash    TEXT,
-    adopt_policy  TEXT    NOT NULL DEFAULT 'manual',
-    last_seen     INTEGER,                     -- epoch seconds
-    created_at    INTEGER NOT NULL,            -- epoch seconds
+    id              TEXT    NOT NULL PRIMARY KEY,
+    org_id          TEXT    NOT NULL REFERENCES org(id),
+    owner_user_id   TEXT    REFERENCES user(id),
+    name            TEXT    NOT NULL,
+    tags            TEXT    NOT NULL DEFAULT '', -- newline-joined
+    token_hash      TEXT,
+    token_issued_at INTEGER,                     -- epoch seconds
+    adopt_policy    TEXT    NOT NULL DEFAULT 'manual',
+    last_seen       INTEGER,                     -- epoch seconds
+    created_at      INTEGER NOT NULL,            -- epoch seconds
     UNIQUE (org_id, name)
 );
+
+-- A node authenticates by presenting its token; the hash is the lookup key.
+CREATE INDEX node_by_token_hash ON node (token_hash);
 
 -- A leasable board. Keyed (org_id, node_id, name) per §6.1: a bare name is only
 -- unique within one node of one org, so revision 1's global board id is gone.
@@ -103,7 +110,7 @@ CREATE TABLE grant (
 );
 
 -- Pre-minted, org-scoped, revocable auth keys for unattended node enrollment.
--- Created by the bearer-auth task; nothing mints them yet.
+-- Redeemed at `POST /auth/token` for a node token.
 CREATE TABLE auth_key (
     key_hash   TEXT    NOT NULL PRIMARY KEY,   -- lowercase hex SHA-256
     org_id     TEXT    NOT NULL REFERENCES org(id),
@@ -111,7 +118,8 @@ CREATE TABLE auth_key (
     single_use INTEGER NOT NULL DEFAULT 1,     -- 0/1
     expires    INTEGER,                        -- epoch seconds
     created_by TEXT,
-    created_at INTEGER NOT NULL                -- epoch seconds
+    created_at INTEGER NOT NULL,               -- epoch seconds
+    consumed_at INTEGER                        -- epoch seconds, NULL until used
 );
 
 -- ---------------------------------------------------------------------------
@@ -163,30 +171,24 @@ CREATE TABLE audit_log (
 CREATE INDEX idx_audit_org_ts ON audit_log (org_id, ts);
 
 -- ---------------------------------------------------------------------------
--- Revision-1 mTLS bootstrap enrollment
+-- Sessions
 -- ---------------------------------------------------------------------------
+
+-- A user's bearer session. Short-lived and refreshable: a session token is a
+-- pure bearer credential, so a short TTL is what bounds the value of a leak.
+-- Only the lowercase-hex SHA-256 of the token is stored.
 --
--- The bearer-auth / private-CA-deletion task deletes both of these tables along
--- with the enrollment stack that uses them. Until it lands they stay, now
--- org-scoped so nothing here is a tenancy hole in the meantime.
-
--- One-time bootstrap secrets minted by `coordinator enroll`. The secret itself
--- is never stored; only its lowercase-hex SHA-256.
-CREATE TABLE enroll_tokens (
-    secret_hash TEXT    NOT NULL PRIMARY KEY,
-    org_id      TEXT    NOT NULL REFERENCES org(id),
-    principal   TEXT    NOT NULL,              -- cert CN to issue
-    kind        TEXT    NOT NULL,              -- 'agent' | 'client'
-    created_at  INTEGER NOT NULL,              -- epoch seconds
-    expires_at  INTEGER NOT NULL,              -- epoch seconds
-    consumed_at INTEGER                        -- epoch seconds, NULL until used
+-- `user_id` carries its foreign key like every other table here. The
+-- provisioning order (org → user → member → session) guarantees the row exists,
+-- and a session for a nonexistent user is a bug we want to fail loudly at
+-- insert rather than discover as an unauthenticated-but-valid token.
+CREATE TABLE session (
+    token_hash TEXT    NOT NULL PRIMARY KEY,   -- lowercase hex SHA-256
+    org_id     TEXT    NOT NULL REFERENCES org(id),
+    user_id    TEXT    NOT NULL REFERENCES user(id),
+    issued_at  INTEGER NOT NULL,               -- epoch seconds
+    expires    INTEGER NOT NULL                -- epoch seconds
 );
 
--- Agent pins recorded on successful enrollment: issued cert fingerprint -> the
--- agent id it may claim.
-CREATE TABLE agent_pins (
-    fingerprint TEXT    NOT NULL PRIMARY KEY,  -- lowercase hex SHA-256 of cert DER
-    org_id      TEXT    NOT NULL REFERENCES org(id),
-    agent_id    TEXT    NOT NULL,
-    created_at  INTEGER NOT NULL               -- epoch seconds
-);
+CREATE INDEX session_by_user ON session (org_id, user_id);
+

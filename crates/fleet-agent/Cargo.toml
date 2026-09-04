@@ -17,9 +17,7 @@ gpio = ["dep:tokio-gpiod"]
 [dependencies]
 fleet-proto.workspace = true
 fleet-tls.workspace = true
-fleet-wire.workspace = true
-
-rustls.workspace = true
+fleet-wire = { workspace = true, features = ["tungstenite"] }
 
 postcard.workspace = true
 postcard-rpc.workspace = true
@@ -27,7 +25,6 @@ serde.workspace = true
 
 tokio.workspace = true
 async-trait.workspace = true
-tokio-rustls.workspace = true
 
 toml.workspace = true
 thiserror.workspace = true
@@ -42,6 +39,8 @@ tokio-gpiod = { workspace = true, optional = true }
 [dev-dependencies]
 rand_core.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true
+fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
 
 [lints]
 workspace = true

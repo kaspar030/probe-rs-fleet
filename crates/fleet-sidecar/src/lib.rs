@@ -32,7 +32,7 @@
 //!   a clean no-selector → local fallback.
 //! * [`lease_cache`] — time-based lease sharing keyed by selector + subject key.
 //! * [`proxy`] — the documented relay seam (lease / byte-splice contract).
-//! * [`transport`] — the live mTLS + byte-opaque relay client: lease a board, open
+//! * [`transport`] — the live `WebSocket` + byte-opaque relay client: lease a board, open
 //!   a relay channel, splice the genuine probe-rs client's bytes verbatim.
 //! * [`gdb`] — the gdb-tunnel client side: a local TCP listener (default
 //!   `127.0.0.1:1337`) byte-spliced to the agent's `probe-rs gdb` stub over a
@@ -102,7 +102,8 @@ where
 /// transparently exec the local probe-rs or proxy the session through the
 /// fleet, returning the process exit code to propagate.
 ///
-/// The fleet path leases a board over mTLS, opens a relay channel, exposes a
+/// The fleet path leases a board over a bearer-authenticated `WebSocket`, opens
+/// a relay channel, exposes a
 /// local endpoint, and execs the genuine probe-rs (or tunnels gdb) against it
 /// via [`transport`]. The local fallback path execs probe-rs directly.
 ///
@@ -339,8 +340,9 @@ mod tests {
         // tokio runtime, the Fleet arm must run on the caller's runtime rather
         // than building a nested one. Before the fix, calling the sync `run`
         // here panicked while building the inner runtime; `run_async` drives
-        // `run_fleet` directly and instead surfaces the mandatory-mTLS
-        // transport error (proving we reached the relay code, not a panic).
+        // `run_fleet` directly and instead surfaces a connection error against
+        // the unresolvable host (proving we reached the relay code, not a
+        // panic).
         let env = MapEnv::new(&[
             (selector::env::BOARD, "nrf52840-dk-3"),
             (selector::env::COORDINATOR, "c:4443"),
@@ -354,7 +356,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            RunError::Transport(transport::TransportError::Tls(_))
+            RunError::Transport(transport::TransportError::Connect(_))
         ));
     }
 
@@ -377,14 +379,17 @@ mod tests {
     }
 
 
+    /// The fleet path reaches the transport rather than short-circuiting: with
+    /// a bearer token and an unresolvable coordinator it must surface a
+    /// *connection* error. Before revision 2 this test asserted the opposite —
+    /// that a token-only configuration was refused because mTLS was mandatory —
+    /// which is exactly the requirement bearer auth removed.
     #[test]
-    fn run_fleet_path_requires_mtls() {
-        // Token-only auth is rejected for runtime traffic (mTLS is mandatory);
-        // the fleet path surfaces a transport error rather than connecting.
+    fn run_fleet_path_dials_with_the_bearer_token() {
         let env = MapEnv::new(&[
             (selector::env::BOARD, "nrf52840-dk-3"),
             (selector::env::COORDINATOR, "c:4443"),
-            (selector::env::TOKEN, "t"),
+            (selector::env::TOKEN, "prfs1_t"),
         ]);
         let err = run(
             ["probe-rs", "reset", "--chip", "nrf52"].map(String::from),
@@ -393,7 +398,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            RunError::Transport(transport::TransportError::Tls(_))
+            RunError::Transport(transport::TransportError::Connect(_))
         ));
     }
 

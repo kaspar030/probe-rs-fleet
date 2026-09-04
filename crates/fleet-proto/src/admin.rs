@@ -1,7 +1,7 @@
 //! Operator / admin control-plane payloads (`ctl list` / `who` / `logs`).
 //!
 //! These ride the same sidecar-direction transport as the lease envelopes (a
-//! `ctl` connects with a sidecar-class client certificate), but describe the
+//! `ctl` connects to `/client` with a user session token), but describe the
 //! fleet-wide *operator* surface rather than a single subject's lease. They
 //! are pure data so both the coordinator (which produces them) and `fleet-bin`'s
 //! `ctl` role (which renders them) share one definition.

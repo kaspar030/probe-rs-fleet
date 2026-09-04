@@ -117,13 +117,14 @@ impl Db {
         OrgDb { db: self, org }
     }
 
-    /// Idempotently create the single-user bootstrap: the default org.
+    /// Idempotently create the bootstrap org.
     ///
-    /// There is exactly one user and no deployment, but every row now needs an
-    /// `org_id`, so the mTLS resolution seam assigns every subject to this org
-    /// until GitHub login exists. The matching `user` + `member` rows are
-    /// created lazily by [`Db::ensure_user_member`] when a subject first
-    /// connects, because their id is the certificate CN and is not known here.
+    /// Every row needs an `org_id`, and a self-hosted deployment starts with no
+    /// orgs at all, so this one exists from the first connect. It is *not* the
+    /// org a connection resolves into: a node's org comes from its own row and a
+    /// user's from the session token's, both established at enrollment. This is
+    /// the org the interim admin verbs (`coordinator auth-key`,
+    /// `coordinator user-token`) default to when the operator names none.
     ///
     /// # Errors
     ///
@@ -203,105 +204,266 @@ impl Db {
         Ok(row.and_then(|r| Role::from_label(&r.0)))
     }
 
-    /// Insert a one-time bootstrap enrollment secret (stored by hash), scoped
-    /// to `org`.
+    /// Look up the node whose bearer token hashes to `token_hash`.
+    ///
+    /// Returns `(node id, org, token issued_at)`. The org comes from the node
+    /// **row**, which is the invariant that stops a node token from being
+    /// replayed into another tenant: `/agent` never consults a configured
+    /// default org.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn node_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(AgentId, OrgId, i64)>> {
+        let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT id, org_id, token_issued_at FROM node WHERE token_hash = ?1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, org, issued)| (AgentId(id), OrgId(org), issued.unwrap_or(0))))
+    }
+
+    /// Replace a node's token hash, recording when it was issued.
+    ///
+    /// Called only *after* the node acks the rotation push, so the old token
+    /// stays authoritative until the replacement is known to be on disk (see
+    /// `fleet_auth::rotation`).
     ///
     /// # Errors
     ///
     /// Returns a database error if the write fails.
-    pub async fn insert_enroll_token(
+    pub async fn set_node_token_hash(
+        &self,
+        node: &AgentId,
+        token_hash: &str,
+        issued_at: i64,
+    ) -> Result<()> {
+        sqlx::query("UPDATE node SET token_hash = ?2, token_issued_at = ?3 WHERE id = ?1")
+            .bind(node.0.as_str())
+            .bind(token_hash)
+            .bind(issued_at)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Register (or refresh) a node in `org` and give it a token hash.
+    ///
+    /// Used by `POST /auth/token` when an auth key is redeemed. The node id is
+    /// derived from `(org, name)` so re-running `agent init` on the same machine
+    /// re-enrolls it rather than creating a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn register_node(
         &self,
         org: &OrgId,
-        secret_hash: &str,
-        principal: &str,
-        kind: &str,
-        created_at: i64,
-        expires_at: i64,
+        name: &str,
+        token_hash: &str,
+        tags: &[String],
+        now: i64,
+    ) -> Result<AgentId> {
+        let node_id = node_id_for(org, name);
+        sqlx::query(
+            "INSERT INTO node (id, org_id, name, tags, token_hash, token_issued_at, last_seen, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                tags = excluded.tags,
+                token_hash = excluded.token_hash,
+                token_issued_at = excluded.token_issued_at",
+        )
+        .bind(node_id.0.as_str())
+        .bind(org.0.as_str())
+        .bind(name)
+        .bind(tags.join("\n"))
+        .bind(token_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(node_id)
+    }
+
+    /// Delete a node row, revoking its token.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_node(&self, node: &AgentId) -> Result<()> {
+        sqlx::query("DELETE FROM node WHERE id = ?1")
+            .bind(node.0.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Insert a user session (stored by token hash).
+    ///
+    /// The caller must have provisioned the org, user and member rows first:
+    /// `session.user_id REFERENCES user(id)` and foreign keys are enforced, so a
+    /// session for a nonexistent user fails loudly here rather than becoming a
+    /// valid token belonging to nobody.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn insert_session(
+        &self,
+        token_hash: &str,
+        org: &OrgId,
+        user: &str,
+        issued_at: i64,
+        expires: i64,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO enroll_tokens (secret_hash, org_id, principal, kind, created_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO session (token_hash, org_id, user_id, issued_at, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
-        .bind(secret_hash)
+        .bind(token_hash)
         .bind(org.0.as_str())
-        .bind(principal)
-        .bind(kind)
-        .bind(created_at)
-        .bind(expires_at)
+        .bind(user)
+        .bind(issued_at)
+        .bind(expires)
         .execute(&self.pool)
         .await?;
         Ok(())
     }
 
-    /// Atomically consume a bootstrap enrollment secret: single-use + TTL.
+    /// Look up a session by its token hash: `(user id, org, expires)`.
     ///
-    /// Marks the matching, not-yet-consumed, not-yet-expired secret as consumed
-    /// at `now` and returns its `(org, principal, kind)`. Returns `None` when
-    /// the secret is unknown, already consumed (reuse), or expired.
+    /// Expiry is **not** checked here; `fleet_auth::authenticate` does that, so
+    /// there is exactly one place that decides what "expired" means.
     ///
     /// # Errors
     ///
     /// Returns a database error if the query fails.
-    pub async fn consume_enroll_token(
+    pub async fn session_by_token_hash(
         &self,
-        secret_hash: &str,
-        now: i64,
-    ) -> Result<Option<(OrgId, String, String)>> {
-        let row: Option<(String, String, String)> = sqlx::query_as(
-            "UPDATE enroll_tokens SET consumed_at = ?2
-             WHERE secret_hash = ?1 AND consumed_at IS NULL AND expires_at > ?2
-             RETURNING org_id, principal, kind",
+        token_hash: &str,
+    ) -> Result<Option<(String, OrgId, i64)>> {
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT user_id, org_id, expires FROM session WHERE token_hash = ?1",
         )
-        .bind(secret_hash)
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(user, org, expires)| (user, OrgId(org), expires)))
+    }
+
+    /// Delete a session (logout, or refresh replacing it).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_session(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("DELETE FROM session WHERE token_hash = ?1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete every session that expired at or before `now`; returns the count.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_expired_sessions(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM session WHERE expires <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Insert a node-enrollment auth key (stored by hash).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn insert_auth_key(
+        &self,
+        org: &OrgId,
+        key_hash: &str,
+        tags: &[String],
+        single_use: bool,
+        expires: Option<i64>,
+        created_by: Option<&str>,
+        created_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO auth_key (key_hash, org_id, tags, single_use, expires, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(key_hash)
+        .bind(org.0.as_str())
+        .bind(tags.join("\n"))
+        .bind(i64::from(single_use))
+        .bind(expires)
+        .bind(created_by)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up an auth key by hash **without** consuming it:
+    /// `(org, tags, single_use, expires)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn auth_key_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<(OrgId, Vec<String>, bool, Option<i64>)>> {
+        let row: Option<(String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT org_id, tags, single_use, expires FROM auth_key
+             WHERE key_hash = ?1 AND consumed_at IS NULL",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(org, tags, single_use, expires)| {
+            (OrgId(org), split_tags(&tags), single_use != 0, expires)
+        }))
+    }
+
+    /// Atomically consume an auth key: single-use + TTL, in one statement.
+    ///
+    /// A single-use key is marked consumed; a multi-use key is left redeemable.
+    /// Doing this as one `UPDATE … RETURNING` is what makes "single use" mean
+    /// single use under concurrent redemption, rather than a check followed by a
+    /// racy write.
+    ///
+    /// Returns `(org, tags)` when the key was redeemable, `None` when it is
+    /// unknown, already consumed, or expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn consume_auth_key(
+        &self,
+        key_hash: &str,
+        now: i64,
+    ) -> Result<Option<(OrgId, Vec<String>)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "UPDATE auth_key
+             SET consumed_at = CASE WHEN single_use != 0 THEN ?2 ELSE consumed_at END
+             WHERE key_hash = ?1
+               AND consumed_at IS NULL
+               AND (expires IS NULL OR expires > ?2)
+             RETURNING org_id, tags",
+        )
+        .bind(key_hash)
         .bind(now)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(org, principal, kind)| (OrgId(org), principal, kind)))
-    }
-
-    /// Record an agent pin (issued-cert fingerprint -> agent id) in `org`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a database error if the write fails.
-    pub async fn insert_agent_pin(
-        &self,
-        org: &OrgId,
-        fingerprint: &str,
-        agent_id: &str,
-        created_at: i64,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO agent_pins (fingerprint, org_id, agent_id, created_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(fingerprint) DO UPDATE SET
-                org_id = excluded.org_id,
-                agent_id = excluded.agent_id",
-        )
-        .bind(fingerprint)
-        .bind(org.0.as_str())
-        .bind(agent_id)
-        .bind(created_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Look up the `(org, agent id)` pinned to a given cert fingerprint.
-    ///
-    /// # Errors
-    ///
-    /// Returns a database error if the query fails.
-    pub async fn agent_pin_for_fingerprint(
-        &self,
-        fingerprint: &str,
-    ) -> Result<Option<(OrgId, AgentId)>> {
-        let row: Option<(String, String)> =
-            sqlx::query_as("SELECT org_id, agent_id FROM agent_pins WHERE fingerprint = ?1")
-                .bind(fingerprint)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(org, agent)| (OrgId(org), AgentId(agent))))
+        Ok(row.map(|(org, tags)| (OrgId(org), split_tags(&tags))))
     }
 
     /// The org a node belongs to, if the node is known.
@@ -624,6 +786,26 @@ pub struct AuditEntry<'a> {
     pub detail: Option<&'a str>,
 }
 
+/// Split a newline-joined tag column back into tags, dropping empties.
+fn split_tags(joined: &str) -> Vec<String> {
+    joined
+        .split('\n')
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Derive a node's id from `(org, name)`.
+///
+/// Deterministic on purpose: re-running `agent init` on the same machine
+/// re-enrolls that node (replacing its token) instead of littering the org with
+/// duplicate rows for one physical Pi. The id is namespaced by org so the same
+/// node name in two tenants is two nodes.
+fn node_id_for(org: &OrgId, name: &str) -> AgentId {
+    AgentId(format!("{}/{name}", org.0))
+}
+
+
 fn board_state_label(state: &BoardState) -> &'static str {
     match state {
         BoardState::Idle => "idle",
@@ -866,41 +1048,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enroll_token_consume_single_use_and_ttl() {
+    async fn auth_key_consume_is_single_use_and_ttl_checked() {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
-        // valid -> consumed once
-        db.insert_enroll_token(&o, "hash-a", "rpi-1", "agent", 1000, 2000)
+        db.insert_auth_key(&o, "hash-a", &["nrf52".to_owned()], true, Some(2000), Some("root"), 1000)
             .await
             .unwrap();
-        let first = db.consume_enroll_token("hash-a", 1500).await.unwrap();
-        assert_eq!(
-            first,
-            Some((o.clone(), "rpi-1".to_owned(), "agent".to_owned()))
-        );
-        // reuse rejected
-        assert!(db.consume_enroll_token("hash-a", 1600).await.unwrap().is_none());
 
-        // expired rejected
-        db.insert_enroll_token(&o, "hash-b", "alice", "client", 1000, 2000)
+        let first = db.consume_auth_key("hash-a", 1500).await.unwrap();
+        assert_eq!(first, Some((o.clone(), vec!["nrf52".to_owned()])));
+        // Single use means single use: the second redemption finds nothing.
+        assert!(db.consume_auth_key("hash-a", 1600).await.unwrap().is_none());
+
+        // Expired.
+        db.insert_auth_key(&o, "hash-b", &[], true, Some(2000), None, 1000)
             .await
             .unwrap();
-        assert!(db.consume_enroll_token("hash-b", 3000).await.unwrap().is_none());
+        assert!(db.consume_auth_key("hash-b", 3000).await.unwrap().is_none());
+        // ... and the expiry boundary is exclusive of `now == expires`.
+        db.insert_auth_key(&o, "hash-c", &[], true, Some(2000), None, 1000)
+            .await
+            .unwrap();
+        assert!(db.consume_auth_key("hash-c", 2000).await.unwrap().is_none());
 
-        // unknown rejected
-        assert!(db.consume_enroll_token("nope", 1500).await.unwrap().is_none());
+        // Unknown.
+        assert!(db.consume_auth_key("nope", 1500).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn agent_pin_round_trip() {
+    async fn multi_use_auth_key_survives_redemption() {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
-        assert!(db.agent_pin_for_fingerprint("fp1").await.unwrap().is_none());
-        db.insert_agent_pin(&o, "fp1", "rpi-1", 1000).await.unwrap();
+        // A fleet-provisioning key that enrolls a rack of Pis is not single-use.
+        db.insert_auth_key(&o, "hash-m", &[], false, None, None, 1000)
+            .await
+            .unwrap();
+        assert!(db.consume_auth_key("hash-m", 1500).await.unwrap().is_some());
+        assert!(db.consume_auth_key("hash-m", 1600).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn node_token_registration_lookup_and_rotation() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        assert!(db.node_by_token_hash("hash-1").await.unwrap().is_none());
+
+        let node = db
+            .register_node(&o, "rpi-lab-1", "hash-1", &["nrf52".to_owned()], 1000)
+            .await
+            .unwrap();
         assert_eq!(
-            db.agent_pin_for_fingerprint("fp1").await.unwrap(),
-            Some((o, AgentId("rpi-1".to_owned())))
+            db.node_by_token_hash("hash-1").await.unwrap(),
+            Some((node.clone(), o.clone(), 1000))
         );
+
+        // Rotation replaces the hash: the old token stops working, the new one
+        // starts. (The coordinator only calls this *after* the node acks.)
+        db.set_node_token_hash(&node, "hash-2", 5000).await.unwrap();
+        assert!(db.node_by_token_hash("hash-1").await.unwrap().is_none());
+        assert_eq!(
+            db.node_by_token_hash("hash-2").await.unwrap(),
+            Some((node.clone(), o.clone(), 5000))
+        );
+
+        // Re-enrolling the same machine re-uses the row rather than duplicating
+        // it, and revocation is deleting that row.
+        let again = db
+            .register_node(&o, "rpi-lab-1", "hash-3", &[], 6000)
+            .await
+            .unwrap();
+        assert_eq!(again, node);
+        db.delete_node(&node).await.unwrap();
+        assert!(db.node_by_token_hash("hash-3").await.unwrap().is_none());
+    }
+
+    /// The same node name in two orgs is two nodes: node ids are org-namespaced,
+    /// so a token minted in one tenant cannot resolve into another.
+    #[tokio::test]
+    async fn node_ids_are_org_namespaced() {
+        let db = Db::connect_in_memory().await.unwrap();
+        db.ensure_org(&org("org-a"), "team").await.unwrap();
+        db.ensure_org(&org("org-b"), "team").await.unwrap();
+        let a = db.register_node(&org("org-a"), "rpi", "h-a", &[], 1).await.unwrap();
+        let b = db.register_node(&org("org-b"), "rpi", "h-b", &[], 1).await.unwrap();
+        assert_ne!(a, b);
+        assert_eq!(db.org_of_node(&a).await.unwrap(), Some(org("org-a")));
+        assert_eq!(db.org_of_node(&b).await.unwrap(), Some(org("org-b")));
+    }
+
+    #[tokio::test]
+    async fn session_round_trip_and_expiry_sweep() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+
+        assert!(db.session_by_token_hash("s1").await.unwrap().is_none());
+        db.insert_session("s1", &o, "alice", 1000, 2000).await.unwrap();
+        assert_eq!(
+            db.session_by_token_hash("s1").await.unwrap(),
+            Some(("alice".to_owned(), o.clone(), 2000))
+        );
+
+        db.insert_session("s2", &o, "alice", 1000, 9000).await.unwrap();
+        // The sweep removes only what has actually expired.
+        assert_eq!(db.delete_expired_sessions(2000).await.unwrap(), 1);
+        assert!(db.session_by_token_hash("s1").await.unwrap().is_none());
+        assert!(db.session_by_token_hash("s2").await.unwrap().is_some());
+
+        db.delete_session("s2").await.unwrap();
+        assert!(db.session_by_token_hash("s2").await.unwrap().is_none());
+    }
+
+    /// `session.user_id REFERENCES user(id)` with foreign keys on: a session for
+    /// a user who does not exist must fail at insert, not become a valid bearer
+    /// token belonging to nobody.
+    #[tokio::test]
+    async fn session_for_an_unknown_user_is_refused() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        assert!(db.insert_session("s1", &o, "ghost", 1000, 2000).await.is_err());
     }
 
     #[tokio::test]

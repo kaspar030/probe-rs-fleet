@@ -7,13 +7,25 @@
 //!
 //! ## Topology
 //!
-//! * **Agents** dial *out* and hold one persistent mTLS connection. They send
+//! Since revision 2 (§3.5) the coordinator is an **HTTP server**: `GET /agent`
+//! and `GET /client` upgrade to `WebSocket`s, `POST /auth/token` exchanges
+//! credentials, `GET /healthz` answers the proxy. Every principal presents
+//! `Authorization: Bearer …` on the upgrade; there are no client certificates.
+//!
+//! * **Agents** dial *out* and hold one persistent `WebSocket`. They send
 //!   [`fleet_proto::agent_api::AgentReport`]s up; the coordinator sends
 //!   [`fleet_proto::agent_api::CoordinatorCommand`]s back down the same
-//!   connection. Agents are pinned by certificate fingerprint.
-//! * **Sidecars** connect to request/extend/release leases and to open relay
-//!   channels. Their wire protocol ([`proto::SidecarToCoord`] /
-//!   [`proto::CoordToSidecar`]) is owned by this crate.
+//!   connection. A node is identified by the `node` row its token hash matched.
+//! * **Sidecars and `ctl`** connect to request/extend/release leases and to open
+//!   relay channels ([`proto::SidecarToCoord`] / [`proto::CoordToSidecar`]).
+//!
+//! ## Deployment
+//!
+//! The expected deployment is **behind an HTTPS reverse proxy**: the proxy
+//! terminates TLS and the coordinator speaks plain HTTP on loopback. That is
+//! what the `WebSocket` transport buys — a proxy can route it, which it could
+//! not do for the bespoke length-prefixed TCP protocol this replaced.
+//! [`config::TlsConfig`] keeps the self-hosted option of terminating TLS here.
 //!
 //! ## Data plane
 //!
@@ -26,31 +38,34 @@
 //! ## Modules
 //!
 //! The lease/relay/auth decision logic lives in [`core::Coordinator`] and is
-//! unit-testable over in-memory channels; [`server`] is the TLS I/O shell and
-//! [`sweep`] is the background expiry task.
+//! unit-testable over in-memory channels; [`http`] is the route surface,
+//! [`server`] the per-connection I/O shell, and [`sweep`] the background expiry
+//! task.
 
 pub mod auth;
 pub mod authz;
 pub mod clock;
 pub mod config;
 pub mod core;
-pub mod enroll;
 pub mod error;
+pub mod http;
 pub mod proto;
 pub mod registry;
 pub mod relay;
 pub mod server;
 pub mod state;
 pub mod sweep;
+pub mod tokens;
+pub mod ws_axum;
 
 use std::sync::Arc;
 
-use tokio_rustls::TlsAcceptor;
+use tracing::info;
 
 pub use crate::auth::Ed25519Signer;
 pub use crate::authz::AuthzError;
 pub use crate::clock::{now_epoch_secs, Clock, SharedClock, SystemClock};
-pub use crate::config::{CoordinatorConfig, SigningKeySource};
+pub use crate::config::{CoordinatorConfig, SigningKeySource, TlsConfig};
 pub use crate::core::{Coordinator, SharedCoordinator};
 pub use crate::error::{CoordinatorError, Result};
 pub use crate::state::{Db, OrgDb};
@@ -59,23 +74,19 @@ use fleet_core::scheduler::Scheduler;
 
 /// Build a fully-wired coordinator from its configuration.
 ///
-/// Loads the TLS material, opens the `SQLite` database (running migrations),
-/// constructs the signer from the configured key, and seeds the scheduler with
-/// the configured policy. Returns the shared coordinator and a ready
-/// [`TlsAcceptor`].
+/// Opens the `SQLite` database (running migrations), constructs the signer from
+/// the configured key, and seeds the scheduler with the configured policy.
+///
+/// Note there is no TLS material to load here any more: the client half is gone
+/// with the private CA, and the optional server half is loaded by [`run`] only
+/// if a `[tls]` table is configured.
 ///
 /// # Errors
 ///
-/// Returns a [`CoordinatorError`] if the config is invalid, TLS material cannot
-/// be loaded, or the database cannot be opened/migrated.
-pub async fn build(config: CoordinatorConfig) -> Result<(SharedCoordinator, TlsAcceptor)> {
+/// Returns a [`CoordinatorError`] if the config is invalid or the database
+/// cannot be opened/migrated.
+pub async fn build(config: CoordinatorConfig) -> Result<SharedCoordinator> {
     config.validate()?;
-
-    let cert_chain = fleet_tls::load_cert_chain(&config.tls_cert)?;
-    let key = fleet_tls::load_private_key(&config.tls_key)?;
-    let client_ca = fleet_tls::load_root_store(&config.client_ca)?;
-    let tls_config = fleet_tls::server_config(cert_chain, key, client_ca)?;
-    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let db = Db::connect(
         config
@@ -92,26 +103,99 @@ pub async fn build(config: CoordinatorConfig) -> Result<(SharedCoordinator, TlsA
     let scheduler = Scheduler::new(config.policy.clone());
     let clock: SharedClock = Arc::new(SystemClock);
 
-    let coord = Arc::new(Coordinator::new(config, scheduler, db, signer, clock));
-    Ok((coord, acceptor))
+    Ok(Arc::new(Coordinator::new(
+        config, scheduler, db, signer, clock,
+    )))
 }
 
-/// Build and run the coordinator: serve the accept loop and the expiry sweep
-/// concurrently until a fatal error.
+/// Build and run the coordinator: serve HTTP and the expiry sweep concurrently
+/// until a fatal error.
 ///
 /// # Errors
 ///
-/// Returns a [`CoordinatorError`] if startup fails or the accept loop errors
+/// Returns a [`CoordinatorError`] if startup fails or the listener errors
 /// fatally.
 pub async fn run(config: CoordinatorConfig) -> Result<()> {
-    let (coord, acceptor) = build(config).await?;
+    let tls = config.tls.clone();
+    let listen_addr = config.listen_addr;
+    let coord = build(config).await?;
 
     let sweep_handle = {
         let coord = Arc::clone(&coord);
         tokio::spawn(async move { sweep::run(coord).await })
     };
 
-    let result = server::serve(coord, acceptor).await;
+    let router = http::router(Arc::clone(&coord));
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    let local = listener.local_addr()?;
+
+    let result = match tls {
+        None => {
+            info!(addr = %local, "coordinator listening (plain HTTP; TLS is the proxy's job)");
+            axum::serve(listener, router)
+                .await
+                .map_err(|e| CoordinatorError::Http(e.to_string()))
+        }
+        Some(tls) => {
+            info!(addr = %local, "coordinator listening (TLS terminated here)");
+            serve_tls(listener, router, &tls).await
+        }
+    };
+
     sweep_handle.abort();
     result
+}
+
+/// Serve the router over coordinator-terminated TLS.
+///
+/// **Not** `axum::serve`: that path cannot carry `WebSocket` upgrades over a
+/// manual TLS accept loop. Upgrades need
+/// `hyper_util::server::conn::auto::Builder::serve_connection_with_upgrades`,
+/// and getting this wrong produces a coordinator whose `/agent` route 400s only
+/// when `[tls]` is configured — which is exactly the configuration that is
+/// hardest to test by accident.
+///
+/// # Errors
+///
+/// Returns a [`CoordinatorError`] if the TLS material cannot be loaded. Per
+/// connection failures are logged and do not stop the loop.
+async fn serve_tls(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    tls: &TlsConfig,
+) -> Result<()> {
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+    use hyper_util::service::TowerToHyperService;
+
+    let chain = fleet_tls::load_cert_chain(&tls.cert)?;
+    let key = fleet_tls::load_private_key(&tls.key)?;
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(fleet_tls::server_config(chain, key)?));
+
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let service = TowerToHyperService::new(router.clone());
+        tokio::spawn(async move {
+            let stream = match acceptor.accept(sock).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+            if let Err(e) = builder
+                .serve_connection_with_upgrades(TokioIo::new(stream), service)
+                .await
+            {
+                tracing::debug!(%peer, error = %e, "connection closed");
+            }
+        });
+    }
 }

@@ -1,16 +1,15 @@
 //! Coordinator configuration.
 //!
 //! This is the in-process configuration struct plus light validation. Loading
-//! it from a file (TOML) and wiring the CLI is the job of `fleet-bin` (task
-//! 1714); here we only model the shape so the rest of the crate can depend on
-//! it.
+//! it from a file (TOML) and wiring the CLI is the job of `fleet-bin`; here we
+//! only model the shape so the rest of the crate can depend on it.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fleet_core::policy::Policy;
-use fleet_proto::ids::{AgentId, OrgId};
+use fleet_proto::ids::OrgId;
 
 use crate::error::{CoordinatorError, Result};
 
@@ -21,46 +20,67 @@ pub enum SigningKeySource {
     Seed([u8; 32]),
 }
 
+/// Optional coordinator-terminated TLS.
+///
+/// The hosted deployment (architecture §3.5) puts an HTTPS reverse proxy in
+/// front and the coordinator speaks plain HTTP on loopback — a proxy terminates
+/// TLS and routes `/agent`, `/client`, `/auth/*` and `/healthz` by path, which
+/// is the whole reason the transport moved to `WebSocket`s. This table exists
+/// for the self-hosted and development case, where there is no proxy.
+#[derive(Debug, Clone)]
+pub struct TlsConfig {
+    /// PEM file holding the coordinator's server certificate chain.
+    pub cert: PathBuf,
+    /// PEM file holding the coordinator's server private key.
+    pub key: PathBuf,
+}
+
 /// Full coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
-    /// The TCP address to listen on for inbound mTLS connections.
-    pub listen_addr: SocketAddr,
-    /// The address (`host:port`) that clients/agents should dial to reach this
-    /// coordinator, embedded into enrollment tokens.
+    /// The TCP address to listen on.
     ///
-    /// This is distinct from [`listen_addr`](Self::listen_addr): the listen
-    /// address is frequently a wildcard (`0.0.0.0` / `::`) which is not
-    /// routable from another host. When unset, `coordinator enroll` falls back
-    /// to `listen_addr` but errors if that is a wildcard.
-    pub advertise_addr: Option<String>,
-    /// PEM file holding the coordinator's server certificate chain.
-    pub tls_cert: PathBuf,
-    /// PEM file holding the coordinator's server private key.
-    pub tls_key: PathBuf,
-    /// PEM file holding the CA used to verify client (agent/sidecar) certs.
-    pub client_ca: PathBuf,
-    /// PEM file holding the client CA's private key, used to sign CSRs during
-    /// bootstrap enrollment.
-    pub client_ca_key: PathBuf,
+    /// Defaults to loopback: the expected deployment is behind a proxy on the
+    /// same host, and binding a public interface should be a deliberate act.
+    pub listen_addr: SocketAddr,
+    /// The externally reachable base URL of this coordinator
+    /// (`https://fleet.example`), as handed to operators for
+    /// `agent init --fleet-url` / `ctl init --fleet-url`.
+    ///
+    /// This is not derivable from [`listen_addr`](Self::listen_addr): behind a
+    /// proxy the coordinator listens on `127.0.0.1:7000` and the world reaches
+    /// it at a name it never sees.
+    pub public_url: String,
+    /// Coordinator-terminated TLS, or `None` to serve plain HTTP (behind a
+    /// proxy).
+    pub tls: Option<TlsConfig>,
     /// Path to the `SQLite` database file.
     pub sqlite_path: PathBuf,
     /// The capability-token signing key.
     pub signing_key: SigningKeySource,
     /// Lease scheduling policy.
     pub policy: Policy,
-    /// Pinned agents: maps a cert SHA-256 fingerprint to the expected
-    /// [`AgentId`]. A connection whose fingerprint is in this map is treated
-    /// as an agent; everything else resolves to a sidecar `Subject`.
-    pub pinned_agents: HashMap<String, AgentId>,
     /// How often (seconds) the expiry sweep runs.
     pub sweep_interval_secs: u64,
-    /// The org every authenticated subject is assigned to.
+    /// How often (seconds) the coordinator pings an idle connection.
     ///
-    /// Single-tenant stopgap: until GitHub login exists (a separate task) the
-    /// mTLS resolution seam in [`crate::server`] puts every caller in this org.
-    /// The authorization layer is org-generic regardless, so swapping the seam
-    /// changes nothing downstream.
+    /// Keepalive is load-bearing now: a reverse proxy reaps idle `WebSocket`s
+    /// on a timeout we do not control, so the node's persistent connection must
+    /// generate traffic even when the fleet is quiet.
+    pub ping_interval_secs: u64,
+    /// How long (seconds) a connection may go without any inbound frame or pong
+    /// before it is dropped.
+    pub pong_timeout_secs: u64,
+    /// How long (seconds) a freshly minted user session token is valid.
+    pub session_ttl_secs: u64,
+    /// How old (seconds) a node token may get before it is rotated.
+    pub node_token_rotate_secs: u64,
+    /// The org an interim admin-minted subject is assigned to when none is
+    /// specified.
+    ///
+    /// Note this is **not** consulted for node connections: a node's org comes
+    /// from its own row, so a node token cannot be replayed into another tenant
+    /// (see `http::authenticate_request`).
     pub default_org: OrgId,
 }
 
@@ -69,23 +89,42 @@ impl CoordinatorConfig {
     ///
     /// # Errors
     ///
-    /// Returns [`CoordinatorError::Config`] if a required path is empty or the
-    /// sweep interval is zero.
+    /// Returns [`CoordinatorError::Config`] if a required path or value is
+    /// empty/zero, or a `[tls]` table is missing one of its two paths.
     pub fn validate(&self) -> Result<()> {
-        for (label, path) in [
-            ("tls_cert", &self.tls_cert),
-            ("tls_key", &self.tls_key),
-            ("client_ca", &self.client_ca),
-            ("client_ca_key", &self.client_ca_key),
-            ("sqlite_path", &self.sqlite_path),
-        ] {
-            if path.as_os_str().is_empty() {
-                return Err(CoordinatorError::Config(format!("{label} path is empty")));
+        if self.sqlite_path.as_os_str().is_empty() {
+            return Err(CoordinatorError::Config("sqlite_path is empty".to_owned()));
+        }
+        if let Some(tls) = &self.tls {
+            for (label, path) in [("tls.cert", &tls.cert), ("tls.key", &tls.key)] {
+                if path.as_os_str().is_empty() {
+                    return Err(CoordinatorError::Config(format!("{label} path is empty")));
+                }
             }
         }
-        if self.sweep_interval_secs == 0 {
+        if self.public_url.trim().is_empty() {
             return Err(CoordinatorError::Config(
-                "sweep_interval_secs must be non-zero".to_owned(),
+                "public_url must be non-empty".to_owned(),
+            ));
+        }
+        for (label, value) in [
+            ("sweep_interval_secs", self.sweep_interval_secs),
+            ("ping_interval_secs", self.ping_interval_secs),
+            ("pong_timeout_secs", self.pong_timeout_secs),
+            ("session_ttl_secs", self.session_ttl_secs),
+            ("node_token_rotate_secs", self.node_token_rotate_secs),
+        ] {
+            if value == 0 {
+                return Err(CoordinatorError::Config(format!(
+                    "{label} must be non-zero"
+                )));
+            }
+        }
+        if self.pong_timeout_secs <= self.ping_interval_secs {
+            return Err(CoordinatorError::Config(
+                "pong_timeout_secs must exceed ping_interval_secs, or every idle \
+                 connection is dropped before it can answer a ping"
+                    .to_owned(),
             ));
         }
         if self.default_org.0.is_empty() {
@@ -96,10 +135,44 @@ impl CoordinatorConfig {
         Ok(())
     }
 
-    /// Whether the given cert fingerprint identifies a pinned agent.
+    /// The keepalive ping interval.
     #[must_use]
-    pub fn agent_for_fingerprint(&self, fingerprint: &str) -> Option<&AgentId> {
-        self.pinned_agents.get(fingerprint)
+    pub fn ping_interval(&self) -> Duration {
+        Duration::from_secs(self.ping_interval_secs)
+    }
+
+    /// The keepalive liveness deadline.
+    #[must_use]
+    pub fn pong_timeout(&self) -> Duration {
+        Duration::from_secs(self.pong_timeout_secs)
+    }
+
+    /// The node-token rotation policy this configuration implies.
+    #[must_use]
+    pub fn rotation_policy(&self) -> fleet_auth::RotationPolicy {
+        fleet_auth::RotationPolicy {
+            max_age_secs: self.node_token_rotate_secs,
+            ..fleet_auth::RotationPolicy::DEFAULT
+        }
+    }
+}
+
+impl Default for CoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            listen_addr: "127.0.0.1:7000".parse().expect("valid literal"),
+            public_url: "http://127.0.0.1:7000".to_owned(),
+            tls: None,
+            sqlite_path: "coordinator.sqlite".into(),
+            signing_key: SigningKeySource::Seed([0u8; 32]),
+            policy: Policy::default(),
+            sweep_interval_secs: 5,
+            ping_interval_secs: 20,
+            pong_timeout_secs: 60,
+            session_ttl_secs: 12 * 60 * 60,
+            node_token_rotate_secs: fleet_auth::RotationPolicy::DEFAULT.max_age_secs,
+            default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+        }
     }
 }
 
@@ -107,58 +180,79 @@ impl CoordinatorConfig {
 mod tests {
     use super::*;
 
-    fn cfg() -> CoordinatorConfig {
-        CoordinatorConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            advertise_addr: None,
-            tls_cert: "cert.pem".into(),
-            tls_key: "key.pem".into(),
-            client_ca: "ca.pem".into(),
-            client_ca_key: "ca-key.pem".into(),
-            sqlite_path: "coord.sqlite".into(),
-            signing_key: SigningKeySource::Seed([0u8; 32]),
-            policy: Policy::default(),
-            pinned_agents: HashMap::new(),
-            sweep_interval_secs: 5,
-            default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+    #[test]
+    fn default_config_is_valid_and_loopback() {
+        let c = CoordinatorConfig::default();
+        assert!(c.validate().is_ok());
+        assert!(c.listen_addr.ip().is_loopback());
+        assert!(c.tls.is_none(), "plain HTTP behind a proxy is the default");
+    }
+
+    #[test]
+    fn empty_sqlite_path_rejected() {
+        let mut c = CoordinatorConfig::default();
+        c.sqlite_path = PathBuf::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn tls_table_needs_both_paths() {
+        let mut c = CoordinatorConfig::default();
+        c.tls = Some(TlsConfig {
+            cert: "cert.pem".into(),
+            key: PathBuf::new(),
+        });
+        assert!(c.validate().is_err());
+        c.tls = Some(TlsConfig {
+            cert: "cert.pem".into(),
+            key: "key.pem".into(),
+        });
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_intervals_rejected() {
+        for mutate in [
+            (|c: &mut CoordinatorConfig| c.sweep_interval_secs = 0) as fn(&mut CoordinatorConfig),
+            |c| c.ping_interval_secs = 0,
+            |c| c.pong_timeout_secs = 0,
+            |c| c.session_ttl_secs = 0,
+            |c| c.node_token_rotate_secs = 0,
+        ] {
+            let mut c = CoordinatorConfig::default();
+            mutate(&mut c);
+            assert!(c.validate().is_err());
         }
     }
 
+    /// A pong timeout at or below the ping interval means the connection is
+    /// reaped before the peer can possibly answer — a configuration that looks
+    /// plausible and drops every idle node.
     #[test]
-    fn valid_config_passes() {
-        assert!(cfg().validate().is_ok());
-    }
-
-    #[test]
-    fn empty_path_rejected() {
-        let mut c = cfg();
-        c.tls_cert = PathBuf::new();
+    fn pong_timeout_must_exceed_ping_interval() {
+        let mut c = CoordinatorConfig::default();
+        c.ping_interval_secs = 30;
+        c.pong_timeout_secs = 30;
         assert!(c.validate().is_err());
+        c.pong_timeout_secs = 31;
+        assert!(c.validate().is_ok());
     }
 
     #[test]
-    fn zero_sweep_interval_rejected() {
-        let mut c = cfg();
-        c.sweep_interval_secs = 0;
+    fn empty_public_url_or_default_org_rejected() {
+        let mut c = CoordinatorConfig::default();
+        c.public_url = "  ".to_owned();
         assert!(c.validate().is_err());
-    }
 
-    #[test]
-    fn empty_default_org_rejected() {
-        let mut c = cfg();
+        let mut c = CoordinatorConfig::default();
         c.default_org = OrgId(String::new());
         assert!(c.validate().is_err());
     }
 
     #[test]
-    fn agent_pinning_lookup() {
-        let mut c = cfg();
-        c.pinned_agents
-            .insert("abcd".to_owned(), AgentId("agent-a".to_owned()));
-        assert_eq!(
-            c.agent_for_fingerprint("abcd"),
-            Some(&AgentId("agent-a".to_owned()))
-        );
-        assert!(c.agent_for_fingerprint("zzzz").is_none());
+    fn rotation_policy_follows_the_configured_age() {
+        let mut c = CoordinatorConfig::default();
+        c.node_token_rotate_secs = 3600;
+        assert_eq!(c.rotation_policy().max_age_secs, 3600);
     }
 }

@@ -1,34 +1,54 @@
 //! The dial-out control-plane connection (architecture §5).
 //!
-//! The agent opens **one** persistent mTLS connection *out* to the coordinator
-//! and holds it; all coordinator→agent commands travel back down it, so the Pi
-//! needs no inbound ports. Over the connection the agent registers, reports
-//! inventory, heartbeats, and dispatches [`CoordinatorCommand`]s to the
-//! [`Agent`]; the opaque data plane is multiplexed alongside.
+//! The agent opens **one** persistent `WebSocket` connection *out* to the
+//! coordinator (`wss://…/agent`) and holds it; all coordinator→agent commands
+//! travel back down it, so the Pi needs no inbound ports. Over the connection
+//! the agent registers, reports inventory, heartbeats, and dispatches
+//! [`CoordinatorCommand`]s to the [`Agent`]; the opaque data plane is
+//! multiplexed alongside.
 //!
-//! What ships here: the reconnect-with-backoff policy, the mTLS dial via
-//! `fleet_tls::client_config`, and the live control + data multiplex — register,
-//! inventory, heartbeat, command dispatch through the [`Agent`] handlers, and
-//! per-channel `DataFrame` splicing onto each session's `probe-rs serve` socket
-//! (or gdb stub). The shared length-delimited postcard framing + envelopes live
-//! in [`fleet_wire`].
+//! What ships here: the reconnect-with-backoff policy, the dial via
+//! `fleet_wire::client::dial` (which presents the node's bearer token on the
+//! upgrade), ping/pong keepalive, node-token rotation, and the live control +
+//! data multiplex — register, inventory, heartbeat, command dispatch through the
+//! [`Agent`] handlers, and per-channel `DataFrame` splicing onto each session's
+//! `probe-rs serve` socket (or gdb stub).
+//!
+//! # Why keepalive and backoff stopped being niceties
+//!
+//! The hosted deployment puts an HTTPS reverse proxy in front of the
+//! coordinator, and a proxy reaps idle `WebSocket`s on a timeout nobody here
+//! controls. A lab node is idle most of the time, so without ping/pong the
+//! control plane would evaporate every few minutes; and when a connection does
+//! drop, the whole fleet drops together, so the backoff carries **jitter** to
+//! avoid a synchronised reconnect stampede against a coordinator that has just
+//! restarted.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex};
-use tokio_rustls::TlsConnector;
 
 use crate::agent::Agent;
 use crate::config::AgentConfig;
 use crate::error::{AgentError, Result};
 use crate::probers::ProbeRsBackend;
 
-use fleet_wire::{read_frame, write_frame, AgentToCoord, CoordToAgent};
 use fleet_proto::agent_api::AgentReport;
 use fleet_proto::{ChannelId, ChannelKind, CoordinatorCommand, DataFrame, PROTOCOL_VERSION};
+use fleet_wire::client::{dial, DialOpts};
+use fleet_wire::{AgentToCoord, CoordToAgent, WireError, WireEvent, WireRx, WireTx};
+
+/// How often the agent pings an otherwise idle connection.
+///
+/// Shorter than any plausible proxy idle timeout, and shorter than the
+/// coordinator's own interval, so the connection stays warm even if the
+/// coordinator's pings are the ones being dropped.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// How long the agent tolerates silence before declaring the connection dead.
+const SILENCE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Exponential-backoff schedule for reconnect attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,24 +94,29 @@ impl Default for Backoff {
     }
 }
 
-/// Build the mTLS [`rustls::ClientConfig`] the agent dials out with.
+/// Apply ±20% jitter to a backoff delay.
 ///
-/// Loads the agent's client cert/key and the coordinator-CA trust anchor from
-/// the paths in `config`, then delegates to [`fleet_tls::client_config`].
-///
-/// # Errors
-///
-/// Returns [`AgentError::Connection`] if any PEM material fails to load or the
-/// rustls config is rejected.
-pub fn build_client_config(config: &AgentConfig) -> Result<rustls::ClientConfig> {
-    let certs = fleet_tls::load_cert_chain(&config.tls_cert)
-        .map_err(|e| AgentError::Connection(format!("loading agent cert: {e}")))?;
-    let key = fleet_tls::load_private_key(&config.tls_key)
-        .map_err(|e| AgentError::Connection(format!("loading agent key: {e}")))?;
-    let ca = fleet_tls::load_root_store(&config.tls_ca)
-        .map_err(|e| AgentError::Connection(format!("loading coordinator CA: {e}")))?;
-    fleet_tls::client_config(certs, key, ca)
-        .map_err(|e| AgentError::Connection(format!("building TLS client config: {e}")))
+/// Every node in a fleet loses its connection at the same instant when the
+/// coordinator restarts. Without jitter they all come back at the same instant
+/// too, and keep doing so on every doubling — turning a restart into a
+/// self-inflicted thundering herd. Jitter is cheap and there is no reason for
+/// the retries to be synchronised.
+fn jittered(delay: Duration) -> Duration {
+    // A coarse, dependency-free source of variation: nanosecond-resolution
+    // wall-clock noise is plenty for spreading retries and needs no RNG.
+    let noise = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    let millis = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+    if millis == 0 {
+        return delay;
+    }
+    let spread = millis / 5; // 20%
+    if spread == 0 {
+        return delay;
+    }
+    let offset = noise % (spread * 2 + 1);
+    Duration::from_millis(millis + offset - spread)
 }
 
 /// Routes a decoded [`CoordinatorCommand`] to the agent's handlers.
@@ -115,26 +140,43 @@ pub async fn dispatch_command<B: ProbeRsBackend>(
 /// logical connection to the coordinator and restarts it forever (until the
 /// process is asked to stop).
 ///
+/// The `config` is owned and mutable because a node token can be **rotated**
+/// mid-connection: the coordinator pushes a replacement, the agent persists it
+/// and acks, and the next dial uses the new one. See
+/// [`AgentConfig::persist_node_token`].
+///
 /// # Errors
 ///
-/// Returns an error only on a non-retryable setup failure (e.g. the TLS config
-/// cannot be built). Transient connection failures are retried internally.
+/// Returns an error only on a non-retryable setup failure. Transient connection
+/// failures are retried internally.
 pub async fn run<B: ProbeRsBackend + 'static>(
     agent: Arc<Agent<B>>,
     config: AgentConfig,
 ) -> Result<()> {
-    // Validate TLS material up front (non-retryable if misconfigured).
-    let _tls = build_client_config(&config)?;
+    let mut config = config;
     let mut backoff = Backoff::default();
 
     loop {
-        match connect_and_serve(&agent, &config).await {
+        match connect_and_serve(&agent, &mut config).await {
             Ok(()) => {
                 // Clean disconnect: reset backoff and immediately retry.
                 backoff.reset(Duration::from_millis(500));
             }
             Err(e) => {
-                let delay = backoff.next_delay();
+                if matches!(e, AgentError::CredentialRejected(_))
+                    && config.fall_back_to_previous_token()
+                {
+                    // The coordinator refused our current token but we hold a
+                    // previous one — the signature of a rotation whose *ack*
+                    // was lost, leaving the coordinator on the old hash. Retry
+                    // immediately with it rather than backing off into a state
+                    // that only a physical visit can fix.
+                    tracing::warn!(
+                        "node token rejected; retrying once with the pre-rotation token"
+                    );
+                    continue;
+                }
+                let delay = jittered(backoff.next_delay());
                 tracing::warn!(error = %e, retry_in = ?delay, "connection lost; backing off");
                 tokio::time::sleep(delay).await;
             }
@@ -148,81 +190,91 @@ pub async fn run<B: ProbeRsBackend + 'static>(
 /// # Errors
 ///
 /// Returns [`AgentError::Connection`] when the connection cannot be established
-/// or drops.
+/// or drops, and [`AgentError::CredentialRejected`] when the coordinator refused
+/// the node token.
 async fn connect_and_serve<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
-    config: &AgentConfig,
+    config: &mut AgentConfig,
 ) -> Result<()> {
-    let tls = build_client_config(config)?;
-    let connector = TlsConnector::from(Arc::new(tls));
+    let (tx, rx) = dial(DialOpts {
+        url: config.fleet_url.clone(),
+        path: "/agent",
+        bearer: config.node_token.clone(),
+        pin: config.server_pin(),
+    })
+    .await
+    .map_err(classify_dial_error)?;
 
-    let tcp = tokio::net::TcpStream::connect(&config.coordinator_endpoint)
-        .await
-        .map_err(|e| {
-            AgentError::Connection(format!(
-                "connecting to coordinator {}: {e}",
-                config.coordinator_endpoint
-            ))
-        })?;
-    let _ = tcp.set_nodelay(true);
+    // The dial succeeded, so this token works: the previous one is dead weight
+    // and keeping it would widen the window in which a stale credential is on
+    // disk.
+    if let Err(e) = config.clear_previous_token() {
+        tracing::debug!(error = %e, "could not clear the superseded node token");
+    }
 
-    let server_name = server_name(&config.coordinator_endpoint)?;
-    let stream = connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| AgentError::Connection(format!("TLS handshake failed: {e}")))?;
-
-    let (reader, writer) = tokio::io::split(stream);
-    serve_connection(agent, config, reader, writer).await
+    serve_connection(agent, config, Box::new(tx), Box::new(rx)).await
 }
 
-/// Derive a TLS `ServerName` from a `host:port` address (IP or DNS).
-fn server_name(addr: &str) -> Result<rustls::pki_types::ServerName<'static>> {
-    use rustls::pki_types::ServerName;
-    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(ServerName::IpAddress(ip.into()));
+/// Distinguish "the coordinator refused our credential" from "the network
+/// failed", because the remediation is completely different and a bare 401 in a
+/// log is exactly the thing an operator cannot act on.
+fn classify_dial_error(e: WireError) -> AgentError {
+    let text = e.to_string();
+    if text.contains("401") || text.contains("403") || text.contains("Unauthorized") {
+        return AgentError::CredentialRejected(text);
     }
-    ServerName::try_from(host.to_owned())
-        .map_err(|e| AgentError::Connection(format!("invalid server name '{host}': {e}")))
+    AgentError::Connection(format!("dialing coordinator: {text}"))
 }
 
 /// Drive one established connection: register, report inventory, then run the
 /// control + data multiplex loop until the connection drops.
 ///
-/// Generic over the stream halves so it is exercised over an in-memory duplex
-/// in tests, without any TLS.
+/// Generic over the wire halves so it is exercised over an in-memory pair in
+/// tests, without any HTTP or TLS.
 ///
 /// # Errors
 ///
-/// Returns [`AgentError::Connection`] when a frame cannot be read/written (the
+/// Returns [`AgentError::Connection`] when a message cannot be read/written (the
 /// caller reconnects with backoff).
 #[doc(hidden)]
-pub async fn serve_connection<B, R, W>(
+pub async fn serve_connection<B>(
     agent: &Arc<Agent<B>>,
-    config: &AgentConfig,
-    mut reader: R,
-    writer: W,
+    config: &mut AgentConfig,
+    tx: Box<dyn WireTx + Send>,
+    rx: Box<dyn WireRx + Send>,
 ) -> Result<()>
 where
     B: ProbeRsBackend + 'static,
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut rx = rx;
     // Single writer task: every producer (register/inventory/heartbeat, drained
-    // reports, and per-channel splice tasks) funnels `AgentToCoord` frames
-    // through this mpsc so only one task owns the write half.
+    // reports, and per-channel splice tasks) funnels `AgentToCoord` messages
+    // through this mpsc so only one task owns the write half. Pings ride their
+    // own channel so a backlog of data frames cannot starve the keepalive.
     let (out_tx, mut out_rx) = mpsc::channel::<AgentToCoord>(256);
+    let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
     let writer_task = tokio::spawn(async move {
-        let mut writer = writer;
-        while let Some(msg) = out_rx.recv().await {
-            if write_frame(&mut writer, &msg).await.is_err() {
-                break;
+        let mut tx = tx;
+        loop {
+            tokio::select! {
+                msg = out_rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    if fleet_wire::send(&mut *tx, &msg).await.is_err() {
+                        break;
+                    }
+                }
+                ping = ping_rx.recv() => {
+                    if ping.is_none() || tx.send_ping().await.is_err() {
+                        break;
+                    }
+                }
             }
         }
+        let _ = tx.close().await;
     });
 
-    // 1. Register.
+    // 1. Register. The id is advisory — the coordinator authenticates us by our
+    //    token and will close the connection if this contradicts it.
     let agent_id = fleet_proto::ids::AgentId(config.agent_id.clone());
     send_report(
         &out_tx,
@@ -247,26 +299,56 @@ where
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The first tick fires immediately; skip it so we don't double-report.
     heartbeat.tick().await;
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await;
     let started = std::time::Instant::now();
+    let mut last_seen = tokio::time::Instant::now();
 
     let result = loop {
         tokio::select! {
-            // Inbound control / data frames from the coordinator.
-            frame = read_frame::<_, CoordToAgent>(&mut reader) => {
-                match frame {
-                    Ok(CoordToAgent::Command(cmd)) => {
-                        handle_inbound_command(agent, config, &out_tx, &routes, cmd).await;
+            // Inbound control / data messages from the coordinator.
+            event = rx.recv() => {
+                last_seen = tokio::time::Instant::now();
+                match event {
+                    Ok(WireEvent::Binary(bytes)) => {
+                        match fleet_wire::decode::<CoordToAgent>(&bytes) {
+                            Ok(CoordToAgent::Command(cmd)) => {
+                                handle_inbound_command(agent, config, &out_tx, &routes, cmd).await;
+                            }
+                            Ok(CoordToAgent::Data(data)) => {
+                                route_inbound_data(&routes, data).await;
+                            }
+                            Err(e) => {
+                                break Err(AgentError::Connection(format!("decode failed: {e}")));
+                            }
+                        }
                     }
-                    Ok(CoordToAgent::Data(data)) => {
-                        route_inbound_data(&routes, data).await;
+                    // Liveness only; the timestamp above is the point.
+                    Ok(WireEvent::Pong) => {}
+                    Ok(WireEvent::Closed) => {
+                        break Err(AgentError::Connection("coordinator closed the connection".to_owned()));
                     }
                     Err(e) => break Err(AgentError::Connection(format!("read failed: {e}"))),
                 }
             }
-            // Heartbeat tick.
+            // Heartbeat tick (an application-level report, distinct from the
+            // transport-level ping below: this one tells the coordinator the
+            // *agent* is healthy, not merely that the socket is open).
             _ = heartbeat.tick() => {
                 let uptime_secs = started.elapsed().as_secs();
                 if send_report(&out_tx, AgentReport::Heartbeat { uptime_secs }).await.is_err() {
+                    break Err(AgentError::Connection("writer closed".to_owned()));
+                }
+            }
+            // Keepalive tick.
+            _ = ping.tick() => {
+                if last_seen.elapsed() > SILENCE_TIMEOUT {
+                    break Err(AgentError::Connection(
+                        "no traffic from the coordinator within the liveness deadline".to_owned(),
+                    ));
+                }
+                if ping_tx.send(()).await.is_err() {
                     break Err(AgentError::Connection("writer closed".to_owned()));
                 }
             }
@@ -318,11 +400,23 @@ async fn route_inbound_data(
 /// dispatched through the (tested) command handlers.
 async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
-    config: &AgentConfig,
+    config: &mut AgentConfig,
     out_tx: &mpsc::Sender<AgentToCoord>,
     routes: &Arc<Mutex<HashMap<ChannelId, mpsc::Sender<DataFrame>>>>,
     cmd: CoordinatorCommand,
 ) {
+    // Token rotation is handled here rather than in the agent's command
+    // handlers because it touches the *connection's* configuration, not the
+    // board state the handlers own.
+    if let CoordinatorCommand::RotateNodeToken {
+        token,
+        rotation_id,
+    } = &cmd
+    {
+        rotate_token(config, out_tx, token, *rotation_id).await;
+        return;
+    }
+
     // Capture the channel/kind before dispatch so we can splice afterwards.
     let open = if let CoordinatorCommand::OpenSession { channel, kind, .. } = &cmd {
         Some((*channel, *kind))
@@ -353,6 +447,37 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
     }
     if let Some(channel) = killed {
         routes.lock().await.remove(&channel);
+    }
+}
+
+/// Persist a pushed replacement node token, then acknowledge it.
+///
+/// **Persist before acking, always.** The coordinator keeps the old token
+/// authoritative until this ack arrives, so the only divergence this ordering
+/// can produce is "node has the new token, coordinator still has the old" —
+/// which the retained previous token recovers from on the next dial. Acking
+/// first would allow the opposite, where the coordinator retires a token the
+/// node never managed to write, and that one needs a person with a keyboard
+/// standing next to the Pi.
+async fn rotate_token(
+    config: &mut AgentConfig,
+    out_tx: &mpsc::Sender<AgentToCoord>,
+    token: &str,
+    rotation_id: u64,
+) {
+    if let Err(e) = config.persist_node_token(token) {
+        // Not acked: the coordinator keeps the old token, which we also still
+        // hold in memory, so the connection survives and rotation is retried.
+        tracing::warn!(error = %e, "failed to persist a rotated node token; not acking");
+        return;
+    }
+    if send_report(out_tx, AgentReport::TokenRotated { rotation_id })
+        .await
+        .is_err()
+    {
+        tracing::warn!("could not acknowledge the token rotation; will retry on reconnect");
+    } else {
+        tracing::info!(rotation_id, "node token rotated");
     }
 }
 
@@ -493,10 +618,8 @@ mod tests {
         let toml = format!(
             r#"
 agent_id = "pi-1"
-coordinator_endpoint = "c:1"
-tls_cert = "/c.pem"
-tls_key = "/k.pem"
-tls_ca = "/ca.pem"
+fleet_url = "https://coordinator.example:7000"
+node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 coordinator_token_pubkey = "{pubkey_hex}"
 boards_path = "/boards.toml"
 heartbeat_secs = 1
@@ -575,22 +698,20 @@ kind = "none"
         let agent = Arc::new(Agent::new(agent_config(), boards(), backend).unwrap());
         agent.seed_inventory_from_boards().await;
 
-        // The agent's dial-out connection speaks over `agent_side`; the test
-        // plays the coordinator on `coord_side`.
-        let (agent_side, coord_side) = tokio::io::duplex(8192);
-        let (agent_reader, agent_writer) = tokio::io::split(agent_side);
-        let config = agent_config();
+        // The agent's dial-out connection speaks over one half of an in-memory
+        // wire pair; the test plays the coordinator on the other.
+        let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let mut config = agent_config();
         let agent_task = {
             let agent = Arc::clone(&agent);
             tokio::spawn(async move {
-                let _ = serve_connection(&agent, &config, agent_reader, agent_writer).await;
+                let _ = serve_connection(&agent, &mut config, Box::new(agent_tx), Box::new(agent_rx))
+                    .await;
             })
         };
 
-        let (mut coord_reader, mut coord_writer) = tokio::io::split(coord_side);
-
         // 1. Register.
-        match read_frame::<_, AgentToCoord>(&mut coord_reader).await.unwrap() {
+        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
             AgentToCoord::Report(AgentReport::Register { agent, protocol_version }) => {
                 assert_eq!(agent.0, "pi-1");
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
@@ -598,7 +719,7 @@ kind = "none"
             other => panic!("expected Register, got {other:?}"),
         }
         // 2. Inventory (one online board with full metadata).
-        match read_frame::<_, AgentToCoord>(&mut coord_reader).await.unwrap() {
+        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
             AgentToCoord::Report(AgentReport::Inventory(inv)) => {
                 assert_eq!(inv.boards.len(), 1);
                 assert_eq!(inv.boards[0].board.0, "b1");
@@ -609,8 +730,8 @@ kind = "none"
 
         // 3. Command the agent to open a data session on channel 1.
         let token = signed_token(7, "b1", vec![AllowedOp::Attach], u64::MAX);
-        write_frame(
-            &mut coord_writer,
+        fleet_wire::send(
+            &mut coord_tx,
             &CoordToAgent::Command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
                 board: board_ref("b1"),
@@ -622,8 +743,8 @@ kind = "none"
         .await
         .unwrap();
 
-        // The agent emits a Log report acknowledging the open; drain reports
-        // until the splice peer is wired.
+        // The agent emits a Log report acknowledging the open; wait until the
+        // splice peer is wired.
         let peer = loop {
             if let Some(p) = peer_slot.lock().await.take() {
                 break p;
@@ -633,8 +754,8 @@ kind = "none"
         let mut peer = peer;
 
         // 4. Data round-trip: coordinator -> agent -> serve socket.
-        write_frame(
-            &mut coord_writer,
+        fleet_wire::send(
+            &mut coord_tx,
             &CoordToAgent::Data(DataFrame {
                 channel: ChannelId(1),
                 bytes: b"ping".to_vec(),
@@ -651,7 +772,7 @@ kind = "none"
         peer.flush().await.unwrap();
         // Skip any interleaved Log reports; assert the data frame arrives.
         let data = loop {
-            match read_frame::<_, AgentToCoord>(&mut coord_reader).await.unwrap() {
+            match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
                 AgentToCoord::Data(f) => break f,
                 AgentToCoord::Report(_) => {}
             }
@@ -659,8 +780,88 @@ kind = "none"
         assert_eq!(data.channel, ChannelId(1));
         assert_eq!(data.bytes, b"pong");
 
-        drop(coord_writer);
-        drop(coord_reader);
         agent_task.abort();
+    }
+
+    /// A pushed rotation is persisted to disk **before** it is acknowledged, so
+    /// the only reachable divergence is the one the retained previous token
+    /// recovers from. Acking a token that was never written is what would strand
+    /// a headless node.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rotation_persists_before_acking() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        let cfg = agent_config();
+        std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        let mut config = AgentConfig::from_path(&path).unwrap();
+        let original = config.node_token.clone();
+
+        let backend = Arc::new(DuplexBackend {
+            peer: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let agent = Arc::new(Agent::new(agent_config(), boards(), backend).unwrap());
+        agent.seed_inventory_from_boards().await;
+
+        let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let task = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                let _ = serve_connection(&agent, &mut config, Box::new(agent_tx), Box::new(agent_rx))
+                    .await;
+            })
+        };
+
+        // Drain Register + Inventory.
+        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+
+        let new_token = "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        fleet_wire::send(
+            &mut coord_tx,
+            &CoordToAgent::Command(CoordinatorCommand::RotateNodeToken {
+                token: new_token.to_owned(),
+                rotation_id: 7,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // The ack arrives ...
+        let ack = loop {
+            match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+                AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }) => break rotation_id,
+                _ => {}
+            }
+        };
+        assert_eq!(ack, 7);
+
+        // ... and by the time it did, the new token was already on disk, with
+        // the old one retained for the lost-ack retry.
+        let persisted = AgentConfig::from_path(&path).unwrap();
+        assert_eq!(persisted.node_token, new_token);
+        assert_eq!(persisted.previous_node_token.as_deref(), Some(original.as_str()));
+
+        task.abort();
+    }
+
+    /// Jitter must stay within ±20% of the requested delay: it exists to
+    /// desynchronise a fleet's reconnects, not to change the backoff schedule.
+    #[test]
+    fn jitter_stays_within_twenty_percent() {
+        for base_ms in [100u64, 500, 1_000, 30_000] {
+            let base = Duration::from_millis(base_ms);
+            for _ in 0..50 {
+                let j = jittered(base);
+                let spread = base_ms / 5;
+                assert!(
+                    j >= Duration::from_millis(base_ms - spread)
+                        && j <= Duration::from_millis(base_ms + spread),
+                    "{j:?} outside ±20% of {base:?}"
+                );
+            }
+        }
+        // Degenerate inputs must not panic or produce nonsense.
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+        assert_eq!(jittered(Duration::from_millis(1)), Duration::from_millis(1));
     }
 }

@@ -26,8 +26,8 @@
 //!   **zero** gdbremote parsing.
 //!
 //! Latency: the pump flushes each chunk immediately and sets `TCP_NODELAY` on
-//! the loopback hop so step-debugging is not Nagle-batched. The two mTLS relay
-//! hops add ~2×RTT per gdb round-trip; gdb is request/response and tolerant of
+//! the loopback hop so step-debugging is not Nagle-batched. The two relay hops
+//! (sidecar→coordinator and coordinator→agent, both `WebSocket`s over HTTPS) add ~2×RTT per gdb round-trip; gdb is request/response and tolerant of
 //! LAN-scale RTT, so this is acceptable for interactive use (revisit if
 //! step-debugging feels sluggish — see `docs/architecture.md` §10 Q3).
 

@@ -227,6 +227,13 @@ impl<B: ProbeRsBackend> Agent<B> {
             } => self.on_release_lease(lease, &board, erase).await,
             CoordinatorCommand::PowerCycle { board } => self.on_power_cycle(&board).await,
             CoordinatorCommand::QueryState => self.on_query_state().await,
+            // Rotation is a property of the *connection*, not of board state:
+            // it is handled in `connection.rs`, which owns the config file this
+            // agent's credential lives in. Reaching here means the connection
+            // layer did not intercept it.
+            CoordinatorCommand::RotateNodeToken { .. } => Err(AgentError::Connection(
+                "token rotation must be handled by the connection layer".to_owned(),
+            )),
         }
     }
 
@@ -546,10 +553,8 @@ mod tests {
         let toml = format!(
             r#"
 agent_id = "pi-1"
-coordinator_endpoint = "c:1"
-tls_cert = "/c.pem"
-tls_key = "/k.pem"
-tls_ca = "/ca.pem"
+fleet_url = "https://coordinator.example:7000"
+node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 coordinator_token_pubkey = "{pubkey_hex}"
 boards_path = "/boards.toml"
 "#

@@ -1,29 +1,30 @@
-//! The live mTLS + byte-opaque relay transport for the sidecar's fleet path.
+//! The live `WebSocket` + byte-opaque relay transport for the sidecar's fleet
+//! path.
 //!
 //! This is the concrete implementation of the relay seam described in
-//! [`crate::proxy`]: it dials the coordinator over mTLS, leases a board, opens a
-//! relay data (or gdb) channel, exposes a local endpoint the genuine probe-rs
-//! client connects to, and byte-splices the two verbatim. The sidecar never
-//! parses the relayed frames (WebSocket-over-TCP) — it is a pure byte pipe.
+//! [`crate::proxy`]: it dials the coordinator's `/client` route (presenting a
+//! bearer token on the upgrade), leases a board, opens a relay data (or gdb)
+//! channel, exposes a local endpoint the genuine probe-rs client connects to,
+//! and byte-splices the two verbatim. The sidecar never parses the relayed
+//! frames — it is a pure byte pipe.
 //!
-//! The control plane and the data plane share one TLS connection, multiplexed
-//! by the [`fleet_wire`] envelopes. A single reader task demultiplexes
-//! coordinator replies (control) from relayed [`fleet_proto::DataFrame`]s
-//! (data), routing the latter to the active channel's splice.
+//! The control plane and the data plane share one `WebSocket`, multiplexed by
+//! the [`fleet_wire`] envelopes. A single reader task demultiplexes coordinator
+//! replies (control) from relayed [`fleet_proto::DataFrame`]s (data), routing
+//! the latter to the active channel's splice.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
-use tokio_rustls::TlsConnector;
 
 use fleet_proto::lease::{LeaseGrant, LeaseRequest};
 use fleet_proto::{ChannelId, ChannelKind, DataFrame, PROTOCOL_VERSION};
-use fleet_wire::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
+use fleet_wire::client::{dial, DialOpts};
+use fleet_wire::{CoordToSidecar, SidecarToCoord, WireEvent, WireRx, WireTx};
 
-use crate::selector::{Auth, FleetConfig};
+use crate::selector::FleetConfig;
 
 /// Errors from the live relay transport.
 #[derive(Debug, thiserror::Error)]
@@ -45,47 +46,6 @@ pub enum TransportError {
     Io(String),
 }
 
-/// Build the sidecar's mTLS client config from a [`FleetConfig`].
-///
-/// The architecture mandates mutual TLS for runtime traffic (the bearer token
-/// is bootstrap-only). A token-only `FleetConfig` is therefore rejected here.
-fn client_config(cfg: &FleetConfig) -> Result<rustls::ClientConfig, TransportError> {
-    let Auth::Mtls {
-        client_cert,
-        client_key,
-        ca,
-    } = &cfg.auth
-    else {
-        return Err(TransportError::Tls(
-            "fleet relay requires mTLS client material (cert + key + ca); \
-             a bearer token alone is not accepted for runtime traffic"
-                .to_owned(),
-        ));
-    };
-    let ca = ca.as_ref().ok_or_else(|| {
-        TransportError::Tls("fleet relay requires a pinned CA (PROBE_RS_FLEET_CA)".to_owned())
-    })?;
-    let chain = fleet_tls::load_cert_chain(client_cert)
-        .map_err(|e| TransportError::Tls(format!("loading client cert: {e}")))?;
-    let key = fleet_tls::load_private_key(client_key)
-        .map_err(|e| TransportError::Tls(format!("loading client key: {e}")))?;
-    let roots = fleet_tls::load_root_store(ca)
-        .map_err(|e| TransportError::Tls(format!("loading CA: {e}")))?;
-    fleet_tls::client_config(chain, key, roots)
-        .map_err(|e| TransportError::Tls(format!("building client TLS config: {e}")))
-}
-
-/// Derive a TLS `ServerName` from a `host:port` address (IP or DNS).
-fn server_name(addr: &str) -> Result<rustls::pki_types::ServerName<'static>, TransportError> {
-    use rustls::pki_types::ServerName;
-    let host = addr.rsplit_once(':').map_or(addr, |(h, _)| h);
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        return Ok(ServerName::IpAddress(ip.into()));
-    }
-    ServerName::try_from(host.to_owned())
-        .map_err(|e| TransportError::Connect(format!("invalid server name '{host}': {e}")))
-}
-
 /// The active relay channel's data sink: when set, the reader routes inbound
 /// `Data` frames for that channel to the splice.
 type DataSink = Arc<Mutex<Option<(ChannelId, mpsc::Sender<DataFrame>)>>>;
@@ -104,46 +64,49 @@ pub struct CoordSession {
 }
 
 impl CoordSession {
-    /// Dial the coordinator over mTLS and complete the Hello handshake.
+    /// Dial the coordinator's `/client` route and complete the Hello handshake.
+    ///
+    /// The bearer token rides the `WebSocket` upgrade; there is no client
+    /// certificate. Trust configuration (WebPKI roots, or the optional pinned
+    /// server-cert hash) is shared with every other outbound connection in the
+    /// tree via `fleet_tls::client_trust_config`.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError`] on a TLS, connection, or version mismatch.
     pub async fn connect(cfg: &FleetConfig) -> Result<Self, TransportError> {
-        let tls = client_config(cfg)?;
-        let connector = TlsConnector::from(Arc::new(tls));
-        let tcp = TcpStream::connect(&cfg.coordinator)
-            .await
-            .map_err(|e| TransportError::Connect(format!("connecting to {}: {e}", cfg.coordinator)))?;
-        let _ = tcp.set_nodelay(true);
-        let name = server_name(&cfg.coordinator)?;
-        let stream = connector
-            .connect(name, tcp)
-            .await
-            .map_err(|e| TransportError::Connect(format!("TLS handshake failed: {e}")))?;
-        let (reader, writer) = tokio::io::split(stream);
-        Self::start(reader, writer).await
+        let (tx, rx) = dial(DialOpts {
+            url: cfg.coordinator.clone(),
+            path: "/client",
+            bearer: cfg.token.clone(),
+            pin: cfg.server_pin(),
+        })
+        .await
+        .map_err(|e| TransportError::Connect(format!("dialing {}: {e}", cfg.coordinator)))?;
+        Self::start(Box::new(tx), Box::new(rx)).await
     }
 
-    /// Start the reader/writer tasks over an established stream and complete the
-    /// Hello/Welcome exchange. Generic so it is testable over a duplex.
+    /// Start the reader/writer tasks over established wire halves and complete
+    /// the Hello/Welcome exchange. Generic so it is testable over an in-memory
+    /// pair.
     ///
     /// # Errors
     ///
     /// Returns [`TransportError`] on a framing failure or version mismatch.
-    pub async fn start<R, W>(mut reader: R, writer: W) -> Result<Self, TransportError>
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
+    pub async fn start(
+        tx: Box<dyn WireTx + Send>,
+        rx: Box<dyn WireRx + Send>,
+    ) -> Result<Self, TransportError> {
+        let mut rx = rx;
         let (out_tx, mut out_rx) = mpsc::channel::<SidecarToCoord>(256);
         tokio::spawn(async move {
-            let mut writer = writer;
+            let mut tx = tx;
             while let Some(msg) = out_rx.recv().await {
-                if write_frame(&mut writer, &msg).await.is_err() {
+                if fleet_wire::send(&mut *tx, &msg).await.is_err() {
                     break;
                 }
             }
+            let _ = tx.close().await;
         });
 
         // Hello / Welcome handshake.
@@ -153,7 +116,7 @@ impl CoordSession {
             })
             .await
             .map_err(|_| TransportError::Connect("writer closed".to_owned()))?;
-        match read_frame::<_, CoordToSidecar>(&mut reader).await {
+        match fleet_wire::recv::<CoordToSidecar>(&mut *rx).await {
             Ok(CoordToSidecar::Welcome { protocol_version }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(TransportError::Connect(format!(
@@ -173,7 +136,18 @@ impl CoordSession {
         let sink = Arc::clone(&data_sink);
         tokio::spawn(async move {
             loop {
-                match read_frame::<_, CoordToSidecar>(&mut reader).await {
+                let event = match rx.recv().await {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
+                let bytes = match event {
+                    WireEvent::Binary(bytes) => bytes,
+                    // Liveness only; the coordinator pings an idle connection so
+                    // a proxy does not reap it mid-flash.
+                    WireEvent::Pong => continue,
+                    WireEvent::Closed => break,
+                };
+                match fleet_wire::decode::<CoordToSidecar>(&bytes) {
                     Ok(CoordToSidecar::Data(frame)) => {
                         let route = {
                             let guard = sink.lock().await;
@@ -395,18 +369,25 @@ mod tests {
         assert_eq!(hex_encode(&[0x00, 0xde, 0xad, 0xff]), "00deadff");
     }
 
+    /// The pin is decoded from the resolved config, so a self-hosted
+    /// deployment's `--server-cert-sha256` reaches the dialer as bytes.
     #[test]
-    fn client_config_rejects_token_only_auth() {
+    fn fleet_config_decodes_its_pin() {
         let cfg = FleetConfig {
-            coordinator: "c:1".to_owned(),
-            auth: Auth::Token("t".to_owned()),
+            coordinator: "https://c:1".to_owned(),
+            token: "prfs1_t".to_owned(),
             select: fleet_proto::lease::Constraint::Board(fleet_proto::ids::BoardName(
                 "b".to_owned(),
             )),
-            subject_id: None,
+            server_cert_sha256: Some("cd".repeat(32)),
         };
-        let err = client_config(&cfg).unwrap_err();
-        assert!(matches!(err, TransportError::Tls(_)));
+        assert_eq!(cfg.server_pin(), Some([0xcdu8; 32]));
+
+        let unpinned = FleetConfig {
+            server_cert_sha256: None,
+            ..cfg
+        };
+        assert!(unpinned.server_pin().is_none());
     }
 
     /// End-to-end sidecar transport over an in-memory duplex against a
@@ -427,23 +408,21 @@ mod tests {
             "b1",
         );
 
-        let (sidecar_side, coord_side) = tokio::io::duplex(8192);
-        let (sc_reader, sc_writer) = tokio::io::split(sidecar_side);
-        let (mut coord_reader, mut coord_writer) = tokio::io::split(coord_side);
+        let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
 
         // Coordinator peer task: Welcome -> Lease grant -> ChannelOpened ->
         // echo any Data frame back on the same channel.
         let board_ref_for_peer = board_ref.clone();
         let coord = tokio::spawn(async move {
             // Hello -> Welcome.
-            match read_frame::<_, SidecarToCoord>(&mut coord_reader).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
                 SidecarToCoord::Hello { protocol_version } => {
                     assert_eq!(protocol_version, PROTOCOL_VERSION);
                 }
                 other => panic!("expected Hello, got {other:?}"),
             }
-            write_frame(
-                &mut coord_writer,
+            fleet_wire::send(
+                &mut coord_tx,
                 &CoordToSidecar::Welcome {
                     protocol_version: PROTOCOL_VERSION,
                 },
@@ -452,12 +431,12 @@ mod tests {
             .unwrap();
 
             // Lease.
-            match read_frame::<_, SidecarToCoord>(&mut coord_reader).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
                 SidecarToCoord::Lease(_) => {}
                 other => panic!("expected Lease, got {other:?}"),
             }
-            write_frame(
-                &mut coord_writer,
+            fleet_wire::send(
+                &mut coord_tx,
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
                     board: board_ref_for_peer.clone(),
@@ -475,15 +454,15 @@ mod tests {
             .unwrap();
 
             // OpenChannel -> ChannelOpened(7).
-            match read_frame::<_, SidecarToCoord>(&mut coord_reader).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
                 SidecarToCoord::OpenChannel { lease, kind } => {
                     assert_eq!(lease, LeaseId(1));
                     assert_eq!(kind, ChannelKind::Data);
                 }
                 other => panic!("expected OpenChannel, got {other:?}"),
             }
-            write_frame(
-                &mut coord_writer,
+            fleet_wire::send(
+                &mut coord_tx,
                 &CoordToSidecar::ChannelOpened {
                     channel: ChannelId(7),
                 },
@@ -492,20 +471,22 @@ mod tests {
             .unwrap();
 
             // Echo the next Data frame back (relay agent stand-in).
-            match read_frame::<_, SidecarToCoord>(&mut coord_reader).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
                 SidecarToCoord::Data(frame) => {
                     assert_eq!(frame.channel, ChannelId(7));
-                    write_frame(&mut coord_writer, &CoordToSidecar::Data(frame))
+                    fleet_wire::send(&mut coord_tx, &CoordToSidecar::Data(frame))
                         .await
                         .unwrap();
                 }
                 other => panic!("expected Data, got {other:?}"),
             }
             // Keep the connection open until the test drops it.
-            let _ = read_frame::<_, SidecarToCoord>(&mut coord_reader).await;
+            let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
         });
 
-        let session = CoordSession::start(sc_reader, sc_writer).await.unwrap();
+        let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+            .await
+            .unwrap();
         let grant = session
             .lease(&LeaseRequest {
                 select: Constraint::Board(BoardName("b1".to_owned())),

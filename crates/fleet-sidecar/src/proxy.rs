@@ -30,7 +30,7 @@
 //!
 //! # Status
 //!
-//! The concrete mTLS + byte-opaque relay transport that implements all of the
+//! The concrete `WebSocket` + byte-opaque relay transport that implements all of the
 //! [`crate::transport`] ([`crate::transport::CoordSession`] +
 //! [`crate::transport::splice_client`]), driven from the fleet arm of
 //! [`crate::run`]. This module retains the error type and the trait *seam*

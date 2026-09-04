@@ -10,17 +10,16 @@ description = "Sidecar role implementation for probe-rs-fleet."
 [dependencies]
 fleet-proto = { workspace = true }
 fleet-tls = { workspace = true }
-fleet-wire = { workspace = true }
+fleet-wire = { workspace = true, features = ["tungstenite"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 fleet-agent = { workspace = true }
+fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
 
 [lints]
 workspace = true

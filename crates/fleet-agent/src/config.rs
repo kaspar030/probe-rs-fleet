@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use fleet_proto::{BoardName, PowerKind};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Errors arising from configuration parsing and validation.
 #[derive(Debug, thiserror::Error)]
@@ -173,7 +173,8 @@ impl BoardsConfig {
             path: path.display().to_string(),
             source,
         })?;
-        Self::from_str(&text)
+        let cfg = Self::from_str(&text)?;
+        Ok(cfg)
     }
 
     /// Validate semantic invariants: non-empty ids/serials, unique ids, unique
@@ -226,18 +227,37 @@ fn default_heartbeat_secs() -> u64 {
 ///
 /// Parsed from the agent's own config TOML. Carries connection identity, the
 /// coordinator's token-verification public key, and policy knobs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct AgentConfig {
-    /// This agent's id (must match the pinned cert fingerprint).
+    /// This node's id, as returned by the token exchange at `agent init`.
+    ///
+    /// **Advisory.** The coordinator identifies this node by the token it
+    /// presents, not by this field; it is written here so logs and
+    /// `AgentReport::Register` are legible, and the coordinator refuses the
+    /// connection if it contradicts the token.
     pub agent_id: String,
-    /// `host:port` of the coordinator to dial out to.
-    pub coordinator_endpoint: String,
-    /// Path to this agent's TLS client certificate chain (PEM).
-    pub tls_cert: String,
-    /// Path to this agent's TLS private key (PEM).
-    pub tls_key: String,
-    /// Path to the CA used to verify the coordinator's server cert (PEM).
-    pub tls_ca: String,
+    /// The coordinator's base URL (`https://fleet.example`), or a bare
+    /// `host:port` (which defaults to `https`).
+    pub fleet_url: String,
+    /// This node's bearer token (`prfn1_…`).
+    ///
+    /// Rotated by the coordinator over the established connection; see
+    /// [`AgentConfig::persist_node_token`].
+    pub node_token: String,
+    /// The node token this one replaced, kept until a connection with
+    /// `node_token` succeeds.
+    ///
+    /// This closes the one rotation window the coordinator's ack-then-retire
+    /// scheme cannot: if the *ack* is lost after the node persisted the new
+    /// token, the node holds the new token while the coordinator still holds the
+    /// old. Retrying once with the previous token recovers without any server
+    /// state, and without it that case would need a physical visit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_node_token: Option<String>,
+    /// Optional pinned coordinator server-certificate SHA-256 (64 hex chars),
+    /// for a self-hosted deployment with no publicly trusted certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_cert_sha256: Option<String>,
     /// Hex-encoded ed25519 public key of the coordinator's token signer.
     pub coordinator_token_pubkey: String,
     /// Path to `boards.toml`.
@@ -248,6 +268,10 @@ pub struct AgentConfig {
     /// Whether to erase the target's flash on lease release.
     #[serde(default)]
     pub erase_on_release: bool,
+    /// The file this configuration was read from, so a rotated token can be
+    /// written back. `None` when the config was parsed from a string.
+    #[serde(skip)]
+    pub source_path: Option<std::path::PathBuf>,
 }
 
 impl AgentConfig {
@@ -278,16 +302,16 @@ impl AgentConfig {
             path: path.display().to_string(),
             source,
         })?;
-        Self::from_str(&text)
+        let mut cfg = Self::from_str(&text)?;
+        cfg.source_path = Some(path.to_path_buf());
+        Ok(cfg)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
         for (name, value) in [
             ("agent_id", &self.agent_id),
-            ("coordinator_endpoint", &self.coordinator_endpoint),
-            ("tls_cert", &self.tls_cert),
-            ("tls_key", &self.tls_key),
-            ("tls_ca", &self.tls_ca),
+            ("fleet_url", &self.fleet_url),
+            ("node_token", &self.node_token),
             ("coordinator_token_pubkey", &self.coordinator_token_pubkey),
             ("boards_path", &self.boards_path),
         ] {
@@ -295,8 +319,99 @@ impl AgentConfig {
                 return Err(ConfigError::Invalid(format!("{name} must not be empty")));
             }
         }
+        if let Some(pin) = &self.server_cert_sha256 {
+            if fleet_tls::parse_fingerprint(pin).is_none() {
+                return Err(ConfigError::Invalid(
+                    "server_cert_sha256 must be 64 hex characters".to_owned(),
+                ));
+            }
+        }
         let key = self.coordinator_token_pubkey_bytes()?;
         debug_assert_eq!(key.len(), 32);
+        Ok(())
+    }
+
+    /// The pinned coordinator server-certificate hash, decoded.
+    ///
+    /// Validated at load time, so a malformed pin cannot reach the dialer and
+    /// silently downgrade to WebPKI verification.
+    #[must_use]
+    pub fn server_pin(&self) -> Option<[u8; 32]> {
+        self.server_cert_sha256
+            .as_deref()
+            .and_then(fleet_tls::parse_fingerprint)
+    }
+
+    /// Persist a rotated node token back to the config file, atomically.
+    ///
+    /// Written to a temporary file in the same directory and renamed, so a crash
+    /// mid-write cannot leave a truncated credential — which on a headless node
+    /// would mean a physical visit. The previous token is retained for the
+    /// one-shot retry described on
+    /// [`previous_node_token`](AgentConfig::previous_node_token).
+    ///
+    /// The file is created 0600: it holds a bearer credential, and a bearer
+    /// credential readable by other users on the host is equivalent to no
+    /// credential at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Read`] if the config has no known source path or
+    /// the write fails, and [`ConfigError::Invalid`] if it cannot be rendered.
+    pub fn persist_node_token(&mut self, new_token: &str) -> Result<(), ConfigError> {
+        let previous = std::mem::replace(&mut self.node_token, new_token.to_owned());
+        self.previous_node_token = Some(previous);
+        self.write_back()
+    }
+
+    /// Forget the previous token once the current one has proven itself.
+    ///
+    /// # Errors
+    ///
+    /// As [`AgentConfig::persist_node_token`].
+    pub fn clear_previous_token(&mut self) -> Result<(), ConfigError> {
+        if self.previous_node_token.is_none() {
+            return Ok(());
+        }
+        self.previous_node_token = None;
+        self.write_back()
+    }
+
+    /// Swap in the previous token for a one-shot retry after an auth rejection.
+    ///
+    /// Returns `false` when there is no previous token to fall back to.
+    pub fn fall_back_to_previous_token(&mut self) -> bool {
+        let Some(previous) = self.previous_node_token.take() else {
+            return false;
+        };
+        self.previous_node_token = Some(std::mem::replace(&mut self.node_token, previous));
+        true
+    }
+
+    fn write_back(&self) -> Result<(), ConfigError> {
+        let path = self
+            .source_path
+            .clone()
+            .ok_or_else(|| ConfigError::Invalid("agent config has no source path".to_owned()))?;
+        let rendered = toml::to_string_pretty(self)
+            .map_err(|e| ConfigError::Invalid(format!("rendering agent config: {e}")))?;
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let tmp = dir.join(format!(
+            ".{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("agent.toml")
+        ));
+        let read_err = |source| ConfigError::Read {
+            path: path.display().to_string(),
+            source,
+        };
+        std::fs::write(&tmp, rendered).map_err(read_err)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .map_err(read_err)?;
+        }
+        std::fs::rename(&tmp, &path).map_err(read_err)?;
         Ok(())
     }
 
@@ -508,11 +623,9 @@ chip = "c1"
     }
 
     const AGENT_CFG: &str = r#"
-agent_id = "pi-lab-1"
-coordinator_endpoint = "coordinator.fleet.internal:7443"
-tls_cert = "/etc/fleet/agent.pem"
-tls_key = "/etc/fleet/agent.key"
-tls_ca = "/etc/fleet/ca.pem"
+agent_id = "default/pi-lab-1"
+fleet_url = "https://fleet.example:7000"
+node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 boards_path = "/etc/fleet/boards.toml"
 "#;
@@ -520,9 +633,12 @@ boards_path = "/etc/fleet/boards.toml"
     #[test]
     fn agent_config_parses_with_defaults() {
         let cfg = AgentConfig::from_str(AGENT_CFG).unwrap();
-        assert_eq!(cfg.agent_id, "pi-lab-1");
+        assert_eq!(cfg.agent_id, "default/pi-lab-1");
+        assert_eq!(cfg.fleet_url, "https://fleet.example:7000");
         assert_eq!(cfg.heartbeat_secs, 15);
         assert!(!cfg.erase_on_release);
+        assert!(cfg.previous_node_token.is_none());
+        assert!(cfg.server_pin().is_none());
         assert_eq!(cfg.heartbeat_interval(), Duration::from_secs(15));
         let key = cfg.coordinator_token_pubkey_bytes().unwrap();
         assert_eq!(key[0], 0x01);
@@ -541,8 +657,71 @@ boards_path = "/etc/fleet/boards.toml"
 
     #[test]
     fn agent_config_rejects_empty_field() {
-        let bad = AGENT_CFG.replace("pi-lab-1", "");
+        let bad = AGENT_CFG.replace("default/pi-lab-1", "");
         let err = AgentConfig::from_str(&bad).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("agent_id")));
+    }
+
+    /// A malformed pin must be rejected at load, not at dial time: silently
+    /// ignoring it would downgrade a deliberately pinned deployment to WebPKI
+    /// verification, which for a self-signed coordinator means "nothing works"
+    /// or, worse, "anything with a public cert works".
+    #[test]
+    fn agent_config_rejects_a_malformed_pin() {
+        let bad = format!("{AGENT_CFG}server_cert_sha256 = \"nope\"\n");
+        let err = AgentConfig::from_str(&bad).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(m) if m.contains("server_cert_sha256")));
+
+        let good = format!("{AGENT_CFG}server_cert_sha256 = \"{}\"\n", "ab".repeat(32));
+        let cfg = AgentConfig::from_str(&good).unwrap();
+        assert_eq!(cfg.server_pin(), Some([0xabu8; 32]));
+    }
+
+    /// Rotation persists the new token and keeps the old one, then forgets it
+    /// once the new one has proven itself. The file is rewritten atomically and
+    /// stays 0600, because it holds a bearer credential.
+    #[test]
+    fn node_token_rotation_round_trips_through_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        std::fs::write(&path, AGENT_CFG).unwrap();
+
+        let mut cfg = AgentConfig::from_path(&path).unwrap();
+        let original = cfg.node_token.clone();
+        cfg.persist_node_token("prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
+            .unwrap();
+
+        let reloaded = AgentConfig::from_path(&path).unwrap();
+        assert_eq!(
+            reloaded.node_token,
+            "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+        );
+        assert_eq!(reloaded.previous_node_token.as_deref(), Some(original.as_str()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "a bearer credential must not be world-readable");
+        }
+
+        let mut reloaded = reloaded;
+        reloaded.clear_previous_token().unwrap();
+        let again = AgentConfig::from_path(&path).unwrap();
+        assert!(again.previous_node_token.is_none());
+    }
+
+    /// The one-shot fallback: if the coordinator never saw the ack, the node
+    /// must be able to reconnect with the token the coordinator still holds.
+    #[test]
+    fn falling_back_swaps_current_and_previous() {
+        let mut cfg = AgentConfig::from_str(AGENT_CFG).unwrap();
+        assert!(!cfg.fall_back_to_previous_token(), "nothing to fall back to");
+
+        cfg.previous_node_token = Some("prfn1_old".to_owned());
+        let current = cfg.node_token.clone();
+        assert!(cfg.fall_back_to_previous_token());
+        assert_eq!(cfg.node_token, "prfn1_old");
+        assert_eq!(cfg.previous_node_token.as_deref(), Some(current.as_str()));
     }
 }

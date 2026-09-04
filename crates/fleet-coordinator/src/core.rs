@@ -102,6 +102,21 @@ impl Coordinator {
         &self.signer
     }
 
+    /// Hex-encoded ed25519 public key of the capability-token signer.
+    ///
+    /// Handed to a node at enrollment so it can verify the capability tokens
+    /// the coordinator later mints for its sessions.
+    #[must_use]
+    pub fn token_pubkey_hex(&self) -> String {
+        let bytes = self.signer.public_key_bytes();
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
     /// The persistent state handle.
     #[must_use]
     pub fn db(&self) -> &Db {
@@ -250,6 +265,12 @@ impl Coordinator {
             AgentReport::SessionClosed { channel, exit_code } => {
                 debug!(%agent_id, ?channel, ?exit_code, "session closed");
                 relay::close_channel(&self.channels, None, channel).await;
+            }
+            AgentReport::TokenRotated { rotation_id } => {
+                // Handled by the connection task, which owns the pending
+                // rotation; reaching `core` means the connection did not
+                // recognise it, which is worth a trace but nothing more.
+                debug!(%agent_id, rotation_id, "stray token-rotation ack");
             }
         }
         Ok(())

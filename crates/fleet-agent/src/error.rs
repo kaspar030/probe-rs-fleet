@@ -32,6 +32,19 @@ pub enum AgentError {
     #[error("connection error: {0}")]
     Connection(String),
 
+    /// The coordinator refused this node's bearer token.
+    ///
+    /// Distinguished from [`AgentError::Connection`] because the remediation is
+    /// completely different: a network failure resolves itself, a rejected
+    /// credential never does. The HTTP response is deliberately generic (no
+    /// oracle for an attacker), so this local error text is where the operator
+    /// gets told what to do about it.
+    #[error(
+        "node token rejected by the coordinator ({0}); \
+         re-enroll with `fleet agent init --fleet-url <url> --auth-key <key>`"
+    )]
+    CredentialRejected(String),
+
     /// An unknown board id was referenced by a coordinator command.
     #[error("unknown board: {0}")]
     UnknownBoard(String),

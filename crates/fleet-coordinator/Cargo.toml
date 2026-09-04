@@ -12,22 +12,32 @@ fleet-proto.workspace = true
 fleet-core.workspace = true
 fleet-tls.workspace = true
 fleet-wire.workspace = true
+fleet-auth.workspace = true
 
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
+
+# HTTP/WebSocket server. This is the *only* crate in the workspace that depends
+# on axum/hyper's server half; fleet-agent and fleet-sidecar dial out with
+# tokio-tungstenite through fleet-wire. See
+# `crates/fleet-agent/tests/no_http_server_dep.rs`.
+axum.workspace = true
+hyper-util = { workspace = true, features = ["server", "server-auto", "http1", "tokio"] }
+tower.workspace = true
+futures-util.workspace = true
 
 postcard.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 
 sqlx.workspace = true
 
-rcgen.workspace = true
 sha2.workspace = true
 
 ed25519-dalek.workspace = true
 
+async-trait.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
@@ -37,11 +47,14 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 fleet-agent.workspace = true
 fleet-sidecar.workspace = true
-fleet-wire.workspace = true
+fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+fleet-auth = { workspace = true, features = ["client"] }
+tokio-tungstenite.workspace = true
 async-trait.workspace = true
 fleet-tls.workspace = true
-rustls-pemfile.workspace = true
 fleet-core.workspace = true
+rcgen.workspace = true
+http.workspace = true
 
 [lints]
 workspace = true
