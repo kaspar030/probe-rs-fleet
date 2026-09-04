@@ -241,12 +241,15 @@ async fn connect_and_serve<B: ProbeRsBackend + 'static>(
     .map_err(|e| classify_dial_error(&e))?;
     *connected = true;
 
-    // The dial succeeded, so this token works: the previous one is dead weight
-    // and keeping it would widen the window in which a stale credential is on
-    // disk.
+    // The dial succeeded, so this token works. Write it down as *the* token:
+    // after a fallback the working token is the one that was stored as
+    // `previous`, so merely dropping the fallback would leave the rejected
+    // token on disk and lose the one we are actually connected with — a restart
+    // would then load a credential the coordinator refuses, with nothing left to
+    // fall back to. See `NodeTokenStore::commit_current`.
     if config.previous_node_token.take().is_some() {
-        if let Err(e) = store.clear_previous() {
-            tracing::debug!(error = %e, "could not clear the superseded node token");
+        if let Err(e) = store.commit_current(&config.node_token) {
+            tracing::debug!(error = %e, "could not record the proven node token");
         }
     }
 
@@ -459,11 +462,7 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
     // Token rotation is handled here rather than in the agent's command
     // handlers because it touches the *connection's* configuration, not the
     // board state the handlers own.
-    if let CoordinatorCommand::RotateNodeToken {
-        token,
-        rotation_id,
-    } = &cmd
-    {
+    if let CoordinatorCommand::RotateNodeToken { token, rotation_id } = &cmd {
         rotate_token(config, store, out_tx, token, *rotation_id).await;
         return;
     }
@@ -694,13 +693,18 @@ mod tests {
     }
 
     impl NodeTokenStore for MemoryStore {
-        fn persist(&self, new_token: &str, previous: Option<&str>) -> std::result::Result<(), String> {
+        fn persist(
+            &self,
+            new_token: &str,
+            previous: Option<&str>,
+        ) -> std::result::Result<(), String> {
             *self.current.lock().unwrap() = Some(new_token.to_owned());
             *self.previous.lock().unwrap() = previous.map(ToOwned::to_owned);
             Ok(())
         }
 
-        fn clear_previous(&self) -> std::result::Result<(), String> {
+        fn commit_current(&self, current: &str) -> std::result::Result<(), String> {
+            *self.current.lock().unwrap() = Some(current.to_owned());
             *self.previous.lock().unwrap() = None;
             Ok(())
         }
@@ -796,15 +800,24 @@ kind = "none"
         };
 
         // 1. Register.
-        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
-            AgentToCoord::Report(AgentReport::Register { agent, protocol_version }) => {
+        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
+            AgentToCoord::Report(AgentReport::Register {
+                agent,
+                protocol_version,
+            }) => {
                 assert_eq!(agent.0, "pi-1");
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
             }
             other => panic!("expected Register, got {other:?}"),
         }
         // 2. Inventory (one online board with full metadata).
-        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             AgentToCoord::Report(AgentReport::Inventory(inv)) => {
                 assert_eq!(inv.boards.len(), 1);
                 assert_eq!(inv.boards[0].board.0, "b1");
@@ -857,7 +870,10 @@ kind = "none"
         peer.flush().await.unwrap();
         // Skip any interleaved Log reports; assert the data frame arrives.
         let data = loop {
-            match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 AgentToCoord::Data(f) => break f,
                 AgentToCoord::Report(_) => {}
             }
@@ -902,8 +918,12 @@ kind = "none"
         };
 
         // Drain Register + Inventory.
-        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
-        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
+        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
 
         let new_token = "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         fleet_wire::send(
@@ -919,7 +939,9 @@ kind = "none"
         // The ack arrives ...
         let ack = loop {
             if let AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }) =
-                fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap()
+                fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+                    .await
+                    .unwrap()
             {
                 break rotation_id;
             }
@@ -928,10 +950,7 @@ kind = "none"
 
         // ... and by the time it did, the new token was already persisted, with
         // the old one retained for the lost-ack retry.
-        assert_eq!(
-            memory.current.lock().unwrap().as_deref(),
-            Some(new_token)
-        );
+        assert_eq!(memory.current.lock().unwrap().as_deref(), Some(new_token));
         assert_eq!(
             memory.previous.lock().unwrap().as_deref(),
             Some(original.as_str())
@@ -978,6 +997,45 @@ kind = "none"
         assert!(should_fall_back(&rejected, false));
         // Second in a row: back off instead of hot-looping.
         assert!(!should_fall_back(&rejected, true));
+    }
+
+    /// After a fallback, the token the agent is actually connected with must be
+    /// the one on disk — otherwise a restart loads the token the coordinator
+    /// just rejected, with no fallback left, and the node is only recoverable by
+    /// physically visiting it.
+    ///
+    /// This reproduces the whole lost-ack sequence against the store, because
+    /// the bug it guards was invisible in memory: the in-memory swap looked
+    /// correct while the file kept the rejected token.
+    #[test]
+    fn a_fallback_that_works_is_written_down_as_the_current_token() {
+        let store = MemoryStore::default();
+        let mut config = agent_config();
+        let t1 = config.node_token.clone();
+        let t2 = "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+        // 1. Rotation to T2 is persisted, then the ack is lost: the coordinator
+        //    still holds T1.
+        store.persist(t2, Some(&t1)).unwrap();
+        config.previous_node_token = Some(std::mem::replace(&mut config.node_token, t2.to_owned()));
+        assert_eq!(store.current.lock().unwrap().as_deref(), Some(t2));
+
+        // 2. Reconnect with T2 is refused; fall back to T1 in memory.
+        assert!(config.fall_back_to_previous_token());
+        assert_eq!(config.node_token, t1);
+
+        // 3. The dial with T1 succeeds — this is `connect_and_serve`'s commit.
+        assert!(config.previous_node_token.take().is_some());
+        store.commit_current(&config.node_token).unwrap();
+
+        // 4. The store holds the token the agent is running on, not the rejected
+        //    one, and the spent fallback is gone.
+        assert_eq!(
+            store.current.lock().unwrap().as_deref(),
+            Some(t1.as_str()),
+            "the working token must be the one on disk"
+        );
+        assert!(store.previous.lock().unwrap().is_none());
     }
 
     /// A network failure is never a reason to swap credentials: the token is

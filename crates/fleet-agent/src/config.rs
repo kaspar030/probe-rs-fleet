@@ -297,13 +297,28 @@ pub trait NodeTokenStore: Send + Sync {
     /// valid and the node stays reachable.
     fn persist(&self, new_token: &str, previous: Option<&str>) -> Result<(), String>;
 
-    /// Forget the retained previous token once the current one has proven
-    /// itself.
+    /// Record that `current` has just proven itself on a live connection: make
+    /// it the stored token and drop any retained fallback.
+    ///
+    /// # Why this takes the token rather than just clearing the previous one
+    ///
+    /// After [`AgentConfig::fall_back_to_previous_token`] the in-memory current
+    /// token is the one that was *previously* stored, and the stored one is the
+    /// token the coordinator just rejected — the two have swapped. A method that
+    /// only cleared `previous` would leave the rejected token on disk and throw
+    /// the working one away, so the next restart would load a credential the
+    /// coordinator refuses, with no fallback left. On a headless node that is a
+    /// physical visit.
+    ///
+    /// Taking `current` makes that unrepresentable: the caller cannot forget to
+    /// write down the token it is actually using.
     ///
     /// # Errors
     ///
-    /// Returns a human-readable message if the write fails.
-    fn clear_previous(&self) -> Result<(), String>;
+    /// Returns a human-readable message if the write fails. Non-fatal to the
+    /// caller: the connection is already up, and the stale fallback costs
+    /// nothing until the next rotation.
+    fn commit_current(&self, current: &str) -> Result<(), String>;
 }
 
 /// A [`NodeTokenStore`] that discards writes.
@@ -320,7 +335,7 @@ impl NodeTokenStore for NullTokenStore {
         Ok(())
     }
 
-    fn clear_previous(&self) -> Result<(), String> {
+    fn commit_current(&self, _current: &str) -> Result<(), String> {
         Ok(())
     }
 }
@@ -348,7 +363,9 @@ impl AgentConfig {
             }
         }
         if self.boards_path.as_os_str().is_empty() {
-            return Err(ConfigError::Invalid("boards_path must not be empty".to_owned()));
+            return Err(ConfigError::Invalid(
+                "boards_path must not be empty".to_owned(),
+            ));
         }
         if let Some(pin) = &self.server_cert_sha256 {
             if fleet_tls::parse_fingerprint(pin).is_none() {
@@ -390,8 +407,9 @@ impl AgentConfig {
     ///
     /// Returns [`ConfigError::Invalid`] if the hex is malformed or not 32 bytes.
     pub fn coordinator_token_pubkey_bytes(&self) -> Result<[u8; 32], ConfigError> {
-        decode_hex_32(&self.coordinator_token_pubkey)
-            .ok_or_else(|| ConfigError::Invalid("coordinator_token_pubkey must be 64 hex chars (32 bytes)".into()))
+        decode_hex_32(&self.coordinator_token_pubkey).ok_or_else(|| {
+            ConfigError::Invalid("coordinator_token_pubkey must be 64 hex chars (32 bytes)".into())
+        })
     }
 
     /// The configured heartbeat interval as a [`Duration`].
@@ -623,7 +641,10 @@ chip = "c1"
             coordinator_token_pubkey: "xyz".to_owned(),
             ..agent_cfg()
         };
-        assert!(matches!(cfg.validate().unwrap_err(), ConfigError::Invalid(_)));
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            ConfigError::Invalid(_)
+        ));
     }
 
     #[test]
@@ -671,7 +692,10 @@ chip = "c1"
     #[test]
     fn falling_back_swaps_current_and_previous() {
         let mut cfg = agent_cfg();
-        assert!(!cfg.fall_back_to_previous_token(), "nothing to fall back to");
+        assert!(
+            !cfg.fall_back_to_previous_token(),
+            "nothing to fall back to"
+        );
 
         cfg.previous_node_token = Some("prfn1_old".to_owned());
         let current = cfg.node_token.clone();

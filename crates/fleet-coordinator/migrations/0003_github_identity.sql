@@ -7,10 +7,18 @@
 -- plain UNIQUE would collapse them all into one under SQLite's NULL-distinct
 -- rules only by accident — being explicit is cheaper than relying on that.
 --
--- Why uniqueness matters: `upsert_github_user` resolves an existing user by
--- `github_user_id` and creates one otherwise. Without the index a race between
--- two concurrent first logins for the same human would create two `user` rows
--- and two personal orgs, and the second login would silently land in a
--- different org than the first — the leases and grants would appear to vanish.
+-- Why uniqueness matters: it is a schema-level statement of the invariant
+-- `Db::upsert_github_user` relies on — one `user` row per GitHub account — so a
+-- future code path that tries to create a second one fails at the database
+-- rather than quietly splitting a person's identity in two.
+--
+-- Note it does NOT prevent a concurrent double first-login from creating two
+-- users: `user.id` is deterministic (`gh-<id>`) and is the primary key, so that
+-- race is already impossible. What can genuinely race is the slug: two brand-new
+-- users whose sanitised logins collide can both pick the same free candidate,
+-- and the loser's INSERT fails on `org.slug`'s UNIQUE constraint, surfacing as a
+-- 503 `server_error`. That is acceptable — retrying the login resolves it, and
+-- the alternative (holding a write lock across the whole provisioning) costs
+-- more than the failure does.
 CREATE UNIQUE INDEX IF NOT EXISTS user_by_github_id
     ON user (github_user_id) WHERE github_user_id IS NOT NULL;

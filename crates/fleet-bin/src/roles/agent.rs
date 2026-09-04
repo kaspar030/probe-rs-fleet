@@ -73,26 +73,78 @@ struct FleetFileTokenStore {
     path: PathBuf,
 }
 
+impl FleetFileTokenStore {
+    /// Apply `edit` to the fleet file's `[node]` table.
+    ///
+    /// A missing `[node]` table is an **error**, not a no-op. The silent-skip
+    /// version of this looks harmless and is not: `rotate_token` acks only if
+    /// the persist succeeded, so a no-op would have the node acknowledge a
+    /// rotation it never wrote, the coordinator would retire the old token, and
+    /// the next restart would load a credential that no longer exists. That is
+    /// the same brick the ack-after-persist ordering exists to prevent, reached
+    /// from a different direction (a hand-edited or `[node]`-less file).
+    fn edit_node(
+        &self,
+        edit: impl FnOnce(&mut crate::fleet_config::NodeSection),
+    ) -> Result<(), String> {
+        let mut had_node = false;
+        fleet_config::update(&self.path, |f| {
+            if let Some(node) = f.node.as_mut() {
+                had_node = true;
+                edit(node);
+            }
+        })
+        .map_err(|e| format!("{e:#}"))?;
+        if had_node {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} has no [node] table to write the node token into",
+                self.path.display()
+            ))
+        }
+    }
+}
+
 impl NodeTokenStore for FleetFileTokenStore {
     fn persist(&self, new_token: &str, previous: Option<&str>) -> Result<(), String> {
-        fleet_config::update(&self.path, |f| {
-            if let Some(node) = f.node.as_mut() {
-                new_token.clone_into(&mut node.node_token);
-                node.previous_node_token = previous.map(ToOwned::to_owned);
-            }
+        self.edit_node(|node| {
+            new_token.clone_into(&mut node.node_token);
+            node.previous_node_token = previous.map(ToOwned::to_owned);
         })
-        .map(|_| ())
-        .map_err(|e| format!("{e:#}"))
     }
 
-    fn clear_previous(&self) -> Result<(), String> {
-        fleet_config::update(&self.path, |f| {
-            if let Some(node) = f.node.as_mut() {
-                node.previous_node_token = None;
-            }
+    fn commit_current(&self, current: &str) -> Result<(), String> {
+        self.edit_node(|node| {
+            current.clone_into(&mut node.node_token);
+            node.previous_node_token = None;
         })
-        .map(|_| ())
-        .map_err(|e| format!("{e:#}"))
+    }
+}
+
+/// Assemble the agent's runtime config from the two sources that hold it.
+///
+/// Split out from [`run`] so the mapping is testable without a coordinator: this
+/// is the function that decides which token the agent dials with after a
+/// restart, which is exactly what the lost-ack recovery depends on.
+fn assemble_agent_config(
+    file: &crate::fleet_config::FleetFile,
+    node: &crate::fleet_config::NodeSection,
+    settings: &NodeSettings,
+    boards_path: PathBuf,
+) -> AgentConfig {
+    AgentConfig {
+        agent_id: node.node_id.clone(),
+        fleet_url: file.url.clone(),
+        node_token: node.node_token.clone(),
+        previous_node_token: node.previous_node_token.clone(),
+        server_cert_sha256: file.server_cert_sha256.clone(),
+        coordinator_token_pubkey: node.coordinator_token_pubkey.clone(),
+        boards_path,
+        heartbeat_secs: settings
+            .heartbeat_secs
+            .unwrap_or_else(fleet_agent::config::default_heartbeat_secs),
+        erase_on_release: settings.erase_on_release,
     }
 }
 
@@ -132,21 +184,10 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let settings = load_node_settings(&node_dir.join("node.toml"))?;
     let boards_path = settings
         .boards_path
+        .clone()
         .unwrap_or_else(|| node_dir.join("boards.toml"));
 
-    let agent_config = AgentConfig {
-        agent_id: node.node_id.clone(),
-        fleet_url: file.url.clone(),
-        node_token: node.node_token.clone(),
-        previous_node_token: node.previous_node_token.clone(),
-        server_cert_sha256: file.server_cert_sha256.clone(),
-        coordinator_token_pubkey: node.coordinator_token_pubkey.clone(),
-        boards_path: boards_path.clone(),
-        heartbeat_secs: settings
-            .heartbeat_secs
-            .unwrap_or_else(fleet_agent::config::default_heartbeat_secs),
-        erase_on_release: settings.erase_on_release,
-    };
+    let agent_config = assemble_agent_config(&file, &node, &settings, boards_path.clone());
     agent_config
         .validate()
         .context("validating the assembled agent configuration")?;
@@ -201,6 +242,17 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 mod tests {
     use super::*;
     use fleet_auth::{OpaqueToken, TokenKind};
+
+    /// Assemble an `AgentConfig` from a fleet file the way `run` does, which is
+    /// what a restart re-does from disk.
+    fn agent_config_from(file: &crate::fleet_config::FleetFile) -> AgentConfig {
+        assemble_agent_config(
+            file,
+            file.node.as_ref().expect("[node] table"),
+            &NodeSettings::default(),
+            PathBuf::from("/boards.toml"),
+        )
+    }
 
     fn node_section() -> crate::fleet_config::NodeSection {
         crate::fleet_config::NodeSection {
@@ -281,9 +333,82 @@ mod tests {
         );
         assert_eq!(after.user.as_ref().unwrap().session_token, session);
 
-        store.clear_previous().unwrap();
+        store.commit_current(&fresh).unwrap();
         let after = fleet_config::load(&path).unwrap();
+        assert_eq!(after.node.as_ref().unwrap().node_token, fresh);
         assert!(after.node.as_ref().unwrap().previous_node_token.is_none());
         assert_eq!(after.user.unwrap().session_token, session);
+    }
+
+    /// The file-backed half of the lost-ack recovery, including the restart that
+    /// is the whole point: after falling back to the pre-rotation token and
+    /// connecting with it, a fresh load of the fleet file must yield **that**
+    /// token — the one the coordinator accepts — and not the rejected one.
+    ///
+    /// Before `commit_current` this left the rejected token on disk and dropped
+    /// the working one, so the next restart loaded a credential the coordinator
+    /// refuses with no fallback left: a headless node recoverable only by
+    /// physically visiting it.
+    #[test]
+    fn a_fallback_survives_a_restart_through_the_fleet_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("default.toml");
+        fleet_config::update(&path, |f| {
+            f.url = "https://fleet.example".to_owned();
+            f.node = Some(node_section());
+        })
+        .unwrap();
+
+        let store = FleetFileTokenStore { path: path.clone() };
+        let t1 = fleet_config::load(&path).unwrap().node.unwrap().node_token;
+        let t2 = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+
+        // Rotation to T2 is persisted; the ack is then lost, so the coordinator
+        // still considers T1 current.
+        store.persist(&t2, Some(&t1)).unwrap();
+
+        // The agent restarts, loads T2, is refused, and falls back to T1.
+        let mut config = agent_config_from(&fleet_config::load(&path).unwrap());
+        assert_eq!(config.node_token, t2);
+        assert!(config.fall_back_to_previous_token());
+        assert_eq!(config.node_token, t1);
+
+        // The dial with T1 succeeds: commit what worked.
+        config.previous_node_token = None;
+        store.commit_current(&config.node_token).unwrap();
+
+        // Restart again: the file yields the token that authenticates.
+        let reloaded = agent_config_from(&fleet_config::load(&path).unwrap());
+        assert_eq!(
+            reloaded.node_token, t1,
+            "a restart must load the token the coordinator accepts"
+        );
+        assert!(reloaded.previous_node_token.is_none());
+    }
+
+    /// A rotation that cannot be written must FAIL, so `rotate_token` withholds
+    /// the ack. Silently no-opping on a `[node]`-less file would have the node
+    /// acknowledge a rotation it never stored; the coordinator would retire the
+    /// old token and the next restart would find no usable credential at all.
+    #[test]
+    fn a_write_with_no_node_table_is_an_error_not_a_silent_no_op() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("default.toml");
+        // A user-only fleet file, as a workstation has.
+        fleet_config::update(&path, |f| {
+            f.url = "https://fleet.example".to_owned();
+            f.user = Some(crate::fleet_config::UserSection {
+                session_token: OpaqueToken::mint(TokenKind::Session).to_secret_string(),
+                org: "gh-1".to_owned(),
+                login: None,
+                expires: None,
+            });
+        })
+        .unwrap();
+
+        let store = FleetFileTokenStore { path };
+        let fresh = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+        assert!(store.persist(&fresh, None).is_err());
+        assert!(store.commit_current(&fresh).is_err());
     }
 }

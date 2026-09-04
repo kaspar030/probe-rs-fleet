@@ -49,6 +49,14 @@ const DEFAULT_EXPIRES_IN: u64 = 900;
 /// broken login.
 const MIN_POLL_INTERVAL: u64 = 5;
 
+/// How many consecutive transport failures to tolerate while polling.
+///
+/// The device code lives for minutes and the user is mid-ceremony in a browser,
+/// so one dropped packet must not force them to start again. A sustained run of
+/// failures is different — that is the coordinator being unreachable, and
+/// saying so beats polling a dead endpoint until the code expires.
+const MAX_TRANSPORT_RETRIES: u32 = 5;
+
 /// Run `probe-rs-fleet login`.
 ///
 /// # Errors
@@ -158,6 +166,11 @@ async fn device_flow(url: &str, pin: Option<[u8; 32]>, no_browser: bool) -> Resu
     };
     let deadline = Instant::now() + Duration::from_secs(expires_in);
     let mut interval = grant.interval.max(MIN_POLL_INTERVAL);
+    // A dropped packet must not kill a ceremony the user is in the middle of.
+    // The device code stays valid for its whole lifetime regardless of what our
+    // socket did, so a transport failure is worth retrying; only a *run* of them
+    // means the coordinator is genuinely unreachable.
+    let mut consecutive_transport_failures = 0_u32;
 
     println!("Waiting for you to authorise this device…");
 
@@ -178,26 +191,41 @@ async fn device_flow(url: &str, pin: Option<[u8; 32]>, no_browser: bool) -> Resu
                     expires: response.expires,
                 });
             }
-            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => match code.as_str()
-            {
-                "authorization_pending" => {}
-                // Back off additively, as RFC 8628 §3.5 requires: GitHub counts
-                // a too-fast poll against us, and answering `slow_down` by
-                // polling at the same rate is how a login stops working.
-                "slow_down" => interval = interval.saturating_add(5),
-                "access_denied" => {
-                    anyhow::bail!("you cancelled the authorisation on GitHub");
+            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => {
+                consecutive_transport_failures = 0;
+                match code.as_str() {
+                    "authorization_pending" => {}
+                    // Back off additively, as RFC 8628 §3.5 requires: GitHub
+                    // counts a too-fast poll against us, and answering
+                    // `slow_down` by polling at the same rate is how a login
+                    // stops working.
+                    "slow_down" => interval = interval.saturating_add(5),
+                    "access_denied" => {
+                        anyhow::bail!("you cancelled the authorisation on GitHub");
+                    }
+                    "expired_token" => {
+                        anyhow::bail!(
+                            "the device code expired before it was authorised; run \
+                             `probe-rs-fleet login` again"
+                        );
+                    }
+                    "device_flow_unconfigured" => anyhow::bail!(UNCONFIGURED),
+                    other => anyhow::bail!("the coordinator rejected the login ({other})"),
                 }
-                "expired_token" => {
-                    anyhow::bail!(
-                        "the device code expired before it was authorised; run \
-                         `probe-rs-fleet login` again"
-                    );
+            }
+            Err(e) => {
+                // Transport, not rejection: the coordinator did not answer at
+                // all. Tolerate a short blip rather than making the user redo
+                // the browser step.
+                consecutive_transport_failures += 1;
+                if consecutive_transport_failures > MAX_TRANSPORT_RETRIES {
+                    return Err(anyhow::anyhow!(
+                        "polling the coordinator failed {consecutive_transport_failures} times in \
+                         a row: {e}"
+                    ));
                 }
-                "device_flow_unconfigured" => anyhow::bail!(UNCONFIGURED),
-                other => anyhow::bail!("the coordinator rejected the login ({other})"),
-            },
-            Err(e) => return Err(anyhow::anyhow!("polling the coordinator failed: {e}")),
+                tracing::debug!(error = %e, "transient failure polling the coordinator; retrying");
+            }
         }
     }
 }

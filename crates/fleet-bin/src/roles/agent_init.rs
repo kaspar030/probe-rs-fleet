@@ -94,6 +94,13 @@ pub async fn run(args: AgentInitArgs, fleet: &str, config_dir: Option<PathBuf>) 
 
     // Read-modify-write: a `[user]` table (this machine's human) must survive an
     // enrollment, exactly as `login` must not drop `[node]`.
+    //
+    // `url` is overwritten here, where `login` prefers a remembered one. That
+    // asymmetry is deliberate: `login`'s URL is optional (a repeat login should
+    // need no flags), whereas `agent init --fleet-url` is required and names the
+    // coordinator this node just enrolled *with* — the one that issued the token
+    // we are about to store. Keeping a stale URL beside a token minted elsewhere
+    // would be the contradiction.
     fleet_config::update(&fleet_path, |f| {
         f.url.clone_from(&fleet_url);
         if server_cert_sha256.is_some() {
