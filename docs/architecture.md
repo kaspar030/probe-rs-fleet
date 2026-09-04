@@ -1,10 +1,23 @@
 # probe-rs-fleet — Architecture
 
 Status: **accepted; scaffolding**. Decision log: myelin dropped — single-stack
-postcard-rpc for both data and control planes (§3). This document records the
-agreed shape of the system and the decisions still open. It is deliberately concrete about how the
-pieces map onto [`myelin`](../../myelin) and the real `probe-rs` CLI surface
-that [ariel-os / laze](../../ariel-os/laze-project.yml) emits.
+postcard-rpc for both data and control planes (§3). **Revision 2 (this
+document): the private-CA / mTLS credential model is withdrawn and replaced by
+GitHub-rooted identity with bearer tokens over WSS (§3.5, §6), the fleet becomes
+multi-tenant with orgs/users/nodes as first-class subjects (§6.1), and
+enrollment is re-rooted on the user rather than the coordinator operator
+(§6.4).** This document records the agreed shape of the system and the decisions
+still open. It is deliberately concrete about how the pieces map onto the real
+`probe-rs` CLI surface that
+[ariel-os / laze](../../ariel-os/laze-project.yml) emits.
+
+> **What revision 2 supersedes.** Everything about a coordinator-run client CA,
+> CSR issuance, client certificates, cert-fingerprint pinning, `agent_pins`, and
+> the `coordinator enroll` → `agent init` / `ctl init` token dance is **dropped**,
+> not amended. Where an older section is preserved below for its probe-rs ground
+> truth (notably §4.2), only its credential wiring changes. Capability tokens
+> (§6.3) are **unchanged** — they were always orthogonal to connection auth.
+
 
 ## 1. Problem
 
@@ -22,30 +35,36 @@ inside it.
 ## 2. Topology (decided)
 
 ```
-   dev workstation / CI                 coordinator (1 node)              Raspberry Pi "agent"
+   dev workstation / CI                coordinator (hosted)             Raspberry Pi / laptop "node"
  ┌───────────────────────┐           ┌──────────────────────┐         ┌──────────────────────────┐
- │  laze … run           │           │  sqlite state        │         │  boards.toml             │
- │    │                  │           │  scheduler / leases  │         │  USB power (uhubctl/gpio)│
- │    ▼ (real probe-rs   │  mTLS +   │  auth / quotas       │  mTLS + │  probe-rs (as library OR │
- │     CLI args)         │  myelin   │  audit log           │  myelin │   child server process)  │
+ │  laze … run           │           │  sqlite state        │         │  probe discovery         │
+ │    │                  │           │  orgs/users/grants   │         │  USB power (uhubctl/gpio)│
+ │    ▼ (real probe-rs   │  WSS +    │  scheduler / leases  │  WSS +  │  probe-rs (child `serve` │
+ │     CLI args)         │  bearer   │  auth / quotas       │  bearer │   process per board)     │
  │  fleet sidecar  ──────┼──────────▶│  RELAY (data plane)  │◀────────┼──  fleet agent           │
- │  (probe-rs shim)      │  (TLS     │                      │ (agent  │                          │
- └───────────────────────┘  dial-in) └──────────────────────┘ dials   └──────────────────────────┘
-                                                               OUT)
+ │  (probe-rs shim)      │  (dials   │  /auth/* (device flow│ (node   │                          │
+ └───────────────────────┘   in)     └──────────────────────┘  dials  └──────────────────────────┘
+                                      behind an HTTPS proxy    OUT)
 ```
 
 Key constraints that drove this shape:
 
-- **No direct workstation→agent connection.** All traffic relays through the
-  coordinator. Agents live behind NAT on lab networks; the coordinator is the
-  only publicly reachable node.
-- **Agents dial out.** The agent opens a persistent mTLS connection *to* the
+- **No direct workstation→node connection.** All traffic relays through the
+  coordinator. Nodes live behind NAT on lab networks; the coordinator is the
+  only publicly reachable component.
+- **Nodes dial out.** The node opens a persistent WSS connection *to* the
   coordinator. Over that one connection the coordinator can also call *into*
-  the agent (see §5). No inbound ports on the Pis.
+  the node (see §5). No inbound ports on the Pis.
+- **The coordinator sits behind an HTTPS reverse proxy** and speaks WebSocket
+  over it (§3.5). It terminates no TLS of its own in the hosted deployment.
+- **One host may hold several roles at once.** A laptop is routinely both a
+  *user* (leasing fleet boards) and a *node* (offering its own probes). The
+  credential model must express that without two disjoint enrollments (§6.4).
 - **Single multi-role binary** (`probe-rs-fleet`), role chosen by subcommand:
-  `agent`, `coordinator`, `sidecar`, `ctl`.
+  `agent`, `coordinator`, `sidecar`, `ctl`, plus the user verbs `login`,
+  `share`, `grant`.
 
-## 3. Transport: postcard-rpc data plane, typed control plane, over mTLS (decided)
+## 3. Transport: postcard data plane, typed control plane, over WSS (decided)
 
 Key fact (confirmed by reading the source): **probe-rs's client/server mode is
 [`postcard-rpc`](https://docs.rs/postcard-rpc) 0.12.** That crate abstracts its
@@ -63,8 +82,8 @@ it — we tunnel the raw bytes of that
 connection:
 
 ```
-  sidecar's probe-rs client  ──WebSocket/TCP bytes──▶  [ mTLS to coordinator ]
-      ──relay──▶  [ mTLS to agent ]  ──▶  agent's `probe-rs serve`
+  sidecar's probe-rs client  ──WebSocket/TCP bytes──▶  [ WSS to coordinator ]
+      ──relay──▶  [ WSS to node ]  ──▶  node's `probe-rs serve`
 ```
 
 The coordinator forwards opaque bytes on a leased channel; it never decodes
@@ -74,44 +93,67 @@ its accepted connection onto the relay — the same bytes flow through verbatim.
 
 ### Control plane — leases, inventory, auth, power, heartbeats
 
-Small typed request/response + a few server→client pushes. **Two candidates,
-and this is now the main open transport decision (was: "is myelin needed?"):**
+Small typed request/response + a few server→client pushes.
 
-- **Option A — myelin.** `DuplexStreamTransport` gives genuine bidirectional
-  call-and-serve over one stream (agent dials out, coordinator calls back), with
-  `api_id` multiplexing so several service traits and the opaque data-plane
-  channel share one mTLS connection. Clean fit; one more dependency.
-- **Option B — reuse postcard-rpc for control too.** postcard-rpc has Endpoints
-  (req/resp) *and* Topics with `ToServer`/`ToClient` direction, so server→client
-  push (coordinator→agent commands) is expressible via topics. Using it for both
-  planes means **one RPC stack, and myelin can be dropped entirely.** Costs:
-  topic-based "server calls client" is more awkward than myelin duplex, and we'd
-  hand-roll the multiplexing of control + data over the single TLS pipe.
+> **DECISION (accepted):** myelin is dropped. We use **postcard for both
+> planes**. Coordinator→node commands ride the node's single dial-out
+> connection; the opaque data channel is multiplexed over the same pipe.
+> Revisit only if control ergonomics force it.
 
-**Recommendation:** prototype Option B first (drop myelin) — the data plane is
-*already* postcard-rpc, so using it for control keeps the stack singular and the
-binary smaller. Fall back to myelin (Option A) only if duplex control ergonomics
-or multiplexing get painful. Either way, the data plane is unchanged.
+### 3.5 WebSocket over HTTPS (revision 2, decided)
 
-> **DECISION (accepted):** myelin is dropped. We use **postcard-rpc for both
-> planes**. Coordinator→agent commands ride `ToClient` topics over the agent's
-> single dial-out connection; the opaque data channel is multiplexed over the
-> same TLS pipe. Revisit only if control ergonomics force it.
+Revision 1 ran a bespoke TCP protocol — `u32`-LE length prefix + postcard body
+(`fleet-wire`) — with rustls terminated by the coordinator itself on port 7000.
+**That is replaced by the same postcard frames carried as WebSocket binary
+messages over HTTPS.** Drivers, in order of force:
 
-### mTLS is an I/O-layer concern in both options
+1. **Deployment behind an HTTPS reverse proxy is a requirement.** A proxy cannot
+   route a bespoke TCP protocol; it would need `stream`-mode passthrough on a
+   second port, forfeiting HTTP routing and splitting the listener story.
+2. **Bearer auth gets a natural carrier** — `Authorization: Bearer …` on the
+   WebSocket upgrade request, rather than an auth frame hand-rolled into the
+   `Hello` handshake.
+3. **OAuth device flow needs HTTP endpoints anyway** (§6.4); they share the port
+   and the proxy.
+4. **Port 443 traverses corporate firewalls and lab NAT**, which a custom port
+   does not.
+5. **probe-rs already speaks WebSocket** (`/worker`), so the whole stack becomes
+   one protocol family.
 
-`tokio_rustls::TlsStream` is `AsyncRead + AsyncWrite`. postcard-rpc's wire and
-myelin's `tokio_io` adapter both sit on top of that stream, so **mTLS needs no
-change to either RPC library.** We own a `fleet-tls` crate for rustls config and
-cert pinning.
+What changes: the length prefix disappears (WebSocket already delimits
+messages), and `fleet-wire`'s codec becomes a thin adapter over WS binary
+payloads. What does **not** change: the `fleet-wire` envelopes, the relay, the
+byte-opaque splice, and every `fleet-proto` payload type.
 
-mTLS policy:
+Routes:
 
-- Coordinator presents a server cert; agents and sidecars present client certs.
-- Agent identity is pinned in coordinator config (cert fingerprint → agent id).
-- Workstation/CI identity is pinned to a user/service-account principal.
-- The TLS client-cert authenticates the *connection*; per-board capability is a
-  separate short-lived token (see §6).
+| Route | Who | Purpose |
+|---|---|---|
+| `GET /agent` (WS upgrade) | nodes | persistent dial-out control + data |
+| `GET /client` (WS upgrade) | ctl + sidecar | leases, relay channels, admin surface |
+| `POST /auth/device/*` | `login` | GitHub device-flow start/poll (§6.4) |
+| `POST /auth/token` | CI, nodes | token exchange (workload OIDC, auth keys) |
+| `GET /healthz` | proxy | liveness |
+
+**Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
+reaped on a timeout we do not control, so the node connection must run
+ping/pong keepalive, and the existing reconnect backoff stops being a nicety.
+
+**Cross-compilation constraint:** the WS implementation must build for
+`armv7-musl` / `aarch64` (Raspberry Pi nodes). `tokio-tungstenite` on rustls
+with the `ring` provider is the intended choice; verify early, as this is the
+same constraint that forced `ring` over `aws-lc-rs`.
+
+### TLS is an I/O-layer concern
+
+In the hosted deployment the reverse proxy terminates TLS and the coordinator
+speaks plain HTTP on loopback; in a self-hosted deployment the coordinator may
+terminate TLS itself. Either way the framing above is unchanged. `fleet-tls`
+shrinks to client-side trust configuration: normal WebPKI roots by default,
+plus an optional pinned server-cert fingerprint for local/self-hosted
+deployments with no public DNS (§10). Everything to do with **client**
+certificates — CA loading, CSR signing, `PinnedServerCertVerifier` as a
+bootstrap mechanism, `principal_from_cert`, `agent_id_from_cert` — is deleted.
 
 ## 4. Roles
 
@@ -121,7 +163,8 @@ Central daemon, single node, sqlite (via `sqlx`) for state. Responsibilities:
 - **Inventory:** reconcile board reports from all agents into one fleet view.
 - **Scheduling & leases:** match constraint requests to idle boards; queue when
   none free; lease TTL + heartbeat renewal; fairness/quotas.
-- **Auth:** verify mTLS principals; issue per-lease capability tokens.
+- **Auth:** authenticate bearer tokens → a [`Subject`](#61-identity-model-revision-2);
+  evaluate grants; issue per-lease capability tokens.
 - **Relay (data plane):** splice a sidecar's probe-rs session to the owning
   agent. The coordinator does **not** parse probe-rs traffic; it forwards
   opaque framed payloads on a leased channel. Restartable without dropping
@@ -132,49 +175,105 @@ Does **not** touch USB.
 
 #### Config & scaffolding (`coordinator init`)
 
-The coordinator reads a TOML config. By default it is discovered at the XDG
-path `~/.config/probe-rs-fleet/coordinator.toml`
-(`$XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml`); `--config` /
-`PROBE_RS_FLEET_CONFIG` override it. Generated key/cert/seed material and the
-SQLite database default to the data dir `~/.local/share/probe-rs-fleet/`
-(`$XDG_DATA_HOME/probe-rs-fleet/`).
+The coordinator reads a TOML config, discovered at the XDG path
+`~/.config/probe-rs-fleet/coordinator/coordinator.toml`; `--config` /
+`PROBE_RS_FLEET_CONFIG` override it. Generated key material and the SQLite
+database default to `~/.local/share/probe-rs-fleet/coordinator/`.
 
-#### Per-role + per-profile layout
-
-Config and data are organised **per role** so several roles can coexist on one
-host without colliding, and the agent + client roles are additionally **per
-profile** so one host can target several coordinators:
-
-- coordinator → `<config>/coordinator/coordinator.toml`, data
-  `<data>/coordinator/…` (NOT profiled);
-- agent → `<config>/agent/<profile>/agent.toml`, data `<data>/agent/<profile>/`;
-- client (shared by `ctl` + the `probe-rs` sidecar) →
-  `<config>/client/<profile>/client.toml`, data `<data>/client/<profile>/`.
-
-The default profile is `default`. `--profile <name>` (env
-`PROBE_RS_FLEET_PROFILE`) selects a profile for `agent`, `ctl`, the `sidecar`
-subcommand, and the `init` subcommands; the coordinator is not profiled.
-**Selection precedence:** an explicit `--config` / `--data-dir` wins, then
-`--profile` / `PROBE_RS_FLEET_PROFILE`, then the `default` profile. `agent
-profiles` / `ctl profiles` list the profiles that have a config.
-
-`probe-rs-fleet coordinator init` scaffolds a ready-to-run coordinator on a
-clean machine:
+`probe-rs-fleet coordinator init` scaffolds a ready-to-run coordinator:
 
 - generates a fresh ed25519 capability-token signing seed
-  (`<data>/coordinator/signing.seed`, 64 hex chars, `0600`);
-- generates a development client CA (`client-ca.pem` + `client-ca-key.pem`) and
-  a coordinator server cert/key (`coordinator-cert.pem` /
-  `coordinator-key.pem`) signed by it, with SANs from `--hostname` / `--ip`
-  (default `localhost` / `127.0.0.1`);
-- writes a populated `coordinator.toml` pointing at all of the above
-  (`listen_addr = "0.0.0.0:7000"`, `client_ca_key` for CSR signing, default
-  policy, optional `[pinned_agents]`).
+  (`signing.seed`, 64 hex chars, `0600`);
+- generates a fresh secret for signing user session tokens (`session.seed`,
+  `0600`);
+- writes a populated `coordinator.toml`: `listen_addr` (loopback by default,
+  since an HTTPS reverse proxy fronts it), `public_url` (the externally
+  reachable origin, used for OAuth redirect construction), the GitHub OAuth app
+  credentials, and the lease policy.
 
-Keys are written `0600`. `init` refuses to overwrite existing files unless
-`--force` is passed; `--config-dir` / `--data-dir` override the target
-directories. Afterwards, `probe-rs-fleet coordinator` (no `--config`) loads the
-generated config and starts listening.
+It no longer generates a client CA, a server cert, or a server key: TLS is the
+reverse proxy's job (§3.5). `init` refuses to overwrite existing files unless
+`--force` is passed.
+
+**`coordinator enroll` is demoted.** It survives only as the **auth-key minter**
+for unattended nodes (§6.4) and as an admin escape hatch; it is no longer on the
+normal path for either users or CI. Its old CSR-issuing behaviour is gone.
+
+#### Per-fleet config layout (revision 2)
+
+Revision 1 organised client config **per role, then per profile**
+(`<config>/agent/<profile>/`, `<config>/client/<profile>/`). That is the direct
+cause of the laptop dual-role conflict (§6.4): a machine that is both a user and
+a node had to be enrolled twice, into two unrelated identities, in two trees,
+each separately told the coordinator address and trust material.
+
+**Config is now per *fleet*, not per role:**
+
+```
+~/.config/probe-rs-fleet/fleets/<name>.toml
+```
+
+```toml
+# The fleet's coordinator.
+url = "https://fleet.example.com"
+# Optional: pinned server-cert SHA-256, for self-hosted deployments
+# without a publicly trusted certificate.
+# server_cert_sha256 = "…"
+
+[user]                 # present once `login` has run
+session_token = "…"    # short-TTL bearer, refreshable
+org = "kaspar"
+
+[node]                 # present once `share` / `agent up` has run
+node_token = "…"       # long-lived machine bearer, auto-rotating
+node_id = "kaspar-laptop"
+```
+
+A laptop that both consumes and provides simply has **both tables**. A headless
+Pi has only `[node]`. A CI runner has neither (it exchanges a workload token per
+job). `--fleet <name>` / `PROBE_RS_FLEET` select among several fleets; `default`
+is used otherwise. Credentials are stored `0600`; the two tokens stay **distinct**
+by design (§6.4).
+
+This replaces `agent.toml`'s credential fields and the whole of `client.toml`.
+Node-local, non-credential settings (`boards.toml`, power config) stay where
+they are.
+
+#### End-to-end deployment flow (revision 2)
+
+```sh
+# 1. On the coordinator host: scaffold signing keys + config.
+probe-rs-fleet coordinator init --public-url https://fleet.example.com
+#    Set GitHub OAuth app id/secret in coordinator.toml, then start it
+#    behind your HTTPS reverse proxy.
+probe-rs-fleet coordinator
+
+# 2. On your laptop: log in. Opens a browser (or prints a code when headless).
+probe-rs-fleet login --fleet-url https://fleet.example.com
+#    → personal org created on first login; session cached in fleets/default.toml
+
+# 3. Offer this machine's probes to the fleet. No token, no out-of-band step:
+#    it reuses the session from step 2.
+probe-rs-fleet share
+
+# 4. Use the fleet.
+probe-rs-fleet ctl list
+probe-rs-fleet ctl lease --select 'tag=nrf52'
+
+# 5. A headless Pi in the lab: prints a URL + code; approve it in your browser.
+probe-rs-fleet agent up --fleet-url https://fleet.example.com
+
+# 5b. …or, for an unattended image, a pre-minted auth key:
+probe-rs-fleet coordinator auth-key --org acme --tags lab,nrf52 --ttl 24h
+probe-rs-fleet agent up --auth-key prffk1_…
+
+# 6. Give a colleague access to some of your boards.
+probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
+
+# 7. Hand a sandboxed agent one board, with no fleet identity of its own.
+probe-rs-fleet ctl delegate --select 'tag=nrf52' --ops flash,attach --ttl 2h
+#    → prints a lease-bound capability token; nothing else is granted.
+```
 
 To enroll an agent, ctl user, or sidecar, use the **bootstrap-token** flow. The
 token is a one-time *bootstrap* credential; **runtime authentication stays mTLS,
@@ -349,23 +448,42 @@ Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
 and exposed explicitly via `ctl`.
 
-#### Config & scaffolding (`agent init`)
+#### Config & scaffolding (`agent up`, revision 2)
 
-The agent reads `agent.toml`, discovered at the per-profile XDG path
-`~/.config/probe-rs-fleet/agent/<profile>/agent.toml`
-(`PROBE_RS_FLEET_AGENT_CONFIG` / `--config` override the path,
-`PROBE_RS_FLEET_PROFILE` / `--profile` select the profile).
-`probe-rs-fleet agent init --profile <p> --token <t>` redeems a bootstrap
-enrollment token: it opens a server-cert-pinned bootstrap TLS connection to the
-coordinator, generates a keypair + CSR locally (the private key never leaves
-the Pi), receives a CA-signed client cert, writes `agent-cert.pem` /
-`agent-key.pem` (0600) / `client-ca.pem` into the profile data dir, derives
-`agent_id` from the issued cert CN (matching the coordinator's auto-pin), and
-writes a populated `agent.toml` (populating `coordinator_token_pubkey` from the
-enrollment response) plus a commented starter `boards.toml`. `--force` is
-required to overwrite existing files. Afterwards `probe-rs-fleet agent
---profile <p>` connects via **mTLS** with the issued cert. Fully-commented
-references live at `examples/agent.toml` and `examples/boards.toml`.
+The node's credential lives in the **per-fleet config** (§4.1), not in a
+per-profile `agent.toml`. Node-local settings (`boards.toml`, power control)
+remain at `~/.config/probe-rs-fleet/node/`.
+
+`probe-rs-fleet agent up` registers this machine as a node and starts serving.
+It obtains a node token by whichever of these applies, in order:
+
+1. **An existing `[node]` credential** in the fleet config — just reconnect.
+2. **An existing `[user]` session** (i.e. `login` has run here) — self-register
+   silently against your org. This is what `share` does; membership is
+   sufficient, no admin approval (decided).
+3. **Interactive approval** — print a URL + short code; the user approves in a
+   browser on any machine. This is the headless-Pi path, and it replaces the
+   copy-paste of a bootstrap token.
+4. **An auth key** (`--auth-key`) — org-scoped, expiring, optionally
+   single-use, carrying default tags. This is the unattended/image path.
+
+The node token is long-lived but **rotating**: the coordinator can issue a
+replacement over the established connection, so a leaked token has bounded
+value and revocation is a `DELETE` in the `node` table rather than a CRL.
+
+**Probe adoption is now per-node policy, not a global gate.** Revision 1 made
+every probe wait for a `boards.toml` declaration, which is right for a lab and
+pure friction for a laptop:
+
+- `adopt = "auto"` (default for nodes created by `share`): discovered probes are
+  adopted into the owning org automatically, with tags inferred from probe and
+  chip. Plug in a board, it is usable.
+- `adopt = "declared"` (default for auth-key / lab nodes): unknown probes are
+  reported but not leasable until declared, so CI gets stable ids and no
+  surprises.
+
+`boards.toml` therefore becomes **annotation and override** — stable ids, power
+wiring, curated tags — rather than admission control.
 
 
 ### 4.3 `sidecar` (workstation / CI)
@@ -382,79 +500,214 @@ as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
    `run` = embedded-test pass/fail and for CI).
 6. Heartbeats to renew the lease for long-lived sessions (`attach`, `gdb`).
 
-#### Config & scaffolding (`ctl init`, shared with the sidecar)
+#### Credentials (revision 2)
 
-ctl and the sidecar share the **same client credentials**. They discover them
-via env vars or via a small per-profile `client.toml` at
-`~/.config/probe-rs-fleet/client/<profile>/client.toml`. `probe-rs-fleet ctl
-init --profile <p> --token <t>` redeems a `--kind client` bootstrap enrollment
-token (server-cert-pinned bootstrap TLS → local CSR → CA-signed client cert),
-writes `client-cert.pem` / `client-key.pem` (0600) / `client-ca.pem` into the
-profile data dir, and writes `client.toml` (coordinator endpoint + cert/key/ca
-paths). A single `ctl init` configures **both** ctl and the `probe-rs` shim
-for that profile (the shim selects the profile via `PROBE_RS_FLEET_PROFILE`).
+ctl and the sidecar both read the **`[user]` session** from the per-fleet config
+(§4.1) — or, in CI, a token exchanged from a workload OIDC credential. The
+revision-1 arrangement (a shared client certificate, discovered through two
+different sets of env var names, bridged by the shim) is deleted along with the
+rest of the client-cert model.
 
-Resolution precedence is **explicit flag / env var > `client.toml`**. Note the
-two roles read different env var names: `ctl` reads `PROBE_RS_FLEET_COORDINATOR`
-/ `_CERT` / `_KEY` / `_CA`, while the sidecar selector reads
-`PROBE_RS_FLEET_COORDINATOR` / `_CLIENT_CERT` / `_CLIENT_KEY` / `_CA`. The shim
-bridges this by injecting `client.toml` values into the sidecar's env var names
-for any key not already set. The sidecar still keys leases by selector +
-principal (unchanged); `client.toml` only adds endpoint / credential discovery,
-not a board selector (`_BOARD` / `_SELECT` still come from your environment). A
-fully-commented reference lives at `examples/client.toml`.
+Resolution precedence is **explicit flag / env var > fleet config**. The
+selector env vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) are unchanged; the
+credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`.
+
+**A sandboxed agent is never given these credentials.** It receives a
+lease-bound capability token instead (`ctl delegate`, §6.5).
 
 
 ## 5. The dial-out connection (NAT traversal)
 
-The agent opens **one persistent mTLS connection out** to the coordinator and
-holds it. All coordinator→agent commands travel back down that same connection,
-so the Pis need **no inbound ports**. Over this connection:
+The node opens **one persistent WSS connection out** to the coordinator
+(`GET /agent`, `Authorization: Bearer <node token>`) and holds it. All
+coordinator→node commands travel back down that same connection, so the Pis need
+**no inbound ports**. Ping/pong keepalive holds it open through the reverse
+proxy (§3.5). Over this connection:
 
 - agent → coordinator: register, report inventory, heartbeat, emit
   faults/logs/power events.
-- coordinator → agent: "open a probe-rs session to board X for lease L",
-  "power-cycle board X", "kill session", "what's your state".
+- coordinator → node: "open a probe-rs session to board X for lease L",
+  "power-cycle board X", "kill session", "what's your state", "here is your
+  rotated node token".
 - a **leased opaque channel** carries the data plane (probe-rs postcard-rpc
   frames — flash bytes, RTT) multiplexed alongside the small control RPCs.
 
-The server→client direction is the crux. How we get it depends on the §3
-transport choice:
+The server→client direction rides the same WebSocket: the coordinator writes
+command frames down the node's dial-out connection, multiplexed with the opaque
+data channel by the `fleet-wire` envelopes.
 
-- **myelin (Option A):** `DuplexStreamTransport` — genuine call-and-serve both
-  ways over one stream, `api_id` multiplexing for control traits + data channel.
-- **postcard-rpc only (Option B, preferred):** coordinator→agent commands are
-  modeled as `ToClient` Topics (or a reverse Endpoint channel); we multiplex the
-  opaque data channel over the same TLS pipe ourselves.
+## 6. Identity, auth & leases (revision 2)
 
-Either way the agent-dials-out property and the opaque data plane are identical;
-only the control-plane ergonomics differ.
+Revision 1 had authentication (mTLS client cert → `Principal`) and **no
+authorization**: nothing consulted the authenticated principal. This section
+replaces the whole credential model and adds the missing authorization layer.
 
-## 6. Auth & leases
+### 6.1 Identity model (revision 2)
 
-- **Bootstrap enrollment (one-time):** `coordinator enroll` mints a single-use
-  token (coordinator addr + server-cert SHA-256 pin + random secret; the secret
-  hash is stored in SQLite, single-use + TTL'd). `agent init` / `ctl init`
-  redeem it over a **server-cert-pinned** bootstrap TLS connection (no client
-  cert, verified against the pin — not blind TOFU), generate a keypair + CSR
-  locally, and receive a CA-signed client cert. This is **bootstrap-only**: the
-  token is never used at runtime, and the private key never leaves the client.
-  For agents, the issued cert's fingerprint is auto-pinned in the coordinator
-  database.
-- **Connection auth (runtime):** **mTLS** client cert → principal (agent id, or
-  user/service account), exactly as before. The coordinator's listener allows
-  optional client auth so an enroll connection (no cert) can complete the
-  handshake to reach the bootstrap handler; runtime dispatch requires a verified
-  client cert. The bootstrap token does **not** replace mTLS.
-- **Capability token:** coordinator issues a signed, short-TTL token scoped to
-  `{lease_id, board_id, allowed_ops}` (unchanged). The agent verifies the
-  token's signature locally; it does not need to call back to the coordinator
-  per operation.
-- **Lease lifecycle:** `request{constraints, duration, priority}` →
-  `Leased{board, agent, channel, token, expires}` or `Queued`. Heartbeat
-  renews; missed heartbeats free the board and trigger agent cleanup.
-- **Fairness v1:** FIFO queue + per-principal concurrency cap + priority classes
-  (interactive dev > nightly CI > soak). Grow later.
+The fleet is **multi-tenant**. Every object belongs to an org; every subject acts
+within one.
+
+```
+org      { id, slug, kind: personal | team }
+user     { id, personal_org_id, github_user_id, login, email }
+member   { org_id, user_id, role: admin | member }
+node     { id, org_id, owner_user_id, name, tags[], token_hash,
+           adopt_policy, last_seen }
+board    { org_id, node_id, name, chip, tags[], … }   -- PK (org_id, node_id, name)
+grant    { id, org_id, subject, selector, ops[], expires }
+auth_key { org_id, key_hash, tags[], single_use, expires, created_by }
+```
+
+Three decisions are load-bearing:
+
+- **Everyone is always in an org; yours is an org of one.** A personal org is
+  created on first login (decided). There is no user-owned/org-owned branch —
+  one scoping rule everywhere, so no code path can forget the org check. Moving
+  a node from personal to team use is a move, not a migration.
+- **Boards are keyed `(org, node, name)`**, not by a globally unique string.
+  Revision 1's flat `BoardId` breaks under both multi-tenancy and auto-adoption
+  (two people plug in an `nrf52840-dk`).
+- **`Principal(String)` is replaced by a `Subject`:**
+
+  ```rust
+  struct Subject { org: OrgId, kind: SubjectKind, id: String, groups: Vec<Group> }
+  enum SubjectKind { User, Node, Workload }
+  ```
+
+  All three authentication paths resolve to this one shape, so authorization is
+  a single mechanism regardless of how the caller proved itself.
+
+### 6.2 Connection auth: bearer tokens (revision 2)
+
+**The private CA and mTLS are withdrawn.** Deleted: `client_ca` /
+`client_ca_key`, CSR generation and signing, `EnrollRequest` cert issuance,
+cert-fingerprint pinning, the `agent_pins` table, the bootstrap-TLS pinning
+verifier, and the optional-client-auth listener branch.
+
+Rationale: with user identity rooted in GitHub, the CA bought nothing that
+bearer tokens do not, while imposing a cert ceremony on every enrollment and
+leaving **no revocation story at all** — revision 1 issued client certs that
+could not be withdrawn short of rotating the CA and re-enrolling the fleet.
+Under bearer tokens revocation is a row delete.
+
+All three principal kinds present `Authorization: Bearer …` on the WebSocket
+upgrade (§3.5):
+
+| Kind | Token | Lifetime | Revocation |
+|---|---|---|---|
+| User | session token, minted after GitHub login | short, refreshable | delete session |
+| Node | node token, minted at registration | long, auto-rotating | delete node row |
+| Workload (CI) | exchanged from a GH Actions OIDC JWT | one job | expiry / grant removal |
+
+The cost, stated honestly: bearer tokens are pure bearer credentials, so a leak
+is immediately usable. Short user sessions, rotating node tokens, and per-job CI
+tokens bound the window.
+
+### 6.3 Capability tokens (unchanged)
+
+The coordinator mints an ed25519-signed `CapabilityToken { lease, board,
+allowed_ops, expires }` per lease; the node verifies the signature **locally**
+with the coordinator's public key, so there is no per-operation round trip. This
+survives revision 2 untouched — it was always orthogonal to connection auth, and
+it is exactly the attenuated, lease-bound, expiring credential the sandboxed-agent
+story needs (§6.5).
+
+### 6.4 Bootstrapping: one ceremony, several flavours (revision 2)
+
+Revision 1's enrollment was **coordinator-operator-rooted**: someone with a shell
+on the coordinator minted a single-use secret and sent it out of band. Every path
+— user, agent, CI — went through that one manual funnel.
+
+Revision 2 inverts it to be **user-rooted**: a human authenticates once against
+GitHub, and every other credential is derived from that authority.
+
+```
+probe-rs-fleet login
+  → GitHub device flow (browser, or URL + code when headless)
+  → personal org created on first login
+  → session token cached in the per-fleet config
+```
+
+| Principal | Bootstrap | Ceremony |
+|---|---|---|
+| **User** (laptop) | `login` — GitHub device flow | browser, once |
+| **Node, user present** | `share` — reuses the session to self-register | zero extra steps |
+| **Node, headless** | `agent up` prints URL + code; approve in a browser | no token copy-paste |
+| **Node, unattended** | pre-minted **auth key** (org-scoped, expiring, tagged) | one paste, revocable |
+| **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token` | zero secrets |
+| **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
+
+One exchange endpoint, several proofs. Note that **GitHub is two identity
+systems**, and v1 needs both verifiers:
+
+- *User login* is **OAuth2, not OIDC** — no discovery document, no ID token, no
+  JWKS. The device flow yields an access token; identity comes from calling
+  `GET /user`. Store `github_user_id` (the immutable numeric id), **never** the
+  login name, which can be renamed and reused.
+- *CI* is **real OIDC** — a signed JWT with a JWKS endpoint and claims
+  `repository`, `repository_owner`, `ref`, `job_workflow_ref`. No secret ever
+  enters the runner.
+
+**CI trust rule (v1):** a workload token proves "a job in repo `owner/name` at
+ref X". Mapping that to a fleet org requires an explicit **per-repo** grant.
+`repository_owner` alone is deliberately *not* sufficient — a fork or a new repo
+under the same owner must not inherit hardware access.
+
+#### The laptop dual-role case (resolved)
+
+A laptop is routinely both a user and a node. Revision 1 forced two unrelated
+enrollments producing two unrelated identities (`alice` as a client CN,
+`alice-laptop` as a pinned agent fingerprint) in two config trees. Revision 2:
+
+- **Config is per fleet, not per role** (§4.1) — one file, an optional `[user]`
+  table and an optional `[node]` table. A laptop has both.
+- **The node is owned by the user** (`node.owner_user_id`), so "my laptop's
+  boards" is expressible and revoking the user cascades sensibly.
+- **The two credentials stay distinct.** The node token is machine-scoped and
+  survives reboots; the session token is human-scoped and short-lived. Merging
+  them would make a compromised Pi equivalent to a compromised you.
+- **One command:** `probe-rs-fleet share` — "this machine now offers its probes
+  to the fleet", using the login you already have.
+
+### 6.5 Authorization (new)
+
+Revision 1 shipped **no authorization**. Concretely, any holder of any valid
+client cert could `open_channel` on **another principal's lease** (the handler
+took `_principal` unused, looked the board up by lease id, and minted a
+capability token for it), extend or release anyone's lease, power-cycle any
+board, and read the entire audit log. These are fixed as part of the subject
+model, not as separate work.
+
+The model, deliberately minimal:
+
+- **Deny by default.** Every request resolves to a `Subject` and is checked
+  against the target object's org before anything else.
+- **Two roles per org**, `admin` and `member`. Membership alone is enough to add
+  a node and to use the org's boards (decided; finer roles can come later
+  without a data migration).
+- **Ownership checks**, unconditionally: a lease may be extended, released, or
+  channel-opened only by its holder (or an org admin).
+- **Grants** carry sharing: `grant { subject, selector, ops[], expires }`, where
+  the selector is the existing tag/chip constraint language. `grant bob --select
+  'tag=nrf52' --ops flash,attach` is the "give access to other people" path, and
+  it is revocable and audited. Individual-board grants are a degenerate
+  selector.
+- **Delegation to a sandbox** is *not* a grant and creates no principal:
+  `ctl delegate` leases a board as you and hands out only the **capability
+  token** for that lease — narrow, expiring, revocable by releasing the lease.
+  The crypto for this already exists (§6.3); only the command is new.
+
+### 6.6 Lease lifecycle (unchanged)
+
+- `request{constraints, duration, priority}` → `Leased{board, node, channel,
+  token, expires}` or `Queued`. Heartbeat renews; missed heartbeats free the
+  board and trigger node cleanup.
+- **Fairness v1:** FIFO queue + per-subject concurrency cap + priority classes
+  (interactive dev > nightly CI > soak).
+- Leases are now **org-scoped**, and the per-principal concurrency cap is keyed
+  by `Subject` rather than by a bare string.
+- Lease records are the natural basis for future metering (lease-seconds per
+  org); no billing is built now, but the data is recoverable by construction.
 
 ### Time-based *sharing* (decided requirement)
 
@@ -536,8 +789,14 @@ hub  = "1-1"
 port = 2
 ```
 
-The agent reconciles discovered probes against this file; unknown probes are
-reported but not leasable until declared.
+The node reconciles discovered probes against this file. **Whether an
+undeclared probe is leasable is per-node policy** (§4.2): `adopt = "auto"`
+(default for nodes created by `share`) adopts discovered probes into the owning
+org with inferred tags; `adopt = "declared"` (default for auth-key / lab nodes)
+reports them but keeps them unleasable until declared here. Under `auto`, this
+file is annotation and override — stable ids, power wiring, curated tags —
+rather than admission control. `id` is unique **within its node**, not globally
+(§6.1).
 
 ## 9. Crate layout (proposed)
 
@@ -545,36 +804,59 @@ reported but not leasable until declared.
 probe-rs-fleet/
 ├─ Cargo.toml                  # workspace
 ├─ crates/
-│  ├─ fleet-proto/             # service traits (postcard-rpc/myelin) + shared wire types (no I/O)
+│  ├─ fleet-proto/             # shared wire types + Subject/ids (no I/O)
 │  ├─ fleet-core/              # Board/Lease/Policy domain + scheduler (pure, unit-testable)
-│  ├─ fleet-tls/               # rustls config, cert pinning, TLS stream glue
-│  ├─ fleet-agent/             # probe-rs process control, USB power, boards.toml
-│  ├─ fleet-coordinator/       # sqlite state, scheduler, auth, relay
-│  ├─ fleet-sidecar/           # probe-rs CLI shim + relay client
-│  └─ fleet-bin/               # single multi-role binary; thin dispatch
+│  ├─ fleet-tls/               # client trust config (WebPKI + optional pin); no client certs
+│  ├─ fleet-auth/              # NEW: GitHub OAuth/OIDC verifiers, token mint/verify, grants
+│  ├─ fleet-agent/            # probe-rs process control, USB power, boards.toml
+│  ├─ fleet-coordinator/      # sqlite state, scheduler, authz, relay, HTTP/WS surface
+│  ├─ fleet-sidecar/          # probe-rs CLI shim + relay client
+│  └─ fleet-bin/              # single multi-role binary; thin dispatch
 └─ docs/
 ```
 
 `fleet-core` stays pure so the scheduler is testable without sockets or USB.
+`fleet-auth` is likewise pure-ish (verification logic behind traits, HTTP calls
+at the edges) so token and grant evaluation is unit-testable without a network.
 
 ## 10. Open questions / decisions to confirm
 
-**Resolved since first draft:**
+**Resolved (revision 1):**
 
 - *probe-rs transport* = postcard-rpc 0.12 (confirmed from source). Data plane
   tunnels opaque postcard-rpc frames (§3).
 - *"time-based"* = time-based **sharing**: extendable board claims across many
-  probe-rs invocations, not lease-per-run (§6).
-- *myelin* is now **optional** — since the data plane is already postcard-rpc,
-  reusing it for the control plane lets us drop myelin (§3 Option B, preferred).
+  probe-rs invocations, not lease-per-run (§6.6).
+- *myelin* is **dropped**: postcard for both planes (§3).
+
+**Resolved (revision 2 — this revision):**
+
+- *Deployment model* = **hosted, multi-tenant**, behind an HTTPS reverse proxy.
+- *Transport* = **WebSocket over HTTPS**, replacing the bespoke length-prefixed
+  TCP protocol (§3.5).
+- *Connection auth* = **bearer tokens**; the private CA, CSR issuance, client
+  certs and cert pinning are **deleted** (§6.2).
+- *Identity root* = **GitHub only** at v1 — OAuth2 device flow for users, GH
+  Actions workload OIDC for CI (§6.4).
+- *Tenancy* = every subject and object is org-scoped; a **personal org is
+  auto-created on first login** (§6.1). The DB is **wiped**, not migrated.
+- *Node registration* = **self-approving on membership**; no admin approval step
+  at v1 (§6.4).
+- *Probe adoption* = per-node policy, `auto` for personal nodes, `declared` for
+  lab nodes (§4.2, §8).
+- *Capability tokens* are unchanged and remain the sandbox-delegation mechanism
+  (§6.3, §6.5).
 
 **Still open:**
 
-1. **Control-plane transport: drop myelin? (§3)** Preferred path is postcard-rpc
-   for both planes (one stack, no myelin). Confirm before scaffolding, since it
-   changes `fleet-proto`'s dependencies. If postcard-rpc's `ToClient` topics
-   make coordinator→agent commands too awkward in practice, we keep myelin for
-   control only. **Needs your call.**
+1. **Self-hosted TLS story.** A self-hosted coordinator without public DNS
+   cannot get a publicly trusted certificate, so `fleet-tls` keeps an optional
+   **pinned server-cert fingerprint** (`server_cert_sha256` in the fleet
+   config) — the one surviving remnant of the deleted pinning code. Whether we
+   also ship a self-hosting story beyond dev use is a **product** question, not
+   an architectural one; keeping the coordinator a self-hostable artifact is
+   cheap now and expensive to retrofit (NDA-bound customers may be structurally
+   unable to point lab hardware at a third-party control plane).
 2. **Does probe-rs's postcard-rpc server already expose remote probe/chip
    selection over the wire?** If yes, plain proxying is sufficient and the agent
    only manages process lifecycle + `--probe`. If not, file tasks against
@@ -588,7 +870,7 @@ probe-rs-fleet/
    concurrently. **Latency:** the splice sets `TCP_NODELAY` on both loopback
    hops and flushes each chunk immediately (no Nagle batching), so gdb traffic
    is not coalesced. gdb is request/response and tolerant of LAN-scale RTT; the
-   two mTLS relay hops add ~2×RTT per round-trip, which is acceptable for
+   two relay hops add ~2×RTT per round-trip, which is acceptable for
    interactive use. Revisit (e.g. a lower-overhead path) only if step-debugging
    feels sluggish on a real deployment. *Optional follow-up:* an upstream
    probe-rs feature request to make `gdb` drive a remote `Session` over
@@ -598,6 +880,17 @@ probe-rs-fleet/
    possibly per lease for isolation. Confirm per-lease vs per-board-reused.
 5. **Sidecar install UX.** argv0 `probe-rs` shim on PATH vs explicit
    `fleet sidecar run -- …` wrapper. Which install story do you want?
-6. **Buffer sizing.** Concurrent ops per connection + flash-chunk buffer size —
+6. **Where the hosted control plane runs**, and therefore the GitHub OAuth app's
+   registered callback origin. Must be answered before `login` hardcodes
+   anything.
+7. **Data-plane latency budget.** All traffic relays through the coordinator; if
+   remote debugging proves unusably slow at WAN RTT, direct workstation↔node
+   brokering (with relay as fallback) stops being an optimisation and becomes
+   mandatory. Measure on a real deployment before designing it.
+8. **End-to-end encryption of the data plane.** With the coordinator relaying
+   bytes, a server compromise exposes firmware images and debug traffic. Making
+   the coordinator an *introducer* rather than a reader is far easier to design
+   in than to add later, and is a genuine differentiator for customers with
+   pre-release silicon. Not in v1 scope; flagged so v1 does not preclude it.
+9. **Buffer sizing.** Concurrent ops per connection + flash-chunk buffer size —
    measure against real ariel-os flash images. (Deferred to implementation.)
-```
