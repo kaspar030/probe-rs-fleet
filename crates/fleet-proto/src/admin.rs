@@ -2,14 +2,14 @@
 //!
 //! These ride the same sidecar-direction transport as the lease envelopes (a
 //! `ctl` connects with a sidecar-class client certificate), but describe the
-//! fleet-wide *operator* surface rather than a single principal's lease. They
+//! fleet-wide *operator* surface rather than a single subject's lease. They
 //! are pure data so both the coordinator (which produces them) and `fleet-bin`'s
 //! `ctl` role (which renders them) share one definition.
 
 use serde::{Deserialize, Serialize};
 
 use crate::board::PowerKind;
-use crate::ids::{AgentId, BoardId, LeaseId, Principal};
+use crate::ids::{AgentId, BoardRef, LeaseId, Subject};
 
 /// A coarse, operator-facing lifecycle label for a board in `ctl list`.
 ///
@@ -31,9 +31,12 @@ pub enum BoardAvailability {
 /// One row of the `ctl list` fleet inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardSummary {
-    /// The board id.
-    pub board: BoardId,
+    /// The board's fleet-unique key.
+    pub board: BoardRef,
     /// The agent that owns the board.
+    ///
+    /// Redundant with `board.node`, but kept so `ctl list` rendering and any
+    /// consumer that only wants the node do not have to reach into the key.
     pub agent: AgentId,
     /// probe-rs target/chip name.
     pub chip: String,
@@ -46,7 +49,7 @@ pub struct BoardSummary {
     /// Coarse availability.
     pub availability: BoardAvailability,
     /// If leased, the current holder.
-    pub holder: Option<Principal>,
+    pub holder: Option<Subject>,
     /// If leased, the lease id.
     pub lease: Option<LeaseId>,
     /// If leased, the expiry (epoch seconds).
@@ -59,9 +62,9 @@ pub struct LeaseHolderSummary {
     /// The lease id.
     pub lease: LeaseId,
     /// The board held.
-    pub board: BoardId,
-    /// The principal holding it.
-    pub holder: Principal,
+    pub board: BoardRef,
+    /// The subject holding it.
+    pub holder: Subject,
     /// Expiry as epoch seconds.
     pub expires: u64,
 }

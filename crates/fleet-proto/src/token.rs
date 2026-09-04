@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BoardId, LeaseId};
+use crate::ids::{BoardRef, LeaseId};
 
 /// One capability a token may grant. A token carries the set of operations its
 /// holder is allowed to perform against the leased board.
@@ -53,7 +53,11 @@ pub struct CapabilityToken {
     /// The lease this token authorises.
     pub lease: LeaseId,
     /// The board this token authorises operations against.
-    pub board: BoardId,
+    ///
+    /// Fleet-unique by construction (`(org, node, name)`), so a token minted
+    /// for one org's `nrf52840-dk` cannot be replayed against another org's
+    /// same-named board.
+    pub board: BoardRef,
     /// Operations the holder may perform.
     pub allowed_ops: Vec<AllowedOp>,
     /// Expiry as epoch seconds. The agent rejects the token once the wall
@@ -225,11 +229,16 @@ pub enum TokenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::{AgentId, OrgId};
 
     fn sample() -> CapabilityToken {
         CapabilityToken {
             lease: LeaseId(7),
-            board: BoardId("nrf52840-dk-3".to_owned()),
+            board: BoardRef::new(
+                OrgId("acme".to_owned()),
+                AgentId("rpi-1".to_owned()),
+                "nrf52840-dk-3",
+            ),
             allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],
             expires: 1_780_000_000,
         }

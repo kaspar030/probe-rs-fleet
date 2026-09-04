@@ -15,4 +15,6 @@ pub mod policy;
 pub mod scheduler;
 
 pub use policy::Policy;
-pub use scheduler::{ExpireResult, ExpiredLease, GrantedLease, LeaseDecision, Scheduler};
+pub use scheduler::{
+    ExpireResult, ExpiredLease, GrantedLease, LeaseAuthError, LeaseDecision, Scheduler,
+};

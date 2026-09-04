@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::board::PowerKind;
-use crate::ids::{AgentId, BoardId, LeaseId};
+use crate::ids::{AgentId, BoardName, BoardRef, LeaseId};
 use crate::ChannelId;
 
 /// A probe physically discovered on an agent host (via `probe-rs` enumeration).
@@ -60,8 +60,12 @@ pub enum BoardPresence {
 /// (it is not repeated on the wire) and its lease state defaults to available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardStatus {
-    /// The board id from `boards.toml`.
-    pub board: BoardId,
+    /// The board's node-local name from `boards.toml`.
+    ///
+    /// Node-local by construction: the node does not know its own org, so the
+    /// coordinator attaches the org (yielding a [`BoardRef`]) when it
+    /// reconciles this inventory.
+    pub board: BoardName,
     /// The probe serial bound to this board.
     pub serial: String,
     /// Whether the probe is currently present.
@@ -154,8 +158,8 @@ pub enum AgentReport {
     },
     /// A board fault that should quarantine the board.
     Fault {
-        /// The affected board.
-        board: BoardId,
+        /// The affected board (node-local name).
+        board: BoardName,
         /// Human-readable reason.
         reason: String,
     },
@@ -163,15 +167,15 @@ pub enum AgentReport {
     Log {
         /// Severity.
         level: LogLevel,
-        /// Optionally, the board this log line concerns.
-        board: Option<BoardId>,
+        /// Optionally, the board this log line concerns (node-local name).
+        board: Option<BoardName>,
         /// The message text.
         message: String,
     },
     /// A power transition the agent performed.
     PowerEvent {
-        /// The affected board.
-        board: BoardId,
+        /// The affected board (node-local name).
+        board: BoardName,
         /// What happened.
         action: PowerAction,
     },
@@ -197,8 +201,10 @@ pub enum CoordinatorCommand {
     OpenSession {
         /// The authorising lease.
         lease: LeaseId,
-        /// The target board.
-        board: BoardId,
+        /// The target board, as the fleet-unique key the capability token is
+        /// scoped to. The agent compares it against the token verbatim and
+        /// uses only [`BoardRef::name`] for its local `boards.toml` lookup.
+        board: BoardRef,
         /// The signed capability token (wire framing: see [`crate::token`]).
         token: Vec<u8>,
         /// The relay channel to splice the session onto.
@@ -217,15 +223,15 @@ pub enum CoordinatorCommand {
     ReleaseLease {
         /// The lease being released.
         lease: LeaseId,
-        /// The board to clean up.
-        board: BoardId,
+        /// The board to clean up (node-local name).
+        board: BoardName,
         /// Whether to erase the target's flash as part of cleanup.
         erase: bool,
     },
     /// Explicitly cut/restore/cycle power to a board (operator action).
     PowerCycle {
-        /// The board to power-cycle.
-        board: BoardId,
+        /// The board to power-cycle (node-local name).
+        board: BoardName,
     },
     /// Ask the agent to re-report its current state and inventory.
     QueryState,
@@ -240,12 +246,21 @@ pub type BoardPower = PowerKind;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::OrgId;
+
+    fn test_board_ref() -> BoardRef {
+        BoardRef::new(
+            OrgId("acme".to_owned()),
+            AgentId("rpi-1".to_owned()),
+            "b1",
+        )
+    }
 
     #[test]
     fn report_roundtrips_through_postcard() {
         let report = AgentReport::Inventory(ProbeInventory {
             boards: vec![BoardStatus {
-                board: BoardId("b1".to_owned()),
+                board: BoardName("b1".to_owned()),
                 serial: "001050257890".to_owned(),
                 presence: BoardPresence::Online,
                 chip: "nRF52840_xxAA".to_owned(),
@@ -279,7 +294,7 @@ mod tests {
     fn command_roundtrips_through_postcard() {
         let cmd = CoordinatorCommand::OpenSession {
             lease: LeaseId(42),
-            board: BoardId("b1".to_owned()),
+            board: test_board_ref(),
             token: vec![1, 2, 3, 4],
             channel: ChannelId(9),
             kind: ChannelKind::Data,
@@ -293,7 +308,7 @@ mod tests {
     fn gdb_open_session_roundtrips_through_postcard() {
         let cmd = CoordinatorCommand::OpenSession {
             lease: LeaseId(7),
-            board: BoardId("b1".to_owned()),
+            board: test_board_ref(),
             token: vec![9, 9],
             channel: ChannelId(3),
             kind: ChannelKind::Gdb,

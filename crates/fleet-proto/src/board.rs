@@ -2,13 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, BoardId, LeaseId, Principal};
+use crate::ids::{AgentId, BoardRef, LeaseId, Subject};
 
 /// A leasable board, as known to the coordinator (reconciled from an agent's
 /// `boards.toml` plus live probe discovery).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Board {
-    pub id: BoardId,
+    pub id: BoardRef,
     pub agent: AgentId,
     /// probe-rs target name (informational; the `--chip` the caller passes
     /// still flows through untouched).
@@ -38,10 +38,10 @@ pub enum PowerKind {
 pub enum BoardState {
     /// Available to be leased.
     Idle,
-    /// Held by a principal until `expires` (epoch seconds). Extendable.
+    /// Held by a subject until `expires` (epoch seconds). Extendable.
     Leased {
         lease: LeaseId,
-        by: Principal,
+        by: Subject,
         expires: u64,
     },
     /// Quarantined after a fault; not leasable until cleared.

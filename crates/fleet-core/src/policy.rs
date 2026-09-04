@@ -7,7 +7,7 @@
 use fleet_proto::lease::Priority;
 use serde::{Deserialize, Serialize};
 
-/// Leasing policy: duration caps per priority class, a per-principal
+/// Leasing policy: duration caps per priority class, a per-subject
 /// concurrency cap, and a default TTL used when a request omits a duration.
 ///
 /// Values are supplied by coordinator config; this type only models them and
@@ -20,8 +20,9 @@ pub struct Policy {
     pub max_duration_ci: u64,
     /// Maximum lease duration (seconds) for [`Priority::Interactive`] requests.
     pub max_duration_interactive: u64,
-    /// Maximum number of concurrently-held leases per principal.
-    pub max_concurrent_per_principal: u32,
+    /// Maximum number of concurrently-held leases per subject, keyed by
+    /// [`fleet_proto::ids::SubjectKey`] (so a group change does not reset it).
+    pub max_concurrent_per_subject: u32,
     /// Default TTL (seconds) applied when a request's `duration_secs` is `0`.
     pub default_ttl_secs: u64,
 }
@@ -34,7 +35,7 @@ impl Default for Policy {
             max_duration_soak: 24 * 60 * 60,
             max_duration_ci: 60 * 60,
             max_duration_interactive: 4 * 60 * 60,
-            max_concurrent_per_principal: 2,
+            max_concurrent_per_subject: 2,
             default_ttl_secs: 15 * 60,
         }
     }

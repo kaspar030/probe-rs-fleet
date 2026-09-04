@@ -1,12 +1,12 @@
 //! Lease request/grant types and selection constraints.
 //!
-//! A lease is *not* tied to a single `probe-rs run`: a principal claims a board
+//! A lease is *not* tied to a single `probe-rs run`: a subject claims a board
 //! and holds it (with an extendable timeout) across many probe-rs invocations,
 //! so remote DX feels local. See `docs/architecture.md` §6.
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, BoardId, LeaseId, Principal};
+use crate::ids::{AgentId, BoardName, BoardRef, LeaseId, Subject};
 
 /// A request to lease a board, by id or by constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,8 +22,13 @@ pub struct LeaseRequest {
 /// How a caller picks a board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Constraint {
-    /// Exactly this board.
-    Board(BoardId),
+    /// Exactly this board, by its node-local name.
+    ///
+    /// A bare name is only unique within one node of one org, so the
+    /// coordinator resolves it to a [`BoardRef`] **within the caller's org**
+    /// (erroring on ambiguity). Keeping the request side node-local is what
+    /// lets `PROBE_RS_FLEET_BOARD=nrf52840-dk-3` keep working unchanged.
+    Board(BoardName),
     /// Any idle board matching all of these tags.
     Tags(Vec<String>),
     /// Any idle board with this probe-rs chip name.
@@ -51,9 +56,9 @@ pub enum LeaseOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseGrant {
     pub lease: LeaseId,
-    pub board: BoardId,
+    pub board: BoardRef,
     pub agent: AgentId,
-    pub holder: Principal,
+    pub holder: Subject,
     /// Expiry as epoch seconds; extend via heartbeat before this.
     pub expires: u64,
     /// Opaque signed capability token (see `fleet-coordinator` auth).

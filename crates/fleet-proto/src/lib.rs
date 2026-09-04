@@ -25,7 +25,10 @@ pub use agent_api::{
 };
 pub use board::{Board, BoardState, PowerKind};
 pub use enroll::{EnrollRequest, EnrollResponse, EnrollTokenError, EnrollmentToken};
-pub use ids::{AgentId, BoardId, LeaseId, Principal};
+pub use ids::{
+    AgentId, BoardName, BoardRef, Group, LeaseId, NodeId, OrgId, Role, Subject, SubjectKey,
+    SubjectKind, UserId,
+};
 pub use lease::{Constraint, LeaseGrant, LeaseRequest};
 pub use token::{
     AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner, TokenVerifier, SIGNATURE_LEN,
@@ -61,4 +64,9 @@ pub struct ChannelId(pub u64);
 ///   list` reports probes it cannot open). postcard is positional, so adding a
 ///   field changes the encoding of every `AgentReport::Inventory`; `#[serde(default)]`
 ///   would not have saved it.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// * 3 → 4: revision-2 identity. `Principal` is replaced by [`ids::Subject`]
+///   (org + kind + id + groups) and the flat `BoardId` is split into a
+///   fleet-unique [`ids::BoardRef`] (`(org, node, name)`) and a node-local
+///   [`ids::BoardName`]. postcard is positional, so every envelope carrying
+///   either re-encodes.
+pub const PROTOCOL_VERSION: u32 = 4;
