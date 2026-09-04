@@ -270,3 +270,91 @@ async fn a_fresh_token_is_not_rotated_on_connect() {
     );
     assert_eq!(fleet.upgrade_status("/agent", Some(&token)).await, 101);
 }
+
+/// **Regression: rotation must not re-fire once it has completed.**
+///
+/// `Authenticated` is captured at authentication time and never updated, so a
+/// read loop that evaluates the rotation policy against `auth.token_issued_at`
+/// keeps seeing the *pre-rotation* age forever. With a policy shorter than the
+/// connection's lifetime that re-fires on every ping tick — each cycle minting a
+/// token, rewriting the Pi's SD card, and appending an audit row, for as long as
+/// the node stays connected.
+///
+/// The loop therefore tracks the token's age as connection state and advances it
+/// on a successful promotion.
+///
+/// The policy here is deliberately an **hour** while the ping interval is a
+/// second: the seeded token is ancient (`issued_at = 0`) so exactly one rotation
+/// is due on connect, and a correctly-updated age makes the freshly promoted
+/// token nowhere near due again. A frozen `issued_at` still reads as an hour
+/// overdue, so it re-fires on every one of the ~3 ping ticks below. (A short
+/// policy would not discriminate: re-rotating a second later would be the
+/// configuration working as asked.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_completed_rotation_does_not_re_fire_every_ping() {
+    let fleet = TestCoordinator::start_with(|c| {
+        c.node_token_rotate_secs = 3_600;
+        c.ping_interval_secs = 1;
+        c.pong_timeout_secs = 30;
+    })
+    .await;
+    let (old_token, _node) = fleet.seed_node_at("default", "rpi-1", 0).await;
+
+    let (mut tx, mut rx) = fleet.dial("/agent", &old_token).await.unwrap();
+    let (new_token, rotation_id) = expect_push(&mut rx).await;
+
+    // Ack it, as the agent does after persisting.
+    fleet_wire::send(
+        &mut tx,
+        &AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }),
+    )
+    .await
+    .unwrap();
+
+    // Wait for the promotion to land, so the connection has definitely
+    // completed a full cycle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if fleet.upgrade_status("/agent", Some(&new_token)).await == 101 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the acked token was never promoted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Now watch for several ping intervals. Keep the connection alive and
+    // draining so the coordinator has every opportunity to push again.
+    let mut extra_pushes = 0;
+    let watch_until = std::time::Instant::now() + std::time::Duration::from_millis(3_500);
+    while std::time::Instant::now() < watch_until {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            fleet_wire::recv::<CoordToAgent>(&mut rx),
+        )
+        .await
+        {
+            Ok(Ok(CoordToAgent::Command(CoordinatorCommand::RotateNodeToken { .. }))) => {
+                extra_pushes += 1;
+            }
+            // Timeouts and other frames are the expected quiet case.
+            _ => {
+                let _ = fleet_wire::send(
+                    &mut tx,
+                    &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+                )
+                .await;
+            }
+        }
+    }
+
+    assert_eq!(
+        extra_pushes, 0,
+        "rotation re-fired {extra_pushes} more time(s) after completing; each one \
+         rewrites the node's on-disk credential and writes an audit row"
+    );
+    // The promoted token is still the live one — no later cycle superseded it.
+    assert_eq!(fleet.upgrade_status("/agent", Some(&new_token)).await, 101);
+}

@@ -47,6 +47,26 @@ fn now() -> i64 {
     i64::try_from(fleet_coordinator::now_epoch_secs()).unwrap_or(i64::MAX)
 }
 
+/// The `org.kind` to create an org with, given whether the operator named it.
+///
+/// A personal org is an org-of-one, created implicitly for a user. An org the
+/// operator named on the command line is by definition not that, so creating it
+/// as `personal` would be a lie the schema then carries forever — `kind` is only
+/// consulted at creation (`ON CONFLICT DO NOTHING`), so nothing later corrects
+/// it.
+///
+/// TODO(3447): once the device flow mints personal orgs on first login, this
+/// should stop being a CLI-shaped guess. A team org ought to be created by an
+/// explicit `coordinator org create` rather than as a side effect of minting a
+/// credential for it.
+fn org_kind(explicit: bool) -> &'static str {
+    if explicit {
+        "team"
+    } else {
+        "personal"
+    }
+}
+
 /// Run `coordinator auth-key`: mint an org-scoped node-enrollment key.
 ///
 /// # Errors
@@ -61,8 +81,9 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     );
 
     let (db, default_org, _) = open_db(args.config_dir).await?;
+    let explicit_org = args.org.is_some();
     let org = args.org.map_or(default_org, OrgId);
-    db.ensure_org(&org, "personal")
+    db.ensure_org(&org, org_kind(explicit_org))
         .await
         .context("ensuring the org exists")?;
 
@@ -129,6 +150,7 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     );
 
     let (db, default_org, default_ttl) = open_db(args.config_dir).await?;
+    let explicit_org = args.org.is_some();
     let org = args.org.map_or(default_org, OrgId);
     let role: Role = args.role.into();
     let ttl = args.ttl.unwrap_or(default_ttl);
@@ -136,7 +158,7 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     let now = now();
     let expires = now.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
 
-    db.ensure_org(&org, "personal")
+    db.ensure_org(&org, org_kind(explicit_org))
         .await
         .context("ensuring the org exists")?;
     db.ensure_user_member(&org, &args.login, role)
@@ -234,5 +256,32 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// An org the operator named is not an org-of-one. `kind` is only consulted
+    /// at creation, so getting it wrong here is permanent.
+    #[test]
+    fn an_explicitly_named_org_is_created_as_a_team() {
+        assert_eq!(org_kind(true), "team");
+        assert_eq!(org_kind(false), "personal");
+    }
+
+    /// `ensure_org` is idempotent, so the kind chosen at creation is the one
+    /// that sticks — which is exactly why the choice above matters.
+    #[tokio::test]
+    async fn ensure_org_does_not_revise_an_existing_kind() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let acme = OrgId("acme".to_owned());
+
+        db.ensure_org(&acme, org_kind(true)).await.unwrap();
+        // A later call with a different kind must not silently reclassify it.
+        db.ensure_org(&acme, "personal").await.unwrap();
+
+        // Observable through the API surface this crate has: the org exists and
+        // membership in it behaves normally.
+        db.ensure_user_member(&acme, "alice", Role::Admin)
+            .await
+            .unwrap();
+        assert_eq!(db.role_of(&acme, "alice").await.unwrap(), Some(Role::Admin));
     }
 }

@@ -133,10 +133,19 @@ async fn agent_read_loop(
     let mut pending: Option<PendingRotation> = None;
     let mut next_rotation_id: u64 = 1;
 
+    // The age of the token this connection is currently authenticated by.
+    //
+    // **Connection state, not a re-read of `auth`.** `auth` is captured once at
+    // authentication and never updated, so evaluating `should_rotate` against
+    // `auth.token_issued_at` would keep reporting the *pre-rotation* age after a
+    // completed cycle — re-firing a rotation every ping tick for the life of the
+    // connection, each one rewriting the Pi's SD card and appending an audit
+    // row. `complete_rotation` advances this on a successful promotion.
+    let mut token_issued_at = auth.token_issued_at.unwrap_or(0);
+
     // Rotate on connect if the token is already old enough: a node that
     // reconnects after a long outage should not have to wait a full interval.
-    let mut rotation_due =
-        fleet_auth::should_rotate(auth.token_issued_at.unwrap_or(0), coord.now(), policy);
+    let mut rotation_due = fleet_auth::should_rotate(token_issued_at, coord.now(), policy);
 
     loop {
         if rotation_due && pending.is_none() {
@@ -162,9 +171,15 @@ async fn agent_read_loop(
                     WireEvent::Binary(bytes) => {
                         match fleet_wire::decode::<AgentToCoord>(&bytes)? {
                             AgentToCoord::Report(report) => {
-                                if let Some(outcome) =
-                                    handle_agent_report(coord, agent_id, auth, &mut pending, report)
-                                        .await?
+                                if let Some(outcome) = handle_agent_report(
+                                    coord,
+                                    agent_id,
+                                    auth,
+                                    &mut pending,
+                                    &mut token_issued_at,
+                                    report,
+                                )
+                                .await?
                                 {
                                     break Err(outcome);
                                 }
@@ -200,11 +215,7 @@ async fn agent_read_loop(
                     }
                 }
                 if pending.is_none()
-                    && fleet_auth::should_rotate(
-                        auth.token_issued_at.unwrap_or(0),
-                        coord.now(),
-                        policy,
-                    )
+                    && fleet_auth::should_rotate(token_issued_at, coord.now(), policy)
                 {
                     rotation_due = true;
                 }
@@ -222,6 +233,7 @@ async fn handle_agent_report(
     agent_id: &AgentId,
     auth: &fleet_auth::Authenticated,
     pending: &mut Option<PendingRotation>,
+    token_issued_at: &mut u64,
     report: AgentReport,
 ) -> Result<Option<CoordinatorError>> {
     match report {
@@ -253,7 +265,7 @@ async fn handle_agent_report(
             ))))
         }
         AgentReport::TokenRotated { rotation_id } => {
-            complete_rotation(coord, agent_id, auth, pending, rotation_id).await;
+            complete_rotation(coord, agent_id, auth, pending, token_issued_at, rotation_id).await;
             Ok(None)
         }
         other => {
@@ -287,11 +299,16 @@ async fn push_rotation(
 }
 
 /// Promote a pending rotation once the node has acked it.
+///
+/// On success this advances `token_issued_at`, the connection's own record of
+/// how old its credential is. Without that the read loop would keep evaluating
+/// the rotation policy against the pre-rotation age and re-fire on every ping.
 async fn complete_rotation(
     coord: &Coordinator,
     agent_id: &AgentId,
     auth: &fleet_auth::Authenticated,
     pending: &mut Option<PendingRotation>,
+    token_issued_at: &mut u64,
     rotation_id: u64,
 ) {
     let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
@@ -328,6 +345,10 @@ async fn complete_rotation(
         warn!(%agent_id, error = %e, "failed to promote a rotated node token");
         return;
     }
+    // The promotion is committed: this connection's credential is now `now` old,
+    // so the next policy evaluation sees a fresh token rather than the stale one
+    // it authenticated with.
+    *token_issued_at = coord.now();
     let _ = coord
         .db()
         .scoped(org)

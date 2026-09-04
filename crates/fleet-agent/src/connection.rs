@@ -133,6 +133,25 @@ pub async fn dispatch_command<B: ProbeRsBackend>(
     agent.handle_command(cmd).await
 }
 
+/// Whether a failed connection should be retried immediately with the node's
+/// *previous* token instead of backing off.
+///
+/// This exists to close exactly one window: the agent persisted a rotated token
+/// and acked it, but the ack was lost, so the coordinator still holds the old
+/// hash while this node holds the new one. Retrying once with the previous token
+/// recovers without any server state.
+///
+/// `already_tried` is what makes it *once*. Without it the retry is unbounded:
+/// [`AgentConfig::fall_back_to_previous_token`] merely swaps the two tokens and
+/// keeps returning `true`, and `previous_node_token` is only cleared after a
+/// **successful** dial — so when both tokens are rejected (a genuine revocation,
+/// which is precisely the case an operator most needs to see) the loop would
+/// alternate them forever at TCP-connect rate, never reaching the backoff and
+/// emitting a warning per iteration.
+fn should_fall_back(e: &AgentError, already_tried: bool) -> bool {
+    matches!(e, AgentError::CredentialRejected(_)) && !already_tried
+}
+
 /// Run the persistent dial-out connection loop: connect, serve, reconnect with
 /// backoff on failure.
 ///
@@ -155,22 +174,29 @@ pub async fn run<B: ProbeRsBackend + 'static>(
 ) -> Result<()> {
     let mut config = config;
     let mut backoff = Backoff::default();
+    // Reset on every successful dial, so the one-shot fallback is once *per
+    // connection*, not once for the lifetime of the process.
+    let mut fallback_used = false;
 
     loop {
-        match connect_and_serve(&agent, &mut config).await {
+        let mut connected = false;
+        match connect_and_serve(&agent, &mut config, &mut connected).await {
             Ok(()) => {
                 // Clean disconnect: reset backoff and immediately retry.
                 backoff.reset(Duration::from_millis(500));
+                fallback_used = false;
             }
             Err(e) => {
-                if matches!(e, AgentError::CredentialRejected(_))
-                    && config.fall_back_to_previous_token()
-                {
+                if connected {
+                    fallback_used = false;
+                }
+                if should_fall_back(&e, fallback_used) && config.fall_back_to_previous_token() {
                     // The coordinator refused our current token but we hold a
                     // previous one — the signature of a rotation whose *ack*
                     // was lost, leaving the coordinator on the old hash. Retry
                     // immediately with it rather than backing off into a state
                     // that only a physical visit can fix.
+                    fallback_used = true;
                     tracing::warn!(
                         "node token rejected; retrying once with the pre-rotation token"
                     );
@@ -187,6 +213,11 @@ pub async fn run<B: ProbeRsBackend + 'static>(
 /// One connection lifetime: dial, register, then serve commands + heartbeats
 /// until the connection drops.
 ///
+/// `connected` is set once the dial succeeds, so the caller can tell a
+/// credential rejection (we never got in) from a connection that worked and then
+/// dropped — which is what makes the one-shot fallback *per connection* rather
+/// than once per process lifetime.
+///
 /// # Errors
 ///
 /// Returns [`AgentError::Connection`] when the connection cannot be established
@@ -195,6 +226,7 @@ pub async fn run<B: ProbeRsBackend + 'static>(
 async fn connect_and_serve<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
     config: &mut AgentConfig,
+    connected: &mut bool,
 ) -> Result<()> {
     let (tx, rx) = dial(DialOpts {
         url: config.fleet_url.clone(),
@@ -204,6 +236,7 @@ async fn connect_and_serve<B: ProbeRsBackend + 'static>(
     })
     .await
     .map_err(|e| classify_dial_error(&e))?;
+    *connected = true;
 
     // The dial succeeded, so this token works: the previous one is dead weight
     // and keeping it would widen the window in which a stale credential is on
@@ -218,6 +251,17 @@ async fn connect_and_serve<B: ProbeRsBackend + 'static>(
 /// Distinguish "the coordinator refused our credential" from "the network
 /// failed", because the remediation is completely different and a bare 401 in a
 /// log is exactly the thing an operator cannot act on.
+///
+/// **This matches on substrings of tungstenite's `Display` output**, because its
+/// `Error::Http` variant carries the response but the dial helper has already
+/// collapsed it to a `WireError::Protocol(String)` — deliberately, so callers
+/// cannot branch on a status they should not be reasoning about. The cost is a
+/// dependency on an upstream error's *format*: if a tungstenite bump changes how
+/// `Http` renders, this silently degrades to classifying every rejection as a
+/// network failure, and a revoked node then retries forever with a generic
+/// "connection lost" instead of the re-enroll remediation. Check it when bumping
+/// tungstenite; `classify_dial_error_recognises_auth_rejections` pins the shapes
+/// we rely on.
 fn classify_dial_error(e: &WireError) -> AgentError {
     let text = e.to_string();
     if text.contains("401") || text.contains("403") || text.contains("Unauthorized") {
@@ -864,5 +908,113 @@ kind = "none"
         // Degenerate inputs must not panic or produce nonsense.
         assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
         assert_eq!(jittered(Duration::from_millis(1)), Duration::from_millis(1));
+    }
+
+    /// **Regression: the "one-shot" fallback must actually be once.**
+    ///
+    /// `fall_back_to_previous_token` only swaps the two tokens and keeps
+    /// returning `true`, and `previous_node_token` is cleared only after a
+    /// *successful* dial. So without the `already_tried` gate, a node whose
+    /// credential was genuinely revoked — both tokens rejected — would alternate
+    /// them forever at TCP-connect rate, never reaching the backoff, emitting a
+    /// warning per iteration. That is the case an operator most needs to see, so
+    /// it must fall through to the jittered backoff instead.
+    #[test]
+    fn credential_fallback_is_attempted_at_most_once() {
+        let rejected = AgentError::CredentialRejected("401".to_owned());
+
+        // First rejection after a connection: try the previous token.
+        assert!(should_fall_back(&rejected, false));
+        // Second in a row: back off instead of hot-looping.
+        assert!(!should_fall_back(&rejected, true));
+    }
+
+    /// A network failure is never a reason to swap credentials: the token is
+    /// fine, the network is not, and rotating through tokens would only muddy
+    /// which one the coordinator last accepted.
+    #[test]
+    fn a_network_failure_does_not_trigger_the_credential_fallback() {
+        let network = AgentError::Connection("connection refused".to_owned());
+        assert!(!should_fall_back(&network, false));
+        assert!(!should_fall_back(&network, true));
+    }
+
+    /// Simulates the loop's bookkeeping across a revocation: two rejections must
+    /// produce exactly one fallback, then backoff. Before the fix this ran
+    /// forever.
+    #[test]
+    fn a_revoked_node_stops_falling_back_and_reaches_the_backoff() {
+        let mut cfg = agent_config();
+        cfg.previous_node_token = Some("prfn1_old".to_owned());
+
+        let rejected = AgentError::CredentialRejected("401 Unauthorized".to_owned());
+        let mut fallback_used = false;
+        let mut fallbacks = 0;
+
+        // Ten consecutive rejections, as a revoked node would see.
+        for _ in 0..10 {
+            if should_fall_back(&rejected, fallback_used) && cfg.fall_back_to_previous_token() {
+                fallback_used = true;
+                fallbacks += 1;
+                continue;
+            }
+            // Reached the backoff arm.
+            break;
+        }
+        assert_eq!(fallbacks, 1, "exactly one fallback, then back off");
+    }
+
+    /// The counter is per *connection*, not per process: a node that connects,
+    /// serves, drops, and is later rejected must still get its one retry.
+    #[test]
+    fn a_successful_connection_re_arms_the_fallback() {
+        let rejected = AgentError::CredentialRejected("401".to_owned());
+        let mut fallback_used = false;
+
+        assert!(should_fall_back(&rejected, fallback_used));
+        fallback_used = true;
+        assert!(!should_fall_back(&rejected, fallback_used));
+
+        // A dial succeeded (the loop clears the flag on `connected`).
+        fallback_used = false;
+        assert!(should_fall_back(&rejected, fallback_used));
+    }
+
+    /// The substring classification this relies on. If a tungstenite bump breaks
+    /// these shapes, a revoked node degrades to "connection lost" forever and
+    /// the operator never sees the re-enroll remediation.
+    #[test]
+    fn classify_dial_error_recognises_auth_rejections() {
+        for text in [
+            "HTTP error: 401 Unauthorized",
+            "HTTP error: 403 Forbidden",
+            "Unauthorized",
+        ] {
+            assert!(
+                matches!(
+                    classify_dial_error(&fleet_wire::WireError::Protocol(text.to_owned())),
+                    AgentError::CredentialRejected(_)
+                ),
+                "`{text}` must classify as a credential rejection"
+            );
+        }
+
+        // ... and a genuine network failure must not.
+        assert!(matches!(
+            classify_dial_error(&fleet_wire::WireError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "connection refused"
+            ))),
+            AgentError::Connection(_)
+        ));
+    }
+
+    /// The remediation text is the whole point of the distinct variant: a bare
+    /// 401 is what an operator cannot act on.
+    #[test]
+    fn credential_rejection_names_the_remedy() {
+        let rendered = AgentError::CredentialRejected("401".to_owned()).to_string();
+        assert!(rendered.contains("agent init"), "got: {rendered}");
+        assert!(rendered.contains("--auth-key"), "got: {rendered}");
     }
 }
