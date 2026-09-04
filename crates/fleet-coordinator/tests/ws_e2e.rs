@@ -90,18 +90,17 @@ fn agent_config(
     node_token: &str,
     token_pubkey: &[u8; 32],
 ) -> fleet_agent::config::AgentConfig {
-    let toml = format!(
-        r#"
-agent_id = "{node_id}"
-fleet_url = "{fleet_url}"
-node_token = "{node_token}"
-coordinator_token_pubkey = "{}"
-boards_path = "/boards.toml"
-heartbeat_secs = 30
-"#,
-        hex_encode(token_pubkey)
-    );
-    fleet_agent::config::AgentConfig::from_str(&toml).unwrap()
+    fleet_agent::config::AgentConfig {
+        agent_id: node_id.to_owned(),
+        fleet_url: fleet_url.to_owned(),
+        node_token: node_token.to_owned(),
+        previous_node_token: None,
+        server_cert_sha256: None,
+        coordinator_token_pubkey: hex_encode(token_pubkey),
+        boards_path: std::path::PathBuf::from("/boards.toml"),
+        heartbeat_secs: 30,
+        erase_on_release: false,
+    }
 }
 
 fn boards() -> fleet_agent::config::BoardsConfig {
@@ -143,9 +142,14 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
     {
         let agent = Arc::clone(&agent);
         tokio::spawn(async move {
+            // A node that never persists its rotated token: these tests are
+            // about the wire, and the storage half is covered in fleet-bin.
+            let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
+                Arc::new(fleet_agent::config::NullTokenStore);
             let _ = fleet_agent::connection::serve_connection(
                 &agent,
                 &mut config,
+                &store,
                 Box::new(agent_tx),
                 Box::new(agent_rx),
             )
@@ -253,9 +257,12 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
 
     let (tx, rx) = fleet.dial("/agent", &node_token).await.unwrap();
     tokio::spawn(async move {
+        let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
+            Arc::new(fleet_agent::config::NullTokenStore);
         let _ = fleet_agent::connection::serve_connection(
             &agent,
             &mut config,
+            &store,
             Box::new(tx),
             Box::new(rx),
         )

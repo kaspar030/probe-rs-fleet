@@ -27,14 +27,13 @@ use fleet_sidecar::selector::ProcessEnv;
 ///
 /// Returns an error on a parse failure, a partial fleet environment, a failure
 /// to locate / run the real probe-rs, or a relay transport error.
-pub async fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode> {
-    // Discover coordinator endpoint + client credentials from `client.toml`
-    // (written by `ctl init`) and inject them into the process environment for
-    // any keys the user has NOT already set. This lets a single `ctl init`
-    // configure both `ctl` and this shim. The sidecar still keys leases by
-    // selector + subject (unchanged); selector env (`_BOARD` / `_SELECT`)
-    // continues to come from the user's environment.
-    inject_client_config_env(profile);
+pub async fn run(probe_rs_args: Vec<OsString>, fleet: &str) -> Result<ExitCode> {
+    // Discover the coordinator endpoint + user credential from the selected
+    // fleet file (written by `probe-rs-fleet login`) and inject them into the
+    // process environment for any keys the user has NOT already set. This lets
+    // one `login` configure both `ctl` and this shim. Selector env
+    // (`_BOARD` / `_SELECT`) continues to come from the user's environment.
+    inject_client_config_env(fleet);
 
     // Reconstruct a full argv: program name + the forwarded probe-rs args.
     let mut argv: Vec<OsString> = Vec::with_capacity(probe_rs_args.len() + 1);
@@ -45,26 +44,30 @@ pub async fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode
     Ok(exit_code_from_i32(code))
 }
 
-/// Populate the sidecar's coordinator / credential env vars from `client.toml`
+/// Populate the sidecar's coordinator / credential env vars from the fleet file
 /// for any key not already present in the environment.
 ///
-/// `client.toml` is shared with `ctl`; since revision 2 both read the same three
-/// values, so this is a straight bridge rather than the name translation it used
-/// to be.
-fn inject_client_config_env(profile: &str) {
-    let Ok(path) = crate::paths::client_config_path(profile) else {
+/// Only the `[user]` table is consulted: the shim runs a probe-rs invocation on
+/// the human's behalf, and a machine that is also a node must not silently
+/// present its *node* credential here. That is the whole reason the two tokens
+/// stay separate.
+///
+/// No refresh happens on this path. The shim is a short-lived child process of
+/// a build or test run, and blocking it on an HTTP round trip — or worse,
+/// racing a concurrent `ctl` for the one refreshable token — is not worth the
+/// few minutes it would buy; an expired token surfaces as an auth error telling
+/// the user to run `login`.
+fn inject_client_config_env(fleet: &str) {
+    let Some(file) = crate::fleet_config::load_named_opt(fleet) else {
         return;
     };
-    if !path.exists() {
-        return;
-    }
-    let Ok(cfg) = crate::config::load_client_config(&path) else {
+    let Some(user) = file.user.as_ref() else {
         return;
     };
 
-    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", &cfg.fleet_url);
-    set_env_if_absent("PROBE_RS_FLEET_TOKEN", &cfg.token);
-    if let Some(pin) = &cfg.server_cert_sha256 {
+    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", &file.url);
+    set_env_if_absent("PROBE_RS_FLEET_TOKEN", &user.session_token);
+    if let Some(pin) = &file.server_cert_sha256 {
         set_env_if_absent("PROBE_RS_FLEET_SERVER_CERT_SHA256", pin);
     }
 }

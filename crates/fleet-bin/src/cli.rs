@@ -45,6 +45,49 @@ pub enum Command {
     Sidecar(SidecarArgs),
     /// Admin / UX CLI: talk to the coordinator over its `/client` WebSocket.
     Ctl(CtlArgs),
+    /// Log in to a fleet with GitHub, caching a session token for `ctl` and the
+    /// `probe-rs` sidecar shim.
+    Login(LoginArgs),
+    /// List the fleets this machine has a config for.
+    Fleets,
+}
+
+/// Arguments for `probe-rs-fleet login`.
+///
+/// GitHub **device flow**: the CLI asks the coordinator to start one, prints the
+/// short code and the URL, opens a browser where it can, and polls until the
+/// human has authorised it. The CLI never talks to GitHub directly — the OAuth
+/// app's credentials stay on the coordinator, which is also what lets a
+/// self-hosted deployment use its own app without a rebuild.
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
+    ///
+    /// Required the first time; afterwards the fleet file remembers it.
+    #[arg(long)]
+    pub fleet_url: Option<String>,
+    /// Pin the coordinator's server certificate by its SHA-256 (64 hex chars),
+    /// for a self-hosted deployment with no publicly trusted certificate.
+    #[arg(long)]
+    pub server_cert_sha256: Option<String>,
+    /// Record an externally minted session token instead of running the device
+    /// flow.
+    ///
+    /// The escape hatch for an air-gapped fleet or one whose coordinator has no
+    /// GitHub app: pair it with `coordinator user-token`. Also what the
+    /// integration tests use, so they need no GitHub at all.
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Do not try to open a browser; just print the URL and code.
+    #[arg(long)]
+    pub no_browser: bool,
+    /// The fleet to log in to.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the fleets directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// Arguments for the `coordinator` role.
@@ -177,16 +220,17 @@ impl From<RoleArg> for fleet_proto::ids::Role {
 /// Arguments for the `agent` role.
 #[derive(Debug, Args)]
 pub struct AgentArgs {
-    /// Path to the agent config (TOML).
+    /// The fleet whose `[node]` credential this agent connects with.
     ///
-    /// When unset, defaults to the per-profile XDG path
-    /// `$XDG_CONFIG_HOME/probe-rs-fleet/agent/<profile>/agent.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET_AGENT_CONFIG")]
-    pub config: Option<std::path::PathBuf>,
-    /// Profile to select (per-profile config/data subdir). An explicit
-    /// `--config` takes precedence over the profile.
-    #[arg(long, env = "PROBE_RS_FLEET_PROFILE", default_value = crate::paths::DEFAULT_PROFILE, global = true)]
-    pub profile: String,
+    /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`. There is no
+    /// `--config` any more: `agent.toml` is gone, the credential lives in the
+    /// fleet file and the node-local settings in `node/node.toml`.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true, global = true)]
+    pub config_dir: Option<std::path::PathBuf>,
     /// Optional nested subcommand (e.g. `init`). When absent, the agent runs.
     #[command(subcommand)]
     pub command: Option<AgentCommand>,
@@ -195,11 +239,9 @@ pub struct AgentArgs {
 /// `agent` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
-    /// Redeem an auth key for a node token and scaffold a ready-to-run agent
-    /// config (`agent.toml` + `boards.toml`) under the per-profile XDG paths.
+    /// Redeem an auth key for a node token, write it into the fleet file's
+    /// `[node]` table, and scaffold `node/node.toml` + `node/boards.toml`.
     Init(AgentInitArgs),
-    /// List the agent profiles that have a config under the XDG config dir.
-    Profiles,
 }
 
 /// Arguments for `agent init`.
@@ -227,13 +269,7 @@ pub struct AgentInitArgs {
     /// Without it the coordinator is verified against the public web PKI roots.
     #[arg(long)]
     pub server_cert_sha256: Option<String>,
-    /// Override the config directory (default: XDG config dir).
-    #[arg(long)]
-    pub config_dir: Option<std::path::PathBuf>,
-    /// Override where `boards.toml` is written (default: profile config dir).
-    #[arg(long)]
-    pub boards_path: Option<std::path::PathBuf>,
-    /// Overwrite existing files instead of refusing.
+    /// Overwrite an existing `[node]` credential instead of refusing.
     #[arg(long)]
     pub force: bool,
 }
@@ -242,9 +278,9 @@ pub struct AgentInitArgs {
 /// Arguments for the explicit `sidecar` subcommand.
 #[derive(Debug, Args)]
 pub struct SidecarArgs {
-    /// Profile to select (per-profile client config/data subdir).
-    #[arg(long, env = "PROBE_RS_FLEET_PROFILE", default_value = crate::paths::DEFAULT_PROFILE)]
-    pub profile: String,
+    /// The fleet whose `[user]` credential the shim connects with.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
     /// The probe-rs subcommand and its arguments, forwarded verbatim.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub probe_rs_args: Vec<OsString>,
@@ -267,10 +303,10 @@ pub struct CtlClientArgs {
         global = true
     )]
     pub server_cert_sha256: Option<String>,
-    /// Profile to select (per-profile client config/data subdir). An explicit
-    /// `--config`/credential flag takes precedence over the profile.
-    #[arg(long, env = "PROBE_RS_FLEET_PROFILE", default_value = crate::paths::DEFAULT_PROFILE, global = true)]
-    pub profile: String,
+    /// The fleet to talk to. An explicit credential flag takes precedence over
+    /// what the fleet file holds.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true)]
+    pub fleet: String,
 }
 
 /// Arguments for the `ctl` role.
@@ -285,11 +321,6 @@ pub struct CtlArgs {
 /// `ctl` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CtlCommand {
-    /// Write `client.toml` so both `ctl` and the `probe-rs` sidecar shim
-    /// discover the coordinator and the session token.
-    Init(CtlInitArgs),
-    /// List the client profiles that have a config under the XDG config dir.
-    Profiles,
     /// List the fleet inventory (boards and their state).
     List,
     /// Lease a board by id or selector (`tag=…`, `chip=…`).
@@ -320,30 +351,6 @@ pub enum CtlCommand {
         #[arg(long)]
         follow: bool,
     },
-}
-
-/// Arguments for `ctl init`.
-///
-/// Writes `client.toml` (0600) from an already-minted session token; the shared
-/// `--coordinator` / `--token` flags are ignored by `init` in favour of the
-/// explicit ones below.
-#[derive(Debug, Args)]
-pub struct CtlInitArgs {
-    /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
-    #[arg(long)]
-    pub fleet_url: String,
-    /// The session token printed by `coordinator user-token`.
-    #[arg(long)]
-    pub token: String,
-    /// Pin the coordinator's server certificate by its SHA-256 (64 hex chars).
-    #[arg(long)]
-    pub server_cert_sha256: Option<String>,
-    /// Override the config directory (default: XDG config dir).
-    #[arg(long)]
-    pub config_dir: Option<std::path::PathBuf>,
-    /// Overwrite existing files instead of refusing.
-    #[arg(long)]
-    pub force: bool,
 }
 
 /// What argv0 inspection decided the process should do.
@@ -419,13 +426,13 @@ pub fn main() -> ExitCode {
 async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<ExitCode> {
     match dispatch {
         Dispatch::Sidecar(probe_rs_args) => {
-            // argv0 (`probe-rs` symlink) path: no clap, so read the profile
-            // directly from the env (default profile otherwise).
-            let profile = std::env::var("PROBE_RS_FLEET_PROFILE")
+            // argv0 (`probe-rs` symlink) path: no clap, so read the fleet
+            // selector directly from the env (default fleet otherwise).
+            let fleet = std::env::var("PROBE_RS_FLEET")
                 .ok()
                 .filter(|p| !p.is_empty())
-                .unwrap_or_else(|| crate::paths::DEFAULT_PROFILE.to_owned());
-            roles::sidecar::run(probe_rs_args, &profile).await
+                .unwrap_or_else(|| crate::paths::DEFAULT_FLEET.to_owned());
+            roles::sidecar::run(probe_rs_args, &fleet).await
         }
         Dispatch::Clap => {
             let cli = Cli::parse_from(process_args);
@@ -450,11 +457,7 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 },
                 Command::Agent(args) => match args.command {
                     Some(AgentCommand::Init(init)) => {
-                        roles::agent_init::run(init, args.profile).await?;
-                        Ok(ExitCode::SUCCESS)
-                    }
-                    Some(AgentCommand::Profiles) => {
-                        roles::list_profiles(crate::paths::Role::Agent)?;
+                        roles::agent_init::run(init, &args.fleet, args.config_dir).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                     None => {
@@ -462,21 +465,21 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         Ok(ExitCode::SUCCESS)
                     }
                 },
-                Command::Sidecar(args) => roles::sidecar::run(args.probe_rs_args, &args.profile).await,
-                Command::Ctl(args) => match args.command {
-                    CtlCommand::Init(init) => {
-                        roles::ctl_init::run(init, args.client.profile).await?;
-                        Ok(ExitCode::SUCCESS)
-                    }
-                    CtlCommand::Profiles => {
-                        roles::list_profiles(crate::paths::Role::Client)?;
-                        Ok(ExitCode::SUCCESS)
-                    }
-                    _ => {
-                        roles::ctl::run(args).await?;
-                        Ok(ExitCode::SUCCESS)
-                    }
-                },
+                Command::Sidecar(args) => {
+                    roles::sidecar::run(args.probe_rs_args, &args.fleet).await
+                }
+                Command::Ctl(args) => {
+                    roles::ctl::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Login(args) => {
+                    roles::login::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Fleets => {
+                    roles::list_fleets()?;
+                    Ok(ExitCode::SUCCESS)
+                }
             }
         }
     }
@@ -587,12 +590,23 @@ mod tests {
 
     #[test]
     fn parses_agent() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "--config", "a.toml"]));
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "--fleet", "lab1"]));
         match cli.command {
             Command::Agent(a) => {
-                assert_eq!(a.config.as_deref(), Some(Path::new("a.toml")));
+                assert_eq!(a.fleet, "lab1");
                 assert!(a.command.is_none());
             }
+            other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    /// The default fleet is what an unconfigured invocation gets, so a fresh
+    /// install needs no flags at all once `login` has run.
+    #[test]
+    fn fleet_defaults_to_default() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent"]));
+        match cli.command {
+            Command::Agent(a) => assert_eq!(a.fleet, "default"),
             other => panic!("expected agent, got {other:?}"),
         }
     }
@@ -687,7 +701,7 @@ mod tests {
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
             "agent",
-            "--profile",
+            "--fleet",
             "lab1",
             "init",
             "--fleet-url",
@@ -697,7 +711,7 @@ mod tests {
         ]));
         match cli.command {
             Command::Agent(a) => {
-                assert_eq!(a.profile, "lab1");
+                assert_eq!(a.fleet, "lab1");
                 match a.command {
                     Some(AgentCommand::Init(init)) => {
                         assert_eq!(init.fleet_url, "https://fleet.example");
@@ -712,49 +726,52 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_profiles() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "profiles"]));
-        assert!(matches!(
-            cli.command,
-            Command::Agent(a) if matches!(a.command, Some(AgentCommand::Profiles))
-        ));
-    }
-
-    #[test]
-    fn parses_ctl_init() {
+    fn parses_login() {
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
-            "ctl",
-            "--profile",
+            "login",
+            "--fleet",
             "ci",
-            "init",
+            "--fleet-url",
+            "https://fleet.example",
+            "--no-browser",
+        ]));
+        match cli.command {
+            Command::Login(a) => {
+                assert_eq!(a.fleet, "ci");
+                assert_eq!(a.fleet_url.as_deref(), Some("https://fleet.example"));
+                assert!(a.no_browser);
+                assert!(a.token.is_none());
+            }
+            other => panic!("expected login, got {other:?}"),
+        }
+    }
+
+    /// The escape hatch for a coordinator with no GitHub app (and the hook the
+    /// e2e tests use, so they need no GitHub at all).
+    #[test]
+    fn parses_login_with_an_explicit_token() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "login",
             "--fleet-url",
             "https://fleet.example",
             "--token",
             "prfs1_xyz",
         ]));
         match cli.command {
-            Command::Ctl(a) => {
-                assert_eq!(a.client.profile, "ci");
-                match a.command {
-                    CtlCommand::Init(init) => {
-                        assert_eq!(init.fleet_url, "https://fleet.example");
-                        assert_eq!(init.token, "prfs1_xyz");
-                    }
-                    other => panic!("expected ctl init, got {other:?}"),
-                }
+            Command::Login(a) => {
+                assert_eq!(a.token.as_deref(), Some("prfs1_xyz"));
+                assert_eq!(a.fleet, "default");
             }
-            other => panic!("expected ctl, got {other:?}"),
+            other => panic!("expected login, got {other:?}"),
         }
     }
 
     #[test]
-    fn parses_ctl_profiles() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "profiles"]));
-        assert!(matches!(
-            cli.command,
-            Command::Ctl(a) if matches!(a.command, CtlCommand::Profiles)
-        ));
+    fn parses_fleets() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "fleets"]));
+        assert!(matches!(cli.command, Command::Fleets));
     }
 
     #[test]

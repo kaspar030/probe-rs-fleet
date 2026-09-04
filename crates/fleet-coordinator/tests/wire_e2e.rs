@@ -108,18 +108,17 @@ fn coordinator_config() -> CoordinatorConfig {
 }
 
 fn agent_config(token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
-    let toml = format!(
-        r#"
-agent_id = "agent-a"
-fleet_url = "https://coordinator.example:7000"
-node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-coordinator_token_pubkey = "{}"
-boards_path = "/boards.toml"
-heartbeat_secs = 30
-"#,
-        hex_encode(token_pubkey)
-    );
-    fleet_agent::config::AgentConfig::from_str(&toml).unwrap()
+    fleet_agent::config::AgentConfig {
+        agent_id: "agent-a".to_owned(),
+        fleet_url: "https://coordinator.example:7000".to_owned(),
+        node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        previous_node_token: None,
+        server_cert_sha256: None,
+        coordinator_token_pubkey: hex_encode(token_pubkey),
+        boards_path: std::path::PathBuf::from("/boards.toml"),
+        heartbeat_secs: 30,
+        erase_on_release: false,
+    }
 }
 
 fn boards() -> fleet_agent::config::BoardsConfig {
@@ -180,9 +179,14 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         let agent = Arc::clone(&agent);
         let mut config = agent_config(&token_pubkey);
         tokio::spawn(async move {
+            // A node that never persists its rotated token: these tests are
+            // about the wire, and the storage half is covered in fleet-bin.
+            let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
+                Arc::new(fleet_agent::config::NullTokenStore);
             let _ = fleet_agent::connection::serve_connection(
                 &agent,
                 &mut config,
+                &store,
                 Box::new(agent_tx),
                 Box::new(agent_rx),
             )

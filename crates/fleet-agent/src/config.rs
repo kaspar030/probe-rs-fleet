@@ -666,7 +666,7 @@ chip = "c1"
 
     /// The one-shot fallback: if the coordinator never saw the ack, the node
     /// must be able to reconnect with the token the coordinator still holds.
-    /// This is a pure in-memory swap now \u2014 where the tokens are *written* is the
+    /// This is a pure in-memory swap now — where the tokens are *written* is the
     /// binary's business (see [`NodeTokenStore`]).
     #[test]
     fn falling_back_swaps_current_and_previous() {

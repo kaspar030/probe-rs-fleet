@@ -2,11 +2,12 @@
 //!
 //! The crate ships a single binary (`probe-rs-fleet`), but it also exposes its
 //! modules as a library so integration tests can exercise the role handlers
-//! in-process (see `tests/bearer_e2e.rs`, which drives `agent init` / `ctl init`
-//! against a live coordinator).
+//! in-process (see `tests/bearer_e2e.rs`, which drives `login --token` /
+//! `agent init` against a live coordinator).
 
 pub mod cli;
 pub mod config;
+pub mod fleet_config;
 pub mod logging;
 pub mod paths;
 pub mod roles;

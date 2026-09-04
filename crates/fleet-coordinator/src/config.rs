@@ -37,7 +37,7 @@ pub struct TlsConfig {
 
 /// The GitHub OAuth app the coordinator brokers the device flow with.
 ///
-/// **OAuth2, not OIDC.** GitHub user login has no discovery document, no ID
+/// **`OAuth2`, not OIDC.** GitHub user login has no discovery document, no ID
 /// token and no JWKS; the device flow yields an *access token* and identity
 /// comes from `GET /user`. (GitHub Actions workload identity *is* real OIDC —
 /// a different verifier, a different task.)

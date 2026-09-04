@@ -26,8 +26,8 @@
 //! neither.
 //!
 //! The two tokens stay **distinct credentials**. Merging them would make a
-//! compromised Pi \u2014 a device sitting on a shelf in an office, reachable by
-//! anyone who walks past \u2014 equivalent to a compromised user account.
+//! compromised Pi — a device sitting on a shelf in an office, reachable by
+//! anyone who walks past — equivalent to a compromised user account.
 //!
 //! # Writing: read-modify-write, then atomic rename
 //!
@@ -38,7 +38,7 @@
 //!
 //! The residual race (a login landing at the same instant as a token rotation)
 //! is a lost update, recoverable by re-running the command. There is no file
-//! locking in v1 \u2014 but note the asymmetry: re-running `login` costs a browser
+//! locking in v1 — but note the asymmetry: re-running `login` costs a browser
 //! tab, whereas silently clobbering a node credential costs a physical visit to
 //! the Pi. That is why the node writer patches rather than rewrites.
 
@@ -107,7 +107,7 @@ pub struct NodeSection {
 }
 
 /// The comment header every rendered fleet file carries.
-const HEADER: &str = r"# probe-rs-fleet \u2014 per-fleet configuration
+const HEADER: &str = r"# probe-rs-fleet — per-fleet configuration
 #
 # One file per fleet, at ~/.config/probe-rs-fleet/fleets/<name>.toml. Select it
 # with `--fleet <name>` or PROBE_RS_FLEET; the default is `default`.
@@ -270,13 +270,13 @@ fn tmp_path(path: &Path) -> PathBuf {
 ///
 /// Returns an error if the existing file is unparseable, the patched result is
 /// invalid, or the write fails.
-pub fn update(path: &Path, patch: impl FnOnce(&mut FleetFile)) -> Result<FleetFile> {
+pub fn update(path: &Path, edit: impl FnOnce(&mut FleetFile)) -> Result<FleetFile> {
     let mut file = if path.exists() {
         load(path)?
     } else {
         FleetFile::default()
     };
-    patch(&mut file);
+    edit(&mut file);
     validate(&file)?;
     save_atomic(path, &file)?;
     Ok(file)
@@ -287,9 +287,9 @@ pub fn update(path: &Path, patch: impl FnOnce(&mut FleetFile)) -> Result<FleetFi
 /// # Errors
 ///
 /// See [`update`].
-pub fn update_named(fleet: &str, patch: impl FnOnce(&mut FleetFile)) -> Result<FleetFile> {
-    let path = paths::fleet_config_path(fleet)?;
-    update(&path, patch)
+pub fn update_named(fleet: &str, edit: impl FnOnce(&mut FleetFile)) -> Result<FleetFile> {
+    let target = paths::fleet_config_path(fleet)?;
+    update(&target, edit)
 }
 
 impl FleetFile {
@@ -347,7 +347,7 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
             // than the next run refreshing again.
             if let Err(e) = update_named(fleet, |f| {
                 if let Some(u) = f.user.as_mut() {
-                    u.session_token = response.token.clone();
+                    u.session_token.clone_from(&response.token);
                     u.expires = response.expires;
                     u.org.clone_from(&response.org);
                 }

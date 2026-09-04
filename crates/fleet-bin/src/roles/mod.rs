@@ -8,6 +8,11 @@
 //! - [`sidecar`] → [`fleet_sidecar::run`]
 //! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
 //!   coordinator client the tree has
+//! - [`login`] → the GitHub device flow, brokered by the coordinator
+//!
+//! Every client role selects its credentials by **fleet name**
+//! (`--fleet` / `PROBE_RS_FLEET`), resolving to one file per fleet. See
+//! [`crate::fleet_config`].
 //!
 //! The daemon roles (`coordinator`, `agent`) race their service against
 //! [`crate::signal::shutdown`] for graceful termination.
@@ -17,25 +22,25 @@ pub mod agent;
 pub mod agent_init;
 pub mod coordinator;
 pub mod ctl;
-pub mod ctl_init;
 pub mod init;
+pub mod login;
 pub mod sidecar;
 
 use anyhow::Result;
 
-/// Print the profiles that exist for `role`, one per line. Used by the
-/// `agent profiles` / `ctl profiles` subcommands.
+/// Print the fleets this machine has a config for, one per line. Backs
+/// `probe-rs-fleet fleets`.
 ///
 /// # Errors
 ///
 /// Returns an error if the XDG config root cannot be resolved.
-pub fn list_profiles(role: crate::paths::Role) -> Result<()> {
-    let profiles = crate::paths::list_profiles(role)?;
-    if profiles.is_empty() {
-        println!("(no profiles)");
+pub fn list_fleets() -> Result<()> {
+    let fleets = crate::paths::list_fleets()?;
+    if fleets.is_empty() {
+        println!("(no fleets configured — run `probe-rs-fleet login --fleet-url <url>`)");
     } else {
-        for profile in profiles {
-            println!("{profile}");
+        for fleet in fleets {
+            println!("{fleet}");
         }
     }
     Ok(())

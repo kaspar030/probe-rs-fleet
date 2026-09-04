@@ -1,10 +1,10 @@
 //! Shared filesystem helpers used by the init scaffolding.
 //!
 //! These were originally private to [`crate::roles::init`]; they are factored
-//! out here so `coordinator init`, `agent init` and `ctl init` reuse the exact
-//! same secret-writing, permission, and TOML-rendering behaviour rather than
-//! duplicating it. `agent.toml` and `client.toml` now hold bearer credentials,
-//! so all three write through [`write_secret`].
+//! out here so `coordinator init`, `agent init` and `login` reuse the exact same
+//! secret-writing, permission, and TOML-rendering behaviour rather than
+//! duplicating it. The per-fleet config file holds bearer credentials, so
+//! [`crate::fleet_config`] writes through [`write_secret`] too.
 //!
 //! Random *token* generation deliberately does not live here: it belongs to
 //! `fleet_auth::OpaqueToken`, which owns the prefix scheme and the hashing

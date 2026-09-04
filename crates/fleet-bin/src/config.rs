@@ -9,6 +9,11 @@
 //! owns the on-disk TOML shape and the conversion into the runtime struct —
 //! that mapping is precisely "the job of `fleet-bin`" called out in the
 //! coordinator config docs.
+//!
+//! Client-side configuration is **not** here: since revision 2 it is one file
+//! per fleet, owned by [`crate::fleet_config`]. `fleet_agent::AgentConfig` is
+//! likewise no longer a file format — the agent role assembles it from the
+//! fleet file plus `node/node.toml`.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -16,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource, TlsConfig};
+use fleet_coordinator::config::{CoordinatorConfig, GithubConfig, SigningKeySource, TlsConfig};
 use fleet_core::policy::Policy;
 
 /// Optional coordinator-terminated TLS, as a `[tls]` table.
@@ -26,6 +31,47 @@ struct TlsToml {
     cert: PathBuf,
     /// PEM file holding the coordinator's server private key.
     key: PathBuf,
+}
+
+/// The `[github]` table: the OAuth app backing `probe-rs-fleet login`.
+///
+/// Omit it entirely for an air-gapped or development fleet; the device-flow
+/// routes then answer a named `503` and `coordinator user-token` remains the
+/// bootstrap path.
+#[derive(Debug, Clone, Deserialize)]
+struct GithubToml {
+    /// The OAuth app's client id.
+    client_id: String,
+    /// The OAuth app's client secret, when the app requires one.
+    #[serde(default)]
+    client_secret: Option<String>,
+    /// The OAuth scope to request. Empty (the default) is correct for
+    /// identity-only login: `GET /user` needs no scope, and asking for more
+    /// than we use is a permission the user cannot easily take back.
+    #[serde(default)]
+    scope: String,
+    /// Overridable so tests (and a GitHub Enterprise deployment) can point the
+    /// flow somewhere other than github.com.
+    #[serde(default = "default_device_code_url")]
+    device_code_url: String,
+    /// See [`GithubToml::device_code_url`].
+    #[serde(default = "default_access_token_url")]
+    access_token_url: String,
+    /// See [`GithubToml::device_code_url`].
+    #[serde(default = "default_api_base")]
+    api_base: String,
+}
+
+fn default_device_code_url() -> String {
+    "https://github.com/login/device/code".to_owned()
+}
+
+fn default_access_token_url() -> String {
+    "https://github.com/login/oauth/access_token".to_owned()
+}
+
+fn default_api_base() -> String {
+    "https://api.github.com".to_owned()
 }
 
 /// The on-disk shape of `coordinator.toml`.
@@ -72,6 +118,9 @@ struct CoordinatorConfigToml {
     /// The org the interim admin verbs default to.
     #[serde(default = "default_org")]
     default_org: String,
+    /// The GitHub OAuth app backing `probe-rs-fleet login`.
+    #[serde(default)]
+    github: Option<GithubToml>,
 }
 
 fn default_sweep_interval_secs() -> u64 {
@@ -140,6 +189,14 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         session_ttl_secs: raw.session_ttl_secs,
         node_token_rotate_secs: raw.node_token_rotate_secs,
         default_org: fleet_proto::ids::OrgId(raw.default_org),
+        github: raw.github.map(|g| GithubConfig {
+            client_id: g.client_id,
+            client_secret: g.client_secret,
+            scope: g.scope,
+            device_code_url: g.device_code_url,
+            access_token_url: g.access_token_url,
+            api_base: g.api_base,
+        }),
     })
 }
 
@@ -176,86 +233,6 @@ fn decode_seed_hex(hex: &str) -> Result<[u8; 32]> {
             u8::from_str_radix(s, 16).with_context(|| "signing key contains non-hex characters")?;
     }
     Ok(out)
-}
-
-/// Resolved client (ctl / sidecar) connection configuration loaded from
-/// `client.toml`.
-///
-/// A single `ctl init` writes this file so that both `ctl` and the `probe-rs`
-/// sidecar shim discover the coordinator URL and the session token from one
-/// place (in addition to the explicit flags / env vars, which take precedence).
-///
-/// It holds a bearer credential, so it is written 0600. There are no certificate
-/// paths any more: one token is the whole credential.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ClientConfig {
-    /// Base URL of the coordinator (`https://fleet.example`), or a bare
-    /// `host:port`.
-    pub fleet_url: String,
-    /// The user's bearer session token.
-    pub token: String,
-    /// Optional pinned coordinator server-certificate SHA-256, for a
-    /// self-hosted deployment with no publicly trusted certificate.
-    #[serde(default)]
-    pub server_cert_sha256: Option<String>,
-}
-
-/// Load and parse a client config TOML file (`client.toml`).
-///
-/// # Errors
-///
-/// Returns an error if the file cannot be read or the TOML is malformed /
-/// missing required keys.
-pub fn load_client_config(path: &Path) -> Result<ClientConfig> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read client config {}", path.display()))?;
-    let cfg: ClientConfig = toml::from_str(&text)
-        .with_context(|| format!("failed to parse client config {}", path.display()))?;
-    Ok(cfg)
-}
-
-/// Render a populated `client.toml`.
-#[must_use]
-pub fn render_client_config(fleet_url: &str, token: &str, pin: Option<&str>) -> String {
-    let pin_block = pin.map_or_else(
-        || {
-            "\n# Optional: pin the coordinator's server certificate by its SHA-256, for a\n\
-             # self-hosted deployment with no publicly trusted certificate. Without it the\n\
-             # coordinator is verified against the usual public web PKI roots.\n\
-             # server_cert_sha256 = \"<64 hex chars>\"\n"
-                .to_owned()
-        },
-        |p| {
-            format!(
-                "\n# Pinned coordinator server certificate (self-hosted deployment).\n\
-                 server_cert_sha256 = {}\n",
-                toml::Value::String(p.to_owned())
-            )
-        },
-    );
-    format!(
-        r"# probe-rs-fleet client config
-#
-# Generated by `probe-rs-fleet ctl init`. Used by BOTH `ctl` and the `probe-rs`
-# sidecar shim to discover the coordinator and the session token when the
-# explicit flags / env vars are absent. Discovered at the XDG path
-#   $XDG_CONFIG_HOME/probe-rs-fleet/client.toml
-#   (i.e. ~/.config/probe-rs-fleet/client.toml).
-#
-# Precedence: explicit flag / env var > this file.
-#
-# THIS FILE HOLDS A BEARER CREDENTIAL. It is written 0600; anyone who can read
-# `token` can act as you until it expires.
-
-# Base URL of the coordinator (a bare `host:port` is accepted and assumes https).
-fleet_url = {fleet_url}
-
-# Your session token. Short-lived and refreshable.
-token = {token}
-{pin_block}",
-        fleet_url = toml::Value::String(fleet_url.to_owned()),
-        token = toml::Value::String(token.to_owned()),
-    )
 }
 
 #[cfg(test)]
@@ -386,31 +363,4 @@ signing_key_hex = "{seed}"
         assert!(load_coordinator_config(f.path()).is_err());
     }
 
-    #[test]
-    fn client_config_round_trips() {
-        let rendered = render_client_config("https://fleet.example", "prfs1_secret", None);
-        let f = write_tmp(&rendered);
-        let cfg = load_client_config(f.path()).unwrap();
-        assert_eq!(cfg.fleet_url, "https://fleet.example");
-        assert_eq!(cfg.token, "prfs1_secret");
-        assert!(cfg.server_cert_sha256.is_none());
-    }
-
-    #[test]
-    fn client_config_round_trips_with_a_pin() {
-        let pin = "ab".repeat(32);
-        let rendered = render_client_config("https://fleet.example", "prfs1_s", Some(&pin));
-        let f = write_tmp(&rendered);
-        let cfg = load_client_config(f.path()).unwrap();
-        assert_eq!(cfg.server_cert_sha256.as_deref(), Some(pin.as_str()));
-    }
-
-    #[test]
-    fn client_config_missing_key_errors() {
-        let toml = r#"
-fleet_url = "https://fleet.example"
-"#;
-        let f = write_tmp(toml);
-        assert!(load_client_config(f.path()).is_err());
-    }
 }

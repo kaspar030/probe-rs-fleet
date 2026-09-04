@@ -19,7 +19,6 @@ use fleet_sidecar::transport::CoordSession;
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
 use crate::cli::{CtlArgs, CtlClientArgs, CtlCommand};
-use crate::paths;
 
 /// Resolved connection configuration for the ctl client.
 #[derive(Debug, Clone)]
@@ -33,36 +32,61 @@ pub struct CtlConnection {
 }
 
 impl CtlConnection {
-    /// Resolve the connection config from the CLI/env flags, falling back to a
-    /// `client.toml` (at the XDG config path) for any field the flags / env
-    /// vars do not supply.
+    /// Resolve the connection config from the CLI/env flags, falling back to the
+    /// selected fleet's file for any field the flags / env vars do not supply.
     ///
-    /// Precedence: explicit flag / env var > `client.toml`. Errors only if a
-    /// required field is supplied by neither source.
+    /// Precedence: explicit flag / env var > `fleets/<name>.toml`. Errors only
+    /// if a required field is supplied by neither source.
+    ///
+    /// The session token is refreshed on the way through if it is about to
+    /// expire (see [`crate::fleet_config::ensure_fresh_session`]) — which is why
+    /// this is `async` and why a flag-supplied token bypasses it: a token the
+    /// user handed us is not ours to rotate.
     ///
     /// # Errors
     ///
-    /// Returns an error if `--coordinator` or `--token` (or their env /
-    /// `client.toml` equivalents) cannot be resolved.
-    pub fn from_args(args: CtlClientArgs) -> Result<Self> {
-        let fallback = load_client_fallback(&args.profile);
-        Self::resolve(args, fallback)
+    /// Returns an error if `--coordinator` or `--token` (or their env / fleet
+    /// file equivalents) cannot be resolved.
+    pub async fn from_args(args: CtlClientArgs) -> Result<Self> {
+        let fleet = args.fleet.clone();
+        let fallback = crate::fleet_config::load_named_opt(&fleet);
+        let token = match (&args.token, &fallback) {
+            (None, Some(file)) => Some(
+                crate::fleet_config::ensure_fresh_session(&fleet, file)
+                    .await
+                    .with_context(|| format!("resolving the session token for fleet `{fleet}`"))?,
+            ),
+            _ => None,
+        };
+        Self::resolve(args, fallback.as_ref(), token)
     }
 
-    /// Resolve against an explicit (possibly absent) `client.toml` fallback.
-    fn resolve(args: CtlClientArgs, fallback: Option<crate::config::ClientConfig>) -> Result<Self> {
-        let (fb_url, fb_token, fb_pin) = match fallback {
-            Some(c) => (Some(c.fleet_url), Some(c.token), c.server_cert_sha256),
-            None => (None, None, None),
+    /// Resolve against an explicit (possibly absent) fleet-file fallback.
+    ///
+    /// `fallback_token` is the (possibly refreshed) session token from the fleet
+    /// file, threaded in separately so this stays synchronous and testable.
+    fn resolve(
+        args: CtlClientArgs,
+        fallback: Option<&crate::fleet_config::FleetFile>,
+        fallback_token: Option<String>,
+    ) -> Result<Self> {
+        let (fb_url, fb_pin) = match fallback {
+            Some(f) => (Some(f.url.clone()), f.server_cert_sha256.clone()),
+            None => (None, None),
         };
-        let fleet_url = args
-            .coordinator
-            .or(fb_url)
-            .context("--coordinator (or PROBE_RS_FLEET_COORDINATOR / client.toml) is required")?;
-        let token = args.token.or(fb_token).context(
-            "--token (or PROBE_RS_FLEET_TOKEN / client.toml) is required; mint one with \
-             `probe-rs-fleet coordinator user-token <login>`",
-        )?;
+        let fleet = args.fleet.clone();
+        let fleet_url = args.coordinator.or(fb_url).with_context(|| {
+            format!(
+                "--coordinator (or PROBE_RS_FLEET_COORDINATOR, or fleets/{fleet}.toml) is \
+                 required"
+            )
+        })?;
+        let token = args.token.or(fallback_token).with_context(|| {
+            format!(
+                "no credential for fleet `{fleet}`; run `probe-rs-fleet login --fleet {fleet}` \
+                 (or pass --token / PROBE_RS_FLEET_TOKEN)"
+            )
+        })?;
         let server_cert_sha256 = args.server_cert_sha256.or(fb_pin);
         if let Some(pin) = &server_cert_sha256 {
             anyhow::ensure!(
@@ -84,18 +108,6 @@ impl CtlConnection {
             .as_deref()
             .and_then(fleet_tls::parse_fingerprint)
     }
-}
-
-/// Load the `client.toml` fallback from the XDG config path, if it exists.
-///
-/// A missing file (or unresolvable config path) is not an error here — it just
-/// means there is no fallback and the flags / env vars must supply everything.
-fn load_client_fallback(profile: &str) -> Option<crate::config::ClientConfig> {
-    let path = paths::client_config_path(profile).ok()?;
-    if !path.exists() {
-        return None;
-    }
-    crate::config::load_client_config(&path).ok()
 }
 
 /// Parse a `lease`/board selector into a [`Constraint`].
@@ -302,15 +314,10 @@ impl CtlClient {
 /// Returns an error if the connection config is incomplete or the coordinator
 /// RPC fails.
 pub async fn run(args: CtlArgs) -> Result<()> {
-    let conn = CtlConnection::from_args(args.client)?;
+    let conn = CtlConnection::from_args(args.client).await?;
     let client = CtlClient::new(conn);
 
     match args.command {
-        CtlCommand::Init(_) | CtlCommand::Profiles => {
-            // `ctl init` / `ctl profiles` are dispatched in cli.rs before a
-            // connection is built; reaching here would be a logic error.
-            anyhow::bail!("`ctl init`/`ctl profiles` must be handled before connecting")
-        }
         CtlCommand::List => client.list().await,
         CtlCommand::Lease { selector, duration } => {
             let request = LeaseRequest {
@@ -338,15 +345,14 @@ mod tests {
             coordinator: coordinator.map(ToOwned::to_owned),
             token: token.map(ToOwned::to_owned),
             server_cert_sha256: None,
-            profile: "default".to_owned(),
+            fleet: "default".to_owned(),
         }
     }
 
-    fn fallback(url: &str, token: &str) -> crate::config::ClientConfig {
-        crate::config::ClientConfig {
-            fleet_url: url.to_owned(),
-            token: token.to_owned(),
-            server_cert_sha256: None,
+    fn fallback(url: &str) -> crate::fleet_config::FleetFile {
+        crate::fleet_config::FleetFile {
+            url: url.to_owned(),
+            ..crate::fleet_config::FleetFile::default()
         }
     }
 
@@ -381,25 +387,27 @@ mod tests {
 
     #[test]
     fn connection_requires_a_url_and_a_token() {
-        assert!(CtlConnection::resolve(args(None, None), None).is_err());
-        assert!(CtlConnection::resolve(args(Some("c:1"), None), None).is_err());
-        assert!(CtlConnection::resolve(args(None, Some("prfs1_t")), None).is_err());
+        assert!(CtlConnection::resolve(args(None, None), None, None).is_err());
+        assert!(CtlConnection::resolve(args(Some("c:1"), None), None, None).is_err());
+        assert!(CtlConnection::resolve(args(None, Some("prfs1_t")), None, None).is_err());
     }
 
     #[test]
     fn connection_resolves_when_both_present() {
         let conn =
-            CtlConnection::resolve(args(Some("https://coord"), Some("prfs1_t")), None).unwrap();
+            CtlConnection::resolve(args(Some("https://coord"), Some("prfs1_t")), None, None)
+                .unwrap();
         assert_eq!(conn.fleet_url, "https://coord");
         assert_eq!(conn.token, "prfs1_t");
         assert!(conn.pin().is_none());
     }
 
     #[test]
-    fn connection_falls_back_to_client_toml() {
+    fn connection_falls_back_to_the_fleet_file() {
         let conn = CtlConnection::resolve(
             args(None, None),
-            Some(fallback("https://fb.example", "prfs1_fb")),
+            Some(&fallback("https://fb.example")),
+            Some("prfs1_fb".to_owned()),
         )
         .unwrap();
         assert_eq!(conn.fleet_url, "https://fb.example");
@@ -407,10 +415,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flag_overrides_client_toml() {
+    fn explicit_flag_overrides_the_fleet_file() {
         let conn = CtlConnection::resolve(
             args(Some("https://flag.example"), Some("prfs1_flag")),
-            Some(fallback("https://fb.example", "prfs1_fb")),
+            Some(&fallback("https://fb.example")),
+            Some("prfs1_fb".to_owned()),
         )
         .unwrap();
         assert_eq!(conn.fleet_url, "https://flag.example");
@@ -424,11 +433,11 @@ mod tests {
     fn malformed_pin_is_rejected() {
         let mut a = args(Some("https://c"), Some("prfs1_t"));
         a.server_cert_sha256 = Some("nope".to_owned());
-        assert!(CtlConnection::resolve(a, None).is_err());
+        assert!(CtlConnection::resolve(a, None, None).is_err());
 
         let mut a = args(Some("https://c"), Some("prfs1_t"));
         a.server_cert_sha256 = Some("ab".repeat(32));
-        let conn = CtlConnection::resolve(a, None).unwrap();
+        let conn = CtlConnection::resolve(a, None, None).unwrap();
         assert_eq!(conn.pin(), Some([0xabu8; 32]));
     }
 }

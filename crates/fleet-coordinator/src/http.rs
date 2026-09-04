@@ -33,8 +33,8 @@
 //! Two accepted risks, recorded rather than fixed (there is no rate limiting
 //! anywhere in the coordinator today):
 //!
-//! * **Quota DoS.** `/auth/device/start` must be unauthenticated, so anyone who
-//!   can reach it can burn the OAuth app's device-code rate limit and block
+//! * **Quota exhaustion.** `/auth/device/start` must be unauthenticated, so anyone
+//!   who can reach it can burn the OAuth app's device-code rate limit and block
 //!   logins. No credential is exposed. Acceptable for v1.
 //! * **Device-flow remote phishing** (RFC 8628 §5.4). An attacker starts a flow,
 //!   gets the `device_code`, and social-engineers a victim into typing the
@@ -511,6 +511,11 @@ pub async fn mint_session_for_user(
 }
 
 /// Build the GitHub OAuth client from configuration, or produce the named 503.
+///
+/// The `Err` variant is a whole `Response` rather than a code, because the two
+/// call sites want to return it verbatim; it is built once per request on a path
+/// that is already making network calls, so its size is not worth a `Box`.
+#[allow(clippy::result_large_err)]
 fn github_app(coord: &Coordinator) -> Result<GithubApp, Response> {
     let Some(cfg) = coord.config().github.as_ref() else {
         warn!(
@@ -609,9 +614,8 @@ async fn auth_device_poll(
     // The immutable numeric id is the identity; `login` is cached for display
     // and refreshed here. Keying off the login would let a rename + re-claim
     // land the new owner in the old owner's org (see `Db::upsert_github_user`).
-    let gh_id = match i64::try_from(user.id) {
-        Ok(id) => id,
-        Err(_) => return reject(StatusCode::BAD_GATEWAY, "upstream_error"),
+    let Ok(gh_id) = i64::try_from(user.id) else {
+        return reject(StatusCode::BAD_GATEWAY, "upstream_error");
     };
     let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
     let (user_id, org, created) = match coord
