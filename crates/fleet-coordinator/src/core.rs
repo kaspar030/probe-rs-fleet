@@ -332,9 +332,21 @@ impl Coordinator {
             let mut sched = self.scheduler.lock().await;
             for status in &inv.boards {
                 // Enforcement, not decoration: a `declared` node that reports
-                // an adopted board has drifted from (or is contradicting) the
-                // policy its owner set, and the row here is what decides.
-                if status.adopted && adopt != AdoptPolicy::Auto {
+                // an adopted board as *online* has drifted from (or is
+                // contradicting) the policy its owner set, and the row here is
+                // what decides.
+                //
+                // Scoped to online deliberately. An adopted board reported
+                // **offline** is a tombstone — "this probe is gone, drop it" —
+                // and must be honoured whatever the policy says, or a node
+                // whose policy was flipped `auto` → `declared` would strand
+                // every board it had adopted while it was `auto`. Removing a
+                // board is never a tenancy risk; refusing to is the one that
+                // leaves a phantom the scheduler will happily lease.
+                if status.adopted
+                    && adopt != AdoptPolicy::Auto
+                    && status.presence == BoardPresence::Online
+                {
                     warn!(
                         node = %agent_id,
                         board = %status.board,
@@ -1975,6 +1987,130 @@ mod tests {
             );
             let _ = agent_id;
         }
+    }
+
+    /// **The phantom-board regression.** An adopted board whose probe was
+    /// unplugged arrives as an `Offline` status, and the coordinator must drop
+    /// it from the scheduler.
+    ///
+    /// Without the agent's tombstone the board simply stopped appearing in the
+    /// report, and nothing here prunes a board a report failed to mention: it
+    /// stayed `Idle` forever, `ctl list` showed it, and a lease against it was
+    /// *granted* and then failed at the agent with `UnknownBoard`. On a laptop,
+    /// where probes are unplugged daily, that is the common case.
+    #[tokio::test]
+    async fn an_unplugged_adopted_board_leaves_the_scheduler() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        coord
+            .db()
+            .register_node_full(
+                &org(DEFAULT_ORG_ID),
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Auto,
+                1000,
+            )
+            .await
+            .unwrap();
+        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let key = board_ref(DEFAULT_ORG_ID, &node.0, "j-link-zzz");
+
+        // Plugged in.
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(coord.scheduler().lock().await.board(&key).is_some());
+
+        // Unplugged: the agent tombstones it.
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Offline, "", true)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            coord.scheduler().lock().await.board(&key).is_none(),
+            "an unplugged adopted board must not linger as a leasable phantom"
+        );
+    }
+
+    /// The `declared`-policy guard must not swallow a **tombstone**. A node
+    /// whose policy was flipped `auto` → `declared` still has to retire what it
+    /// adopted while it was `auto`; refusing the offline report would strand
+    /// exactly the phantom the tombstone exists to clear.
+    ///
+    /// Removing a board is never a tenancy risk, which is why the guard is
+    /// scoped to `Online` rather than to `adopted`.
+    #[tokio::test]
+    async fn a_declared_node_still_honours_a_tombstone_for_a_previously_adopted_board() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let o = org(DEFAULT_ORG_ID);
+        coord
+            .db()
+            .register_node_full(&o, "laptop", "hash", &[], Some("op"), AdoptPolicy::Auto, 1000)
+            .await
+            .unwrap();
+        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let key = board_ref(DEFAULT_ORG_ID, &node.0, "j-link-zzz");
+
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(coord.scheduler().lock().await.board(&key).is_some());
+
+        // The owner re-registers the node as `declared`.
+        coord
+            .db()
+            .register_node_full(
+                &o,
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Declared,
+                1001,
+            )
+            .await
+            .unwrap();
+
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Offline, "", true)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            coord.scheduler().lock().await.board(&key).is_none(),
+            "a policy flip must not strand what auto-adoption scheduled"
+        );
     }
 
     /// A declared board is unaffected by the policy: `declared` is the

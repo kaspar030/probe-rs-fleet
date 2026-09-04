@@ -18,6 +18,8 @@
 //! probes [`reconcile`] put in `unknown`, which is by definition the set no
 //! declaration matched.
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 
 use fleet_proto::{
@@ -220,13 +222,16 @@ fn slugify(s: &str) -> String {
 /// coordinator would happily lease a board the agent then fails to find, with
 /// no error anywhere until the last hop.
 ///
+/// `presence` is a parameter because an adopted board has to be reportable as
+/// **`Offline`** too — see [`adopt_unknown`] for why that is not optional.
+///
 /// [`Agent::board_spec`]: crate::agent::Agent
 #[must_use]
-pub fn adopted_board_status(spec: &BoardSpec) -> BoardStatus {
+pub fn adopted_board_status(spec: &BoardSpec, presence: BoardPresence) -> BoardStatus {
     BoardStatus {
         board: spec.board_id(),
         serial: spec.serial.clone(),
-        presence: BoardPresence::Online,
+        presence,
         chip: spec.chip.clone(),
         tags: spec.tags.clone(),
         exclusive: spec.exclusive,
@@ -236,43 +241,95 @@ pub fn adopted_board_status(spec: &BoardSpec) -> BoardStatus {
 }
 
 /// Apply [`AdoptPolicy::Auto`] to a reconciled inventory: turn every adoptable
-/// `unknown` probe into an online board.
+/// `unknown` probe into an online board, and report every board adopted by the
+/// *previous* pass that has since gone away as **offline**.
 ///
 /// Returns the synthesised specs by board name, for
 /// [`Agent::set_adopted`](crate::agent::Agent::set_adopted) — the *same*
 /// derivation that produced the reported statuses, which is what keeps the two
 /// from drifting.
 ///
+/// # Why departed boards must be reported, not merely dropped
+///
+/// [`reconcile`] emits a status for every *declared* board, `Offline` when its
+/// probe is absent, and that is what lets the coordinator drop it from the
+/// scheduler. An adopted board has no declaration to emit a status from, so
+/// simply not synthesising it would make it **vanish from the report** — and
+/// nothing on the coordinator prunes a board a report failed to mention. The
+/// board would sit in the scheduler as `Idle` forever: `ctl list` shows it, a
+/// lease against it is granted, a capability token is minted, and the agent
+/// finally answers `UnknownBoard` at the last possible hop.
+///
+/// A laptop is precisely the machine where probes get unplugged several times
+/// a day, so this is the common case, not an edge one. `previously_adopted` is
+/// therefore not an optimisation: it is what keeps the invariant "a board
+/// leaves the scheduler only via an explicit `Offline` report" true for
+/// adopted boards as it already is for declared ones.
+///
+/// The tombstones are emitted **whatever the policy**, so that a node whose
+/// policy flips `auto` → `declared` also cleans up after itself rather than
+/// stranding whatever it adopted while it was `auto`.
+///
 /// The adopted probes stay in `inventory.unknown` as well: they are still
 /// probes nobody declared, and an operator writing `boards.toml` wants to see
 /// them there.
-///
-/// Under [`AdoptPolicy::Declared`] this is a no-op, returning an empty map — so
-/// a caller can apply the policy unconditionally rather than branching.
-pub fn adopt_unknown(
+pub fn adopt_unknown<S: std::hash::BuildHasher>(
     inventory: &mut ProbeInventory,
     policy: AdoptPolicy,
-) -> std::collections::HashMap<BoardName, BoardSpec> {
-    let mut adopted = std::collections::HashMap::new();
-    if policy != AdoptPolicy::Auto {
-        return adopted;
-    }
-    for probe in &inventory.unknown {
-        let Some(spec) = adopted_board_spec(probe) else {
-            if !probe.inaccessible {
+    previously_adopted: &HashMap<BoardName, BoardSpec, S>,
+) -> HashMap<BoardName, BoardSpec> {
+    let mut adopted = HashMap::new();
+    if policy == AdoptPolicy::Auto {
+        for probe in &inventory.unknown {
+            let Some(spec) = adopted_board_spec(probe) else {
+                if !probe.inaccessible {
+                    tracing::warn!(
+                        vid = probe.vid,
+                        pid = probe.pid,
+                        "a probe reporting no serial cannot be adopted (it can be neither \
+                         stably named nor fenced to one probe); declare it in boards.toml \
+                         if you need it"
+                    );
+                }
+                continue;
+            };
+            let name = spec.board_id();
+            // A declaration always wins, and here that has to be enforced by
+            // *name*, not only by serial: `boards.toml` may bind the name a
+            // probe would derive to a different serial entirely. Two statuses
+            // sharing one `BoardName` would have the coordinator upsert both
+            // (last write wins) while `board_spec` resolves the declared one —
+            // so a lease taken out for the adopted probe would attach to the
+            // declared board's hardware. Skipping makes "declared wins" total
+            // rather than dependent on iteration order.
+            if inventory.boards.iter().any(|b| b.board == name) {
                 tracing::warn!(
-                    vid = probe.vid,
-                    pid = probe.pid,
-                    "a probe reporting no serial cannot be adopted (it can be neither \
-                     stably named nor fenced to one probe); declare it in boards.toml \
-                     if you need it"
+                    board = %name,
+                    serial = %spec.serial,
+                    "not adopting a probe whose derived board id is already declared \
+                     in boards.toml; declare this serial explicitly to use it"
                 );
+                continue;
             }
-            continue;
-        };
-        inventory.boards.push(adopted_board_status(&spec));
-        adopted.insert(spec.board_id(), spec);
+            inventory
+                .boards
+                .push(adopted_board_status(&spec, BoardPresence::Online));
+            adopted.insert(name, spec);
+        }
     }
+
+    // Tombstones for boards the previous pass adopted and this one did not:
+    // the probe was unplugged, went inaccessible, or has just been declared.
+    for (name, spec) in previously_adopted {
+        if adopted.contains_key(name) || inventory.boards.iter().any(|b| &b.board == name) {
+            continue;
+        }
+        tracing::info!(board = %name, serial = %spec.serial, "adopted board is gone; reporting offline");
+        inventory
+            .boards
+            .push(adopted_board_status(spec, BoardPresence::Offline));
+    }
+
     adopted
 }
 
@@ -436,6 +493,33 @@ pub(crate) struct StubLister(pub Vec<DiscoveredProbe>);
 impl ProbeLister for StubLister {
     async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
         Ok(self.0.clone())
+    }
+}
+
+/// A [`ProbeLister`] whose probe set can be swapped between calls, for tests
+/// that exercise a *transition* — a probe being plugged in or unplugged —
+/// rather than a single snapshot.
+#[cfg(test)]
+pub(crate) struct SwappableLister(std::sync::Mutex<Vec<DiscoveredProbe>>);
+
+#[cfg(test)]
+impl SwappableLister {
+    /// A lister starting with `probes` attached.
+    pub fn new(probes: Vec<DiscoveredProbe>) -> Self {
+        Self(std::sync::Mutex::new(probes))
+    }
+
+    /// Replace what the next `list_probes` will report (plug/unplug).
+    pub fn set(&self, probes: Vec<DiscoveredProbe>) {
+        *self.0.lock().unwrap() = probes;
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ProbeLister for SwappableLister {
+    async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
+        Ok(self.0.lock().unwrap().clone())
     }
 }
 
@@ -627,6 +711,17 @@ chip = "c2"
 
     // ---- adoption ----------------------------------------------------------
 
+    /// [`adopt_unknown`] on a node that has adopted nothing yet.
+    ///
+    /// Most adoption tests are about the *arrival* of a probe, where there is
+    /// no previous set; the departure cases pass one explicitly.
+    fn adopt_fresh(
+        inventory: &mut ProbeInventory,
+        policy: AdoptPolicy,
+    ) -> HashMap<BoardName, BoardSpec> {
+        adopt_unknown(inventory, policy, &HashMap::new())
+    }
+
     fn named_probe(serial: &str, product: Option<&str>) -> DiscoveredProbe {
         DiscoveredProbe {
             serial: serial.to_owned(),
@@ -647,8 +742,8 @@ chip = "c2"
 
         let mut first = reconcile(&boards(), &[a.clone(), b.clone()]);
         let mut second = reconcile(&boards(), &[b, a]);
-        let ids_a = adopt_unknown(&mut first, AdoptPolicy::Auto);
-        let ids_b = adopt_unknown(&mut second, AdoptPolicy::Auto);
+        let ids_a = adopt_fresh(&mut first, AdoptPolicy::Auto);
+        let ids_b = adopt_fresh(&mut second, AdoptPolicy::Auto);
 
         let mut names_a: Vec<_> = ids_a.keys().map(|n| n.0.clone()).collect();
         let mut names_b: Vec<_> = ids_b.keys().map(|n| n.0.clone()).collect();
@@ -671,7 +766,7 @@ chip = "c2"
         assert!(adopted_board_spec(&probe).is_none());
 
         let mut inv = reconcile(&boards(), &[probe]);
-        assert!(adopt_unknown(&mut inv, AdoptPolicy::Auto).is_empty());
+        assert!(adopt_fresh(&mut inv, AdoptPolicy::Auto).is_empty());
         assert!(inv.boards.iter().all(|b| !b.adopted));
     }
 
@@ -683,7 +778,7 @@ chip = "c2"
         assert!(adopted_board_spec(&inaccessible_probe("ZZZ")).is_none());
         for policy in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
             let mut inv = reconcile(&boards(), &[inaccessible_probe("ZZZ")]);
-            assert!(adopt_unknown(&mut inv, policy).is_empty());
+            assert!(adopt_fresh(&mut inv, policy).is_empty());
             assert!(inv.boards.iter().all(|b| !b.adopted));
         }
     }
@@ -692,7 +787,7 @@ chip = "c2"
     #[test]
     fn declared_policy_adopts_nothing() {
         let mut inv = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
-        assert!(adopt_unknown(&mut inv, AdoptPolicy::Declared).is_empty());
+        assert!(adopt_fresh(&mut inv, AdoptPolicy::Declared).is_empty());
         assert_eq!(inv.unknown.len(), 1);
         assert!(!is_leasable(&inv, &BoardName("j-link-zzz".into())));
     }
@@ -703,7 +798,7 @@ chip = "c2"
     #[test]
     fn an_adopted_board_is_leasable_tagged_auto_and_has_no_chip() {
         let mut inv = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
-        let specs = adopt_unknown(&mut inv, AdoptPolicy::Auto);
+        let specs = adopt_fresh(&mut inv, AdoptPolicy::Auto);
         assert_eq!(specs.len(), 1);
 
         let name = BoardName("j-link-zzz".into());
@@ -731,7 +826,7 @@ chip = "c2"
     #[test]
     fn a_declared_probe_is_never_also_adopted() {
         let mut inv = reconcile(&boards(), &[probe("AAA")]);
-        let specs = adopt_unknown(&mut inv, AdoptPolicy::Auto);
+        let specs = adopt_fresh(&mut inv, AdoptPolicy::Auto);
         assert!(specs.is_empty());
         assert_eq!(inv.boards.iter().filter(|b| b.serial == "AAA").count(), 1);
         let b1 = inv.boards.iter().find(|b| b.board.0 == "b1").unwrap();
@@ -746,7 +841,7 @@ chip = "c2"
     #[test]
     fn the_reported_id_and_the_resolvable_id_are_the_same() {
         let mut inv = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
-        let specs = adopt_unknown(&mut inv, AdoptPolicy::Auto);
+        let specs = adopt_fresh(&mut inv, AdoptPolicy::Auto);
         for status in inv.boards.iter().filter(|b| b.adopted) {
             assert!(
                 specs.contains_key(&status.board),
@@ -766,5 +861,170 @@ chip = "c2"
             .id
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+    }
+
+    // ---- departure ---------------------------------------------------------
+
+    /// **Unplugging an adopted probe must report it `Offline`, not omit it.**
+    ///
+    /// A laptop is the machine where boards come and go several times a day.
+    /// If a departed board simply vanished from the report, nothing on the
+    /// coordinator would prune it: it would sit in the scheduler as `Idle`,
+    /// `ctl list` would show it, a lease would be *granted*, and the agent
+    /// would answer `UnknownBoard` at the last possible hop.
+    #[test]
+    fn an_unplugged_adopted_board_is_reported_offline() {
+        let mut first = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let adopted = adopt_fresh(&mut first, AdoptPolicy::Auto);
+        let name = BoardName("j-link-zzz".into());
+        assert!(is_leasable(&first, &name));
+
+        // The probe is unplugged: discovery returns nothing.
+        let mut second = reconcile(&boards(), &[]);
+        let still = adopt_unknown(&mut second, AdoptPolicy::Auto, &adopted);
+
+        assert!(still.is_empty(), "the spec is dropped");
+        let status = second
+            .boards
+            .iter()
+            .find(|b| b.board == name)
+            .expect("a departed adopted board must still be reported, as Offline");
+        assert_eq!(status.presence, BoardPresence::Offline);
+        assert!(status.adopted);
+        assert!(!is_leasable(&second, &name));
+    }
+
+    /// A probe that goes `inaccessible` is as good as unplugged: it cannot be
+    /// opened, so the board must go offline rather than linger as leasable.
+    #[test]
+    fn an_adopted_board_that_goes_inaccessible_is_reported_offline() {
+        let mut first = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let adopted = adopt_fresh(&mut first, AdoptPolicy::Auto);
+
+        let mut second = reconcile(&boards(), &[inaccessible_probe("ZZZ")]);
+        adopt_unknown(&mut second, AdoptPolicy::Auto, &adopted);
+
+        let name = BoardName("j-link-zzz".into());
+        assert_eq!(
+            second
+                .boards
+                .iter()
+                .find(|b| b.board == name)
+                .map(|b| b.presence),
+            Some(BoardPresence::Offline)
+        );
+    }
+
+    /// A tombstone is emitted whatever the policy, so a node whose policy is
+    /// flipped `auto` → `declared` cleans up after itself rather than stranding
+    /// everything it adopted while it was `auto`.
+    #[test]
+    fn flipping_to_declared_still_retires_what_auto_adopted() {
+        let mut first = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let adopted = adopt_fresh(&mut first, AdoptPolicy::Auto);
+
+        // Same hardware, but the policy is now `declared`.
+        let mut second = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let still = adopt_unknown(&mut second, AdoptPolicy::Declared, &adopted);
+
+        assert!(still.is_empty());
+        let name = BoardName("j-link-zzz".into());
+        assert_eq!(
+            second
+                .boards
+                .iter()
+                .find(|b| b.board == name)
+                .map(|b| b.presence),
+            Some(BoardPresence::Offline),
+            "the board must be retired, not silently left in the scheduler"
+        );
+    }
+
+    /// A board that is *still* present must not be tombstoned: the previous set
+    /// is a departure check, not a one-shot.
+    #[test]
+    fn a_still_present_adopted_board_is_not_tombstoned() {
+        let mut first = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let adopted = adopt_fresh(&mut first, AdoptPolicy::Auto);
+
+        let mut second = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let still = adopt_unknown(&mut second, AdoptPolicy::Auto, &adopted);
+
+        let name = BoardName("j-link-zzz".into());
+        assert!(still.contains_key(&name));
+        assert_eq!(
+            second.boards.iter().filter(|b| b.board == name).count(),
+            1,
+            "exactly one status, and not a tombstone"
+        );
+        assert!(is_leasable(&second, &name));
+    }
+
+    /// Declaring a previously adopted probe is a *handover*, not a duplicate:
+    /// the declared status stands and no tombstone is emitted for it, because
+    /// `reconcile` already produced a status under that name.
+    #[test]
+    fn declaring_a_previously_adopted_probe_does_not_double_report_it() {
+        let mut first = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let adopted = adopt_fresh(&mut first, AdoptPolicy::Auto);
+        let name = BoardName("j-link-zzz".into());
+
+        // The operator has since declared that serial under the same id.
+        let declared = BoardsConfig::from_str(
+            r#"
+[[board]]
+id = "j-link-zzz"
+serial = "ZZZ"
+chip = "nRF52840_xxAA"
+"#,
+        )
+        .unwrap();
+        let mut second = reconcile(&declared, &[named_probe("ZZZ", Some("J-Link"))]);
+        adopt_unknown(&mut second, AdoptPolicy::Auto, &adopted);
+
+        let statuses: Vec<_> = second.boards.iter().filter(|b| b.board == name).collect();
+        assert_eq!(statuses.len(), 1, "one board, one status");
+        assert!(!statuses[0].adopted, "the declaration takes over");
+        assert_eq!(statuses[0].presence, BoardPresence::Online);
+        assert_eq!(statuses[0].chip, "nRF52840_xxAA");
+    }
+
+    /// A derived id colliding with a *declared* id bound to a different serial
+    /// must not produce two statuses under one name: the coordinator would
+    /// upsert both (last wins) while `board_spec` resolves the declared one, so
+    /// a lease taken out for the adopted probe would drive the declared board's
+    /// hardware. Skipping makes "declared wins" total rather than dependent on
+    /// iteration order.
+    #[test]
+    fn a_derived_id_colliding_with_a_declared_id_is_not_adopted() {
+        // `j-link-zzz` is declared, but bound to serial AAA — while a probe
+        // with serial ZZZ (which derives that exact name) is plugged in.
+        let declared = BoardsConfig::from_str(
+            r#"
+[[board]]
+id = "j-link-zzz"
+serial = "AAA"
+chip = "c1"
+"#,
+        )
+        .unwrap();
+        let mut inv = reconcile(
+            &declared,
+            &[named_probe("AAA", None), named_probe("ZZZ", Some("J-Link"))],
+        );
+        let specs = adopt_fresh(&mut inv, AdoptPolicy::Auto);
+
+        let name = BoardName("j-link-zzz".into());
+        assert!(
+            !specs.contains_key(&name),
+            "the colliding probe must not be adopted"
+        );
+        let statuses: Vec<_> = inv.boards.iter().filter(|b| b.board == name).collect();
+        assert_eq!(statuses.len(), 1, "exactly one board may carry a given name");
+        assert!(!statuses[0].adopted);
+        assert_eq!(
+            statuses[0].serial, "AAA",
+            "the declared serial owns the name"
+        );
     }
 }

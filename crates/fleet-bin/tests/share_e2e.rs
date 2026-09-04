@@ -284,9 +284,25 @@ async fn sharing_twice_without_force_is_refused() {
     // With --force it goes through, and the old token is retired.
     let mut forced = share_args(&config_dir, "laptop");
     forced.force = true;
+    // The operator has annotated a board in the meantime — stable id, chip
+    // name, the things auto-adoption cannot infer. Re-sharing must not eat it:
+    // `--force` replaces the *credential*, and `share --force` is the
+    // documented way to re-share a machine, so this is exactly when the file
+    // would be lost.
+    let boards_path = config_dir.join("node").join("boards.toml");
+    let mine = "[[board]]\nid = \"my-dk\"\nserial = \"ZZZ\"\nchip = \"nRF52840_xxAA\"\n";
+    std::fs::write(&boards_path, mine).unwrap();
+
     fleet_bin::roles::share::run(forced)
         .await
         .expect("share --force");
+
+    assert_eq!(
+        std::fs::read_to_string(&boards_path).unwrap(),
+        mine,
+        "re-sharing must not destroy a hand-written board inventory"
+    );
+
     let fresh = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
         .node

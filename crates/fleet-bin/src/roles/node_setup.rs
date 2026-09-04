@@ -129,10 +129,23 @@ pub fn record_node_credential(
 
 /// Scaffold `node/node.toml` and `node/boards.toml` if they are absent.
 ///
-/// These carry no credential, so they are written world-readable, and they are
-/// only written when absent (or `force`): they are the operator's to edit, and
-/// clobbering a hand-written board inventory on a re-enrollment would be
-/// hostile.
+/// These carry no credential, so they are written world-readable.
+///
+/// # What `force` does and does not cover
+///
+/// `force` is a **credential-level** flag: it means "re-enroll this machine,
+/// replacing its node token". It deliberately does not reach `boards.toml`,
+/// which is never overwritten once it exists. That file is now *the* place an
+/// operator records stable ids, chip names, curated tags and power wiring for
+/// auto-adopted boards (§8) — losing it is losing user data, and `share
+/// --force` is the documented way to re-share a machine, so it would be lost
+/// exactly when someone was trying to fix something.
+///
+/// `node.toml` *is* rewritten under `force`, and only then, because `force` is
+/// how `--adopt` is changed on an already-enrolled machine: leaving a stale
+/// `adopt =` behind would have the file contradict the coordinator row it is
+/// supposed to mirror. It holds settings rather than inventory, and the starter
+/// is fully commented apart from that one key.
 ///
 /// Returns `(boards_path, node_settings_path)`.
 ///
@@ -149,7 +162,7 @@ pub fn scaffold_node_dir(
     let boards_path = node_dir.join("boards.toml");
     let node_settings_path = node_dir.join("node.toml");
 
-    if force || !boards_path.exists() {
+    if !boards_path.exists() {
         write_public(&boards_path, starter_boards_toml().as_bytes())
             .with_context(|| format!("writing boards scaffold {}", boards_path.display()))?;
     }
@@ -356,5 +369,50 @@ mod tests {
         scaffold_node_dir(&node_dir, AdoptPolicy::Auto, false).unwrap();
         assert_eq!(std::fs::read_to_string(&boards).unwrap(), "# mine\n");
         assert!(node_dir.join("node.toml").exists());
+    }
+
+    /// **`--force` must not eat a hand-written `boards.toml`.**
+    ///
+    /// `force` is a credential-level flag — "replace this machine's node
+    /// token" — and `share --force` is the documented way to re-share a
+    /// machine. `boards.toml` is now *the* place stable ids, chip names and
+    /// power wiring for auto-adopted boards live, so overwriting it would
+    /// destroy user data exactly when someone was trying to fix something.
+    #[test]
+    fn force_re_enrollment_preserves_a_hand_written_boards_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        let boards = node_dir.join("boards.toml");
+        let mine = "[[board]]\nid = \"my-dk\"\nserial = \"ZZZ\"\nchip = \"nRF52840_xxAA\"\n";
+        std::fs::write(&boards, mine).unwrap();
+
+        scaffold_node_dir(&node_dir, AdoptPolicy::Auto, true).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&boards).unwrap(),
+            mine,
+            "--force is about the credential, not the operator's inventory"
+        );
+    }
+
+    /// `node.toml` *is* rewritten under `--force`, because that is how
+    /// `--adopt` is changed on an already-enrolled machine. Leaving a stale
+    /// `adopt =` behind would have the file contradict the coordinator row it
+    /// exists to mirror.
+    #[test]
+    fn force_re_enrollment_updates_the_recorded_adopt_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node_dir = tmp.path().join("node");
+
+        scaffold_node_dir(&node_dir, AdoptPolicy::Auto, false).unwrap();
+        let settings: crate::roles::agent::NodeSettings =
+            toml::from_str(&std::fs::read_to_string(node_dir.join("node.toml")).unwrap()).unwrap();
+        assert_eq!(settings.adopt, Some(AdoptPolicy::Auto));
+
+        scaffold_node_dir(&node_dir, AdoptPolicy::Declared, true).unwrap();
+        let settings: crate::roles::agent::NodeSettings =
+            toml::from_str(&std::fs::read_to_string(node_dir.join("node.toml")).unwrap()).unwrap();
+        assert_eq!(settings.adopt, Some(AdoptPolicy::Declared));
     }
 }

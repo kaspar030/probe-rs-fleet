@@ -203,8 +203,14 @@ impl<B: ProbeRsBackend> Agent<B> {
     /// or `probe-rs` hiccup taking every board in the fleet offline would be a
     /// great deal worse than a stale snapshot.
     ///
-    /// Under `adopt = "auto"` the inventory and the adopted-spec map are
-    /// installed together (see [`Agent::set_inventory`]).
+    /// The previously adopted set is handed to
+    /// [`adopt_unknown`](crate::discovery::adopt_unknown) so a board whose
+    /// probe has been unplugged is reported **offline** rather than silently
+    /// disappearing from the report — see that function for why a vanishing
+    /// board strands a phantom in the coordinator's scheduler.
+    ///
+    /// The inventory and the adopted-spec map are installed together (see
+    /// [`Agent::set_inventory`]).
     pub async fn discovery_pass(&self) -> Option<ProbeInventory> {
         let discovered = match self.lister.list_probes().await {
             Ok(probes) => probes,
@@ -214,7 +220,8 @@ impl<B: ProbeRsBackend> Agent<B> {
             }
         };
         let mut inventory = discovery::reconcile(&self.boards, &discovered);
-        let adopted = discovery::adopt_unknown(&mut inventory, self.config.adopt);
+        let previous = self.adopted.lock().await.clone();
+        let adopted = discovery::adopt_unknown(&mut inventory, self.config.adopt, &previous);
         if *self.inventory.lock().await == inventory {
             return None;
         }
@@ -1115,6 +1122,107 @@ port = 2
             .expect("an auto-adopted board must be leasable, not UnknownBoard");
         assert_eq!(backend.open_count(), 1);
         assert_eq!(agent.active_session_count().await, 1);
+    }
+
+    /// The other half of the acceptance test: **unplugging** the probe must
+    /// report the board `Offline` and stop resolving it.
+    ///
+    /// A laptop is the machine where boards come and go several times a day.
+    /// If the departed board merely vanished from the report, nothing on the
+    /// coordinator would prune it — it would stay `Idle` in the scheduler and
+    /// the next lease against it would be granted, minted a token, and answered
+    /// with `UnknownBoard` here at the last possible hop.
+    #[tokio::test]
+    async fn unplugging_an_adopted_probe_reports_it_offline_and_stops_resolving_it() {
+        use crate::discovery::{ProbeLister, SwappableLister};
+
+        let mut config = agent_config();
+        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        let probe = fleet_proto::DiscoveredProbe {
+            serial: "ZZZ".to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: Some("J-Link".to_owned()),
+            inaccessible: false,
+        };
+        let lister = Arc::new(SwappableLister::new(vec![probe]));
+        let mut agent = Agent::new(config, boards(), Arc::new(MockBackend::new())).unwrap();
+        agent.set_clock(|| 1_000);
+        let agent = agent.with_lister(Arc::clone(&lister) as Arc<dyn ProbeLister>);
+
+        let inventory = agent.discovery_pass().await.expect("the probe is new");
+        let board = inventory
+            .boards
+            .iter()
+            .find(|b| b.adopted)
+            .expect("adopted")
+            .board
+            .clone();
+        assert!(agent.board_spec(&board).await.is_ok());
+
+        // Unplug it.
+        lister.set(vec![]);
+        let inventory = agent
+            .discovery_pass()
+            .await
+            .expect("losing a board is a change worth reporting");
+
+        let status = inventory
+            .boards
+            .iter()
+            .find(|b| b.board == board)
+            .expect("the board must still be REPORTED, so the coordinator drops it");
+        assert_eq!(status.presence, fleet_proto::BoardPresence::Offline);
+        assert!(status.adopted);
+
+        // ... and the agent no longer resolves it, so the two ends agree.
+        assert!(matches!(
+            agent.board_spec(&board).await,
+            Err(AgentError::UnknownBoard(_))
+        ));
+    }
+
+    /// Re-plugging must bring the same board back under the same id — the
+    /// stability property, across a real absence rather than two snapshots.
+    #[tokio::test]
+    async fn replugging_restores_the_same_board_id() {
+        use crate::discovery::{ProbeLister, SwappableLister};
+
+        let probe = fleet_proto::DiscoveredProbe {
+            serial: "ZZZ".to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: Some("J-Link".to_owned()),
+            inaccessible: false,
+        };
+        let mut config = agent_config();
+        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        let lister = Arc::new(SwappableLister::new(vec![probe.clone()]));
+        let mut agent = Agent::new(config, boards(), Arc::new(MockBackend::new())).unwrap();
+        agent.set_clock(|| 1_000);
+        let agent = agent.with_lister(Arc::clone(&lister) as Arc<dyn ProbeLister>);
+
+        let first = agent.discovery_pass().await.expect("plugged in");
+        let name = first
+            .boards
+            .iter()
+            .find(|b| b.adopted)
+            .unwrap()
+            .board
+            .clone();
+
+        lister.set(vec![]);
+        agent.discovery_pass().await.expect("unplugged");
+
+        lister.set(vec![probe]);
+        let third = agent.discovery_pass().await.expect("plugged back in");
+        let back = third
+            .boards
+            .iter()
+            .find(|b| b.adopted && b.presence == fleet_proto::BoardPresence::Online)
+            .expect("the board is back");
+        assert_eq!(back.board, name, "a lease selector must keep working");
+        assert!(agent.board_spec(&name).await.is_ok());
     }
 
     /// Under `declared`, the same probe stays unadoptable and the same lease

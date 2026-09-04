@@ -487,6 +487,22 @@ quiet. An enumeration failure keeps the previous inventory and does not drop the
 connection — a transient USB or `probe-rs` hiccup taking every board offline
 would be far worse than a stale snapshot.
 
+**Unplugging is a report, not an absence.** A board leaves the scheduler only
+via an explicit `Offline` status, never by going missing from a report — nothing
+on the coordinator prunes a board an inventory failed to mention. That falls out
+for a *declared* board (its `boards.toml` entry is still there to report as
+offline), but an adopted board has no declaration, so the agent remembers what
+the previous pass adopted and emits an offline tombstone for anything that has
+since gone. Without it an unplugged laptop board would sit in the scheduler as
+`Idle` forever: `ctl list` would show it, a lease against it would be *granted*
+and a capability token minted, and the agent would refuse at the last hop. A
+laptop is the machine where probes are unplugged several times a day, so this is
+the common path.
+
+The tombstone is honoured whatever the node's policy currently says — removing a
+board is never a tenancy risk, and a node whose policy was flipped `auto` →
+`declared` must still be able to retire what it adopted while it was `auto`.
+
 
 ### 4.3 `sidecar` (workstation / CI)
 Presents a **vanilla probe-rs CLI surface** so laze runs unmodified. Installed
@@ -833,7 +849,12 @@ two laptops can each plug in an nRF52840-DK.
 A declaration always beats an adoption for the same probe, and the agent
 enforces that in one place (its board lookup consults `boards.toml` first), so
 it is a structural property rather than a convention every call site has to
-remember.
+remember. The same precedence is applied by **name** at synthesis time: a probe
+whose derived id collides with a declared `id` bound to a different serial is
+not adopted at all. Reporting two boards under one name would have the
+coordinator keep whichever it upserted last while the agent resolved the
+declared one — so a lease taken out for the adopted probe would drive the
+declared board's hardware.
 
 ## 9. Crate layout (proposed)
 
