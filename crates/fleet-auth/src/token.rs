@@ -6,6 +6,7 @@
 //! prfn1_<43 chars>      node token     (long-lived, auto-rotating)
 //! prfs1_<43 chars>      session token  (user; short TTL, refreshable)
 //! prffk1_<43 chars>     auth key       (node enrollment; org-scoped, revocable)
+//! prfnd1_<43 chars>     node device    (pending interactive approval; redeemed at a route)
 //! ```
 //!
 //! The prefix is load-bearing, not decoration: it tells the coordinator which
@@ -28,6 +29,8 @@ const PREFIX_NODE: &str = "prfn1_";
 const PREFIX_SESSION: &str = "prfs1_";
 /// Prefix for a node-enrollment auth key.
 const PREFIX_AUTH_KEY: &str = "prffk1_";
+/// Prefix for a pending-node device secret (interactive approval).
+const PREFIX_NODE_DEVICE: &str = "prfnd1_";
 
 /// Number of random bytes in a token secret.
 const SECRET_LEN: usize = 32;
@@ -41,6 +44,14 @@ pub enum TokenKind {
     Session,
     /// A pre-minted, org-scoped, revocable node-enrollment key.
     AuthKey,
+    /// A machine's poll credential for an approval-pending registration
+    /// (architecture §4.2 rung 3).
+    ///
+    /// Like [`TokenKind::AuthKey`] it is **redeemed at a route, never
+    /// presented as a connection credential**, so
+    /// [`crate::verify::authenticate`] rejects it as
+    /// [`crate::AuthError::WrongKind`].
+    NodeDevice,
 }
 
 impl TokenKind {
@@ -51,6 +62,7 @@ impl TokenKind {
             TokenKind::Node => PREFIX_NODE,
             TokenKind::Session => PREFIX_SESSION,
             TokenKind::AuthKey => PREFIX_AUTH_KEY,
+            TokenKind::NodeDevice => PREFIX_NODE_DEVICE,
         }
     }
 
@@ -61,6 +73,7 @@ impl TokenKind {
             TokenKind::Node => "node",
             TokenKind::Session => "session",
             TokenKind::AuthKey => "auth_key",
+            TokenKind::NodeDevice => "node_device",
         }
     }
 }
@@ -161,9 +174,16 @@ impl OpaqueToken {
     /// base64url, or the decoded secret is not 32 bytes.
     pub fn parse(s: &str) -> Result<Self, TokenError> {
         let s = s.trim();
-        // Longest prefix first: `prffk1_` and `prfs1_` share no prefix, but
-        // ordering by length keeps this correct if a future kind does.
-        let kinds = [TokenKind::AuthKey, TokenKind::Node, TokenKind::Session];
+        // Longest prefix first: `prffk1_`, `prfnd1_` and `prfs1_` share no
+        // prefix, but ordering by length keeps this correct if a future kind
+        // does. **Every kind must appear here** — omitting one makes its
+        // tokens unparseable with no compile error.
+        let kinds = [
+            TokenKind::AuthKey,
+            TokenKind::NodeDevice,
+            TokenKind::Node,
+            TokenKind::Session,
+        ];
         let (kind, body) = kinds
             .into_iter()
             .find_map(|k| s.strip_prefix(k.prefix()).map(|body| (k, body)))
@@ -221,7 +241,12 @@ mod tests {
 
     #[test]
     fn mint_parse_round_trips_for_every_kind() {
-        for kind in [TokenKind::Node, TokenKind::Session, TokenKind::AuthKey] {
+        for kind in [
+            TokenKind::Node,
+            TokenKind::Session,
+            TokenKind::AuthKey,
+            TokenKind::NodeDevice,
+        ] {
             let token = OpaqueToken::mint(kind);
             let s = token.to_secret_string();
             assert!(s.starts_with(kind.prefix()), "{s} lacks {}", kind.prefix());
@@ -263,6 +288,13 @@ mod tests {
         );
         let key = OpaqueToken::mint(TokenKind::AuthKey).to_secret_string();
         assert_eq!(OpaqueToken::parse(&key).unwrap().kind(), TokenKind::AuthKey);
+        // `prfnd1_` vs `prfn1_`: unambiguous only because the strip is
+        // longest-first, which is exactly what this asserts.
+        let device = OpaqueToken::mint(TokenKind::NodeDevice).to_secret_string();
+        assert_eq!(
+            OpaqueToken::parse(&device).unwrap().kind(),
+            TokenKind::NodeDevice
+        );
     }
 
     #[test]

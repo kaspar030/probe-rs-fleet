@@ -94,9 +94,10 @@ pub struct Authenticated {
 /// `bearer` is the raw credential (the value *after* `Bearer `). `now` is epoch
 /// seconds.
 ///
-/// Auth keys are deliberately **not** accepted here: they are redeemed at
-/// `POST /auth/token`, not presented on a connection, so treating one as a
-/// connection credential is [`AuthError::WrongKind`].
+/// Auth keys and node-device secrets are deliberately **not** accepted here:
+/// both are redeemed at a route (`POST /auth/token`, `POST /node/register/*`)
+/// rather than presented on a connection, so treating either as a connection
+/// credential is [`AuthError::WrongKind`].
 ///
 /// # Errors
 ///
@@ -150,6 +151,9 @@ pub async fn authenticate(
         }
         TokenKind::AuthKey => Err(AuthError::WrongKind {
             got: TokenKind::AuthKey,
+        }),
+        TokenKind::NodeDevice => Err(AuthError::WrongKind {
+            got: TokenKind::NodeDevice,
         }),
     }
 }
@@ -274,7 +278,8 @@ mod tests {
     }
 
     /// An auth key is redeemed at `/auth/token`; presenting one as a connection
-    /// credential is a wrong-kind rejection, not an unknown-token one.
+    /// credential is a wrong-kind rejection, not an unknown-token one. A
+    /// node-device secret is the same case at `/node/register/poll`.
     #[tokio::test]
     async fn auth_key_is_not_a_connection_credential() {
         let key = OpaqueToken::mint(TokenKind::AuthKey);
@@ -293,6 +298,16 @@ mod tests {
                 .unwrap_err(),
             AuthError::WrongKind {
                 got: TokenKind::AuthKey
+            }
+        );
+
+        let device = OpaqueToken::mint(TokenKind::NodeDevice);
+        assert_eq!(
+            authenticate(&store, &device.to_secret_string(), 0)
+                .await
+                .unwrap_err(),
+            AuthError::WrongKind {
+                got: TokenKind::NodeDevice
             }
         );
     }

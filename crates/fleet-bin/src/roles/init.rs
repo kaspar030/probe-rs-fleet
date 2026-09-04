@@ -81,12 +81,8 @@ pub fn run(args: InitArgs) -> Result<()> {
         .public_url
         .unwrap_or_else(|| format!("http://{DEFAULT_LISTEN_ADDR}"));
 
-    let config_toml = render_coordinator_config(
-        &public_url,
-        &sqlite_path,
-        &seed_path,
-        &Policy::default(),
-    )?;
+    let config_toml =
+        render_coordinator_config(&public_url, &sqlite_path, &seed_path, &Policy::default())?;
     write_public(&config_path, config_toml.as_bytes())
         .with_context(|| format!("writing config {}", config_path.display()))?;
 
@@ -156,6 +152,12 @@ signing_key_path = {signing_key_path}
 # replacement down the established connection. The old token stays valid until
 # the node acknowledges the new one, so a lost push costs a retry, not a visit.
 # node_token_rotate_secs = 604800
+
+# How long (seconds) a node registration awaiting interactive approval lives,
+# and how many may wait at once. The short code is guessable by construction, so
+# the TTL is short; the cap bounds what an unauthenticated caller can write.
+# pending_node_ttl_secs = 900
+# max_pending_nodes = 256
 
 # Coordinator-terminated TLS. OMIT THIS TABLE when a reverse proxy terminates
 # TLS (the expected deployment) — the coordinator then serves plain HTTP on

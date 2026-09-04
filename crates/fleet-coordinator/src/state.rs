@@ -86,6 +86,126 @@ pub struct AuthKeyListing {
     pub created_by: Option<String>,
 }
 
+/// One `pending_node` row as `SQLite` hands it back.
+///
+/// Named rather than written inline so the eleven-tuple does not become an
+/// unreadable annotation at three query sites.
+type PendingNodeRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    i64,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
+/// A node registration awaiting a human's approval (architecture §4.2 rung 3).
+///
+/// The one object in the schema with **no org until it is decided** — which org
+/// it joins is what the approval chooses — so it lives on [`Db`] rather than
+/// [`OrgDb`]. See `migrations/0005_pending_node.sql`.
+///
+/// `node_name` and `tags` arrive from an unauthenticated request and are
+/// therefore attacker-controlled; the route validates them against a
+/// conservative charset before they are stored, because they end up rendered in
+/// a human approver's terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingNode {
+    /// The normalised short code (no hyphen).
+    pub user_code: String,
+    /// The name the enrolling machine asked for.
+    pub node_name: String,
+    /// The tags it asked for.
+    pub tags: Vec<String>,
+    /// The adoption policy it asked for.
+    pub adopt: AdoptPolicy,
+    /// The source address the coordinator saw, if the serve path provided one.
+    /// Advisory — behind a proxy this is the proxy.
+    pub source_ip: Option<String>,
+    /// When the registration was started (epoch seconds).
+    pub created_at: i64,
+    /// When it expires (epoch seconds).
+    pub expires: i64,
+    /// The org it was bound to, once approved.
+    pub org: Option<OrgId>,
+    /// The user who approved it.
+    pub approved_by: Option<String>,
+    /// When it was approved (epoch seconds).
+    pub approved_at: Option<i64>,
+    /// When it was redeemed **or denied** (epoch seconds). Denial is
+    /// "consumed without having been approved"; there is deliberately no
+    /// `denied_at`.
+    pub consumed_at: Option<i64>,
+}
+
+impl PendingNode {
+    /// Whether this registration can still be approved or denied.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.approved_at.is_none() && self.consumed_at.is_none()
+    }
+
+    /// Whether it was denied (consumed without ever being approved).
+    #[must_use]
+    pub fn is_denied(&self) -> bool {
+        self.approved_at.is_none() && self.consumed_at.is_some()
+    }
+
+    /// Whether it is approved and not yet redeemed.
+    #[must_use]
+    pub fn is_approved(&self) -> bool {
+        self.approved_at.is_some() && self.consumed_at.is_none()
+    }
+
+    /// The `pending` | `approved` | `denied` label the wire uses.
+    #[must_use]
+    pub fn state_label(&self) -> &'static str {
+        if self.is_denied() {
+            "denied"
+        } else if self.approved_at.is_some() {
+            "approved"
+        } else {
+            "pending"
+        }
+    }
+
+    fn from_row(row: PendingNodeRow) -> Self {
+        let (
+            user_code,
+            node_name,
+            tags,
+            adopt,
+            source_ip,
+            created_at,
+            expires,
+            org,
+            approved_by,
+            approved_at,
+            consumed_at,
+        ) = row;
+        Self {
+            user_code,
+            node_name,
+            tags: split_tags(&tags),
+            // As in `consume_pending_node`: an unparseable stored policy means
+            // hand-edited state, and `declared` is the conservative landing.
+            adopt: AdoptPolicy::from_label(&adopt).unwrap_or(AdoptPolicy::Declared),
+            source_ip,
+            created_at,
+            expires,
+            org: org.map(OrgId),
+            approved_by,
+            approved_at,
+            consumed_at,
+        }
+    }
+}
+
 impl Db {
     /// Open (creating if absent) the `SQLite` database at `path`, run
     /// migrations, and ensure the default org exists.
@@ -261,12 +381,11 @@ impl Db {
         &self,
         token_hash: &str,
     ) -> Result<Option<(AgentId, OrgId, i64)>> {
-        let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT id, org_id, token_issued_at FROM node WHERE token_hash = ?1",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String, String, Option<i64>)> =
+            sqlx::query_as("SELECT id, org_id, token_issued_at FROM node WHERE token_hash = ?1")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(id, org, issued)| (AgentId(id), OrgId(org), issued.unwrap_or(0))))
     }
 
@@ -312,8 +431,16 @@ impl Db {
         tags: &[String],
         now: i64,
     ) -> Result<AgentId> {
-        self.register_node_full(org, name, token_hash, tags, None, AdoptPolicy::Declared, now)
-            .await
+        self.register_node_full(
+            org,
+            name,
+            token_hash,
+            tags,
+            None,
+            AdoptPolicy::Declared,
+            now,
+        )
+        .await
     }
 
     /// Register (or refresh) a node, recording its owner and adoption policy.
@@ -427,12 +554,11 @@ impl Db {
         &self,
         token_hash: &str,
     ) -> Result<Option<(String, OrgId, i64)>> {
-        let row: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT user_id, org_id, expires FROM session WHERE token_hash = ?1",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(String, String, i64)> =
+            sqlx::query_as("SELECT user_id, org_id, expires FROM session WHERE token_hash = ?1")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(user, org, expires)| (user, OrgId(org), expires)))
     }
 
@@ -614,6 +740,330 @@ impl Db {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|(org, tags)| (OrgId(org), split_tags(&tags))))
+    }
+
+    /// Insert a pending node registration, retrying on a `user_code` collision.
+    ///
+    /// The caller supplies fresh codes through `next_code` rather than a single
+    /// value, because `user_code` is the primary key: at ~40 bits behind a
+    /// 15-minute TTL a collision is astronomically unlikely, but an
+    /// unauthenticated route must not have an unhandled `Err` path for it.
+    /// Three attempts, then the error surfaces as a `500`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if every attempt fails.
+    // One argument per column, and the columns are the pending registration's
+    // whole definition (the same reasoning as `insert_auth_key`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_pending_node(
+        &self,
+        mut next_code: impl FnMut() -> String,
+        device_hash: &str,
+        node_name: &str,
+        tags: &[String],
+        adopt: AdoptPolicy,
+        source_ip: Option<&str>,
+        created_at: i64,
+        expires: i64,
+    ) -> Result<String> {
+        // The last attempt is outside the loop so its error is returned
+        // directly: there is then no "we finished the loop with no error
+        // recorded" branch to fabricate, and therefore no panic path on a route
+        // an unauthenticated caller can reach.
+        for _ in 0..2 {
+            let code = next_code();
+            if self
+                .try_insert_pending_node(
+                    &code,
+                    device_hash,
+                    node_name,
+                    tags,
+                    adopt,
+                    source_ip,
+                    created_at,
+                    expires,
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(code);
+            }
+        }
+        let code = next_code();
+        self.try_insert_pending_node(
+            &code,
+            device_hash,
+            node_name,
+            tags,
+            adopt,
+            source_ip,
+            created_at,
+            expires,
+        )
+        .await?;
+        Ok(code)
+    }
+
+    /// One insert attempt. Fails on a `user_code` collision, which is what
+    /// [`Db::insert_pending_node`] retries past.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_insert_pending_node(
+        &self,
+        code: &str,
+        device_hash: &str,
+        node_name: &str,
+        tags: &[String],
+        adopt: AdoptPolicy,
+        source_ip: Option<&str>,
+        created_at: i64,
+        expires: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_node
+                 (user_code, device_hash, node_name, tags, adopt_policy, source_ip,
+                  created_at, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(code)
+        .bind(device_hash)
+        .bind(node_name)
+        .bind(tags.join("\n"))
+        .bind(adopt.as_str())
+        .bind(source_ip)
+        .bind(created_at)
+        .bind(expires)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// How many pending registrations are live (neither consumed nor expired).
+    ///
+    /// The ceiling `/node/register/start` enforces before its insert. Cheap:
+    /// the table is TTL-bounded and swept.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn live_pending_node_count(&self, now: i64) -> Result<i64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pending_node WHERE consumed_at IS NULL AND expires > ?1",
+        )
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Look up a live pending registration by its normalised code.
+    ///
+    /// "Live" means unexpired; an already-decided row is returned so the caller
+    /// can distinguish approve/deny/redeemed states. Expired and unknown are
+    /// both `None`, which is what lets the route answer them uniformly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn pending_node_by_code(&self, code: &str, now: i64) -> Result<Option<PendingNode>> {
+        let row: Option<PendingNodeRow> = sqlx::query_as(
+            "SELECT user_code, node_name, tags, adopt_policy, source_ip, created_at, expires,
+                    org_id, approved_by, approved_at, consumed_at
+             FROM pending_node WHERE user_code = ?1 AND expires > ?2",
+        )
+        .bind(code)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(PendingNode::from_row))
+    }
+
+    /// Approve a pending registration: bind it to `org` and `approver`.
+    ///
+    /// **One conditional UPDATE**, so two concurrent approvals cannot bind two
+    /// orgs: the second one matches no row and is reported as already decided.
+    /// Returns `true` when this call is the one that approved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn approve_pending_node(
+        &self,
+        code: &str,
+        org: &OrgId,
+        approver: &str,
+        now: i64,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE pending_node
+                SET org_id = ?2, approved_by = ?3, approved_at = ?4
+              WHERE user_code = ?1
+                AND approved_at IS NULL
+                AND consumed_at IS NULL
+                AND expires > ?4",
+        )
+        .bind(code)
+        .bind(org.0.as_str())
+        .bind(approver)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Deny a pending registration, permanently.
+    ///
+    /// Same conditional shape as [`Db::approve_pending_node`], setting only
+    /// `consumed_at` — a denied row is "consumed without ever being approved"
+    /// (see the migration header).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn deny_pending_node(&self, code: &str, now: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE pending_node
+                SET consumed_at = ?2
+              WHERE user_code = ?1
+                AND approved_at IS NULL
+                AND consumed_at IS NULL
+                AND expires > ?2",
+        )
+        .bind(code)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Look up a live pending registration by its device-secret hash.
+    ///
+    /// Read-only, for the poll route's outcome reporting; redemption itself
+    /// goes through [`Db::consume_pending_node`], which is the guard.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn pending_node_by_device_hash(
+        &self,
+        device_hash: &str,
+        now: i64,
+    ) -> Result<Option<PendingNode>> {
+        let row: Option<PendingNodeRow> = sqlx::query_as(
+            "SELECT user_code, node_name, tags, adopt_policy, source_ip, created_at, expires,
+                    org_id, approved_by, approved_at, consumed_at
+             FROM pending_node WHERE device_hash = ?1 AND expires > ?2",
+        )
+        .bind(device_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(PendingNode::from_row))
+    }
+
+    /// Atomically redeem an approved pending registration.
+    ///
+    /// **The single atomic consume**, exactly as [`Db::consume_auth_key`] is:
+    /// one conditional `UPDATE … RETURNING`, so a node token is minted at most
+    /// once however many polls race. Every check the route makes before calling
+    /// this is a courtesy that lets it report *why*, not the guard.
+    ///
+    /// Returns `(org, approver, node_name, tags, adopt)`, or `None` when the
+    /// registration is unknown, unapproved, already redeemed, denied or
+    /// expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn consume_pending_node(
+        &self,
+        device_hash: &str,
+        now: i64,
+    ) -> Result<Option<(OrgId, String, String, Vec<String>, AdoptPolicy)>> {
+        let row: Option<(String, String, String, String, String)> = sqlx::query_as(
+            "UPDATE pending_node
+                SET consumed_at = ?2
+              WHERE device_hash = ?1
+                AND approved_at IS NOT NULL
+                AND consumed_at IS NULL
+                AND expires > ?2
+            RETURNING org_id, approved_by, node_name, tags, adopt_policy",
+        )
+        .bind(device_hash)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(org, approver, name, tags, adopt)| {
+            (
+                OrgId(org),
+                approver,
+                name,
+                split_tags(&tags),
+                // A row's policy was validated at insert; an unparseable one
+                // means hand-edited state, and `declared` is the conservative
+                // landing place (the same choice migration 0004 made).
+                AdoptPolicy::from_label(&adopt).unwrap_or(AdoptPolicy::Declared),
+            )
+        }))
+    }
+
+    /// Every live pending registration, newest first: `(user_code, node_name)`.
+    ///
+    /// Not test scaffolding: this is the query a `node list-pending` verb wants,
+    /// and the integration tests use it to learn the code the enrolling machine
+    /// printed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn live_pending_codes(&self, now: i64) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT user_code, node_name FROM pending_node
+              WHERE consumed_at IS NULL AND expires > ?1
+              ORDER BY created_at DESC",
+        )
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Delete pending registrations that have expired or been consumed.
+    ///
+    /// Hygiene, **not** the security boundary — expiry and single-use are
+    /// enforced at redemption by the conditional statements above. Returns the
+    /// number of rows removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_expired_pending_nodes(&self, now: i64) -> Result<u64> {
+        let result =
+            sqlx::query("DELETE FROM pending_node WHERE expires <= ?1 OR consumed_at IS NOT NULL")
+                .bind(now)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// The id of the node named `name` in `org`, if one exists.
+    ///
+    /// Used by the interactive-approval path to refuse an approval that would
+    /// silently re-credential (and thereby take over) an existing node: the
+    /// requesting machine chose its own name before any org was known, so the
+    /// collision cannot be detected any earlier than approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn node_id_in_org_by_name(&self, org: &OrgId, name: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM node WHERE org_id = ?1 AND name = ?2")
+                .bind(org.0.as_str())
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| id))
     }
 
     /// The org a node belongs to, if the node is known.
@@ -934,14 +1384,13 @@ impl OrgDb<'_> {
     ///
     /// Returns a database error if the query fails.
     pub async fn has_board(&self, board: &BoardRef) -> Result<bool> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1 FROM board WHERE org_id = ?1 AND node_id = ?2 AND name = ?3",
-        )
-        .bind(self.org.0.as_str())
-        .bind(board.node.0.as_str())
-        .bind(board.name.as_str())
-        .fetch_optional(self.db.pool())
-        .await?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM board WHERE org_id = ?1 AND node_id = ?2 AND name = ?3")
+                .bind(self.org.0.as_str())
+                .bind(board.node.0.as_str())
+                .bind(board.name.as_str())
+                .fetch_optional(self.db.pool())
+                .await?;
         Ok(row.is_some())
     }
 
@@ -1026,12 +1475,11 @@ impl OrgDb<'_> {
     ///
     /// Returns a database error if the query fails.
     pub async fn open_lease_count(&self) -> Result<i64> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM leases WHERE org_id = ?1 AND closed_at IS NULL",
-        )
-        .bind(self.org.0.as_str())
-        .fetch_one(self.db.pool())
-        .await?;
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM leases WHERE org_id = ?1 AND closed_at IS NULL")
+                .bind(self.org.0.as_str())
+                .fetch_one(self.db.pool())
+                .await?;
         Ok(row.0)
     }
 
@@ -1085,23 +1533,27 @@ impl OrgDb<'_> {
         limit: i64,
     ) -> Result<Vec<fleet_proto::admin::LogLine>> {
         let rows: Vec<(i64, String, Option<String>, Option<String>)> = match board {
-            Some(b) => sqlx::query_as(
-                "SELECT ts, action, board, detail FROM audit_log
+            Some(b) => {
+                sqlx::query_as(
+                    "SELECT ts, action, board, detail FROM audit_log
                  WHERE org_id = ?1 AND board = ?2 ORDER BY id DESC LIMIT ?3",
-            )
-            .bind(self.org.0.as_str())
-            .bind(b)
-            .bind(limit)
-            .fetch_all(self.db.pool())
-            .await?,
-            None => sqlx::query_as(
-                "SELECT ts, action, board, detail FROM audit_log
+                )
+                .bind(self.org.0.as_str())
+                .bind(b)
+                .bind(limit)
+                .fetch_all(self.db.pool())
+                .await?
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT ts, action, board, detail FROM audit_log
                  WHERE org_id = ?1 ORDER BY id DESC LIMIT ?2",
-            )
-            .bind(self.org.0.as_str())
-            .bind(limit)
-            .fetch_all(self.db.pool())
-            .await?,
+                )
+                .bind(self.org.0.as_str())
+                .bind(limit)
+                .fetch_all(self.db.pool())
+                .await?
+            }
         };
         Ok(rows
             .into_iter()
@@ -1447,9 +1899,17 @@ mod tests {
     async fn auth_key_consume_is_single_use_and_ttl_checked() {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
-        db.insert_auth_key(&o, "hash-a", &["nrf52".to_owned()], true, Some(2000), Some("root"), 1000)
-            .await
-            .unwrap();
+        db.insert_auth_key(
+            &o,
+            "hash-a",
+            &["nrf52".to_owned()],
+            true,
+            Some(2000),
+            Some("root"),
+            1000,
+        )
+        .await
+        .unwrap();
 
         let first = db.consume_auth_key("hash-a", 1500).await.unwrap();
         assert_eq!(first, Some((o.clone(), vec!["nrf52".to_owned()])));
@@ -1761,9 +2221,19 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
         db.ensure_org(&o, "personal").await.unwrap();
-        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Admin)
+            .await
+            .unwrap();
         let node = db
-            .register_node_full(&o, "laptop", "hash", &[], Some("alice"), AdoptPolicy::Auto, 1000)
+            .register_node_full(
+                &o,
+                "laptop",
+                "hash",
+                &[],
+                Some("alice"),
+                AdoptPolicy::Auto,
+                1000,
+            )
             .await
             .unwrap();
 
@@ -1802,11 +2272,22 @@ mod tests {
         // ...then `share`: same id (one physical machine, one row), now owned
         // and auto-adopting.
         let again = db
-            .register_node_full(&o, "laptop", "hash-2", &[], Some("alice"), AdoptPolicy::Auto, 2000)
+            .register_node_full(
+                &o,
+                "laptop",
+                "hash-2",
+                &[],
+                Some("alice"),
+                AdoptPolicy::Auto,
+                2000,
+            )
             .await
             .unwrap();
         assert_eq!(again, node, "one machine must not become two rows");
-        assert_eq!(db.node_owner(&node).await.unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            db.node_owner(&node).await.unwrap().as_deref(),
+            Some("alice")
+        );
         assert_eq!(
             db.node_org_and_policy(&node).await.unwrap().unwrap().1,
             AdoptPolicy::Auto
@@ -1888,7 +2369,248 @@ mod tests {
         assert_eq!(db.list_auth_keys(&other).await.unwrap().len(), 1);
 
         // A revoked key stops being redeemable, which is the point.
-        assert!(db.consume_auth_key("aaaa1111", 1_500).await.unwrap().is_none());
+        assert!(db
+            .consume_auth_key("aaaa1111", 1_500)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Seed a pending registration with a fixed code, for the state-machine
+    /// tests below.
+    async fn seed_pending(db: &Db, code: &str, hash: &str, name: &str, expires: i64) {
+        db.insert_pending_node(
+            || code.to_owned(),
+            hash,
+            name,
+            &["lab".to_owned()],
+            AdoptPolicy::Auto,
+            Some("203.0.113.7"),
+            1_000,
+            expires,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The happy path, and the single-use property that makes it safe:
+    /// approve, redeem once, and a second redemption mints nothing.
+    #[tokio::test]
+    async fn pending_node_approve_then_consume_exactly_once() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        db.ensure_user_member(&o, "alice", Role::Member)
+            .await
+            .unwrap();
+        seed_pending(&db, "ABCD1234", "hash-a", "rpi-lab-3", 2_000).await;
+
+        let pending = db
+            .pending_node_by_code("ABCD1234", 1_100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.is_pending());
+        assert_eq!(pending.state_label(), "pending");
+        assert_eq!(pending.node_name, "rpi-lab-3");
+        assert_eq!(pending.tags, vec!["lab".to_owned()]);
+        assert_eq!(pending.adopt, AdoptPolicy::Auto);
+        assert_eq!(pending.source_ip.as_deref(), Some("203.0.113.7"));
+        assert!(pending.org.is_none(), "no org until it is decided");
+
+        // Not redeemable before approval.
+        assert!(db
+            .consume_pending_node("hash-a", 1_100)
+            .await
+            .unwrap()
+            .is_none());
+
+        assert!(db
+            .approve_pending_node("ABCD1234", &o, "alice", 1_200)
+            .await
+            .unwrap());
+        // A second approval binds nothing: one conditional UPDATE is what stops
+        // two approvers landing the machine in two orgs.
+        let other = org("other");
+        db.ensure_org(&other, "personal").await.unwrap();
+        assert!(!db
+            .approve_pending_node("ABCD1234", &other, "mallory", 1_250)
+            .await
+            .unwrap());
+
+        let (bound_org, approver, name, tags, adopt) = db
+            .consume_pending_node("hash-a", 1_300)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bound_org, o);
+        assert_eq!(approver, "alice");
+        assert_eq!(name, "rpi-lab-3");
+        assert_eq!(tags, vec!["lab".to_owned()]);
+        assert_eq!(adopt, AdoptPolicy::Auto);
+
+        // The single atomic consume: a racing second poll mints nothing.
+        assert!(db
+            .consume_pending_node("hash-a", 1_300)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// Denial is permanent, and is "consumed without ever being approved" —
+    /// the property the schema encodes without a `denied_at` column.
+    #[tokio::test]
+    async fn pending_node_denial_is_final() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        db.ensure_user_member(&o, "alice", Role::Member)
+            .await
+            .unwrap();
+        seed_pending(&db, "ABCD1234", "hash-a", "rpi", 2_000).await;
+
+        assert!(db.deny_pending_node("ABCD1234", 1_200).await.unwrap());
+        let pending = db
+            .pending_node_by_code("ABCD1234", 1_300)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.is_denied());
+        assert_eq!(pending.state_label(), "denied");
+
+        // Neither approvable nor redeemable afterwards.
+        assert!(!db
+            .approve_pending_node("ABCD1234", &o, "alice", 1_400)
+            .await
+            .unwrap());
+        assert!(db
+            .consume_pending_node("hash-a", 1_400)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!db.deny_pending_node("ABCD1234", 1_400).await.unwrap());
+    }
+
+    /// Expiry is enforced by the statements themselves, not by the sweep.
+    #[tokio::test]
+    async fn pending_node_expiry_is_enforced_at_every_transition() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        db.ensure_user_member(&o, "alice", Role::Member)
+            .await
+            .unwrap();
+        seed_pending(&db, "ABCD1234", "hash-a", "rpi", 2_000).await;
+
+        // Boundary: expiry is exclusive, matching session verification.
+        assert!(db
+            .pending_node_by_code("ABCD1234", 2_000)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!db
+            .approve_pending_node("ABCD1234", &o, "alice", 2_000)
+            .await
+            .unwrap());
+        assert!(!db.deny_pending_node("ABCD1234", 2_000).await.unwrap());
+
+        // Approved before expiry, redeemed after: still refused.
+        assert!(db
+            .approve_pending_node("ABCD1234", &o, "alice", 1_500)
+            .await
+            .unwrap());
+        assert!(db
+            .consume_pending_node("hash-a", 2_100)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The listing a `node list-pending` verb (and the e2e test) needs: live
+    /// rows only, newest first.
+    #[tokio::test]
+    async fn live_pending_codes_excludes_spent_and_expired_rows() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        db.ensure_user_member(&o, "alice", Role::Member)
+            .await
+            .unwrap();
+        seed_pending(&db, "AAAA1111", "hash-a", "live", 2_000).await;
+        seed_pending(&db, "BBBB2222", "hash-b", "denied", 2_000).await;
+        seed_pending(&db, "CCCC3333", "hash-c", "expired", 1_050).await;
+        db.deny_pending_node("BBBB2222", 1_100).await.unwrap();
+
+        let live = db.live_pending_codes(1_200).await.unwrap();
+        assert_eq!(live, vec![("AAAA1111".to_owned(), "live".to_owned())]);
+        assert_eq!(db.live_pending_node_count(1_200).await.unwrap(), 1);
+
+        // The sweep is hygiene: it removes the spent and expired rows the
+        // statements above already refuse to act on.
+        assert_eq!(db.delete_expired_pending_nodes(1_200).await.unwrap(), 2);
+        assert_eq!(db.live_pending_codes(1_200).await.unwrap().len(), 1);
+    }
+
+    /// A code collision must not surface as an unhandled error on an
+    /// unauthenticated route: the insert retries with a fresh code.
+    #[tokio::test]
+    async fn insert_pending_node_retries_past_a_code_collision() {
+        let db = Db::connect_in_memory().await.unwrap();
+        seed_pending(&db, "AAAA1111", "hash-a", "first", 2_000).await;
+
+        let mut codes = ["AAAA1111", "AAAA1111", "BBBB2222"].into_iter();
+        let code = db
+            .insert_pending_node(
+                || codes.next().unwrap().to_owned(),
+                "hash-b",
+                "second",
+                &[],
+                AdoptPolicy::Declared,
+                None,
+                1_000,
+                2_000,
+            )
+            .await
+            .unwrap();
+        assert_eq!(code, "BBBB2222");
+
+        // Three collisions in a row is an error, not an infinite loop.
+        assert!(db
+            .insert_pending_node(
+                || "AAAA1111".to_owned(),
+                "hash-c",
+                "third",
+                &[],
+                AdoptPolicy::Declared,
+                None,
+                1_000,
+                2_000,
+            )
+            .await
+            .is_err());
+    }
+
+    /// The collision check the approval path refuses on.
+    #[tokio::test]
+    async fn node_id_in_org_by_name_is_org_scoped() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let other = seeded(&db, "other", "agent-b").await;
+        db.register_node(&o, "rpi-lab-3", "hash", &[], 1_000)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.node_id_in_org_by_name(&o, "rpi-lab-3").await.unwrap(),
+            Some(format!("{DEFAULT_ORG_ID}/rpi-lab-3"))
+        );
+        assert!(db
+            .node_id_in_org_by_name(&o, "rpi-lab-4")
+            .await
+            .unwrap()
+            .is_none());
+        // The same name in another tenant is another node, not a collision.
+        assert!(db
+            .node_id_in_org_by_name(&other, "rpi-lab-3")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

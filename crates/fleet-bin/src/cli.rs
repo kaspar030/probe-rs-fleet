@@ -54,6 +54,9 @@ pub enum Command {
     /// Mint, list and revoke this org's node-enrollment auth keys, using the
     /// login you already have.
     AuthKey(AuthKeyCliArgs),
+    /// Node-side operator verbs. Today: approve a machine that is asking to
+    /// join your org.
+    Node(NodeArgs),
     /// List the fleets this machine has a config for.
     Fleets,
 }
@@ -400,6 +403,68 @@ pub struct AuthKeyRevokeCliArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
+/// Arguments for `probe-rs-fleet node`.
+///
+/// A namespace rather than a bare `node-approve`, because the node-side
+/// operator verbs that will want to live beside it (list pending, revoke) are
+/// obvious follow-ups.
+#[derive(Debug, Args)]
+pub struct NodeArgs {
+    /// The node verb.
+    #[command(subcommand)]
+    pub command: NodeCommand,
+}
+
+/// `node` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum NodeCommand {
+    /// Approve (or deny) a machine that printed a short code and is waiting.
+    Approve(NodeApproveArgs),
+}
+
+/// Arguments for `probe-rs-fleet node approve`.
+///
+/// The approving half of architecture §4.2's rung 3: a headless machine ran
+/// `agent up`, printed a URL and a code, and is polling. This verb runs on a
+/// machine where you are **already logged in**, because the coordinator has no
+/// browser-authenticated surface (§6.4: `login` is the GitHub *device* flow,
+/// with no `redirect_uri` and no cookie session).
+///
+/// It always inspects before it acts: you are granting hardware access in your
+/// org to a machine you cannot see, which is RFC 8628 §5.4's remote-phishing
+/// case sharpened.
+#[derive(Debug, Args)]
+pub struct NodeApproveArgs {
+    /// The short code the waiting machine printed (`ABCD-1234`).
+    ///
+    /// Case, hyphens and the Crockford confusables (`O`/`0`, `I`/`L`/`1`) are
+    /// all folded, so type what you see.
+    pub code: String,
+    /// Deny the request instead of approving it. Permanent.
+    #[arg(long)]
+    pub deny: bool,
+    /// Skip the confirmation prompt.
+    ///
+    /// For scripts that already know what they are approving. Required when
+    /// stdin is not a terminal: a piped confirmation is not a confirmation.
+    #[arg(long)]
+    pub yes: bool,
+    /// Approve even though your org already has a node with the requested
+    /// name, re-credentialing it.
+    ///
+    /// The machine currently running as that node loses its token at its next
+    /// connection, so this is refused by default — the requesting machine
+    /// chose the name, and it may not be the one you think.
+    #[arg(long)]
+    pub replace: bool,
+    /// The fleet whose `[user]` session authorises the approval.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
 
 /// A probe adoption policy, for the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -489,8 +554,38 @@ pub struct AgentUpArgs {
     /// Overwrite an existing `[node]` credential instead of reusing it.
     #[arg(long)]
     pub force: bool,
+    /// Fall back to interactive approval even without a terminal: print a URL
+    /// and a short code, and wait for somebody to run
+    /// `probe-rs-fleet node approve`.
+    ///
+    /// The default is *auto* — on when stdout is a terminal, off otherwise —
+    /// so a service unit with no tty fails fast with remediation instead of
+    /// printing a code into the journal and blocking for 15 minutes on nobody.
+    /// Pass this when you are tailing the log of a machine with no terminal of
+    /// its own.
+    #[arg(long, conflicts_with = "no_interactive")]
+    pub interactive: bool,
+    /// Never fall back to interactive approval; fail instead.
+    #[arg(long)]
+    pub no_interactive: bool,
 }
 
+impl AgentUpArgs {
+    /// The operator's explicit choice about interactive approval, or `None`
+    /// for "decide from whether there is a terminal".
+    ///
+    /// Two flags rather than one `--interactive=<bool>` because that is what a
+    /// person types; they collapse to one tri-state here so the ladder has a
+    /// single thing to consult.
+    #[must_use]
+    pub fn interactive_choice(&self) -> Option<bool> {
+        match (self.interactive, self.no_interactive) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+}
 
 /// Arguments for the explicit `sidecar` subcommand.
 #[derive(Debug, Args)]
@@ -709,6 +804,12 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     roles::auth_key::run(args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
+                Command::Node(args) => match args.command {
+                    NodeCommand::Approve(approve) => {
+                        roles::node_approve::run(&approve).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                },
                 Command::Fleets => {
                     roles::list_fleets()?;
                     Ok(ExitCode::SUCCESS)
@@ -1004,7 +1105,12 @@ mod tests {
     /// on a self-hosted coordinator must be able to administer the fleet.
     #[test]
     fn parses_coordinator_user_token() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "user-token", "alice"]));
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "coordinator",
+            "user-token",
+            "alice",
+        ]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
                 Some(CoordinatorCommand::UserToken(t)) => {

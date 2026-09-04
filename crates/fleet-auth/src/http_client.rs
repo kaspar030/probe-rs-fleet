@@ -30,7 +30,9 @@ use hyper_util::rt::TokioExecutor;
 
 use crate::api::{
     AuthKeyCreated, AuthKeyList, AuthKeyRequest, AuthKeyRevoked, DevicePollRequest,
-    DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest, TokenResponse,
+    DeviceStartRequest, DeviceStartResponse, ErrorResponse, NodeApprovalDecision,
+    NodeApprovalRequest, NodeApprovalResponse, NodeRegisterPollRequest, NodeRegisterStartRequest,
+    NodeRegisterStartResponse, TokenRequest, TokenResponse,
 };
 
 /// How long a token exchange may take before it is abandoned.
@@ -399,6 +401,100 @@ pub async fn revoke_auth_key(
     .await
 }
 
+/// Begin an approval-pending node registration (architecture §4.2 rung 3).
+///
+/// Unauthenticated: the calling machine has no credential yet. What comes back
+/// is a short code for a human to read out, a poll credential for this machine,
+/// and the informational URL.
+///
+/// # Errors
+///
+/// See [`exchange`]. A malformed name/tag or an unrecognised `adopt` label is a
+/// `400 invalid_request`; a coordinator whose pending table is full answers
+/// `503 too_many_pending`.
+pub async fn node_register_start(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    node_name: &str,
+    tags: Vec<String>,
+    adopt: Option<&str>,
+) -> Result<NodeRegisterStartResponse, ClientError> {
+    post_json(
+        &route_uri(base_url, "/node/register/start")?,
+        pin,
+        None,
+        &NodeRegisterStartRequest {
+            node_name: node_name.to_owned(),
+            tags,
+            adopt: adopt.map(ToOwned::to_owned),
+        },
+    )
+    .await
+}
+
+/// Poll for the outcome of a pending node registration.
+///
+/// Pending / expiry / denial all arrive as [`ClientError::Rejected`] carrying
+/// `authorization_pending`, `expired_token` or `access_denied`, mirroring
+/// `/auth/device/poll` so the caller can drive its loop by matching on `code`.
+///
+/// The device secret goes in the **body**, not an `Authorization` header: like
+/// `/auth/token`'s grants it is the *subject* of the request rather than proof
+/// of an established identity, and `verify::authenticate` refuses it as a
+/// connection credential by design.
+///
+/// # Errors
+///
+/// See [`exchange`].
+pub async fn node_register_poll(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    device_secret: &str,
+) -> Result<TokenResponse, ClientError> {
+    post_json(
+        &route_uri(base_url, "/node/register/poll")?,
+        pin,
+        None,
+        &NodeRegisterPollRequest {
+            device_secret: device_secret.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Inspect, approve or deny a pending node registration.
+///
+/// Authenticated with the caller's **session** token, like `/auth/keys`: the
+/// org and the approving user are read from the session, never from the
+/// request, so an approval can never bind a node into an org the caller is not
+/// a member of.
+///
+/// # Errors
+///
+/// See [`exchange`]. An unknown, expired or already-decided code is a uniform
+/// `404 invalid_grant`; a non-member a `403 forbidden`; a name collision
+/// without `replace` a `409 node_name_taken`.
+pub async fn node_approval(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+    user_code: &str,
+    decision: NodeApprovalDecision,
+    replace: bool,
+) -> Result<NodeApprovalResponse, ClientError> {
+    post_json(
+        &route_uri(base_url, "/node/register/approve")?,
+        pin,
+        Some(session_token),
+        &NodeApprovalRequest {
+            user_code: user_code.to_owned(),
+            decision,
+            replace,
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +557,26 @@ mod tests {
                 .to_string(),
             "http://127.0.0.1:7000/auth/keys"
         );
+    }
+
+    #[test]
+    fn node_routes_share_the_base_normalisation() {
+        for route in [
+            "/node/register/start",
+            "/node/register/poll",
+            "/node/register/approve",
+        ] {
+            assert_eq!(
+                route_uri("fleet.example:7000/", route).unwrap().to_string(),
+                format!("https://fleet.example:7000{route}")
+            );
+            assert_eq!(
+                route_uri("http://127.0.0.1:7000", route)
+                    .unwrap()
+                    .to_string(),
+                format!("http://127.0.0.1:7000{route}")
+            );
+        }
     }
 
     #[test]

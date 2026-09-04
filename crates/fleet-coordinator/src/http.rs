@@ -9,6 +9,69 @@
 //! | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys |
 //! | `POST /auth/device/start` | anyone | begin a GitHub device flow |
 //! | `POST /auth/device/poll` | anyone | redeem a device code for a session token |
+//! | `POST /node/register/start` | anyone | begin an approval-pending node registration |
+//! | `POST /node/register/poll` | a pending node | redeem an approved registration for a node token |
+//! | `POST /node/register/approve` | org members | inspect / approve / deny one |
+//! | `GET /node/approve` | anyone | a static page saying what to run |
+//!
+//! # Interactive node approval (architecture §4.2 rung 3, §6.4)
+//!
+//! A headless machine with no credential posts to `/node/register/start`,
+//! prints the short `user_code` it gets back, and polls `/node/register/poll`.
+//! A human on a machine where they are logged in runs `probe-rs-fleet node
+//! approve ABCD-1234`, which inspects, confirms, and approves — binding the
+//! pending row to *their* org and user. The next poll mints a node token
+//! through the same path `self_register` uses.
+//!
+//! **Why the approval is a CLI verb and not a web form.** `login` is the GitHub
+//! *device* flow: deliberately no `redirect_uri`, no cookie session (§6.4). A
+//! page served here therefore cannot know who is looking at it, so approving
+//! from a browser would mean adding an OAuth redirect flow and cookies to the
+//! coordinator — which contradicts §6.4 and reopens §10 Q6. `GET /node/approve`
+//! is informational **because of that**, not by oversight. Please do not "fix"
+//! it by bolting a session onto the coordinator.
+//!
+//! The design keeps a real browser flow open, and these three properties are
+//! commitments, not accidents:
+//!
+//! 1. approval is keyed by `user_code` and is a pure function of `(code,
+//!    decision, authenticated user)` — [`decide_pending_node`] takes an
+//!    already-resolved subject, so a future cookie-authenticated handler
+//!    resolves its subject its own way and calls the *same* function. No schema
+//!    change, no second binding site;
+//! 2. the node-side wire contract (`start` / `poll`) never learns which
+//!    approval mechanism ran, so adding one is additive on the coordinator and
+//!    already-deployed agents keep working;
+//! 3. `GET /node/approve` is the page that would grow the form, and it is
+//!    already what `verification_uri` points at — so the future change is "this
+//!    page gains a POST form behind a session", not "the printed URL changes",
+//!    which would break every deployed agent's printed instructions.
+//!
+//! Three accepted risks, recorded rather than fixed:
+//!
+//! * **Code enumeration across tenants.** An authenticated member who guesses a
+//!   `user_code` can approve a registration someone in another org started,
+//!   capturing that machine into the approver's org — and can learn its
+//!   `node_name` / tags / source IP by `Inspect` alone. What bounds it: ~40 bits
+//!   of entropy behind a 15-minute TTL (blind enumeration is infeasible even
+//!   unthrottled), every attempt audited, and the enrolling machine printing
+//!   the org it landed in, which is the one control that lets the *victim*
+//!   notice rather than only an auditor afterwards.
+//! * **Unauthenticated database growth.** This is **not** the device flow's
+//!   accepted risk and must not be folded into it: the device flow is
+//!   *stateless*, while `/node/register/start` writes a row holding
+//!   attacker-controlled strings. `max_pending_nodes` (default 256) caps the
+//!   live set and the sweep reclaims it at TTL; there is no per-source
+//!   throttle. The honest cost of the cap is that a full table denies
+//!   enrollment to legitimate machines until rows age out.
+//! * **Remote phishing** (RFC 8628 §5.4), sharper here than for login: the
+//!   approver grants hardware access in their org to a machine they cannot see.
+//!   Mitigated by the CLI showing name, tags, policy, source IP and age, and
+//!   requiring an explicit confirmation that defaults to no.
+//!
+//! `slow_down` is never returned by `/node/register/poll` — there is no rate
+//! limiting anywhere in the coordinator — but the CLI handles the code if it
+//! ever appears.
 //!
 //! # The device routes
 //!
@@ -81,18 +144,21 @@
 //! property for the sake of a diagnostic. It stays `NOT NULL`; pre-auth noise is
 //! logged, not audited. **Please do not "fix" this.**
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::extract::{ws::WebSocketUpgrade, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{ws::WebSocketUpgrade, ConnectInfo, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use tracing::{debug, info, warn};
 
 use fleet_auth::api::{
     AuthKeyCreated, AuthKeyInfo, AuthKeyList, AuthKeyRequest, AuthKeyRevoked, DevicePollRequest,
-    DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest, TokenResponse,
+    DeviceStartRequest, DeviceStartResponse, ErrorResponse, NodeApprovalDecision,
+    NodeApprovalRequest, NodeApprovalResponse, NodeRegisterPollRequest, NodeRegisterStartRequest,
+    NodeRegisterStartResponse, TokenRequest, TokenResponse,
 };
 use fleet_auth::github::{self, DevicePoll, GithubApp, GithubEndpoints};
 use fleet_auth::{AuthError, Authenticated, OpaqueToken, TokenKind};
@@ -112,6 +178,10 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         .route("/auth/keys", post(auth_keys))
         .route("/auth/device/start", post(auth_device_start))
         .route("/auth/device/poll", post(auth_device_poll))
+        .route("/node/register/start", post(node_register_start))
+        .route("/node/register/poll", post(node_register_poll))
+        .route("/node/register/approve", post(node_register_approve))
+        .route("/node/approve", get(node_approve_page))
         .with_state(coord)
 }
 
@@ -178,8 +248,9 @@ async fn authenticate_request(
         // token from being replayed into another tenant.
         TokenKind::Node => Subject::new(org, SubjectKind::Node, auth.id.clone()),
         TokenKind::Session => Subject::new(org, SubjectKind::User, auth.id.clone()),
-        // `authenticate` never returns this kind; it is redeemed, not presented.
-        TokenKind::AuthKey => {
+        // `authenticate` never returns these kinds; both are redeemed at a
+        // route, never presented as a connection credential.
+        TokenKind::AuthKey | TokenKind::NodeDevice => {
             return Err(reject(StatusCode::FORBIDDEN, "forbidden"));
         }
     };
@@ -247,7 +318,14 @@ async fn agent_ws(
         .max_frame_size(fleet_wire::MAX_FRAME_LEN)
         .on_upgrade(move |socket| async move {
             let (tx, rx) = crate::ws_axum::split(socket);
-            if let Err(e) = crate::server::handle_agent(coord, Box::new(tx), Box::new(rx), agent_id.clone(), auth).await
+            if let Err(e) = crate::server::handle_agent(
+                coord,
+                Box::new(tx),
+                Box::new(rx),
+                agent_id.clone(),
+                auth,
+            )
+            .await
             {
                 if fleet_wire::is_benign_close(&e.as_wire()) {
                     debug!(%agent_id, "agent connection closed");
@@ -320,7 +398,7 @@ async fn redeem_auth_key(
     let now = coord.now();
     let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
 
-    if node_name.trim().is_empty() {
+    if !valid_node_name(node_name.trim()) || !valid_tags(&tags) {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     }
 
@@ -409,7 +487,11 @@ async fn self_register(
     let now = coord.now();
     let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
 
-    if node_name.trim().is_empty() {
+    // Same validation as the interactive path, which needs it far more (an
+    // unauthenticated caller chooses the name there). Applied here too because
+    // the name lands inside the node id and a member should not be able to
+    // create a node whose name breaks that, even by accident.
+    if !valid_node_name(node_name.trim()) || !valid_tags(&tags) {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     }
 
@@ -417,12 +499,9 @@ async fn self_register(
     // `adopt = "delcared"` quietly meaning `auto` would share probes the
     // operator did not mean to share. Absent means this grant's default, which
     // is `auto` — `share` is a deliberate "offer this machine's probes".
-    let adopt = match adopt {
-        None => AdoptPolicy::Auto,
-        Some(label) => match AdoptPolicy::from_label(label) {
-            Some(policy) => policy,
-            None => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
-        },
+    let adopt = match parse_adopt(adopt, AdoptPolicy::Auto) {
+        Ok(adopt) => adopt,
+        Err(response) => return response,
     };
 
     let auth = match fleet_auth::authenticate(coord.db(), session_token, now).await {
@@ -469,21 +548,59 @@ async fn self_register(
         }
     }
 
-    let token = OpaqueToken::mint(TokenKind::Node);
     let mut all_tags = tags;
     all_tags.sort_unstable();
     all_tags.dedup();
 
+    let detail = format!("self-registered by {} (adopt={adopt})", auth.id);
+    mint_node_token(
+        coord,
+        &org,
+        node_name,
+        &all_tags,
+        &auth.id,
+        adopt,
+        "node.self_register",
+        &detail,
+        now_i64,
+    )
+    .await
+}
+
+/// Mint a node token, create/refresh the node row, and audit it.
+///
+/// The shared tail of [`self_register`] and the interactive-approval redemption
+/// in [`node_register_poll`], so the two paths cannot drift in what a node row
+/// ends up looking like — same owner semantics, same tag handling, same
+/// response shape. The audit `action` and `detail` differ because the two
+/// ceremonies are genuinely different events; everything else is identical.
+///
+/// `owner` is the **user** whose authority created the node (the session holder
+/// for `share`, the approver for interactive approval), so `node.owner_user_id`
+/// means the same thing on both paths.
+#[allow(clippy::too_many_arguments)]
+async fn mint_node_token(
+    coord: &Coordinator,
+    org: &OrgId,
+    node_name: &str,
+    tags: &[String],
+    owner: &str,
+    adopt: AdoptPolicy,
+    audit_action: &'static str,
+    audit_detail: &str,
+    now: i64,
+) -> Response {
+    let token = OpaqueToken::mint(TokenKind::Node);
     let node = match coord
         .db()
         .register_node_full(
-            &org,
+            org,
             node_name,
             token.hash().as_str(),
-            &all_tags,
-            Some(&auth.id),
+            tags,
+            Some(owner),
             adopt,
-            now_i64,
+            now,
         )
         .await
     {
@@ -494,26 +611,25 @@ async fn self_register(
         }
     };
 
-    let detail = format!("self-registered by {} (adopt={adopt})", auth.id);
     let _ = coord
         .db()
         .scoped(org.clone())
         .append_audit(&AuditEntry {
-            ts: now_i64,
-            subject: Some(auth.id.as_str()),
-            action: "node.self_register",
+            ts: now,
+            subject: Some(owner),
+            action: audit_action,
             node: Some(node.0.as_str()),
             board: None,
             lease: None,
-            detail: Some(&detail),
+            detail: Some(audit_detail),
         })
         .await;
-    info!(node = %node, org = %org, owner = %auth.id, %adopt, "node self-registered");
+    info!(node = %node, org = %org, owner = %owner, %adopt, action = audit_action, "node registered");
 
     Json(TokenResponse {
         token: token.to_secret_string(),
         node_id: Some(node.0),
-        org: org.0,
+        org: org.0.clone(),
         expires: None,
         coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
         login: None,
@@ -540,9 +656,8 @@ async fn refresh_session(coord: &Coordinator, session_token: &str) -> Response {
     };
 
     let fresh = OpaqueToken::mint(TokenKind::Session);
-    let expires = now_i64.saturating_add(
-        i64::try_from(coord.config().session_ttl_secs).unwrap_or(i64::MAX),
-    );
+    let expires =
+        now_i64.saturating_add(i64::try_from(coord.config().session_ttl_secs).unwrap_or(i64::MAX));
     let org = OrgId(auth.org_id.clone());
     if coord
         .db()
@@ -1084,6 +1199,555 @@ async fn auth_device_poll(
         login: Some(user.login),
     })
     .into_response()
+}
+
+/// Maximum length of a node name accepted at registration.
+const MAX_NODE_NAME_LEN: usize = 64;
+/// Maximum length of one selection tag accepted at registration.
+const MAX_TAG_LEN: usize = 32;
+/// Maximum number of tags accepted at registration.
+const MAX_TAGS: usize = 16;
+
+/// Whether a node name is acceptable to store.
+///
+/// 1–[`MAX_NODE_NAME_LEN`] characters of `[A-Za-z0-9._-]`. Two independent
+/// reasons, both load-bearing:
+///
+/// * the name lands inside the node id via `node_id_for` (`"<org>/<name>"`), so
+///   `/`, whitespace and control characters are already meaningful there; and
+/// * on the interactive-approval path the name arrives from an
+///   **unauthenticated** request and is then rendered into a human approver's
+///   terminal. ANSI escapes or newlines in it could repaint or scroll away the
+///   "approve only if you started this enrollment" warning that is the whole
+///   RFC 8628 §5.4 mitigation.
+///
+/// Applied at **registration time only**, never at authentication: an existing
+/// node row with an odd name keeps working.
+fn valid_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NODE_NAME_LEN
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// Whether a tag list is acceptable to store. Same charset as a node name, at
+/// most [`MAX_TAGS`] tags of [`MAX_TAG_LEN`] characters.
+fn valid_tags(tags: &[String]) -> bool {
+    tags.len() <= MAX_TAGS
+        && tags.iter().all(|t| {
+            !t.is_empty()
+                && t.len() <= MAX_TAG_LEN
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        })
+}
+
+/// Parse an `adopt` label, or produce the `400` for an unrecognised one.
+///
+/// `None` means this grant's default. A typo'd `adopt = "delcared"` quietly
+/// meaning `auto` would share probes the operator did not mean to share, so it
+/// is a `400`, never a silent default.
+#[allow(clippy::result_large_err)]
+fn parse_adopt(adopt: Option<&str>, default: AdoptPolicy) -> Result<AdoptPolicy, Response> {
+    match adopt {
+        None => Ok(default),
+        Some(label) => AdoptPolicy::from_label(label)
+            .ok_or_else(|| reject(StatusCode::BAD_REQUEST, "invalid_request")),
+    }
+}
+
+/// `POST /node/register/start` — begin an approval-pending node registration.
+///
+/// Necessarily unauthenticated: the calling machine has no credential, which is
+/// what the ceremony exists to fix. Everything in the body is therefore
+/// attacker-controlled and validated before it is stored.
+///
+/// The source address comes from the connection, and the extractor is
+/// deliberately `Option<Extension<ConnectInfo<..>>>` rather than
+/// `ConnectInfo<..>`: a serve path that does not inject it (every test harness,
+/// and anything else built with a plain `axum::serve`) then records
+/// `source_ip = NULL` — the behaviour already documented as correct behind an
+/// opaque proxy — instead of failing the request. `X-Forwarded-For` is not
+/// consulted: it is an unauthenticated header, so trusting it would let the
+/// requester choose what the approver sees, which is worse than showing
+/// nothing.
+async fn node_register_start(
+    State(coord): State<Arc<Coordinator>>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    Json(request): Json<NodeRegisterStartRequest>,
+) -> Response {
+    let now = coord.now();
+    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+
+    let node_name = request.node_name.trim();
+    if !valid_node_name(node_name) || !valid_tags(&request.tags) {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    // Default `auto`: a human is standing over this enrollment and approving it
+    // live, which is the `share` situation rather than the disk-image one.
+    let adopt = match parse_adopt(request.adopt.as_deref(), AdoptPolicy::Auto) {
+        Ok(adopt) => adopt,
+        Err(response) => return response,
+    };
+
+    // The cap is checked before the write, not after: the point is to bound an
+    // unauthenticated caller's ability to grow this table at all.
+    match coord.db().live_pending_node_count(now_i64).await {
+        Ok(live) if live >= coord.config().max_pending_nodes => {
+            warn!(
+                live,
+                "pending node registrations are at the configured ceiling; refusing a new one"
+            );
+            return reject(StatusCode::SERVICE_UNAVAILABLE, "too_many_pending");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "failed to count pending node registrations");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    }
+
+    let mut tags = request.tags;
+    tags.sort_unstable();
+    tags.dedup();
+
+    let device = OpaqueToken::mint(TokenKind::NodeDevice);
+    let ttl = coord.config().pending_node_ttl_secs;
+    let expires = now_i64.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
+    let source_ip = peer.map(|Extension(ConnectInfo(addr))| addr.ip().to_string());
+
+    let code = match coord
+        .db()
+        .insert_pending_node(
+            fleet_auth::user_code::generate,
+            device.hash().as_str(),
+            node_name,
+            &tags,
+            adopt,
+            source_ip.as_deref(),
+            now_i64,
+            expires,
+        )
+        .await
+    {
+        Ok(code) => code,
+        Err(e) => {
+            warn!(error = %e, "failed to record a pending node registration");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    info!(
+        node_name,
+        source_ip = source_ip.as_deref().unwrap_or("(unknown)"),
+        "node registration awaiting approval"
+    );
+
+    Json(NodeRegisterStartResponse {
+        user_code: fleet_auth::user_code::display(&code),
+        device_secret: device.to_secret_string(),
+        // No code in the URL, ever: the page reflects nothing (see
+        // `node_approve_page`), and the code is printed separately by the
+        // enrolling machine, exactly as GitHub's device flow does.
+        verification_uri: format!(
+            "{}/node/approve",
+            coord.config().public_url.trim_end_matches('/')
+        ),
+        interval: 5,
+        expires_in: ttl,
+    })
+    .into_response()
+}
+
+/// `POST /node/register/poll` — redeem an approved registration for a node
+/// token.
+///
+/// Outcomes are relayed verbatim, exactly as `/auth/device/poll` documents:
+/// these describe *the caller's own* pending registration, which it created, so
+/// naming them is not an oracle about anybody else's credential.
+async fn node_register_poll(
+    State(coord): State<Arc<Coordinator>>,
+    Json(request): Json<NodeRegisterPollRequest>,
+) -> Response {
+    let now = coord.now();
+    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+
+    // Wrong kind is `invalid_grant`, not a 403: the caller supplied a secret we
+    // do not recognise as one of ours, which is indistinguishable from an
+    // unknown one and must stay that way.
+    let Ok(device) = OpaqueToken::parse(&request.device_secret) else {
+        return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+    };
+    if device.kind() != TokenKind::NodeDevice {
+        return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+    }
+    let hash = device.hash();
+
+    let pending = match coord
+        .db()
+        .pending_node_by_device_hash(hash.as_str(), now_i64)
+        .await
+    {
+        Ok(Some(pending)) => pending,
+        // Unknown *or* expired: a row past its TTL is filtered out by the
+        // query, so report the expiry the caller can act on. An unknown secret
+        // reaching here is a client bug or a probe; both get `invalid_grant`
+        // below via the state check.
+        Ok(None) => {
+            return reject(StatusCode::UNAUTHORIZED, "expired_token");
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to look up a pending node registration");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    if pending.is_pending() {
+        return reject(StatusCode::UNAUTHORIZED, "authorization_pending");
+    }
+    if pending.is_denied() {
+        return reject(StatusCode::UNAUTHORIZED, "access_denied");
+    }
+
+    // The single atomic consume is what makes redemption single-use under
+    // concurrent polling; every check above is a courtesy that lets this route
+    // say *why*, not the guard.
+    let consumed = match coord
+        .db()
+        .consume_pending_node(hash.as_str(), now_i64)
+        .await
+    {
+        Ok(Some(consumed)) => consumed,
+        // Approved a moment ago but already redeemed (or redeemed by a racing
+        // poll): nothing more to mint.
+        Ok(None) => return reject(StatusCode::UNAUTHORIZED, "invalid_grant"),
+        Err(e) => {
+            warn!(error = %e, "failed to consume a pending node registration");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+    let (org, approver, node_name, tags, adopt) = consumed;
+
+    let detail = format!(
+        "approved by {approver} (adopt={adopt}, code={})",
+        pending.user_code
+    );
+    mint_node_token(
+        &coord,
+        &org,
+        &node_name,
+        &tags,
+        &approver,
+        adopt,
+        "node.approve_register",
+        &detail,
+        now_i64,
+    )
+    .await
+}
+
+/// `POST /node/register/approve` — inspect, approve or deny a pending
+/// registration.
+///
+/// Authenticated with a **session** token; the org and the approver come from
+/// that session and never from the request, so an approval cannot bind a node
+/// into an org the caller is not in. **Membership is sufficient** (§6.4/§6.5),
+/// and the membership check is not decorative: `authz::require_role` denies a
+/// non-member everywhere else, so a node created for one would be an orphan its
+/// "owner" could never use.
+async fn node_register_approve(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(request): Json<NodeApprovalRequest>,
+) -> Response {
+    let (auth, _subject) = match authenticate_request(&coord, &headers, &[TokenKind::Session]).await
+    {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let org = OrgId(auth.org_id.clone());
+    let now_i64 = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+
+    match coord.db().role_of(&org, &auth.id).await {
+        Ok(Some(_role)) => {}
+        Ok(None) => {
+            let _ = coord
+                .db()
+                .scoped(org.clone())
+                .append_audit(&AuditEntry {
+                    ts: now_i64,
+                    subject: Some(auth.id.as_str()),
+                    action: "node.approve.denied",
+                    node: None,
+                    board: None,
+                    lease: None,
+                    detail: Some("not a member of the org the session belongs to"),
+                })
+                .await;
+            warn!(org = %org, subject = %auth.id, "node approval by a non-member");
+            return reject(StatusCode::FORBIDDEN, "forbidden");
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to resolve membership");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    }
+
+    decide_pending_node(
+        &coord,
+        &org,
+        &auth.id,
+        &request.user_code,
+        request.decision,
+        request.replace,
+        now_i64,
+    )
+    .await
+}
+
+/// Decide a pending registration on behalf of an already-resolved subject.
+///
+/// **The seam that keeps a browser flow possible.** Approval is a pure function
+/// of `(code, decision, authenticated user)`: this function takes the subject
+/// rather than resolving it, so a future cookie-authenticated web handler
+/// resolves its subject its own way and calls exactly this — no schema change,
+/// no second binding site. See the module documentation.
+pub(crate) async fn decide_pending_node(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    raw_code: &str,
+    decision: NodeApprovalDecision,
+    replace: bool,
+    now: i64,
+) -> Response {
+    // Unknown / malformed / expired / already-decided are all one answer: a
+    // caller learns nothing about which of them it was.
+    let Some(code) = fleet_auth::user_code::normalise(raw_code) else {
+        return reject(StatusCode::NOT_FOUND, "invalid_grant");
+    };
+    let pending = match coord.db().pending_node_by_code(&code, now).await {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return reject(StatusCode::NOT_FOUND, "invalid_grant"),
+        Err(e) => {
+            warn!(error = %e, "failed to look up a pending node registration");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    // Resolved here and not earlier: there is no org until an approver appears,
+    // so "does this name already exist?" is only answerable now, against *this*
+    // approver's org.
+    let collides_with = match coord
+        .db()
+        .node_id_in_org_by_name(org, &pending.node_name)
+        .await
+    {
+        Ok(existing) => existing,
+        Err(e) => {
+            warn!(error = %e, "failed to check for a node-name collision");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    let describe = |pending: &crate::state::PendingNode, state: &str| NodeApprovalResponse {
+        user_code: fleet_auth::user_code::display(&pending.user_code),
+        node_name: pending.node_name.clone(),
+        tags: pending.tags.clone(),
+        adopt: pending.adopt.as_str().to_owned(),
+        source_ip: pending.source_ip.clone(),
+        created_at: pending.created_at,
+        expires: pending.expires,
+        org: pending.org.as_ref().map(|o| o.0.clone()),
+        state: state.to_owned(),
+        collides_with: collides_with.clone(),
+    };
+
+    let (action, detail) = match decision {
+        NodeApprovalDecision::Inspect => {
+            audit_inspect(coord, org, user_id, &code, &pending.node_name, now).await;
+            return Json(describe(&pending, pending.state_label())).into_response();
+        }
+        NodeApprovalDecision::Approve => {
+            match approve_pending(
+                coord,
+                org,
+                user_id,
+                &code,
+                &pending,
+                collides_with.as_deref(),
+                replace,
+                now,
+            )
+            .await
+            {
+                Ok(detail) => ("node.approve", detail),
+                Err(response) => return response,
+            }
+        }
+        NodeApprovalDecision::Deny => {
+            match coord.db().deny_pending_node(&code, now).await {
+                Ok(true) => {}
+                Ok(false) => return reject(StatusCode::NOT_FOUND, "invalid_grant"),
+                Err(e) => {
+                    warn!(error = %e, "failed to deny a pending node registration");
+                    return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+                }
+            }
+            (
+                "node.approve.deny",
+                format!("code={code} name={}", pending.node_name),
+            )
+        }
+    };
+
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now,
+            subject: Some(user_id),
+            action,
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some(&detail),
+        })
+        .await;
+    info!(org = %org, subject = %user_id, action, "pending node registration decided");
+
+    let state = match decision {
+        NodeApprovalDecision::Approve => "approved",
+        NodeApprovalDecision::Deny => "denied",
+        NodeApprovalDecision::Inspect => pending.state_label(),
+    };
+    let mut response = describe(&pending, state);
+    if matches!(decision, NodeApprovalDecision::Approve) {
+        response.org = Some(org.0.clone());
+    }
+    Json(response).into_response()
+}
+
+/// Audit an inspection.
+///
+/// Inspecting changes nothing, but it is audited anyway: an authenticated
+/// caller poking at codes is exactly what an operator wants to be able to see
+/// after the fact, and it is the only trace the cross-tenant enumeration risk
+/// leaves behind.
+async fn audit_inspect(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    code: &str,
+    node_name: &str,
+    now: i64,
+) {
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now,
+            subject: Some(user_id),
+            action: "node.approve.inspect",
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some(&format!("code={code} name={node_name}")),
+        })
+        .await;
+}
+
+/// Bind a pending registration to `org` / `user_id`, refusing a takeover.
+///
+/// Returns the audit detail on success, or the whole rejection response.
+///
+/// The collision guard lives **here, in the handler**, not only in the CLI: the
+/// route is reachable with curl, and the machine that chose `node_name` did so
+/// before any org existed, so without this an approver could be talked into
+/// silently re-credentialing a node their org is currently running.
+///
+/// Note it is a check-then-act across two statements, and therefore advisory
+/// against a *concurrent* registration — it protects against a human misreading
+/// a name, not against a race. The single-use property
+/// ([`crate::state::Db::consume_pending_node`]) is unaffected and stays atomic.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+async fn approve_pending(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    code: &str,
+    pending: &crate::state::PendingNode,
+    collides_with: Option<&str>,
+    replace: bool,
+    now: i64,
+) -> Result<String, Response> {
+    if !pending.is_pending() {
+        return Err(reject(StatusCode::NOT_FOUND, "invalid_grant"));
+    }
+    if let Some(existing) = collides_with {
+        if !replace {
+            warn!(org = %org, node = %existing, "refusing an approval that would take over an existing node");
+            return Err(reject(StatusCode::CONFLICT, "node_name_taken"));
+        }
+    }
+    match coord
+        .db()
+        .approve_pending_node(code, org, user_id, now)
+        .await
+    {
+        Ok(true) => {}
+        // Lost a race with another approval or a denial: uniform answer.
+        Ok(false) => return Err(reject(StatusCode::NOT_FOUND, "invalid_grant")),
+        Err(e) => {
+            warn!(error = %e, "failed to approve a pending node registration");
+            return Err(reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error"));
+        }
+    }
+    Ok(format!(
+        "code={code} name={} adopt={}{}",
+        pending.node_name,
+        pending.adopt,
+        collides_with.map_or_else(String::new, |n| format!(" replaced={n}"))
+    ))
+}
+
+/// The informational page `verification_uri` points at.
+///
+/// **Reflects nothing.** No query parameter, no path parameter, no echo of a
+/// code: the moment this page renders caller-supplied input it becomes an
+/// injection and confused-deputy surface, and it is served unauthenticated to
+/// anyone who can reach the coordinator. That is also why the code is not in
+/// the URL at all.
+const NODE_APPROVE_PAGE: &str = concat!(
+    "<!doctype html>\n",
+    "<html lang=\"en\">\n",
+    "<head><meta charset=\"utf-8\"><title>Approve a node</title></head>\n",
+    "<body>\n",
+    "<h1>Approve a machine joining your fleet</h1>\n",
+    "<p>A machine has asked to join a fleet org as a node, and printed a short\n",
+    "code on its own terminal. Approving happens from a machine where you are\n",
+    "already logged in:</p>\n",
+    "<pre>probe-rs-fleet node approve &lt;your code&gt;</pre>\n",
+    "<p>It will show you the machine&#39;s requested name, tags and source\n",
+    "address, and ask you to confirm. Approve only if you started that\n",
+    "enrollment: approving grants the machine access to hardware in your org,\n",
+    "and you cannot see it from here.</p>\n",
+    "<p>Not logged in yet? <pre>probe-rs-fleet login</pre></p>\n",
+    "<p>This page is informational: nothing you do here approves anything.</p>\n",
+    "</body>\n</html>\n",
+);
+
+/// `GET /node/approve` — the static page. Unauthenticated, no state change,
+/// byte-identical whatever the query string.
+async fn node_approve_page() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        NODE_APPROVE_PAGE,
+    )
+        .into_response()
 }
 
 #[cfg(test)]

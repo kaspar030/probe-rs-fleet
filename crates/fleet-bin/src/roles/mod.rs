@@ -11,6 +11,7 @@
 //! - [`login`] → the GitHub device flow, brokered by the coordinator
 //! - [`share`] → self-register this machine as a node with the login it has
 //! - [`auth_key`] → mint/list/revoke this org's auth keys with that same login
+//! - [`node_approve`] → approve a headless machine that printed a short code
 //! - [`agent_up`] → the §4.2 credential ladder, then [`agent`]
 //! - [`node_setup`] → the enrollment mechanics [`share`] and [`agent_up`] share
 //!
@@ -29,6 +30,7 @@ pub mod coordinator;
 pub mod ctl;
 pub mod init;
 pub mod login;
+pub mod node_approve;
 pub mod node_setup;
 pub mod share;
 pub mod sidecar;

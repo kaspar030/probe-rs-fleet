@@ -126,6 +126,19 @@ pub async fn sweep_once(coord: &Coordinator) {
         Ok(n) => debug!(count = n, "expired sessions swept"),
         Err(e) => warn!(error = %e, "failed to sweep expired sessions"),
     }
+
+    // Same reasoning for pending node registrations (architecture §4.2 rung 3):
+    // expiry and single-use are *enforced* by the conditional statements in
+    // `state.rs`, so this is hygiene. It matters more here than for sessions,
+    // though, because `/node/register/start` is unauthenticated — the sweep is
+    // what returns capacity to `max_pending_nodes` after an abandoned or
+    // hostile burst. Consumed rows go too: a redeemed or denied code can never
+    // be used again, so keeping it buys nothing.
+    match coord.db().delete_expired_pending_nodes(now_i64).await {
+        Ok(0) => {}
+        Ok(n) => debug!(count = n, "spent pending node registrations swept"),
+        Err(e) => warn!(error = %e, "failed to sweep pending node registrations"),
+    }
 }
 
 #[cfg(test)]

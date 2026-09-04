@@ -132,9 +132,17 @@ pub async fn run(config: CoordinatorConfig) -> Result<()> {
     let result = match tls {
         None => {
             info!(addr = %local, "coordinator listening (plain HTTP; TLS is the proxy's job)");
-            axum::serve(listener, router)
-                .await
-                .map_err(|e| CoordinatorError::Http(e.to_string()))
+            // `into_make_service_with_connect_info` is what populates the peer
+            // address `/node/register/start` records for an approver to look
+            // at. A serve path without it degrades to `source_ip = NULL`
+            // rather than failing — see the `Option<Extension<ConnectInfo<..>>>`
+            // extractor there.
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .map_err(|e| CoordinatorError::Http(e.to_string()))
         }
         Some(tls) => {
             info!(addr = %local, "coordinator listening (TLS terminated here)");
@@ -180,7 +188,17 @@ async fn serve_tls(
             }
         };
         let acceptor = acceptor.clone();
-        let service = TowerToHyperService::new(router.clone());
+        // Not `into_make_service_with_connect_info`: that is a `MakeService`
+        // adapter for `axum::serve`, and this path deliberately does not use
+        // `axum::serve` (see the doc comment above — WS upgrades need
+        // `serve_connection_with_upgrades`). The peer is already bound here, so
+        // it is injected per connection instead, giving handlers the same
+        // `Extension<ConnectInfo<..>>` the plain path produces.
+        let service = TowerToHyperService::new(
+            router
+                .clone()
+                .layer(axum::Extension(axum::extract::ConnectInfo(peer))),
+        );
         tokio::spawn(async move {
             let stream = match acceptor.accept(sock).await {
                 Ok(s) => s,

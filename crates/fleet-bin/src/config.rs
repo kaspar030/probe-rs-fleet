@@ -115,6 +115,12 @@ struct CoordinatorConfigToml {
     /// Node-token rotation age, seconds.
     #[serde(default = "default_node_token_rotate_secs")]
     node_token_rotate_secs: u64,
+    /// How long an approval-pending node registration lives, seconds.
+    #[serde(default = "default_pending_node_ttl_secs")]
+    pending_node_ttl_secs: u64,
+    /// Ceiling on live pending node registrations.
+    #[serde(default = "default_max_pending_nodes")]
+    max_pending_nodes: i64,
     /// The org the interim admin verbs default to.
     #[serde(default = "default_org")]
     default_org: String,
@@ -147,6 +153,14 @@ fn default_org() -> String {
     "default".to_owned()
 }
 
+fn default_pending_node_ttl_secs() -> u64 {
+    15 * 60
+}
+
+fn default_max_pending_nodes() -> i64 {
+    256
+}
+
 /// Load and parse a coordinator config TOML file, converting it into the
 /// runtime [`CoordinatorConfig`].
 ///
@@ -171,7 +185,10 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
     let raw: CoordinatorConfigToml =
         toml::from_str(text).context("failed to parse coordinator config")?;
 
-    let seed = load_signing_seed(raw.signing_key_hex.as_deref(), raw.signing_key_path.as_deref())?;
+    let seed = load_signing_seed(
+        raw.signing_key_hex.as_deref(),
+        raw.signing_key_path.as_deref(),
+    )?;
 
     Ok(CoordinatorConfig {
         listen_addr: raw.listen_addr,
@@ -188,6 +205,8 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         pong_timeout_secs: raw.pong_timeout_secs,
         session_ttl_secs: raw.session_ttl_secs,
         node_token_rotate_secs: raw.node_token_rotate_secs,
+        pending_node_ttl_secs: raw.pending_node_ttl_secs,
+        max_pending_nodes: raw.max_pending_nodes,
         default_org: fleet_proto::ids::OrgId(raw.default_org),
         github: raw.github.map(|g| GithubConfig {
             client_id: g.client_id,

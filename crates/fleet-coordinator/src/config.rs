@@ -111,6 +111,22 @@ pub struct CoordinatorConfig {
     pub session_ttl_secs: u64,
     /// How old (seconds) a node token may get before it is rotated.
     pub node_token_rotate_secs: u64,
+    /// How long (seconds) an approval-pending node registration lives
+    /// (architecture §4.2 rung 3).
+    ///
+    /// Short on purpose: the `user_code` is ~40 bits and guessable by
+    /// construction, so the TTL is half of what bounds enumeration (the other
+    /// half being that every attempt is audited).
+    pub pending_node_ttl_secs: u64,
+    /// Ceiling on live (unconsumed, unexpired) pending node registrations.
+    ///
+    /// `/node/register/start` is unauthenticated and *writes a row*, unlike the
+    /// stateless device flow, so without a cap an unauthenticated caller can
+    /// grow the table freely within each TTL window. At the ceiling the route
+    /// answers `503 too_many_pending`: refusing a new enrollment is
+    /// recoverable, unbounded growth in a table an unauthenticated caller
+    /// controls is not.
+    pub max_pending_nodes: i64,
     /// The org an interim admin-minted subject is assigned to when none is
     /// specified.
     ///
@@ -156,6 +172,7 @@ impl CoordinatorConfig {
             ("pong_timeout_secs", self.pong_timeout_secs),
             ("session_ttl_secs", self.session_ttl_secs),
             ("node_token_rotate_secs", self.node_token_rotate_secs),
+            ("pending_node_ttl_secs", self.pending_node_ttl_secs),
         ] {
             if value == 0 {
                 return Err(CoordinatorError::Config(format!(
@@ -167,6 +184,13 @@ impl CoordinatorConfig {
             return Err(CoordinatorError::Config(
                 "pong_timeout_secs must exceed ping_interval_secs, or every idle \
                  connection is dropped before it can answer a ping"
+                    .to_owned(),
+            ));
+        }
+        if self.max_pending_nodes <= 0 {
+            return Err(CoordinatorError::Config(
+                "max_pending_nodes must be positive, or interactive node approval \
+                 can never succeed"
                     .to_owned(),
             ));
         }
@@ -233,6 +257,8 @@ impl Default for CoordinatorConfig {
             pong_timeout_secs: 60,
             session_ttl_secs: 12 * 60 * 60,
             node_token_rotate_secs: fleet_auth::RotationPolicy::DEFAULT.max_age_secs,
+            pending_node_ttl_secs: 15 * 60,
+            max_pending_nodes: 256,
             default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
             github: None,
         }
@@ -285,6 +311,8 @@ mod tests {
             |c| c.pong_timeout_secs = 0,
             |c| c.session_ttl_secs = 0,
             |c| c.node_token_rotate_secs = 0,
+            |c| c.pending_node_ttl_secs = 0,
+            |c| c.max_pending_nodes = 0,
         ] {
             let mut c = CoordinatorConfig::default();
             mutate(&mut c);

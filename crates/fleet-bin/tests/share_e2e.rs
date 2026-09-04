@@ -338,6 +338,11 @@ async fn agent_up_self_registers_from_an_existing_session() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),
@@ -394,6 +399,11 @@ async fn agent_up_reuses_an_existing_node_credential() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),
@@ -409,8 +419,10 @@ async fn agent_up_reuses_an_existing_node_credential() {
     assert_eq!(after, before, "a working credential must not be replaced");
 }
 
-/// Rung 4: nothing to work with. `agent up` must say so and name `--auth-key`,
-/// rather than doing nothing quietly on a machine someone is waiting on.
+/// Rung 5: nothing to work with, and no terminal to run the interactive rung
+/// on. `agent up` must name every way out — login, interactive approval, and an
+/// auth key — rather than doing nothing quietly on a machine someone is waiting
+/// on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_up_with_no_credential_at_all_explains_itself() {
     let tmp = tempfile::tempdir().unwrap();
@@ -425,6 +437,11 @@ async fn agent_up_with_no_credential_at_all_explains_itself() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),
@@ -434,8 +451,16 @@ async fn agent_up_with_no_credential_at_all_explains_itself() {
     let rendered = format!("{err:#}");
     assert!(rendered.contains("--auth-key"), "got: {rendered}");
     assert!(rendered.contains("login"), "got: {rendered}");
-    // The interactive path is task 3451; the error must not pretend otherwise.
-    assert!(rendered.contains("3451"), "got: {rendered}");
+    // A key is mintable without a shell on the coordinator (task 3454), so the
+    // remediation must point at the command that mints one.
+    assert!(rendered.contains("auth-key create"), "got: {rendered}");
+    // ... and the interactive rung exists now, so it is offered, together with
+    // why it was skipped here.
+    assert!(rendered.contains("--interactive"), "got: {rendered}");
+    assert!(
+        rendered.contains("Interactive approval was disabled"),
+        "got: {rendered}"
+    );
 }
 
 /// An explicit `--auth-key` beats a session that merely happens to be present:
@@ -469,6 +494,11 @@ async fn an_explicit_auth_key_beats_an_incidental_session() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),

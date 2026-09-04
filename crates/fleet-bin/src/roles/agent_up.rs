@@ -11,7 +11,10 @@
 //!    from `coordinator auth-key` on the coordinator host);
 //! 3. an existing `[user]` session → self-register silently (what `share`
 //!    does);
-//! 4. otherwise → an error naming `--auth-key`.
+//! 4. **interactive approval** → print a URL and a short code, and wait for a
+//!    human to run `probe-rs-fleet node approve <code>` on a machine where they
+//!    are logged in (§4.2's rung 3);
+//! 5. otherwise → an error naming all of the above.
 //!
 //! **Deviation from §4.2's ordering, deliberate:** the document lists the
 //! `[user]` session before the auth key. An explicit `--auth-key` is a
@@ -22,14 +25,13 @@
 //! **reused rather than replaced**: re-registering a working node would
 //! invalidate the token it is currently connected with, for nothing.
 //!
-//! **Path 3 of §4.2 — interactive URL + short-code approval — is not here.** It
-//! is task 3451: the coordinator has no browser-authenticated surface (`login`
-//! is the GitHub *device* flow, which by design has no `redirect_uri` and no
-//! cookie session), so an approval page cannot yet know who is looking at it.
-//! Until then, a headless machine with no credential of any kind uses
-//! `--auth-key` — which, since `probe-rs-fleet auth-key create`, any member can
-//! mint from their own laptop — and the error in [`bootstrap`] says exactly
-//! that rather than failing obscurely.
+//! Interactive approval comes **last** among the bootstrapping rungs for the
+//! same reason in reverse: it blocks for up to fifteen minutes waiting for a
+//! human, so anything that can succeed without one should. It is also gated on
+//! there being a human to wait for — `--interactive` / `--no-interactive`,
+//! defaulting to whether stdout is a terminal, so a systemd unit fails fast
+//! with the terminal error instead of printing a code into the journal and
+//! blocking on nobody.
 //!
 //! There is no key material, no CSR, and no certificate any more. The honest
 //! trade: a node token is a pure bearer credential, so anyone who reads the
@@ -37,7 +39,9 @@
 //! row is deleted — unlike a private key that never left the host. Rotation is
 //! what bounds that window.
 
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -47,6 +51,20 @@ use fleet_proto::AdoptPolicy;
 use crate::cli::{AgentArgs, AgentUpArgs};
 use crate::fleet_config::{self, FleetFile};
 use crate::roles::node_setup;
+
+/// Cap on how long the interactive rung waits, if the coordinator reports no
+/// expiry. Mirrors `login`'s constant of the same name.
+const DEFAULT_EXPIRES_IN: u64 = 900;
+
+/// Floor on the poll interval, whatever the coordinator asks for.
+const MIN_POLL_INTERVAL: u64 = 5;
+
+/// How many consecutive transport failures to tolerate while polling.
+///
+/// The human is mid-ceremony at another machine, so one dropped packet must not
+/// force them to start again; a sustained run is the coordinator being
+/// unreachable, and saying so beats polling a dead endpoint for 15 minutes.
+const MAX_TRANSPORT_RETRIES: u32 = 5;
 
 /// Run `agent up` for the given fleet: bootstrap a credential if needed, then
 /// run the agent.
@@ -81,11 +99,7 @@ pub async fn run(args: AgentUpArgs, fleet: &str, config_dir: Option<PathBuf>) ->
 /// # Errors
 ///
 /// See [`run`].
-pub async fn bootstrap(
-    args: &AgentUpArgs,
-    fleet: &str,
-    config_dir: Option<&Path>,
-) -> Result<()> {
+pub async fn bootstrap(args: &AgentUpArgs, fleet: &str, config_dir: Option<&Path>) -> Result<()> {
     let (fleet_path, node_dir) = node_setup::resolve_paths(fleet, config_dir)?;
     let existing = fleet_path
         .exists()
@@ -132,18 +146,53 @@ pub async fn bootstrap(
         // out of *this* file, so the coordinator it names is already the right
         // one.
         return finish(
-            args, fleet, &fleet_path, &node_dir, &response, &node_name, None, adopt,
+            args,
+            fleet,
+            &fleet_path,
+            &node_dir,
+            &response,
+            &node_name,
+            None,
+            adopt,
         );
     }
 
-    // Rung 4: nothing to work with. Say so, rather than doing nothing quietly
+    // Rung 4 (§4.2's rung 3): interactive approval. Nobody is logged in here
+    // and no key was handed to us, but a human may be watching this terminal.
+    if interactive_allowed(args) {
+        let (response, fleet_url, adopt) =
+            approval_flow(args, &node_name, existing.as_ref()).await?;
+        return finish(
+            args,
+            fleet,
+            &fleet_path,
+            &node_dir,
+            &response,
+            &node_name,
+            Some(&fleet_url),
+            adopt,
+        );
+    }
+
+    // Rung 5: nothing to work with. Say so, rather than doing nothing quietly
     // on a machine somebody is waiting on.
+    let skipped = if args.interactive_choice() == Some(false) {
+        "(Interactive approval was disabled with --no-interactive.)"
+    } else {
+        "(Interactive approval was skipped: this is not a terminal, so there is nobody\n\
+         \x20here to read a code. Pass --interactive to run it anyway — when you are\n\
+         \x20tailing this log, say.)"
+    };
     anyhow::bail!(
         "fleet `{fleet}` has no [node] credential and no way to obtain one on this machine.\n\
          \n\
          Either log in first, then bring the agent up:\n\
          \x20   probe-rs-fleet login --fleet {fleet} --fleet-url <url>\n\
          \x20   probe-rs-fleet agent up --fleet {fleet}\n\
+         \n\
+         ...or have somebody approve this machine from theirs. Run this where you\n\
+         can read the output, and give them the code it prints:\n\
+         \x20   probe-rs-fleet agent up --fleet {fleet} --fleet-url <url> --interactive\n\
          \n\
          ...or enroll unattended with a key. Mint one on a machine where you are\n\
          logged in — no shell on the coordinator needed:\n\
@@ -152,9 +201,155 @@ pub async fn bootstrap(
          \x20   probe-rs-fleet agent up --fleet {fleet} --fleet-url <url> --auth-key <key>\n\
          (Self-hosted, with a shell on the coordinator: `coordinator auth-key`.)\n\
          \n\
-         (Interactive URL + short-code approval, for a headless machine with no key,\n\
-         is not implemented yet — see task 3451.)"
+         {skipped}"
     )
+}
+
+/// Whether the interactive-approval rung may run.
+///
+/// Auto by default: a terminal means somebody can read the code; no terminal
+/// means a systemd unit that would otherwise print a code into the journal and
+/// block for fifteen minutes on nobody. `--interactive` forces it on anyway,
+/// for the "I am tailing this log" case, and `--no-interactive` forces it off.
+fn interactive_allowed(args: &AgentUpArgs) -> bool {
+    args.interactive_choice()
+        .unwrap_or_else(|| std::io::stdout().is_terminal())
+}
+
+/// Rung 4: print a URL and a short code, and wait for a human to approve.
+///
+/// Mirrors [`crate::roles::login`]'s device flow closely and deliberately — the
+/// two are the same ceremony from opposite ends and should be read side by
+/// side. Two differences, both intentional:
+///
+/// * **no browser is opened.** This machine is, by assumption, not where the
+///   human is; a browser here would open on the wrong computer.
+/// * both the URL *and* the command are printed, always. The URL is the
+///   discoverable half (it explains the ceremony to somebody who has never seen
+///   it) and the command is the operative half, and a headless box has no
+///   browser to open either way.
+///
+/// Adopt default: `auto`. A human is approving this live, which is the `share`
+/// situation rather than the disk-image one.
+async fn approval_flow(
+    args: &AgentUpArgs,
+    node_name: &str,
+    existing: Option<&FleetFile>,
+) -> Result<(TokenResponse, String, AdoptPolicy)> {
+    let fleet_url = args
+        .fleet_url
+        .clone()
+        .or_else(|| existing.map(|f| f.url.clone()))
+        .context(
+            "interactive approval needs --fleet-url too: this machine has no fleet \
+             config naming a coordinator yet",
+        )?;
+    let pin = pin_of(args)?;
+    let adopt = args.adopt.map_or(AdoptPolicy::Auto, Into::into);
+
+    let grant = fleet_auth::http_client::node_register_start(
+        &fleet_url,
+        pin,
+        node_name,
+        args.tag.clone(),
+        Some(adopt.as_str()),
+    )
+    .await
+    .map_err(|e| describe_start_error(&e))?;
+
+    // Printed before any polling: on a headless box this output *is* the
+    // interface, and a failure afterwards must still leave the human with the
+    // code in front of them.
+    println!();
+    println!("  Open       {}", grant.verification_uri);
+    println!(
+        "  Then run   probe-rs-fleet node approve {}",
+        grant.user_code
+    );
+    println!();
+    println!("...on a machine where you are logged in. Waiting for approval…");
+
+    let expires_in = if grant.expires_in == 0 {
+        DEFAULT_EXPIRES_IN
+    } else {
+        grant.expires_in
+    };
+    let deadline = Instant::now() + Duration::from_secs(expires_in);
+    let mut interval = grant.interval.max(MIN_POLL_INTERVAL);
+    // As in `login`: the pending registration stays valid for its whole
+    // lifetime whatever our socket did, so a dropped packet must not force the
+    // human to start over. Only a *run* of failures means the coordinator is
+    // genuinely unreachable.
+    let mut consecutive_transport_failures = 0_u32;
+
+    loop {
+        if Instant::now() >= deadline {
+            anyhow::bail!(EXPIRED);
+        }
+        tokio::time::sleep(Duration::from_secs(interval)).await;
+
+        match fleet_auth::http_client::node_register_poll(&fleet_url, pin, &grant.device_secret)
+            .await
+        {
+            Ok(response) => return Ok((response, fleet_url, adopt)),
+            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => {
+                consecutive_transport_failures = 0;
+                match code.as_str() {
+                    "authorization_pending" => {}
+                    // The coordinator does not send this today (it has no rate
+                    // limiting at all), but additive back-off is the correct
+                    // response if it ever starts.
+                    "slow_down" => interval = interval.saturating_add(5),
+                    "access_denied" => anyhow::bail!(
+                        "the request was denied. That code is spent and nothing was enrolled."
+                    ),
+                    "expired_token" => anyhow::bail!(EXPIRED),
+                    other => {
+                        anyhow::bail!("the coordinator rejected the registration ({other})")
+                    }
+                }
+            }
+            Err(e) => {
+                consecutive_transport_failures += 1;
+                if consecutive_transport_failures > MAX_TRANSPORT_RETRIES {
+                    return Err(anyhow::anyhow!(
+                        "polling the coordinator failed {consecutive_transport_failures} times \
+                         in a row: {e}"
+                    ));
+                }
+                tracing::debug!(error = %e, "transient failure polling the coordinator; retrying");
+            }
+        }
+    }
+}
+
+/// What to say when nobody approved in time. One sentence, two call sites.
+const EXPIRED: &str = "nobody approved this machine before the code expired; run \
+                       `probe-rs-fleet agent up` again for a fresh one";
+
+/// Turn a `/node/register/start` failure into remediation-shaped text.
+fn describe_start_error(e: &fleet_auth::http_client::ClientError) -> anyhow::Error {
+    let fleet_auth::http_client::ClientError::Rejected { code, status } = e else {
+        return anyhow::anyhow!("could not ask the coordinator for an approval code: {e}");
+    };
+    let hint = match code.as_str() {
+        "invalid_request" => {
+            "the node name or a tag was refused: each may be letters, digits, \
+             `.`, `_` and `-` only. Pass `--node-name <name>` explicitly if this \
+             machine's hostname is unusual"
+        }
+        "too_many_pending" => {
+            "the coordinator is already holding as many registrations awaiting \
+             approval as it will. Try again in a few minutes, once the abandoned \
+             ones expire, or ask its operator to raise `max_pending_nodes`"
+        }
+        _ => {
+            return anyhow::anyhow!(
+                "could not ask the coordinator for an approval code ({status}): {code}"
+            )
+        }
+    };
+    anyhow::anyhow!("could not start interactive approval ({status}): {hint}")
 }
 
 /// Rung 2: redeem an auth key for a node token.

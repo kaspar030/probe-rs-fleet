@@ -174,6 +174,11 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&pi),
@@ -253,6 +258,11 @@ async fn revoking_a_minted_key_stops_it_enrolling() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&pi),

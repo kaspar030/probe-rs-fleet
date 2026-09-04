@@ -135,6 +135,10 @@ Routes:
 | `POST /auth/device/*` | `login` | GitHub device-flow start/poll (§6.4) |
 | `POST /auth/token` | CI, nodes | token exchange (workload OIDC, auth keys) |
 | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys (§6.4) |
+| `POST /node/register/start` | headless nodes | begin an approval-pending registration (§4.2 rung 3) |
+| `POST /node/register/poll` | headless nodes | redeem an approved registration for a node token |
+| `POST /node/register/approve` | org members | inspect / approve / deny a pending registration |
+| `GET /node/approve` | anyone | static page: what to run to approve one |
 | `GET /healthz` | proxy | liveness |
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
@@ -305,8 +309,12 @@ probe-rs-fleet share
 probe-rs-fleet ctl list
 probe-rs-fleet ctl lease --select 'tag=nrf52'
 
-# 5. A headless Pi in the lab: prints a URL + code; approve it in your browser.
-#    (NOT YET IMPLEMENTED — task 3451. Use 5b until then.)
+# 5. A headless Pi in the lab: prints a URL + code; a colleague approves it
+#    from a machine where they are logged in.
+#      probe-rs-fleet agent up --fleet-url <url>       (on the Pi)
+#      probe-rs-fleet node approve ABCD-1234           (on their laptop)
+#    Nothing long-lived is copy-pasted, and the credential is bound at
+#    approval time. For an unattended image, use 5b instead.
 probe-rs-fleet agent up --fleet-url https://fleet.example.com
 
 # 5b. …or, for an unattended image, a pre-minted auth key. Mint it on your
@@ -428,29 +436,43 @@ It obtains a node token by whichever of these applies, in order:
 2. **An existing `[user]` session** (i.e. `login` has run here) — self-register
    silently against your org. This is what `share` does; membership is
    sufficient, no admin approval (decided).
-3. **Interactive approval** — print a URL + short code; the user approves in a
-   browser on any machine. This is the headless-Pi path, and it replaces the
-   copy-paste of a bootstrap token.
+3. **Interactive approval** — print a URL + short code; a human approves from a
+   machine where they are already logged in (`probe-rs-fleet node approve
+   ABCD-1234`). This is the headless-Pi path, and it replaces the copy-paste of
+   a bootstrap token.
 4. **An auth key** (`--auth-key`) — org-scoped, expiring, optionally
    single-use, carrying default tags. This is the unattended/image path.
 
-> **Implementation status (task 3448).** Rungs 1, 2 and 4 ship; **rung 3 is
-> deferred to task 3451**. The coordinator has no browser-authenticated
-> surface — `login` is the GitHub *device* flow, which by design has no
-> `redirect_uri` and no cookie session (§6.4) — so an approval page cannot yet
-> know who is looking at it, and building one means an OAuth redirect flow plus
-> cookies, which contradicts §6.4 and reopens §10 Q6. Until 3451 lands, a
-> headless machine with no credential uses `--auth-key`, and `agent up` says so
-> rather than failing silently.
+> **Implementation status (task 3451).** All four rungs ship. Rung 3's approval
+> is a **CLI verb, not a browser form**, and that is a decision rather than an
+> unfinished edge: `login` is the GitHub *device* flow, which by design has no
+> `redirect_uri` and no cookie session (§6.4), so a page served by the
+> coordinator cannot know who is looking at it. Building one would mean an OAuth
+> redirect flow plus cookies in the coordinator, which contradicts §6.4 and
+> reopens §10 Q6. `GET /node/approve` is therefore an *informational* page that
+> says what to run.
 >
-> **User-mintable auth keys (task 3454) change rung 3's urgency, not its
-> value.** Rung 4's key no longer requires a shell on the coordinator: a member
-> mints one on their laptop with `probe-rs-fleet auth-key create` and pastes it
-> into the Pi, so headless enrollment is now possible for a hosted customer
-> without 3451. What rung 3 still buys that this does not: nothing long-lived is
-> copy-pasted, and the credential is bound at approval time. Whether 3451 ships
-> is therefore a judgement about that advantage, not about whether a customer
-> can enroll a Pi at all.
+> The design deliberately does not foreclose a real browser flow later.
+> Approval is keyed by `user_code` and is a pure function of `(code, decision,
+> authenticated user)`, factored so that a future cookie-authenticated handler
+> resolves its subject its own way and calls the same function; the node-side
+> wire contract (`start` / `poll`) never learns which mechanism approved it, so
+> adding one is additive and deployed agents keep working; and the page that
+> would grow the form already exists at the URL agents already print.
+>
+> **The rung is gated on there being a human.** `--interactive` /
+> `--no-interactive`, defaulting to whether stdout is a terminal: a service unit
+> with no tty fails fast with remediation instead of printing a code into its
+> journal and blocking for fifteen minutes on nobody. It is also tried **last**
+> among the bootstrapping rungs, for the same reason in reverse — anything that
+> can succeed without a human should.
+>
+> **User-mintable auth keys (task 3454) changed rung 3's urgency, not its
+> value.** Rung 4's key no longer requires a shell on the coordinator, so
+> headless enrollment was already possible for a hosted customer without rung 3.
+> What rung 3 buys that a key does not: nothing long-lived is copy-pasted, and
+> the credential is bound at approval time rather than minted in advance and
+> carried around. That property is why it was built.
 >
 > One **deliberate deviation** from the order above: an explicit `--auth-key`
 > beats an existing `[user]` session. Passing it is a deliberate act — a
@@ -695,17 +717,67 @@ is no rate limiting in the coordinator yet):
 |---|---|---|
 | **User** (laptop) | `login` — GitHub device flow | browser, once |
 | **Node, user present** | `share` — reuses the session to self-register | zero extra steps |
-| **Node, headless** | `agent up` prints URL + code; approve in a browser (task 3451) | no token copy-paste |
+| **Node, headless** | `agent up` prints a URL + code; a member runs `node approve <code>` | no token copy-paste |
 | **Node, unattended** | pre-minted **auth key** (org-scoped, expiring, tagged) | one paste, revocable |
 | **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token` | zero secrets |
 | **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
+
+**Interactive node approval** (`agent up` rung 3, §4.2) reuses this ceremony's
+shape for a machine rather than a human, and inherits a sharper version of its
+second risk. The mechanics: the machine posts to `/node/register/start`, prints
+a ~40-bit Crockford-base32 `user_code` (`ABCD-1234`) and polls; a member runs
+`probe-rs-fleet node approve ABCD-1234` from a machine where they are logged in,
+which binds the pending row to **their** org and user; the machine's next poll
+mints its node token through the same code path `share` uses, so the resulting
+`node` row is identical. Three decisions and three accepted risks:
+
+- **Approval is a CLI verb, not a browser form**, for the reason §4.2 records:
+  the device flow has no cookie session, so a coordinator-served page cannot
+  know who is looking at it. `GET /node/approve` is informational and
+  **reflects nothing** — no code in the URL, no query parameter echoed — so it
+  cannot become a confused-deputy surface.
+- **Membership is sufficient to approve**, as it is to `share`, and the node is
+  owned by the approver (`node.owner_user_id`).
+- **Approval refuses to take over an existing node.** The requesting machine
+  chooses its own `node_name` *before any org is known*, and `register_node_full`
+  is an upsert, so approving a name the approver's org already uses would
+  re-credential the running machine and knock it off the fleet. The handler (not
+  just the CLI) refuses that with `409 node_name_taken` unless `--replace` is
+  passed, and the approval output names the collision loudly.
+
+Accepted risks, recorded rather than fixed:
+
+- **Remote phishing** (RFC 8628 §5.4) again, and worse than for login: the
+  approver grants *hardware access in their org to a machine they cannot see*,
+  on the strength of a code somebody read out. Mitigations: the approval verb
+  inspects first and prints the requested name, tags, adoption policy, source IP
+  and age; it says in as many words that you cannot see the machine and should
+  approve only an enrollment you started; confirmation defaults to **no** and a
+  non-tty is refused rather than defaulted. Every field it prints comes from an
+  unauthenticated request, so names and tags are charset-validated server-side
+  and neutered again client-side — otherwise ANSI escapes in a name could
+  repaint the warning itself.
+- **Cross-tenant code enumeration.** An authenticated member who guesses a
+  `user_code` can inspect, and approve into their own org, a registration
+  somebody in another org started. Bounded by ~40 bits behind a 15-minute TTL
+  (blind enumeration is infeasible even unthrottled), by every attempt being
+  audited, and — the control that lets the *victim* notice rather than only an
+  auditor afterwards — by the enrolling machine printing which org it landed in.
+- **Unauthenticated database growth.** This is **not** covered by the device
+  flow's quota-exhaustion bullet above, and conflating the two is how the gap
+  would survive review: the device flow is *stateless*, whereas
+  `/node/register/start` writes a row holding caller-chosen strings.
+  `max_pending_nodes` (default 256) caps the live set and the TTL sweep reclaims
+  it; there is no per-source throttle. The honest cost of the cap is that a full
+  table refuses legitimate enrollments until abandoned rows age out.
 
 **Auth keys are mintable by any member, over the API** (`POST /auth/keys`,
 `probe-rs-fleet auth-key create|list|revoke`). This closes the last surviving
 piece of the revision-1 operator-rooted funnel: minting used to require a shell
 on the coordinator host, which a hosted customer does not have, so "node,
-unattended" was unreachable for them while "node, headless" is deferred (§4.2
-rung 3). Three decisions, recorded:
+unattended" was unreachable for them at all. ("Node, headless" — §4.2 rung 3 —
+now ships too, and is the better path when a human is available to approve; a
+key is the right answer for a disk image.) Three decisions, recorded:
 
 - **Membership is sufficient to mint and to list**, consistent with "membership
   is enough to add a node" in §6.5. A key grants nothing a member could not

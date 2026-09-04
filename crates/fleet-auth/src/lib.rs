@@ -34,6 +34,7 @@
 pub mod rotation;
 pub mod store;
 pub mod token;
+pub mod user_code;
 pub mod verify;
 
 #[cfg(feature = "client")]
@@ -273,5 +274,134 @@ pub mod api {
     pub struct ErrorResponse {
         /// A short machine-readable code (`invalid_grant`, `invalid_request`).
         pub error: String,
+    }
+
+    /// Begin an approval-pending node registration (architecture §4.2 rung 3).
+    ///
+    /// Unauthenticated by construction: the machine sending it has no
+    /// credential of any kind — that is what the ceremony is for. Everything
+    /// in it is therefore **attacker-controlled**, and the coordinator
+    /// validates `node_name` and each tag against a conservative charset
+    /// before storing them, because they are later rendered into a human
+    /// approver's terminal.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NodeRegisterStartRequest {
+        /// The machine's self-chosen name. Advisory; it names the row.
+        pub node_name: String,
+        /// Optional selection tags to record on the node.
+        #[serde(default)]
+        pub tags: Vec<String>,
+        /// Probe adoption policy (`auto` | `declared`). Absent means this
+        /// grant's default, `auto` — a human is approving this enrollment
+        /// live, which is the `share` situation rather than the disk-image
+        /// one. An unrecognised value is a `400`, never a silent default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub adopt: Option<String>,
+    }
+
+    /// The pending registration, as the enrolling machine sees it.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NodeRegisterStartResponse {
+        /// The short code a human types into `node approve`, hyphenated for
+        /// display (`ABCD-1234`).
+        pub user_code: String,
+        /// This machine's poll credential (`prfnd1_…`). Never presented as a
+        /// connection credential; it is redeemed at `/node/register/poll`.
+        pub device_secret: String,
+        /// Where a human can read what to do (`<public_url>/node/approve`).
+        ///
+        /// Deliberately carries **no code**: the page reflects nothing, so it
+        /// can never become a confused-deputy or injection surface. The code
+        /// is printed separately by the enrolling machine, exactly as GitHub's
+        /// device flow does.
+        pub verification_uri: String,
+        /// Minimum seconds between polls.
+        pub interval: u64,
+        /// Seconds until the pending registration expires.
+        pub expires_in: u64,
+    }
+
+    /// A poll for the outcome of a pending node registration.
+    ///
+    /// Success is the ordinary [`TokenResponse`] — the same shape
+    /// `SelfRegister` returns, because it is minted by the same code path.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NodeRegisterPollRequest {
+        /// The device secret from [`NodeRegisterStartResponse`].
+        pub device_secret: String,
+    }
+
+    /// What an approver is doing with a pending registration.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NodeApprovalDecision {
+        /// Describe the pending registration without changing anything.
+        ///
+        /// The CLI always inspects first: an approver is granting hardware
+        /// access in their org to a machine they cannot see, so they must be
+        /// shown what they are approving (RFC 8628 §5.4, sharpened).
+        Inspect,
+        /// Bind the pending registration to the approver's org and user.
+        Approve,
+        /// Refuse it permanently.
+        Deny,
+    }
+
+    /// An approval request, authenticated with `Authorization: Bearer <session>`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NodeApprovalRequest {
+        /// The short code, in any spelling `fleet_auth::user_code::normalise`
+        /// accepts.
+        pub user_code: String,
+        /// Inspect, approve or deny.
+        pub decision: NodeApprovalDecision,
+        /// Approve even though the requested node name already exists in the
+        /// approver's org, re-credentialing (and thereby taking over) that
+        /// node.
+        ///
+        /// Default `false`, and the refusal is enforced by the **handler**:
+        /// the requesting machine chose `node_name` before any org existed, so
+        /// without this guard an approver could be talked into silently
+        /// handing over a production node.
+        #[serde(default)]
+        pub replace: bool,
+    }
+
+    /// A pending registration as an approver sees it.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NodeApprovalResponse {
+        /// The code, hyphenated for display.
+        pub user_code: String,
+        /// The name the machine asked for. **Attacker-controlled**: render it
+        /// defensively.
+        pub node_name: String,
+        /// The tags it asked for. Attacker-controlled, as above.
+        pub tags: Vec<String>,
+        /// The adoption policy it asked for (`auto` | `declared`).
+        pub adopt: String,
+        /// The source address the coordinator saw, if any.
+        ///
+        /// **Advisory.** Behind the expected reverse proxy this is the proxy's
+        /// address, and `X-Forwarded-For` is deliberately not trusted — an
+        /// unauthenticated header would let the requester choose what the
+        /// approver sees, which is worse than showing nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub source_ip: Option<String>,
+        /// When the registration was started (epoch seconds).
+        pub created_at: i64,
+        /// When it expires (epoch seconds).
+        pub expires: i64,
+        /// The org it was bound to, once approved.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub org: Option<String>,
+        /// `pending` | `approved` | `denied`.
+        pub state: String,
+        /// The existing node id this registration would re-credential, if the
+        /// approver's org already has a node by the requested name.
+        ///
+        /// Resolved at `Inspect` time and not before: there is no org until
+        /// approval, so the collision cannot be known any earlier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub collides_with: Option<String>,
     }
 }

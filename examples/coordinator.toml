@@ -129,6 +129,24 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # retry rather than a trip to the lab to re-provision a headless Pi.
 # node_token_rotate_secs = 604800
 
+# How long (seconds) a node registration awaiting interactive approval lives
+# (architecture §4.2 rung 3). Default: 900 (15 minutes).
+#
+# Short on purpose. The short code a waiting machine prints is only ~40 bits and
+# is guessable by construction, so this TTL is half of what bounds enumeration
+# (the other half being that every approval attempt is audited).
+# pending_node_ttl_secs = 900
+
+# Ceiling on how many node registrations may be awaiting approval at once.
+# Default: 256.
+#
+# POST /node/register/start is necessarily unauthenticated AND writes a row —
+# unlike the device flow, which is stateless — so without a cap anyone who can
+# reach the coordinator can grow that table freely within each TTL window. At
+# the ceiling the route answers 503 `too_many_pending`. The honest cost: a full
+# table refuses legitimate enrollments too, until abandoned rows age out.
+# max_pending_nodes = 256
+
 # The org the INTERIM admin verbs (`auth-key`, `user-token`) default to when the
 # operator names none. Default: "default".
 #

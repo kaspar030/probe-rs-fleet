@@ -132,6 +132,11 @@ async fn auth_key_to_agent_up_yields_a_working_node_token() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),
@@ -270,6 +275,11 @@ async fn agent_up_refuses_an_invalid_auth_key_and_writes_nothing() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),
@@ -322,6 +332,11 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
             adopt: None,
             server_cert_sha256: None,
             force: false,
+            // Explicit rather than relying on the tty auto-detection: these
+            // tests assert the other rungs, and a test runner attached to a
+            // terminal must not send them into a 15-minute approval wait.
+            interactive: false,
+            no_interactive: true,
         },
         "default",
         Some(&config_dir),
