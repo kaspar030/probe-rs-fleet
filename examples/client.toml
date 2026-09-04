@@ -2,36 +2,54 @@
 #
 # This is a fully-commented reference for the client config used by BOTH the
 # `ctl` admin CLI and the `probe-rs` sidecar shim. Both discover the coordinator
-# endpoint and client credentials here when the explicit flags / env vars are
-# absent. Discovered at the per-profile XDG default path
+# and the session token here when the explicit flags / env vars are absent.
+# Discovered at the per-profile XDG default path
 #   $XDG_CONFIG_HOME/probe-rs-fleet/client/<profile>/client.toml
 #   (i.e. ~/.config/probe-rs-fleet/client/<profile>/client.toml).
 # Select a profile with `--profile <name>` or PROBE_RS_FLEET_PROFILE (default
 # `default`); selection precedence is `--config` > `--profile`/env > `default`.
 #
-# Bootstrap enrollment (runtime auth stays mTLS; the token is bootstrap-only):
-#   coordinator:  coordinator enroll alice --kind client   (prints a token)
-#   client host:  ctl init --profile ci --token <token>
-#                 (server-cert-pinned bootstrap TLS -> local CSR -> CA-signed
-#                  client cert, written below)
+# Setup:
+#   coordinator:  coordinator user-token alice        (prints `prfs1_…`)
+#   client host:  ctl init --profile ci \
+#                   --fleet-url https://fleet.example --token <token>
 #   run:          ctl --profile ci list
 #
-# Precedence: explicit flag / env var > this file.
+# Precedence: explicit flag / env var > this file. Both roles now read the SAME
+# three variables — the sidecar's separate `_CLIENT_CERT` / `_CLIENT_KEY` /
+# `_CA` names went away with the certificates:
 #
-#   ctl     reads PROBE_RS_FLEET_COORDINATOR / _CERT / _KEY / _CA
-#   sidecar reads PROBE_RS_FLEET_COORDINATOR / _CLIENT_CERT / _CLIENT_KEY / _CA
+#   PROBE_RS_FLEET_COORDINATOR         the base URL below
+#   PROBE_RS_FLEET_TOKEN               the session token below
+#   PROBE_RS_FLEET_SERVER_CERT_SHA256  the optional pin below
 #
-# (The sidecar uses different cert/key env var names; the shim maps this file
-# into both naming schemes for keys you have not already set.)
+# ---------------------------------------------------------------------------
+# THIS FILE HOLDS A BEARER CREDENTIAL — keep it 0600
+# ---------------------------------------------------------------------------
+#
+# `ctl init` writes it 0600. Anyone who can read `token` can act as you until it
+# expires, which is why session tokens are short-lived and refreshable: the TTL
+# is what bounds the damage.
+#
+# Note there is no way to state *who you are* here. The subject comes from the
+# token and from nowhere else — the old `PROBE_RS_FLEET_SUBJECT_ID` override let
+# a client assert its own identity to the coordinator, and it is gone.
 
-# `host:port` of the coordinator to connect to.
-coordinator = "coordinator.example:7000"
+# Base URL of the coordinator to connect to. A bare `host:port` is accepted and
+# assumes https.
+fleet_url = "https://fleet.example"
 
-# Client certificate chain (PEM), issued via bootstrap enrollment.
-cert = "/home/alice/.local/share/probe-rs-fleet/client/ci/client-cert.pem"
+# Your bearer session token. Short-lived; refresh it at POST /auth/token (or
+# re-run `ctl init` with a freshly minted one).
+token = "prfs1_0000000000000000000000000000000000000000000"
 
-# Client private key (PEM). Generated locally during enrollment. Keep this 0600.
-key = "/home/alice/.local/share/probe-rs-fleet/client/ci/client-key.pem"
+# ---------------------------------------------------------------------------
+# Optional keys
+# ---------------------------------------------------------------------------
 
-# CA used to verify the coordinator's server certificate (PEM).
-ca = "/home/alice/.local/share/probe-rs-fleet/client/ci/client-ca.pem"
+# Pin the coordinator's server certificate by its SHA-256 (64 hex chars).
+#
+# For a SELF-HOSTED coordinator with no publicly trusted certificate. Without it
+# the coordinator is verified against the public web PKI roots. Read it with:
+#   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
+# server_cert_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"

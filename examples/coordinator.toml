@@ -7,38 +7,59 @@
 # unless overridden with `--config` or the PROBE_RS_FLEET_CONFIG env var.
 #
 # `probe-rs-fleet coordinator init` generates a populated version of this file
-# alongside fresh signing/TLS material under the data dir
+# alongside a fresh signing seed under the data dir
 #   $XDG_DATA_HOME/probe-rs-fleet/coordinator/  (i.e.
 #   ~/.local/share/probe-rs-fleet/coordinator/).
 #
-# Enrollment flow (runtime auth stays mTLS; the token is bootstrap-only):
+# ---------------------------------------------------------------------------
+# Deployment shape (architecture §3.5)
+# ---------------------------------------------------------------------------
+#
+# The coordinator is an HTTP server. Four routes:
+#
+#   GET  /healthz      liveness, for the proxy
+#   GET  /agent        WebSocket upgrade — a node's persistent control plane
+#   GET  /client       WebSocket upgrade — ctl and the probe-rs sidecar
+#   POST /auth/token   JSON credential exchange (node enrollment, session refresh)
+#
+# Every principal presents `Authorization: Bearer …` on the upgrade. There are
+# no client certificates, no private CA, and no mTLS.
+#
+# The expected deployment puts an HTTPS reverse proxy in front: it terminates
+# TLS and routes by path, which is exactly what the WebSocket transport bought
+# (the pre-revision-2 length-prefixed TCP protocol could not be proxied at all).
+# The coordinator then listens on loopback and speaks plain HTTP. Set `[tls]`
+# below only when you are self-hosting with no proxy.
+#
+# Bootstrap:
 #   1. coordinator init
-#   2. coordinator enroll <id>   --kind agent   [--ttl <secs>]   (prints a token)
-#      coordinator enroll <user> --kind client  [--ttl <secs>]   (prints a token)
-#   3. on the target host: agent init / ctl init --profile <p> --token <token>
-#      (opens a server-cert-pinned bootstrap TLS connection, generates a local
-#       keypair + CSR, and receives a CA-signed client cert)
-#   4. agent --profile <p>  /  ctl --profile <p> …   (full mTLS at runtime)
+#   2. coordinator user-token <you>          (prints a session token) [INTERIM]
+#      ctl init --fleet-url <url> --token <token>
+#   3. coordinator auth-key                  (prints an auth key)     [INTERIM]
+#      on the node: agent init --fleet-url <url> --auth-key <key>
+#
+# Both minting verbs are marked INTERIM: they create credentials from a shell on
+# this host, bypassing any login flow. Once the GitHub device flow lands they
+# become the unattended / air-gapped escape hatch rather than the front door.
 
 # ---------------------------------------------------------------------------
 # Required keys
 # ---------------------------------------------------------------------------
 
-# TCP address the coordinator listens on for inbound mTLS connections.
-listen_addr = "0.0.0.0:7000"
+# TCP address the coordinator listens on.
+#
+# Loopback by default: with a proxy in front, the coordinator itself need not be
+# reachable from outside the host, and binding a public interface should be a
+# deliberate act rather than a default.
+listen_addr = "127.0.0.1:7000"
 
-# Coordinator's server certificate chain (PEM). Presented to agents/sidecars.
-tls_cert = "/var/lib/probe-rs-fleet/coordinator/coordinator-cert.pem"
-
-# Coordinator's server private key (PEM). Keep this 0600.
-tls_key = "/var/lib/probe-rs-fleet/coordinator/coordinator-key.pem"
-
-# CA used to verify client (agent / sidecar) certificates (PEM).
-client_ca = "/var/lib/probe-rs-fleet/coordinator/client-ca.pem"
-
-# Client CA private key (PEM). Used to sign CSRs during bootstrap enrollment
-# (`coordinator enroll` -> `agent/ctl init`). Keep this 0600.
-client_ca_key = "/var/lib/probe-rs-fleet/coordinator/client-ca-key.pem"
+# The externally reachable base URL agents and clients DIAL to reach this
+# coordinator — what you pass to `agent init --fleet-url` / `ctl init
+# --fleet-url`.
+#
+# Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
+# listens on loopback and the world reaches it at a name it never sees.
+public_url = "https://fleet.example"
 
 # SQLite database file for fleet state (created on first run).
 sqlite_path = "/var/lib/probe-rs-fleet/coordinator/coordinator.sqlite"
@@ -47,7 +68,9 @@ sqlite_path = "/var/lib/probe-rs-fleet/coordinator/coordinator.sqlite"
 # Signing key — set EXACTLY ONE of the following.
 #
 # The capability-token signing key is a 32-byte ed25519 seed, encoded as 64
-# lowercase hex characters.
+# lowercase hex characters. It signs the per-lease capability tokens agents
+# verify locally; it is unrelated to the bearer tokens principals authenticate
+# with.
 # ---------------------------------------------------------------------------
 
 # Option A: path to a file holding the 64-hex-char seed (recommended; 0600).
@@ -60,22 +83,64 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # Optional keys
 # ---------------------------------------------------------------------------
 
-# Address (`host:port`) that agents / clients should DIAL to reach this
-# coordinator. Embedded into enrollment tokens by `coordinator enroll`.
-#
-# Must be ROUTABLE — not the wildcard `0.0.0.0` / `::` used above for
-# `listen_addr`. When unset, `enroll` falls back to `listen_addr` and errors if
-# that is a wildcard. Override per-invocation with `enroll --coordinator-addr`.
-# advertise_addr = "192.168.1.10:7000"
-
 # How often (seconds) the lease-expiry sweep runs. Default: 5.
 # sweep_interval_secs = 5
 
-# The org every authenticated subject is assigned to. Every object in the fleet
-# belongs to exactly one org (architecture revision 2 §6.1); until GitHub login
-# exists, the mTLS resolution seam puts every caller in this one. Default:
-# "default".
+# WebSocket keepalive.
+#
+# Load-bearing, not cosmetic: a reverse proxy reaps idle WebSockets on a timeout
+# nobody here controls, and a lab node's connection is idle most of the time.
+# Without keepalive the control plane evaporates every few minutes and the
+# agent's reconnect backoff becomes the primary mechanism rather than the
+# fallback.
+#
+# `pong_timeout_secs` must EXCEED `ping_interval_secs`, or every idle connection
+# is dropped before it can answer a ping. The config validator rejects that.
+# ping_interval_secs = 20
+# pong_timeout_secs  = 60
+
+# How long (seconds) a user session token is valid before it must be refreshed
+# at POST /auth/token. Short by design: a session token is a pure bearer
+# credential, so its TTL is what bounds the value of a leak. Default: 43200 (12h).
+# session_ttl_secs = 43200
+
+# How old (seconds) a node token may get before the coordinator pushes a
+# replacement down the established connection. Default: 604800 (7 days).
+#
+# Rotation is ack-then-retire: the old token stays valid until the node
+# acknowledges the new one, so a push lost to a dropped connection costs one
+# retry rather than a trip to the lab to re-provision a headless Pi.
+# node_token_rotate_secs = 604800
+
+# The org the INTERIM admin verbs (`auth-key`, `user-token`) default to when the
+# operator names none. Default: "default".
+#
+# This is NOT consulted when a connection authenticates: a node's org comes from
+# its own row and a user's from the session token's, so a credential cannot be
+# replayed into another tenant.
 # default_org = "default"
+
+# ---------------------------------------------------------------------------
+# Coordinator-terminated TLS (optional; self-hosted only)
+# ---------------------------------------------------------------------------
+#
+# OMIT this table when a reverse proxy terminates TLS — that is the expected
+# deployment, and the coordinator then serves plain HTTP on loopback.
+#
+# Set both paths to have the coordinator terminate TLS itself:
+#
+# [tls]
+# cert = "/etc/letsencrypt/live/fleet.example/fullchain.pem"
+# key  = "/etc/letsencrypt/live/fleet.example/privkey.pem"
+#
+# With a SELF-SIGNED certificate (no public DNS name), clients cannot verify it
+# against the public web PKI, so they pin it by SHA-256 instead. Read the
+# fingerprint with:
+#
+#   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
+#
+# and pass it as `--server-cert-sha256 <64 hex chars>` to `agent init` /
+# `ctl init`. This is the one surviving piece of the deleted pinning code.
 
 # Lease scheduling policy. Omit the whole block to accept all defaults (shown).
 [policy]
@@ -92,18 +157,3 @@ max_duration_interactive = 14400
 max_concurrent_per_subject = 2
 # Default TTL (seconds) applied when a request omits a duration. Default: 900.
 default_ttl_secs = 900
-
-# Pinned agents: map a client certificate fingerprint to the agent id it is
-# allowed to claim. NOTE: bootstrap enrollment records agent pins AUTOMATICALLY
-# in the coordinator database (the issued agent cert's fingerprint is pinned to
-# its agent id on enrollment), so this section is OPTIONAL — use it only to
-# pre-seed pins by hand. The key is the LOWERCASE HEX SHA-256 of the agent
-# certificate's DER bytes — no `sha256:` prefix, no colons (exactly what
-# `fleet_tls::cert_fingerprint` produces). Reproduce it from a PEM with:
-#
-#   openssl x509 -in agent.pem -outform der | openssl dgst -sha256
-#
-# (or `openssl x509 -in agent.pem -noout -fingerprint -sha256`, then strip the
-# colons and lowercase). Example (64 hex chars):
-[pinned_agents]
-# "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" = "agent-01"

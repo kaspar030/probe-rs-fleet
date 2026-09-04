@@ -94,3 +94,78 @@ proxies). The result is a static `probe-rs` that runs on the Pi.
   rule matching the probe's `idVendor` (e.g. `1366` for SEGGER J-Link) granting
   group/world access. (A proper packaged install should ship this.)
 - The agent needs `probe-rs` on its `PATH` (e.g. install to `/usr/local/bin`).
+
+## The WebSocket stack (architecture revision 2)
+
+Revision 2 moved the control plane from a bespoke length-prefixed TCP protocol
+to **binary WebSocket messages over HTTPS** (§3.5), so it can sit behind an
+ordinary reverse proxy. That drags a whole HTTP stack into a binary whose job is
+to run on diverse ARM Pis, which is exactly the constraint that forced `ring`
+over `aws-lc-rs` in the first place — so it was verified before any of the code
+was written, and re-verified before hand-off.
+
+**Result: a statically linked 32-bit ARM ELF with zero `aws-lc-rs`.**
+
+Verified crates (all `default-features = false`, `ring` only):
+
+| Crate | Role |
+|---|---|
+| `axum` 0.8 (`http1,tokio,ws,json`) | the coordinator's router + WS upgrade |
+| `tokio-tungstenite` 0.29 (`connect,handshake,rustls-tls-webpki-roots`) | the dial-out client, via `fleet-wire` |
+| `hyper` 1 + `hyper-util` (`client-legacy`, `server-auto`) | the `POST /auth/token` client; the TLS-terminating server loop |
+| `hyper-rustls` 0.27 (`ring,tls12,webpki-tokio`) | HTTPS for that client |
+| `tokio-rustls` / `rustls` 0.23 (`ring`) | TLS |
+| `webpki-roots` | trust anchors, compiled in rather than read from the platform |
+
+Reproduce it (this is the exact invocation, not a paraphrase):
+
+```sh
+export PATH="$HOME/toolchains/armv7l-linux-musleabihf-cross/bin:$PATH"
+export CC_armv7_unknown_linux_musleabihf=armv7l-linux-musleabihf-gcc
+export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=armv7l-linux-musleabihf-gcc
+export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-Ctarget-feature=+crt-static"
+
+cargo build -p fleet-bin --release --target armv7-unknown-linux-musleabihf
+
+file target/armv7-unknown-linux-musleabihf/release/probe-rs-fleet
+#   ELF 32-bit LSB executable, ARM, EABI5 … statically linked
+
+# The regression check that matters. Expect NO output:
+cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf \
+  --edges normal,build | grep -i aws-lc
+```
+
+(`ring`'s build script needs the cross-gcc on `PATH`, hence the toolchain — the
+same requirement the baseline build already had.)
+
+If `aws-lc-rs` ever reappears in that tree, something added a dependency without
+`default-features = false`, or enabled a feature that flips rustls's default
+provider. Find it with `cargo tree -i aws-lc-rs` and fix the feature flags
+rather than reaching for the clang escape hatch below.
+
+### Keep two versions of tungstenite off the Pi
+
+`axum` depends on `tokio-tungstenite` internally, and `fleet-wire` depends on it
+directly for the dial-out client. `fleet-bin` links both the coordinator and the
+agent, so a version mismatch ships **two** copies of tungstenite (and its
+`sha1`/`rand`/`data-encoding` tail) on every node. The workspace therefore pins
+`tokio-tungstenite` to the major `axum` uses; bump the two together and re-run:
+
+```sh
+cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf --edges normal \
+  | grep -oE 'tungstenite v[0-9.]+' | sort -u    # expect exactly one line
+```
+
+### Layering: no HTTP *server* framework in the agent
+
+`axum`'s adapter for the wire traits lives in `fleet-coordinator`
+(`src/ws_axum.rs`), not in `fleet-wire`, so `fleet-agent` and `fleet-sidecar`
+link only the client half. `crates/fleet-agent/tests/no_http_server_dep.rs`
+enforces this.
+
+To be accurate about what that buys: it is **not** what keeps the Pi build
+working — `fleet-bin` links the coordinator, so axum ships on the Pi regardless.
+It is a layering rule. A library that discovers probes and dials outward should
+not need a server framework to compile, and the moment `fleet-agent` can reach
+for `axum::extract::ws::WebSocket` the `WireTx`/`WireRx` seam stops being load
+bearing and the next transport change has to be made twice.

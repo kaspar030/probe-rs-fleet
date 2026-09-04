@@ -57,7 +57,11 @@ base64 = "0.22"
 # `fleet-wire`'s `tungstenite` feature) — see
 # `crates/fleet-agent/tests/no_http_server_dep.rs`.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+# Pinned to the major axum 0.8 depends on. A newer tokio-tungstenite compiles
+# fine but ships a SECOND copy of tungstenite on every Raspberry Pi, since
+# `fleet-bin` links both the coordinator (axum's copy) and the dialer (ours).
+# Bump this together with axum.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 hyper = { version = "1", default-features = false }
 hyper-util = { version = "0.1", default-features = false }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"] }
