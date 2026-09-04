@@ -1,9 +1,14 @@
-//! Shared filesystem + key/cert helpers used by the init/enroll scaffolding.
+//! Shared filesystem helpers used by the init scaffolding.
 //!
 //! These were originally private to [`crate::roles::init`]; they are factored
-//! out here so the enrollment (`coordinator enroll`) and per-role init
-//! (`agent init`, `ctl init`) handlers reuse the exact same secret-writing,
-//! permission, and TOML-rendering behaviour rather than duplicating it.
+//! out here so `coordinator init`, `agent init` and `ctl init` reuse the exact
+//! same secret-writing, permission, and TOML-rendering behaviour rather than
+//! duplicating it. `agent.toml` and `client.toml` now hold bearer credentials,
+//! so all three write through [`write_secret`].
+//!
+//! Random *token* generation deliberately does not live here: it belongs to
+//! `fleet_auth::OpaqueToken`, which owns the prefix scheme and the hashing
+//! convention that make a token verifiable.
 
 use std::path::Path;
 
@@ -16,14 +21,6 @@ pub fn generate_seed_hex() -> String {
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
     hex_encode(&seed)
-}
-
-/// Generate a random 32-byte secret (e.g. a one-time bootstrap secret).
-#[must_use]
-pub fn generate_secret() -> [u8; 32] {
-    let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
-    secret
 }
 
 /// Lowercase-hex encode a byte slice.
@@ -89,12 +86,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_secret_is_random_32_bytes() {
-        let a = generate_secret();
-        let b = generate_secret();
-        assert_eq!(a.len(), 32);
-        // Astronomically unlikely to be equal.
-        assert_ne!(a, b);
+    fn seed_hex_is_random_per_call() {
+        // Astronomically unlikely to collide; a fixed seed would mean every
+        // coordinator signed capability tokens with the same key.
+        assert_ne!(generate_seed_hex(), generate_seed_hex());
     }
 
     #[cfg(unix)]

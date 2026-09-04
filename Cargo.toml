@@ -80,6 +80,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
+# Test-only since revision 2: the private CA is gone, so nothing in the shipping
+# binary mints a certificate. It survives as a dev-dependency for the tests that
+# need a self-signed server cert (fleet-tls's trust tests, the coordinator's
+# self-hosted-TLS test).
 rcgen = { version = "0.13", default-features = false, features = ["x509-parser", "ring", "pem"] }
 sha2 = "0.10"
 
