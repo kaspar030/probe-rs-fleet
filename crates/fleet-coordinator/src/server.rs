@@ -3,7 +3,7 @@
 //! The coordinator is the only listening node (architecture §4.1). It binds a
 //! [`tokio::net::TcpListener`], wraps each accepted socket in a
 //! [`tokio_rustls::TlsAcceptor`] built from `fleet_tls::server_config`, derives
-//! the peer's [`Principal`]/[`AgentId`] from its client certificate, and
+//! the peer's [`Subject`]/[`AgentId`] from its client certificate, and
 //! branches on role:
 //!
 //! * **Agents** (cert fingerprint pinned in config) dial out and hold one
@@ -25,7 +25,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, trace, warn};
 
 use fleet_proto::enroll::EnrollRequest;
-use fleet_proto::ids::{AgentId, Principal};
+use fleet_proto::ids::{AgentId, Role, Subject, SubjectKind};
 use fleet_proto::PROTOCOL_VERSION;
 
 use crate::core::Coordinator;
@@ -34,6 +34,34 @@ use crate::proto::{
     read_frame, write_frame, AgentToCoord, CoordToAgent, CoordToSidecar, SidecarToCoord,
 };
 use crate::registry::{AgentHandle, AgentMessage};
+
+/// Resolve a connection's authenticated identity to a [`Subject`].
+///
+/// **This is the only place a `Subject` is constructed from wire input.**
+/// Everything downstream — every authorization check in [`crate::core`] and
+/// [`crate::authz`] — consumes the result and is unchanged by how the caller
+/// proved itself. Bearer tokens / GitHub identity (a separate task) replace
+/// this function's *body*, not its shape.
+///
+/// v1 (mTLS, single-user deployment): the certificate CN becomes the subject
+/// id, the org is the configured default, and the subject is provisioned as an
+/// admin of that org so the repo owner can operate the fleet. `fleet-tls`
+/// deliberately does **not** mint Subjects: it knows nothing about orgs, and a
+/// second minting site in a crate with no membership knowledge is exactly how
+/// tenancy holes appear.
+///
+/// # Errors
+///
+/// Returns a [`CoordinatorError`] if the bootstrap membership write fails; the
+/// connection is then refused rather than served unauthenticated.
+async fn resolve_subject(coord: &Coordinator, cert_cn: &str) -> Result<Subject> {
+    let org = coord.config().default_org.clone();
+    coord
+        .db()
+        .ensure_user_member(&org, cert_cn, Role::Admin)
+        .await?;
+    Ok(Subject::new(org, SubjectKind::User, cert_cn))
+}
 
 /// Run the TLS accept loop until the listener errors fatally.
 ///
@@ -120,7 +148,7 @@ where
 }
 
 /// Test-only entry point: drive the sidecar-side handshake + read/writer pumps
-/// over an arbitrary stream (no TLS), as the given `principal`.
+/// over an arbitrary stream (no TLS), as the given `subject`.
 ///
 /// # Errors
 ///
@@ -129,12 +157,12 @@ where
 pub async fn handle_sidecar_for_test<S>(
     coord: Arc<Coordinator>,
     stream: S,
-    principal: Principal,
+    subject: Subject,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    handle_sidecar(coord, stream, principal).await
+    handle_sidecar(coord, stream, subject).await
 }
 
 /// Accept the TLS handshake, derive the peer identity, and dispatch by role.
@@ -164,7 +192,7 @@ async fn handle_connection(
     };
 
     let fingerprint = fleet_tls::cert_fingerprint(&end_entity);
-    let principal = fleet_tls::principal_from_cert(&end_entity)?;
+    let cert_cn = fleet_tls::subject_id_from_cert(&end_entity)?;
 
     // An agent is identified by a cert fingerprint pinned either in the static
     // config or in the DB (recorded automatically at enrollment time).
@@ -174,15 +202,16 @@ async fn handle_connection(
             .db()
             .agent_pin_for_fingerprint(&fingerprint)
             .await?
-            .map(AgentId),
+            .map(|(_org, agent)| agent),
     };
 
     if let Some(agent_id) = agent_id {
         info!(%agent_id, "agent connected");
         handle_agent(coord, tls, agent_id).await
     } else {
-        debug!(%principal, "sidecar connected");
-        handle_sidecar(coord, tls, principal).await
+        let subject = resolve_subject(&coord, &cert_cn).await?;
+        debug!(%subject, "sidecar connected");
+        handle_sidecar(coord, tls, subject).await
     }
 }
 
@@ -261,7 +290,7 @@ where
 }
 
 /// Drive a sidecar connection: handshake, then service lease/relay requests.
-async fn handle_sidecar<S>(coord: Arc<Coordinator>, stream: S, principal: Principal) -> Result<()>
+async fn handle_sidecar<S>(coord: Arc<Coordinator>, stream: S, subject: Subject) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -277,10 +306,10 @@ where
         }
     });
 
-    let result = sidecar_read_loop(&coord, &mut reader, &principal, &tx).await;
+    let result = sidecar_read_loop(&coord, &mut reader, &subject, &tx).await;
 
     // Release any leases this sidecar still held, then drop its channels.
-    coord.drop_sidecar(&principal);
+    coord.drop_sidecar(&subject);
     writer_task.abort();
     result
 }
@@ -288,7 +317,7 @@ where
 async fn sidecar_read_loop<R>(
     coord: &Coordinator,
     reader: &mut R,
-    principal: &Principal,
+    subject: &Subject,
     tx: &mpsc::Sender<CoordToSidecar>,
 ) -> Result<()>
 where
@@ -326,7 +355,7 @@ where
 
     loop {
         let msg: SidecarToCoord = read_frame(reader).await?;
-        coord.handle_sidecar_message(principal, msg, tx).await?;
+        coord.handle_sidecar_message(subject, msg, tx).await?;
     }
 }
 
@@ -359,6 +388,9 @@ mod tests {
             policy: Policy::default(),
             pinned_agents: HashMap::new(),
             sweep_interval_secs: 5,
+            default_org: fleet_proto::ids::OrgId(
+                crate::state::DEFAULT_ORG_ID.to_owned(),
+            ),
         }
     }
 

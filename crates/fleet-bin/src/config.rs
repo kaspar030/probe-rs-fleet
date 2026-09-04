@@ -59,10 +59,18 @@ struct CoordinatorConfigToml {
     /// How often (seconds) the expiry sweep runs.
     #[serde(default = "default_sweep_interval_secs")]
     sweep_interval_secs: u64,
+    /// The org every authenticated subject is assigned to until GitHub login
+    /// exists (architecture rev 2 §6.1). Single-tenant stopgap.
+    #[serde(default = "default_org")]
+    default_org: String,
 }
 
 fn default_sweep_interval_secs() -> u64 {
     5
+}
+
+fn default_org() -> String {
+    "default".to_owned()
 }
 
 /// Load and parse a coordinator config TOML file, converting it into the
@@ -109,6 +117,7 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         policy: raw.policy,
         pinned_agents,
         sweep_interval_secs: raw.sweep_interval_secs,
+        default_org: fleet_proto::ids::OrgId(raw.default_org),
     })
 }
 

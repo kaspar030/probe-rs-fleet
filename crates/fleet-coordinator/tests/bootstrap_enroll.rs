@@ -22,6 +22,12 @@ use fleet_coordinator::{clock::SystemClock, Db, Ed25519Signer};
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
 use fleet_proto::enroll::{EnrollRequest, EnrollResponse};
+use fleet_proto::ids::OrgId;
+
+/// The org a single-user deployment enrolls everything into.
+fn default_org() -> OrgId {
+    OrgId("default".to_owned())
+}
 
 struct Material {
     ca_cert_pem: String,
@@ -92,6 +98,7 @@ async fn start_coordinator(
         policy: Policy::default(),
         pinned_agents: std::collections::HashMap::new(),
         sweep_interval_secs: 5,
+        default_org: default_org(),
     };
 
     // Build the cert chain / acceptor directly so we keep a handle to the
@@ -169,7 +176,7 @@ async fn enroll_valid_then_reuse_rejected_and_autopinned() {
     let secret_hash = fleet_coordinator::enroll::hash_secret(&secret);
     coord
         .db()
-        .insert_enroll_token(&secret_hash, "rpi-1", "agent", 0, i64::MAX)
+        .insert_enroll_token(&default_org(), &secret_hash, "rpi-1", "agent", 0, i64::MAX)
         .await
         .unwrap();
 
@@ -193,9 +200,10 @@ async fn enroll_valid_then_reuse_rejected_and_autopinned() {
 
     // It was auto-pinned in the DB.
     let fp = fleet_tls::cert_fingerprint(&der);
+    // The pin records the org the node was enrolled into, not just its id.
     assert_eq!(
         coord.db().agent_pin_for_fingerprint(&fp).await.unwrap(),
-        Some("rpi-1".to_owned())
+        Some((default_org(), fleet_proto::ids::AgentId("rpi-1".to_owned())))
     );
 
     // Reuse -> rejected (single-use).
@@ -212,7 +220,7 @@ async fn enroll_wrong_secret_rejected() {
     let secret_hash = fleet_coordinator::enroll::hash_secret(&[1u8; 32]);
     coord
         .db()
-        .insert_enroll_token(&secret_hash, "rpi-1", "agent", 0, i64::MAX)
+        .insert_enroll_token(&default_org(), &secret_hash, "rpi-1", "agent", 0, i64::MAX)
         .await
         .unwrap();
 

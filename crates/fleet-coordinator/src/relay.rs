@@ -23,7 +23,7 @@
 //! be exercised over `tokio::io::duplex` in tests without any TLS or sockets.
 
 use fleet_proto::agent_api::CoordinatorCommand;
-use fleet_proto::ids::{BoardId, LeaseId};
+use fleet_proto::ids::{BoardRef, LeaseId};
 use fleet_proto::{ChannelId, DataFrame};
 
 use crate::error::{CoordinatorError, Result};
@@ -37,8 +37,9 @@ use crate::registry::{AgentHandle, ChannelRoute, ChannelTable, SidecarHandle};
 pub struct OpenRequest {
     /// The authorising lease.
     pub lease: LeaseId,
-    /// The target board.
-    pub board: BoardId,
+    /// The target board, as the fleet-unique key the capability token is
+    /// scoped to.
+    pub board: BoardRef,
     /// The signed capability token (wire framing: see `fleet_proto::token`).
     pub token: Vec<u8>,
     /// Which plane the channel carries (data vs. gdb tunnel).
@@ -167,8 +168,16 @@ pub async fn close_channel(
 mod tests {
     use super::*;
     use crate::registry::AgentMessage;
-    use fleet_proto::ids::AgentId;
+    use fleet_proto::ids::{AgentId, OrgId};
     use tokio::sync::mpsc;
+
+    fn test_board_ref() -> BoardRef {
+        BoardRef::new(
+            OrgId("default".to_owned()),
+            AgentId("agent-a".to_owned()),
+            "b1",
+        )
+    }
 
     /// Build an agent handle and a receiver standing in for the agent's writer
     /// task draining its connection.
@@ -193,7 +202,7 @@ mod tests {
             sidecar_tx.clone(),
             OpenRequest {
                 lease: LeaseId(1),
-                board: BoardId("b1".to_owned()),
+                board: test_board_ref(),
                 token: vec![0xde, 0xad],
                 kind: fleet_proto::ChannelKind::Data,
             },
@@ -212,7 +221,7 @@ mod tests {
                 kind,
             }) => {
                 assert_eq!(lease, LeaseId(1));
-                assert_eq!(board, BoardId("b1".to_owned()));
+                assert_eq!(board, test_board_ref());
                 assert_eq!(token, vec![0xde, 0xad]);
                 assert_eq!(ch, channel);
                 assert_eq!(kind, fleet_proto::ChannelKind::Data);
@@ -269,7 +278,7 @@ mod tests {
             sidecar_tx,
             OpenRequest {
                 lease: LeaseId(1),
-                board: BoardId("b1".to_owned()),
+                board: test_board_ref(),
                 token: vec![],
                 kind: fleet_proto::ChannelKind::Data,
             },

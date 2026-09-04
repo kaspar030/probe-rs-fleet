@@ -30,7 +30,7 @@
 //!   preserving every original argument.
 //! * [`selector`] — resolve the fleet configuration from the environment, with
 //!   a clean no-selector → local fallback.
-//! * [`lease_cache`] — time-based lease sharing keyed by selector + principal.
+//! * [`lease_cache`] — time-based lease sharing keyed by selector + subject key.
 //! * [`proxy`] — the documented relay seam (lease / byte-splice contract).
 //! * [`transport`] — the live mTLS + byte-opaque relay client: lease a board, open
 //!   a relay channel, splice the genuine probe-rs client's bytes verbatim.

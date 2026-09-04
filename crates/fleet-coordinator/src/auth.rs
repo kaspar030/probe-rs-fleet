@@ -135,7 +135,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use fleet_proto::ids::{AgentId, BoardId, LeaseId, Principal};
+    use fleet_proto::ids::{AgentId, BoardRef, LeaseId, OrgId, Subject, SubjectKind};
 
     /// RFC 8032 ed25519 test-vector seed. The agent's verifier tests
     /// (`fleet-agent/src/token.rs`) use the same seed, so a token signed here
@@ -150,10 +150,18 @@ mod tests {
         Ed25519Signer::from_seed(&TEST_SEED)
     }
 
+    fn test_board() -> BoardRef {
+        BoardRef::new(
+            OrgId("acme".to_owned()),
+            AgentId("rpi-1".to_owned()),
+            "nrf52840-dk-3",
+        )
+    }
+
     fn token() -> CapabilityToken {
         CapabilityToken {
             lease: LeaseId(7),
-            board: BoardId("nrf52840-dk-3".to_owned()),
+            board: test_board(),
             allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],
             expires: 1_780_000_000,
         }
@@ -210,9 +218,13 @@ mod tests {
         let s = signer();
         let granted = GrantedLease {
             lease: LeaseId(11),
-            board: BoardId("b1".to_owned()),
+            board: BoardRef::new(
+                OrgId("acme".to_owned()),
+                AgentId("agent-a".to_owned()),
+                "b1",
+            ),
             agent: AgentId("agent-a".to_owned()),
-            holder: Principal("alice".to_owned()),
+            holder: Subject::new(OrgId("acme".to_owned()), SubjectKind::User, "alice"),
             expires: 2_000_000_000,
         };
         let grant = s.grant_to_wire(&granted, default_allowed_ops()).unwrap();

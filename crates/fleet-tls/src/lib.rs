@@ -22,9 +22,11 @@
 //! Once a handshake completes, the coordinator derives a peer identity from the
 //! verified end-entity certificate:
 //!
-//! * [`principal_from_cert`] extracts a [`Principal`] from the certificate's
-//!   Subject Common Name (CN), falling back to the first DNS Subject
-//!   Alternative Name. See the function docs for the rationale.
+//! * [`subject_id_from_cert`] extracts the subject **id string** from the
+//!   certificate's Subject Common Name (CN), falling back to the first DNS
+//!   Subject Alternative Name. It deliberately stops at a `String`: this crate
+//!   knows nothing about orgs, so the coordinator is the only place that turns
+//!   an id into an authenticated `Subject`. See the function docs.
 //! * [`cert_fingerprint`] returns the lowercase-hex SHA-256 of the
 //!   certificate DER. The coordinator pins agent identities by this
 //!   fingerprint (configuration maps fingerprint → [`AgentId`]).
@@ -39,7 +41,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
-use fleet_proto::{AgentId, Principal};
+use fleet_proto::AgentId;
 
 /// Errors produced while loading PEM material or building a TLS config.
 #[derive(Debug, thiserror::Error)]
@@ -89,7 +91,7 @@ pub enum TlsError {
     Rustls(#[from] rustls::Error),
 }
 
-/// Error raised while deriving a [`Principal`]/[`AgentId`] from a peer cert.
+/// Error raised while deriving a subject id / [`AgentId`] from a peer cert.
 #[derive(Debug, thiserror::Error)]
 pub enum IdentityError {
     /// The certificate DER could not be parsed.
@@ -356,16 +358,23 @@ pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
     out
 }
 
-/// Derive a [`Principal`] from a verified peer end-entity certificate.
+/// Derive the **subject id string** from a verified peer end-entity
+/// certificate.
+///
+/// Deliberately returns a plain `String`, not a `Subject`: this crate knows
+/// nothing about orgs or membership, and minting an authenticated identity here
+/// would create a second construction site outside the coordinator's single
+/// resolution seam. The coordinator combines this id with an org to build the
+/// `Subject` that authorization consumes.
 ///
 /// # Identity choice
 ///
-/// We use the certificate's Subject **Common Name (CN)** as the principal
-/// string, falling back to the first **DNS Subject Alternative Name** if no CN
-/// is present. CN is chosen because fleet certificates are issued internally
-/// (a private CA) with the operator-assigned identity placed in the CN — this
-/// keeps the mapping human-meaningful and matches how the certs are minted.
-/// The SAN fallback accommodates modern certs that omit the CN.
+/// We use the certificate's Subject **Common Name (CN)**, falling back to the
+/// first **DNS Subject Alternative Name** if no CN is present. CN is chosen
+/// because fleet certificates are issued internally (a private CA) with the
+/// operator-assigned identity placed in the CN — this keeps the mapping
+/// human-meaningful and matches how the certs are minted. The SAN fallback
+/// accommodates modern certs that omit the CN.
 ///
 /// The certificate is assumed to have already been *verified* by rustls during
 /// the handshake; this function only parses the subject, it does not validate
@@ -375,15 +384,14 @@ pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
 ///
 /// Returns [`IdentityError::Parse`] if the DER cannot be parsed and
 /// [`IdentityError::NoSubject`] if neither a CN nor a DNS SAN is present.
-pub fn principal_from_cert(cert: &CertificateDer<'_>) -> Result<Principal, IdentityError> {
-    let name = subject_identity(cert)?;
-    Ok(Principal(name))
+pub fn subject_id_from_cert(cert: &CertificateDer<'_>) -> Result<String, IdentityError> {
+    subject_identity(cert)
 }
 
 /// Derive an [`AgentId`] from a verified agent end-entity certificate.
 ///
-/// Uses the same subject-string extraction as [`principal_from_cert`] (CN, then
-/// DNS SAN). Note the coordinator additionally *pins* agents by
+/// Uses the same subject-string extraction as [`subject_id_from_cert`] (CN,
+/// then DNS SAN). Note the coordinator additionally *pins* agents by
 /// [`cert_fingerprint`]; this helper provides the human-readable identity that
 /// accompanies the pin.
 ///

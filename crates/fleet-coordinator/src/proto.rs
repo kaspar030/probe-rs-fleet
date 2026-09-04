@@ -61,7 +61,7 @@ where
 mod tests {
     use super::*;
     use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
-    use fleet_proto::ids::BoardId;
+    use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId};
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
     use fleet_proto::{ChannelId, DataFrame, LeaseId};
     use tokio::io::AsyncWriteExt;
@@ -70,7 +70,7 @@ mod tests {
     async fn sidecar_envelope_roundtrip() {
         let (mut a, mut b) = tokio::io::duplex(4096);
         let msg = SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardId("b1".to_owned())),
+            select: Constraint::Board(BoardName("b1".to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         });
@@ -100,7 +100,11 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(4096);
         let cmd = CoordToAgent::Command(CoordinatorCommand::OpenSession {
             lease: LeaseId(1),
-            board: BoardId("b1".to_owned()),
+            board: BoardRef::new(
+                OrgId("default".to_owned()),
+                AgentId("agent-a".to_owned()),
+                "b1",
+            ),
             token: vec![9, 9, 9],
             channel: ChannelId(2),
             kind: fleet_proto::ChannelKind::Data,

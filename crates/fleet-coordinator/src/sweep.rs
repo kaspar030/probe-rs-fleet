@@ -1,12 +1,19 @@
 //! Background lease-expiry sweep.
 //!
-//! Periodically asks the pure scheduler to [`expire`](Scheduler::expire) leases
-//! whose deadline has passed. For each freed lease the coordinator: closes any
-//! relay channels on the board, instructs the owning agent to clean up
-//! (`ReleaseLease` → power-cycle, optional erase), persists the close, and
+//! Periodically asks the pure scheduler to [`expire`](fleet_core::scheduler::Scheduler::expire)
+//! leases whose deadline has passed. For each freed lease the coordinator:
+//! closes any relay channels on the board, instructs the owning agent to clean
+//! up (`ReleaseLease` → power-cycle, optional erase), persists the close, and
 //! audits it. Waiters promoted onto a just-freed board are persisted; notifying
 //! a *disconnected* sidecar of its promotion is best-effort/deferred for v1 —
 //! such a sidecar re-requests on reconnect (architecture §6).
+//!
+//! **No authorization check happens here, deliberately**: the sweep is
+//! system-initiated, not caller-initiated, so there is no subject to check.
+//! That omission is not the same bug as the missing checks on the *request*
+//! paths in [`crate::core`] — it is the absence of a caller. Every write it
+//! makes still goes through the freed board's [`crate::state::OrgDb`], so a
+//! sweep cannot cross a tenant boundary either.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,7 +61,7 @@ pub async fn sweep_once(coord: &Coordinator) {
         if let Some(agent) = coord.agents().get(&freed.agent).await {
             let cmd = CoordinatorCommand::ReleaseLease {
                 lease: freed.lease,
-                board: freed.board.clone(),
+                board: freed.board.board_name(),
                 erase: false,
             };
             if agent.send_command(cmd).await.is_err() {
@@ -64,21 +71,18 @@ pub async fn sweep_once(coord: &Coordinator) {
             debug!(agent = %freed.agent, "owning agent offline; cleanup deferred");
         }
 
-        // Persist + audit the close.
-        if let Err(e) = coord
-            .db()
-            .close_lease(freed.lease, now_i64, "expired")
-            .await
-        {
+        // Persist + audit the close, scoped to the freed board's org.
+        let scoped = coord.db().scoped(freed.board.org.clone());
+        if let Err(e) = scoped.close_lease(freed.lease, now_i64, "expired").await {
             warn!(error = %e, "failed to persist lease close");
         }
-        let _ = coord
-            .db()
+        let _ = scoped
             .append_audit(&AuditEntry {
                 ts: now_i64,
-                principal: Some(freed.holder.0.as_str()),
+                subject: Some(&freed.holder.key().to_string()),
                 action: "lease.expire",
-                board: Some(freed.board.0.as_str()),
+                node: Some(freed.board.node.0.as_str()),
+                board: Some(freed.board.name.as_str()),
                 lease: Some(freed.lease),
                 detail: None,
             })
@@ -87,13 +91,12 @@ pub async fn sweep_once(coord: &Coordinator) {
 
     // Persist any promotions made during the sweep.
     for granted in &result.granted {
-        if let Err(e) = coord
-            .db()
+        let scoped = coord.db().scoped(granted.board.org.clone());
+        if let Err(e) = scoped
             .record_lease(
                 granted.lease,
                 &granted.board,
-                &granted.agent.0,
-                &granted.holder,
+                &granted.holder.key(),
                 now_i64,
                 i64::try_from(granted.expires).unwrap_or(i64::MAX),
             )
@@ -101,13 +104,13 @@ pub async fn sweep_once(coord: &Coordinator) {
         {
             warn!(error = %e, "failed to persist promoted lease");
         }
-        let _ = coord
-            .db()
+        let _ = scoped
             .append_audit(&AuditEntry {
                 ts: now_i64,
-                principal: Some(granted.holder.0.as_str()),
+                subject: Some(&granted.holder.key().to_string()),
                 action: "lease.promote",
-                board: Some(granted.board.0.as_str()),
+                node: Some(granted.board.node.0.as_str()),
+                board: Some(granted.board.name.as_str()),
                 lease: Some(granted.lease),
                 detail: Some("via expiry sweep"),
             })
@@ -123,10 +126,11 @@ mod tests {
     use crate::config::{CoordinatorConfig, SigningKeySource};
     use crate::proto::{CoordToSidecar, SidecarToCoord};
     use crate::registry::{AgentHandle, AgentMessage};
+    use crate::state::DEFAULT_ORG_ID;
     use fleet_core::policy::Policy;
     use fleet_core::scheduler::Scheduler;
     use fleet_proto::board::{Board, BoardState, PowerKind};
-    use fleet_proto::ids::{AgentId, BoardId, Principal};
+    use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Role, Subject, SubjectKind};
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,6 +143,10 @@ mod tests {
         fn now_secs(&self) -> u64 {
             self.0.load(Ordering::SeqCst)
         }
+    }
+
+    fn org() -> OrgId {
+        OrgId(DEFAULT_ORG_ID.to_owned())
     }
 
     fn config() -> CoordinatorConfig {
@@ -154,13 +162,14 @@ mod tests {
             policy: Policy::default(),
             pinned_agents: HashMap::new(),
             sweep_interval_secs: 1,
+            default_org: org(),
         }
     }
 
     async fn coord_with_board(time: Arc<AtomicU64>) -> Coordinator {
         let mut sched = Scheduler::new(Policy::default());
         sched.upsert_board(Board {
-            id: BoardId("b1".to_owned()),
+            id: BoardRef::new(org(), AgentId("agent-a".to_owned()), "b1"),
             agent: AgentId("agent-a".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
             tags: vec![],
@@ -169,6 +178,13 @@ mod tests {
             state: BoardState::Idle,
         });
         let db = crate::state::Db::connect_in_memory().await.unwrap();
+        db.ensure_user_member(&org(), "alice", Role::Member)
+            .await
+            .unwrap();
+        db.scoped(org())
+            .ensure_node(&AgentId("agent-a".to_owned()), 1000)
+            .await
+            .unwrap();
         Coordinator::new(
             config(),
             sched,
@@ -193,30 +209,33 @@ mod tests {
         // alice grabs a short lease.
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         let req = LeaseRequest {
-            select: Constraint::Board(BoardId("b1".to_owned())),
+            select: Constraint::Board(BoardName("b1".to_owned())),
             duration_secs: 10,
             priority: Priority::Interactive,
         };
+        let alice = Subject::new(org(), SubjectKind::User, "alice");
         coord
-            .handle_sidecar_message(&Principal("alice".to_owned()), SidecarToCoord::Lease(req), &tx)
+            .handle_sidecar_message(&alice, SidecarToCoord::Lease(req), &tx)
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
-        assert_eq!(coord.db().open_lease_count().await.unwrap(), 1);
+        let scoped = coord.db().scoped(org());
+        assert_eq!(scoped.open_lease_count().await.unwrap(), 1);
 
         // No expiry yet.
         sweep_once(&coord).await;
-        assert_eq!(coord.db().open_lease_count().await.unwrap(), 1);
+        assert_eq!(scoped.open_lease_count().await.unwrap(), 1);
 
         // Advance past expiry and sweep.
         time.store(2000, Ordering::SeqCst);
         sweep_once(&coord).await;
-        assert_eq!(coord.db().open_lease_count().await.unwrap(), 0);
+        assert_eq!(scoped.open_lease_count().await.unwrap(), 0);
 
-        // Agent received a ReleaseLease cleanup command.
+        // Agent received a ReleaseLease cleanup command, addressed by the
+        // node-local board name it knows.
         match arx.recv().await.unwrap() {
             AgentMessage::Command(CoordinatorCommand::ReleaseLease { board, .. }) => {
-                assert_eq!(board, BoardId("b1".to_owned()));
+                assert_eq!(board, BoardName("b1".to_owned()));
             }
             other => panic!("expected ReleaseLease, got {other:?}"),
         }

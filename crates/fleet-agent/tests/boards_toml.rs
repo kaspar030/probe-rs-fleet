@@ -1,7 +1,7 @@
 //! End-to-end parse of a realistic `boards.toml` fixture (architecture §8).
 
 use fleet_agent::config::BoardsConfig;
-use fleet_proto::{BoardId, PowerKind};
+use fleet_proto::{BoardName, PowerKind};
 
 #[test]
 fn parses_realistic_boards_fixture() {
@@ -11,7 +11,7 @@ fn parses_realistic_boards_fixture() {
     assert_eq!(cfg.boards.len(), 3);
 
     let nrf = cfg
-        .board(&BoardId("nrf52840-dk-3".into()))
+        .board(&BoardName("nrf52840-dk-3".into()))
         .expect("nrf board present");
     assert_eq!(nrf.serial, "001050257890");
     assert_eq!(nrf.chip, "nRF52840_xxAA");
@@ -26,7 +26,7 @@ fn parses_realistic_boards_fixture() {
     );
 
     let rp = cfg
-        .board(&BoardId("rp2040-pico-1".into()))
+        .board(&BoardName("rp2040-pico-1".into()))
         .expect("rp2040 board present");
     // exclusive defaults to true when omitted.
     assert!(rp.exclusive);
@@ -39,7 +39,7 @@ fn parses_realistic_boards_fixture() {
     );
 
     let stm = cfg
-        .board(&BoardId("stm32f4-disco-2".into()))
+        .board(&BoardName("stm32f4-disco-2".into()))
         .expect("stm32 board present");
     assert!(!stm.exclusive);
     assert_eq!(stm.power.to_power_kind(), PowerKind::None);

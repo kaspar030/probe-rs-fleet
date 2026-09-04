@@ -21,7 +21,7 @@
 
 use fleet_proto::admin::{BoardSummary, LeaseHolderSummary, LogLine};
 use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
-use fleet_proto::ids::BoardId;
+use fleet_proto::ids::BoardName;
 use fleet_proto::lease::{LeaseGrant, LeaseRequest};
 use fleet_proto::{ChannelId, ChannelKind, DataFrame, LeaseId};
 use serde::de::DeserializeOwned;
@@ -119,16 +119,19 @@ pub enum SidecarToCoord {
     Who,
     /// Operator: fetch recent audit/log lines (`ctl logs`).
     Logs {
-        /// Restrict to a single board, if set.
-        board: Option<BoardId>,
+        /// Restrict to a single board by its node-local name, if set. The
+        /// coordinator resolves it within the caller's org.
+        board: Option<BoardName>,
         /// Follow mode (advisory; v1 returns the current tail either way).
         #[serde(default)]
         follow: bool,
     },
     /// Operator: power-cycle a board (`ctl power-cycle`).
     PowerCycle {
-        /// The board to power-cycle.
-        board: BoardId,
+        /// The board to power-cycle, by node-local name. The coordinator
+        /// resolves it to a fleet key **within the caller's org**, so a board
+        /// in another org is reported exactly as an absent one.
+        board: BoardName,
     },
 }
 
@@ -179,8 +182,8 @@ pub enum CoordToSidecar {
     LogLines(Vec<LogLine>),
     /// Operator: acknowledgement of a power-cycle request.
     PowerCycled {
-        /// The board that was power-cycled.
-        board: BoardId,
+        /// The board that was power-cycled (node-local name, as requested).
+        board: BoardName,
     },
     /// An error in response to a sidecar request.
     Error {
@@ -246,14 +249,22 @@ where
 mod tests {
     use super::*;
     use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
-    use fleet_proto::ids::BoardId;
+    use fleet_proto::ids::{AgentId, BoardRef, OrgId};
     use fleet_proto::lease::{Constraint, Priority};
+
+    fn test_board_ref() -> BoardRef {
+        BoardRef::new(
+            OrgId("default".to_owned()),
+            AgentId("agent-a".to_owned()),
+            "b1",
+        )
+    }
 
     #[tokio::test]
     async fn sidecar_envelope_roundtrip() {
         let (mut a, mut b) = tokio::io::duplex(4096);
         let msg = SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardId("b1".to_owned())),
+            select: Constraint::Board(BoardName("b1".to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         });
@@ -281,7 +292,7 @@ mod tests {
         let (mut a, mut b) = tokio::io::duplex(4096);
         let cmd = CoordToAgent::Command(CoordinatorCommand::OpenSession {
             lease: LeaseId(1),
-            board: BoardId("b1".to_owned()),
+            board: test_board_ref(),
             token: vec![9, 9, 9],
             channel: ChannelId(2),
             kind: ChannelKind::Data,

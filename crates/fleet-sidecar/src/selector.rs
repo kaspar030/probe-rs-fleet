@@ -13,7 +13,7 @@
 //! | `PROBE_RS_FLEET_CLIENT_CERT` | path to client mTLS cert chain (PEM)                 |
 //! | `PROBE_RS_FLEET_CLIENT_KEY`  | path to client mTLS private key (PEM)                |
 //! | `PROBE_RS_FLEET_CA`          | path to the CA root the coordinator is pinned to     |
-//! | `PROBE_RS_FLEET_PRINCIPAL`   | optional principal override (else derived from cert) |
+//! | `PROBE_RS_FLEET_SUBJECT_ID`  | optional subject-id override (else derived from cert) |
 //!
 //! Resolution rules:
 //!
@@ -27,7 +27,7 @@
 //! The environment is read through an injectable [`EnvSource`] so tests never
 //! touch the real process environment.
 
-use fleet_proto::ids::{BoardId, Principal};
+use fleet_proto::ids::BoardName;
 use fleet_proto::lease::Constraint;
 
 /// Environment variable names the sidecar consults.
@@ -46,8 +46,9 @@ pub mod env {
     pub const CLIENT_KEY: &str = "PROBE_RS_FLEET_CLIENT_KEY";
     /// Path to the pinned CA root (PEM).
     pub const CA: &str = "PROBE_RS_FLEET_CA";
-    /// Optional principal override.
-    pub const PRINCIPAL: &str = "PROBE_RS_FLEET_PRINCIPAL";
+    /// Optional subject-id override (the org is always the coordinator's to
+    /// decide).
+    pub const SUBJECT_ID: &str = "PROBE_RS_FLEET_SUBJECT_ID";
 }
 
 /// A source of environment variables. Implemented for the real process
@@ -99,9 +100,13 @@ pub struct FleetConfig {
     pub auth: Auth,
     /// Which board to lease.
     pub select: Constraint,
-    /// The calling principal, if explicitly overridden. Otherwise the
+    /// The calling subject **id**, if explicitly overridden. Otherwise the
     /// coordinator derives it from the client cert at connect time.
-    pub principal: Option<Principal>,
+    ///
+    /// Only the id: a sidecar cannot know or choose its org. The coordinator
+    /// assigns the org when it resolves the connection to a `Subject`, which
+    /// is what keeps a client from asserting its way into another tenant.
+    pub subject_id: Option<String>,
 }
 
 /// The outcome of [`resolve`].
@@ -171,10 +176,9 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     let client_cert = env.get(env::CLIENT_CERT).filter(|s| !s.is_empty());
     let client_key = env.get(env::CLIENT_KEY).filter(|s| !s.is_empty());
     let ca = env.get(env::CA).filter(|s| !s.is_empty());
-    let principal = env
-        .get(env::PRINCIPAL)
-        .filter(|s| !s.is_empty())
-        .map(Principal);
+    let subject_id = env
+        .get(env::SUBJECT_ID)
+        .filter(|s| !s.is_empty());
 
     let any_fleet = board.is_some()
         || select.is_some()
@@ -183,7 +187,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
         || client_cert.is_some()
         || client_key.is_some()
         || ca.is_some()
-        || principal.is_some();
+        || subject_id.is_some();
 
     // No fleet variables at all → transparent local fallback.
     if !any_fleet {
@@ -193,7 +197,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     // Resolve the board selector.
     let constraint = match (board, select) {
         (Some(_), Some(_)) => return Err(SelectorError::AmbiguousSelector),
-        (Some(b), None) => Constraint::Board(BoardId(b)),
+        (Some(b), None) => Constraint::Board(BoardName(b)),
         (None, Some(expr)) => parse_select(&expr)?,
         (None, None) => return Err(SelectorError::MissingSelector),
     };
@@ -218,7 +222,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
         coordinator,
         auth,
         select: constraint,
-        principal,
+        subject_id,
     }))
 }
 
@@ -328,9 +332,9 @@ mod tests {
             panic!("expected Fleet");
         };
         assert_eq!(cfg.coordinator, "coord.example:4443");
-        assert_eq!(cfg.select, Constraint::Board(BoardId("nrf52840-dk-3".to_owned())));
+        assert_eq!(cfg.select, Constraint::Board(BoardName("nrf52840-dk-3".to_owned())));
         assert_eq!(cfg.auth, Auth::Token("secret".to_owned()));
-        assert_eq!(cfg.principal, None);
+        assert_eq!(cfg.subject_id, None);
     }
 
     #[test]
@@ -341,7 +345,7 @@ mod tests {
             (env::CLIENT_CERT, "/c/cert.pem"),
             (env::CLIENT_KEY, "/c/key.pem"),
             (env::CA, "/c/ca.pem"),
-            (env::PRINCIPAL, "ci-bot"),
+            (env::SUBJECT_ID, "ci-bot"),
         ]);
         let Resolution::Fleet(cfg) = resolve(&env).unwrap() else {
             panic!("expected Fleet");
@@ -358,7 +362,7 @@ mod tests {
                 ca: Some("/c/ca.pem".to_owned()),
             }
         );
-        assert_eq!(cfg.principal, Some(Principal("ci-bot".to_owned())));
+        assert_eq!(cfg.subject_id, Some("ci-bot".to_owned()));
     }
 
     #[test]

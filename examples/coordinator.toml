@@ -71,6 +71,12 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # How often (seconds) the lease-expiry sweep runs. Default: 5.
 # sweep_interval_secs = 5
 
+# The org every authenticated subject is assigned to. Every object in the fleet
+# belongs to exactly one org (architecture revision 2 §6.1); until GitHub login
+# exists, the mTLS resolution seam puts every caller in this one. Default:
+# "default".
+# default_org = "default"
+
 # Lease scheduling policy. Omit the whole block to accept all defaults (shown).
 [policy]
 # Maximum lease duration (seconds) for `soak` priority requests. Default: 86400.
@@ -79,8 +85,11 @@ max_duration_soak = 86400
 max_duration_ci = 3600
 # Maximum lease duration (seconds) for `interactive` requests. Default: 14400.
 max_duration_interactive = 14400
-# Maximum number of concurrently-held leases per principal. Default: 2.
-max_concurrent_per_principal = 2
+# Maximum number of concurrently-held leases per subject. Default: 2.
+# (Renamed from `max_concurrent_per_principal` in architecture revision 2: the
+# cap is keyed by the subject's (org, kind, id), so two same-named users in
+# different orgs have independent budgets.)
+max_concurrent_per_subject = 2
 # Default TTL (seconds) applied when a request omits a duration. Default: 900.
 default_ttl_secs = 900
 

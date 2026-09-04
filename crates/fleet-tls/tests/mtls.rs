@@ -3,7 +3,7 @@
 //! These spin up a self-signed test CA, mint server and client end-entity
 //! certificates, and run a real rustls handshake over an in-memory
 //! `tokio::io::duplex` pair to prove the mTLS configs interoperate. They also
-//! exercise the principal / fingerprint extraction helpers on a known cert.
+//! exercise the subject-id / fingerprint extraction helpers on a known cert.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use fleet_tls::{
-    agent_id_from_cert, cert_fingerprint, client_config, principal_from_cert, root_store_from_certs,
+    agent_id_from_cert, cert_fingerprint, client_config, root_store_from_certs, subject_id_from_cert,
     server_config,
 };
 
@@ -85,8 +85,8 @@ async fn mtls_handshake_round_trip() {
                 .clone()
                 .into_owned()
         };
-        let principal = principal_from_cert(&peer).unwrap();
-        assert_eq!(principal.0, "agent-01");
+        let subject_id = subject_id_from_cert(&peer).unwrap();
+        assert_eq!(subject_id, "agent-01");
 
         let mut buf = [0u8; 5];
         tls.read_exact(&mut buf).await.unwrap();
@@ -142,12 +142,12 @@ async fn handshake_rejects_untrusted_client() {
 }
 
 #[test]
-fn principal_and_agent_id_from_cn() {
+fn subject_id_and_agent_id_from_cn() {
     let (ca, ca_key) = make_ca();
     let leaf = make_leaf("agent-42", "agent-42.fleet.test", &ca, &ca_key);
 
-    let principal = principal_from_cert(&leaf.cert_der).unwrap();
-    assert_eq!(principal.0, "agent-42");
+    let subject_id = subject_id_from_cert(&leaf.cert_der).unwrap();
+    assert_eq!(subject_id, "agent-42");
 
     let agent_id = agent_id_from_cert(&leaf.cert_der).unwrap();
     assert_eq!(agent_id.0, "agent-42");

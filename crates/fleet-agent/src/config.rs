@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-use fleet_proto::{BoardId, PowerKind};
+use fleet_proto::{BoardName, PowerKind};
 use serde::Deserialize;
 
 /// Errors arising from configuration parsing and validation.
@@ -129,10 +129,10 @@ pub struct BoardSpec {
 }
 
 impl BoardSpec {
-    /// This board's id as a [`BoardId`].
+    /// This board's id as a [`BoardName`].
     #[must_use]
-    pub fn board_id(&self) -> BoardId {
-        BoardId(self.id.clone())
+    pub fn board_id(&self) -> BoardName {
+        BoardName(self.id.clone())
     }
 }
 
@@ -213,7 +213,7 @@ impl BoardsConfig {
 
     /// Look up a board by its id.
     #[must_use]
-    pub fn board(&self, id: &BoardId) -> Option<&BoardSpec> {
+    pub fn board(&self, id: &BoardName) -> Option<&BoardSpec> {
         self.boards.iter().find(|b| b.id == id.0)
     }
 }
@@ -503,8 +503,8 @@ chip = "c1"
     #[test]
     fn board_lookup_by_id() {
         let cfg = BoardsConfig::from_str(FULL).unwrap();
-        assert!(cfg.board(&BoardId("rp2040-1".into())).is_some());
-        assert!(cfg.board(&BoardId("nope".into())).is_none());
+        assert!(cfg.board(&BoardName("rp2040-1".into())).is_some());
+        assert!(cfg.board(&BoardName("nope".into())).is_none());
     }
 
     const AGENT_CFG: &str = r#"

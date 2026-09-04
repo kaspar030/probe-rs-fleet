@@ -32,7 +32,7 @@ pub async fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode
     // (written by `ctl init`) and inject them into the process environment for
     // any keys the user has NOT already set. This lets a single `ctl init`
     // configure both `ctl` and this shim. The sidecar still keys leases by
-    // selector + principal (unchanged); selector env (`_BOARD` / `_SELECT`)
+    // selector + subject (unchanged); selector env (`_BOARD` / `_SELECT`)
     // continues to come from the user's environment.
     inject_client_config_env(profile);
 

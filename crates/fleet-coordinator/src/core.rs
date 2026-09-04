@@ -8,6 +8,19 @@
 //! module is the thin I/O shell that reads frames off TLS streams and calls
 //! into here; this split keeps the lease/relay/auth logic unit-testable over
 //! in-memory channels.
+//!
+//! ## Authorization
+//!
+//! Every sidecar handler here is **deny by default** (architecture §6.5): it
+//! resolves the caller's [`Subject`], checks it against the target object's org
+//! (and, for a lease, against the lease's holder) via [`crate::authz`], and only
+//! then acts. Errors are flattened so a cross-org object is indistinguishable
+//! from a nonexistent one — otherwise the error text enumerates other tenants.
+//!
+//! The one place a [`BoardRef`] is minted from node input is
+//! [`Coordinator::reconcile_inventory`], which attaches the org of the
+//! authenticated node connection. Nodes report node-local [`BoardName`]s and
+//! therefore cannot inject a board into another org.
 
 use std::sync::Arc;
 
@@ -15,13 +28,16 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use fleet_core::scheduler::{LeaseDecision, Scheduler};
+use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Scheduler};
 use fleet_proto::agent_api::AgentReport;
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{AgentId, BoardId, LeaseId, Principal};
+use fleet_proto::ids::{
+    AgentId, BoardName, BoardRef, LeaseId, OrgId, Role, Subject, SubjectKey,
+};
 use fleet_proto::lease::LeaseRequest;
 
 use crate::auth::{default_allowed_ops, Ed25519Signer};
+use crate::authz::{self, AuthzError};
 use crate::clock::SharedClock;
 use crate::config::CoordinatorConfig;
 use crate::error::Result;
@@ -108,44 +124,73 @@ impl Coordinator {
         i64::try_from(self.now()).unwrap_or(i64::MAX)
     }
 
+    /// The org a node's inventory and boards belong to.
+    ///
+    /// Resolved from the `node` table, falling back to the configured default
+    /// org (single-user deployment, until bearer auth and `share` land). A node
+    /// whose org cannot be resolved has its inventory **rejected**, never
+    /// defaulted into someone else's tenant.
+    async fn org_of_node(&self, node: &AgentId) -> Option<OrgId> {
+        match self.db.org_of_node(node).await {
+            Ok(Some(org)) => Some(org),
+            Ok(None) => Some(self.config.default_org.clone()),
+            Err(e) => {
+                warn!(%node, error = %e, "failed to resolve node org");
+                None
+            }
+        }
+    }
+
     /// Handle one [`AgentReport`] from a connected agent.
     ///
     /// # Errors
     ///
-    /// Returns a [`CoordinatorError`] only on a fatal DB error; routine report
-    /// content is logged and tolerated.
+    /// Returns a [`crate::error::CoordinatorError`] only on a fatal DB error;
+    /// routine report content is logged and tolerated.
     pub async fn handle_agent_report(
         &self,
         agent_id: &AgentId,
         report: AgentReport,
     ) -> Result<()> {
+        let Some(org) = self.org_of_node(agent_id).await else {
+            warn!(%agent_id, "dropping report from a node with no resolvable org");
+            return Ok(());
+        };
         match report {
             AgentReport::Register {
                 agent,
                 protocol_version,
             } => {
                 debug!(%agent, protocol_version, "agent register");
-                self.audit("agent.register", None, None, None, Some(&agent.0))
-                    .await?;
+                self.audit(
+                    &org,
+                    "agent.register",
+                    None,
+                    Some(&agent.0),
+                    None,
+                    None,
+                    Some(&agent.0),
+                )
+                .await?;
             }
             AgentReport::Inventory(inv) => {
                 // Reconcile the agent's inventory into the scheduler's board set
                 // so the boards become leasable and `open_channel` can resolve
                 // board -> owning agent. Each present (online) declared board is
-                // upserted as a `Board` owned by this agent; the agent is
-                // authoritative for its board metadata via `boards.toml`. The
-                // scheduler preserves any live lease state on re-report
-                // (see `Scheduler::upsert_board`).
-                let online = self.reconcile_inventory(agent_id, &inv).await;
+                // upserted as a `Board` owned by this agent *within the node's
+                // org*; the agent is authoritative for its board metadata via
+                // `boards.toml`, but never for the org. The scheduler preserves
+                // any live lease state on re-report (see
+                // `Scheduler::upsert_board`).
+                let online = self.reconcile_inventory(&org, agent_id, &inv).await;
                 self.audit(
+                    &org,
                     "agent.inventory",
                     None,
+                    Some(&agent_id.0),
                     None,
                     None,
-                    Some(&format!(
-                        "{} boards ({online} online)",
-                        inv.boards.len()
-                    )),
+                    Some(&format!("{} boards ({online} online)", inv.boards.len())),
                 )
                 .await?;
             }
@@ -154,9 +199,18 @@ impl Coordinator {
             }
             AgentReport::Fault { board, reason } => {
                 warn!(%agent_id, %board, %reason, "board fault");
-                self.fault_board(&board, &reason).await;
-                self.audit("board.fault", None, Some(&board.0), None, Some(&reason))
-                    .await?;
+                let board_ref = BoardRef::new(org.clone(), agent_id.clone(), board.0.clone());
+                self.fault_board(&board_ref, &reason).await;
+                self.audit(
+                    &org,
+                    "board.fault",
+                    None,
+                    Some(&agent_id.0),
+                    Some(&board.0),
+                    None,
+                    Some(&reason),
+                )
+                .await?;
             }
             AgentReport::Log {
                 level,
@@ -165,8 +219,10 @@ impl Coordinator {
             } => {
                 debug!(%agent_id, ?level, ?board, %message, "agent log");
                 self.audit(
+                    &org,
                     "agent.log",
                     None,
+                    Some(&agent_id.0),
                     board.as_ref().map(|b| b.0.as_str()),
                     None,
                     Some(&message),
@@ -176,8 +232,10 @@ impl Coordinator {
             AgentReport::PowerEvent { board, action } => {
                 debug!(%agent_id, %board, ?action, "power event");
                 self.audit(
+                    &org,
                     "board.power",
                     None,
+                    Some(&agent_id.0),
                     Some(&board.0),
                     None,
                     Some(&format!("{action:?}")),
@@ -195,26 +253,42 @@ impl Coordinator {
     /// Reconcile an agent inventory snapshot into the scheduler's board set.
     ///
     /// Online declared boards are upserted (and persisted to the board table)
-    /// as `Board`s owned by `agent_id`; offline boards are removed from the
-    /// scheduler unless they currently hold a live lease. Returns the number of
-    /// online boards.
+    /// as `Board`s owned by `agent_id` **in `org`**; offline boards are removed
+    /// from the scheduler unless they currently hold a live lease. Returns the
+    /// number of online boards.
+    ///
+    /// This is the only place a [`BoardRef`] is minted from node input: the
+    /// node supplies a node-local [`BoardName`] and the coordinator attaches the
+    /// org of the authenticated connection, so cross-org board injection is not
+    /// expressible.
     async fn reconcile_inventory(
         &self,
+        org: &OrgId,
         agent_id: &AgentId,
         inv: &fleet_proto::agent_api::ProbeInventory,
     ) -> usize {
         use fleet_proto::agent_api::BoardPresence;
 
         let now = self.now_i64();
+        let scoped = self.db.scoped(org.clone());
+        // Boards reference their node row, so the node must exist first —
+        // otherwise every board insert below fails the foreign key.
+        if let Err(e) = scoped.ensure_node(agent_id, now).await {
+            warn!(node = %agent_id, error = %e, "failed to record node; skipping inventory");
+            return 0;
+        }
+
         let mut online = 0usize;
         let mut boards_to_record: Vec<Board> = Vec::new();
         {
             let mut sched = self.scheduler.lock().await;
             for status in &inv.boards {
+                let board_ref =
+                    BoardRef::new(org.clone(), agent_id.clone(), status.board.0.clone());
                 if status.presence == BoardPresence::Online {
                     online += 1;
                     let board = Board {
-                        id: status.board.clone(),
+                        id: board_ref,
                         agent: agent_id.clone(),
                         chip: status.chip.clone(),
                         tags: status.tags.clone(),
@@ -228,11 +302,11 @@ impl Coordinator {
                     // An offline board is dropped from the scheduler unless it
                     // is currently leased (an in-flight lease is preserved).
                     let leased = matches!(
-                        sched.board(&status.board).map(|b| &b.state),
+                        sched.board(&board_ref).map(|b| &b.state),
                         Some(BoardState::Leased { .. })
                     );
                     if !leased {
-                        sched.remove_board(&status.board);
+                        sched.remove_board(&board_ref);
                     }
                 }
             }
@@ -240,16 +314,15 @@ impl Coordinator {
         // Persist the board rows (best-effort; a DB error is logged, not fatal
         // — the scheduler is the source of truth for leasing).
         for board in &boards_to_record {
-            if let Err(e) = self.db.record_board(board, now).await {
+            if let Err(e) = scoped.record_board(board, now).await {
                 warn!(board = %board.id, error = %e, "failed to record board");
             }
         }
         online
     }
 
-
     /// Mark a board as faulted in the scheduler (best-effort).
-    async fn fault_board(&self, board: &BoardId, reason: &str) {
+    async fn fault_board(&self, board: &BoardRef, reason: &str) {
         let mut sched = self.scheduler.lock().await;
         if let Some(existing) = sched.board(board).cloned() {
             let faulted = Board {
@@ -266,12 +339,13 @@ impl Coordinator {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoordinatorError`] only on a fatal error (DB / token
-    /// signing); request-level failures are reported back to the sidecar via
-    /// [`CoordToSidecar::Error`] and return `Ok`.
+    /// Returns a [`crate::error::CoordinatorError`] only on a fatal error (DB /
+    /// token signing); request-level failures — including every authorization
+    /// refusal — are reported back to the sidecar via [`CoordToSidecar::Error`]
+    /// and return `Ok`.
     pub async fn handle_sidecar_message(
         &self,
-        principal: &Principal,
+        subject: &Subject,
         msg: SidecarToCoord,
         tx: &mpsc::Sender<CoordToSidecar>,
     ) -> Result<()> {
@@ -285,19 +359,19 @@ impl Coordinator {
                     .await;
             }
             SidecarToCoord::Lease(req) => {
-                let reply = self.request_lease(principal, req).await?;
+                let reply = self.request_lease(subject, req).await?;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::Extend { lease } => {
-                let reply = self.extend_lease(principal, lease).await?;
+                let reply = self.extend_lease(subject, lease).await?;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::Release { lease } => {
-                let reply = self.release_lease(principal, lease).await?;
+                let reply = self.release_lease(subject, lease).await?;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::OpenChannel { lease, kind } => {
-                let reply = self.open_channel(principal, lease, kind, tx.clone()).await?;
+                let reply = self.open_channel(subject, lease, kind, tx.clone()).await?;
                 if let Some(reply) = reply {
                     let _ = tx.send(reply).await;
                 }
@@ -306,39 +380,98 @@ impl Coordinator {
                 self.relay_from_sidecar(frame).await;
             }
             SidecarToCoord::CloseChannel { channel } => {
+                // Only the sidecar that owns the channel may close it: the
+                // route records the authorising lease, so the same
+                // holder-or-admin rule applies as everywhere else.
                 let route = self.channels.get(channel).await;
-                let agent = match route {
-                    Some(r) => self.agents.get(&r.agent).await,
-                    None => None,
+                let Some(route) = route else {
+                    return Ok(());
                 };
+                {
+                    let sched = self.scheduler.lock().await;
+                    if authz::require_lease_control(&self.db, &sched, subject, route.lease)
+                        .await
+                        .is_err()
+                    {
+                        let _ = tx
+                            .send(CoordToSidecar::Error {
+                                message: AuthzError::lease_message(),
+                            })
+                            .await;
+                        return Ok(());
+                    }
+                }
+                let agent = self.agents.get(&route.agent).await;
                 relay::close_channel(&self.channels, agent.as_ref(), channel).await;
             }
             SidecarToCoord::ListBoards => {
-                let reply = self.list_boards().await;
+                let reply = self.list_boards(subject).await;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::Who => {
-                let reply = self.who().await;
+                let reply = self.who(subject).await;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::Logs { board, follow } => {
-                let reply = self.logs(board.as_ref(), follow).await?;
+                let reply = self.logs(subject, board.as_ref(), follow).await?;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::PowerCycle { board } => {
-                let reply = self.operator_power_cycle(principal, &board).await?;
+                let reply = self.operator_power_cycle(subject, &board).await?;
                 let _ = tx.send(reply).await;
             }
         }
         Ok(())
     }
 
-    /// Build the operator board-inventory reply (`ctl list`).
-    async fn list_boards(&self) -> CoordToSidecar {
+    /// The flat refusal reply. Never says *why*, and never says whether the
+    /// object exists in another org.
+    fn denied() -> CoordToSidecar {
+        CoordToSidecar::Error {
+            message: "not authorized".to_owned(),
+        }
+    }
+
+    /// Resolve a node-local board name to a [`BoardRef`] **within the caller's
+    /// org**.
+    ///
+    /// The request wire stays node-local (so `PROBE_RS_FLEET_BOARD=nrf52840-dk-3`
+    /// keeps working); the coordinator is the only thing that turns a name into
+    /// a fleet key, and it can only do so inside one org. An absent board and a
+    /// board in another org are both `None`, deliberately indistinguishable.
+    /// An ambiguous name (the same name on two of the org's nodes) is also
+    /// refused rather than resolved arbitrarily.
+    async fn resolve_board(&self, subject: &Subject, name: &BoardName) -> Option<BoardRef> {
+        let sched = self.scheduler.lock().await;
+        let mut matching = sched
+            .boards()
+            .filter(|b| b.id.org == subject.org && b.id.name == name.0)
+            .map(|b| b.id.clone());
+        let first = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(first)
+    }
+
+    /// Build the operator board-inventory reply (`ctl list`), scoped to the
+    /// caller's org.
+    ///
+    /// Membership is enough: "membership alone is enough to add a node and to
+    /// use the org's boards" (§6.5).
+    async fn list_boards(&self, subject: &Subject) -> CoordToSidecar {
         use fleet_proto::admin::{BoardAvailability, BoardSummary};
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Self::denied();
+        }
         let sched = self.scheduler.lock().await;
         let boards = sched
             .boards()
+            .filter(|b| b.id.org == org)
             .map(|b| {
                 let (availability, holder, lease, expires) = match &b.state {
                     BoardState::Idle => (BoardAvailability::Available, None, None, None),
@@ -368,12 +501,21 @@ impl Coordinator {
         CoordToSidecar::BoardList(boards)
     }
 
-    /// Build the operator lease-holder reply (`ctl who`).
-    async fn who(&self) -> CoordToSidecar {
+    /// Build the operator lease-holder reply (`ctl who`), scoped to the
+    /// caller's org.
+    async fn who(&self, subject: &Subject) -> CoordToSidecar {
         use fleet_proto::admin::LeaseHolderSummary;
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Self::denied();
+        }
         let sched = self.scheduler.lock().await;
         let holders = sched
             .boards()
+            .filter(|b| b.id.org == org)
             .filter_map(|b| match &b.state {
                 BoardState::Leased { lease, by, expires } => Some(LeaseHolderSummary {
                     lease: *lease,
@@ -388,27 +530,54 @@ impl Coordinator {
     }
 
     /// Build the operator logs reply (`ctl logs`).
-    async fn logs(&self, board: Option<&BoardId>, _follow: bool) -> Result<CoordToSidecar> {
+    ///
+    /// Two independent fences: the audit log is admin-only (§6.5), *and* the
+    /// rows are read through the caller's [`crate::state::OrgDb`], so even a bug
+    /// in the role check cannot surface another tenant's log.
+    async fn logs(
+        &self,
+        subject: &Subject,
+        board: Option<&BoardName>,
+        _follow: bool,
+    ) -> Result<CoordToSidecar> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Admin)
+            .await
+            .is_err()
+        {
+            return Ok(Self::denied());
+        }
         let board = board.map(|b| b.0.as_str());
-        let lines = self.db.recent_audit(board, 200).await?;
+        let lines = self.db.scoped(org).recent_audit(board, 200).await?;
         Ok(CoordToSidecar::LogLines(lines))
     }
 
     /// Operator power-cycle: command the owning agent to power-cycle the board.
+    ///
+    /// Scoped to the caller's org: a board in another org resolves to "no such
+    /// board", exactly as an absent one does.
     async fn operator_power_cycle(
         &self,
-        principal: &Principal,
-        board: &BoardId,
+        subject: &Subject,
+        board: &BoardName,
     ) -> Result<CoordToSidecar> {
-        let agent_id = {
-            let sched = self.scheduler.lock().await;
-            sched.board(board).map(|b| b.agent.clone())
-        };
-        let Some(agent_id) = agent_id else {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Ok(Self::denied());
+        }
+        let Some(board_ref) = self.resolve_board(subject, board).await else {
             return Ok(CoordToSidecar::Error {
-                message: format!("unknown board {board}"),
+                message: format!("no such board {board}"),
             });
         };
+        // Belt and braces: the resolved board must live in the caller's org.
+        if authz::same_org(subject, &board_ref.org).is_err() {
+            return Ok(Self::denied());
+        }
+        let agent_id = board_ref.node.clone();
         let Some(agent) = self.agents.get(&agent_id).await else {
             return Ok(CoordToSidecar::Error {
                 message: format!("agent {agent_id} for board {board} is not connected"),
@@ -426,9 +595,11 @@ impl Coordinator {
             });
         }
         self.audit(
+            &org,
             "board.power-cycle",
-            Some(&principal.0),
-            Some(&board.0),
+            Some(&subject.key().to_string()),
+            Some(&agent_id.0),
+            Some(&board_ref.name),
             None,
             Some("operator request"),
         )
@@ -438,16 +609,24 @@ impl Coordinator {
         })
     }
 
-    /// Process a lease request: ask the scheduler, mint + persist a grant.
+    /// Process a lease request: check membership, ask the scheduler, mint +
+    /// persist a grant.
     async fn request_lease(
         &self,
-        principal: &Principal,
+        subject: &Subject,
         req: LeaseRequest,
     ) -> Result<CoordToSidecar> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Ok(Self::denied());
+        }
         let now = self.now();
         let decision = {
             let mut sched = self.scheduler.lock().await;
-            sched.request_lease(principal.clone(), req, now)
+            sched.request_lease(subject.clone(), req, now)
         };
         match decision {
             LeaseDecision::Granted(granted) => {
@@ -455,19 +634,21 @@ impl Coordinator {
                     .signer
                     .grant_to_wire(&granted, default_allowed_ops())?;
                 self.db
+                    .scoped(org.clone())
                     .record_lease(
                         granted.lease,
                         &granted.board,
-                        &granted.agent.0,
-                        &granted.holder,
+                        &granted.holder.key(),
                         self.now_i64(),
                         i64::try_from(granted.expires).unwrap_or(i64::MAX),
                     )
                     .await?;
                 self.audit(
+                    &org,
                     "lease.grant",
-                    Some(&principal.0),
-                    Some(&granted.board.0),
+                    Some(&subject.key().to_string()),
+                    Some(&granted.board.node.0),
+                    Some(&granted.board.name),
                     Some(granted.lease),
                     None,
                 )
@@ -478,59 +659,82 @@ impl Coordinator {
         }
     }
 
-    /// Extend a lease the principal holds.
-    async fn extend_lease(
-        &self,
-        principal: &Principal,
-        lease: LeaseId,
-    ) -> Result<CoordToSidecar> {
+    /// Extend a lease the subject holds (or, as an org admin, someone else's).
+    async fn extend_lease(&self, subject: &Subject, lease: LeaseId) -> Result<CoordToSidecar> {
         let now = self.now();
-        let new_expires = {
+        let outcome = {
             let mut sched = self.scheduler.lock().await;
-            sched.extend_lease(lease, now)
+            match authz::require_lease_control(&self.db, &sched, subject, lease).await {
+                Ok(holder) => sched.extend_lease(lease, &holder, now).map(|e| (holder, e)),
+                Err(_) => Err(LeaseAuthError::Unknown),
+            }
         };
-        match new_expires {
-            Some(expires) => {
+        match outcome {
+            Ok((holder, expires)) => {
                 self.db
+                    .scoped(subject.org.clone())
                     .update_lease_expiry(lease, i64::try_from(expires).unwrap_or(i64::MAX))
                     .await?;
                 self.audit(
+                    &subject.org,
                     "lease.extend",
-                    Some(&principal.0),
+                    Some(&subject.key().to_string()),
+                    None,
                     None,
                     Some(lease),
-                    None,
+                    Self::override_detail(subject, &holder).as_deref(),
                 )
                 .await?;
                 Ok(CoordToSidecar::Extended { lease, expires })
             }
-            None => Ok(CoordToSidecar::Error {
-                message: format!("lease {lease:?} not found"),
+            Err(_) => Ok(CoordToSidecar::Error {
+                message: AuthzError::lease_message(),
             }),
         }
     }
 
     /// Release a lease, tearing down its channels and persisting the close.
-    async fn release_lease(
-        &self,
-        principal: &Principal,
-        lease: LeaseId,
-    ) -> Result<CoordToSidecar> {
+    async fn release_lease(&self, subject: &Subject, lease: LeaseId) -> Result<CoordToSidecar> {
         let now = self.now();
+
+        // Authorize *before* any teardown: a refused release must have no
+        // observable effect at all.
+        let holder = {
+            let sched = self.scheduler.lock().await;
+            match authz::require_lease_control(&self.db, &sched, subject, lease).await {
+                Ok(holder) => holder,
+                Err(_) => {
+                    return Ok(CoordToSidecar::Error {
+                        message: AuthzError::lease_message(),
+                    })
+                }
+            }
+        };
+
         // Close any relay channels for this lease first.
         self.teardown_lease_channels(lease).await;
 
         let promoted = {
             let mut sched = self.scheduler.lock().await;
-            sched.release_lease(lease, now)
+            match sched.release_lease(lease, &holder, now) {
+                Ok(promoted) => promoted,
+                Err(_) => {
+                    return Ok(CoordToSidecar::Error {
+                        message: AuthzError::lease_message(),
+                    })
+                }
+            }
         };
-        self.db.close_lease(lease, self.now_i64(), "released").await?;
+        let scoped = self.db.scoped(subject.org.clone());
+        scoped.close_lease(lease, self.now_i64(), "released").await?;
         self.audit(
+            &subject.org,
             "lease.release",
-            Some(&principal.0),
+            Some(&subject.key().to_string()),
+            None,
             None,
             Some(lease),
-            None,
+            Self::override_detail(subject, &holder).as_deref(),
         )
         .await?;
 
@@ -538,20 +742,23 @@ impl Coordinator {
         // promoted holder is notified out-of-band when it next polls/re-requests
         // (v1 limitation: no push to a disconnected sidecar).
         if let Some(granted) = promoted {
+            let promoted_org = granted.board.org.clone();
             self.db
+                .scoped(promoted_org.clone())
                 .record_lease(
                     granted.lease,
                     &granted.board,
-                    &granted.agent.0,
-                    &granted.holder,
+                    &granted.holder.key(),
                     self.now_i64(),
                     i64::try_from(granted.expires).unwrap_or(i64::MAX),
                 )
                 .await?;
             self.audit(
+                &promoted_org,
                 "lease.promote",
-                Some(&granted.holder.0),
-                Some(&granted.board.0),
+                Some(&granted.holder.key().to_string()),
+                Some(&granted.board.node.0),
+                Some(&granted.board.name),
                 Some(granted.lease),
                 None,
             )
@@ -561,33 +768,60 @@ impl Coordinator {
         Ok(CoordToSidecar::Released { lease })
     }
 
+    /// Audit detail noting an admin override, if the acting subject is not the
+    /// holder.
+    fn override_detail(subject: &Subject, holder: &SubjectKey) -> Option<String> {
+        (subject.key() != *holder).then(|| format!("admin override; holder {holder}"))
+    }
+
     /// Open a relay channel for a held lease.
+    ///
+    /// Revision 1's version of this handler took its principal argument
+    /// **unused** and minted a full-ops capability token for whatever lease id
+    /// it was handed — i.e. any authenticated client could get flash/debug
+    /// access to any board in the fleet. The fix is the first statement below:
+    /// nothing happens, and in particular **no token is minted**, until the
+    /// caller is proven to hold the lease (or administer its org).
     ///
     /// Returns `Some(reply)` to send to the sidecar, or `None` if the reply was
     /// already handled.
     async fn open_channel(
         &self,
-        _principal: &Principal,
+        subject: &Subject,
         lease: LeaseId,
         kind: fleet_proto::ChannelKind,
         sidecar_tx: mpsc::Sender<CoordToSidecar>,
     ) -> Result<Option<CoordToSidecar>> {
-        // Find the board + agent for this lease from the scheduler's board set.
-        let target = {
+        let (holder, board, agent_id, expires) = {
             let sched = self.scheduler.lock().await;
-            let found = sched.boards().find_map(|b| match &b.state {
-                BoardState::Leased { lease: l, .. } if *l == lease => {
-                    Some((b.id.clone(), b.agent.clone()))
-                }
-                _ => None,
-            });
-            found
+            let Ok(holder) = authz::require_lease_control(&self.db, &sched, subject, lease).await
+            else {
+                return Ok(Some(CoordToSidecar::Error {
+                    message: AuthzError::lease_message(),
+                }));
+            };
+            let Some((board, agent_id)) = sched.lease_target(lease) else {
+                return Ok(Some(CoordToSidecar::Error {
+                    message: AuthzError::lease_message(),
+                }));
+            };
+            let (board, agent_id) = (board.clone(), agent_id.clone());
+            let expires = sched
+                .board(&board)
+                .and_then(|b| match &b.state {
+                    BoardState::Leased { expires, .. } => Some(*expires),
+                    _ => None,
+                })
+                .unwrap_or_else(|| self.now());
+            (holder, board, agent_id, expires)
         };
-        let Some((board, agent_id)) = target else {
+
+        // Belt and braces: the board itself must be in the caller's org.
+        if authz::same_org(subject, &board.org).is_err() {
             return Ok(Some(CoordToSidecar::Error {
-                message: format!("no active lease {lease:?}"),
+                message: AuthzError::lease_message(),
             }));
-        };
+        }
 
         let Some(agent) = self.agents.get(&agent_id).await else {
             return Ok(Some(CoordToSidecar::Error {
@@ -595,18 +829,8 @@ impl Coordinator {
             }));
         };
 
-        // Mint a fresh capability token scoped to this lease/board.
-        let now = self.now();
-        let expires = {
-            let sched = self.scheduler.lock().await;
-            sched
-                .board(&board)
-                .and_then(|b| match &b.state {
-                    BoardState::Leased { expires, .. } => Some(*expires),
-                    _ => None,
-                })
-                .unwrap_or(now)
-        };
+        // Mint a fresh capability token scoped to this lease/board. Reached
+        // only after the ownership check above.
         let token = fleet_proto::token::CapabilityToken {
             lease,
             board: board.clone(),
@@ -630,11 +854,18 @@ impl Coordinator {
         .await?;
 
         self.audit(
+            &board.org,
             "channel.open",
-            None,
-            Some(&board.0),
+            Some(&subject.key().to_string()),
+            Some(&board.node.0),
+            Some(&board.name),
             Some(lease),
-            Some(&format!("{channel:?}")),
+            Some(&format!(
+                "{channel:?}{}",
+                Self::override_detail(subject, &holder)
+                    .map(|d| format!("; {d}"))
+                    .unwrap_or_default()
+            )),
         )
         .await?;
         Ok(Some(CoordToSidecar::ChannelOpened { channel }))
@@ -657,7 +888,8 @@ impl Coordinator {
     ///
     /// # Errors
     ///
-    /// Returns a [`CoordinatorError`] if the sidecar's connection has closed.
+    /// Returns a [`crate::error::CoordinatorError`] if the sidecar's connection
+    /// has closed.
     pub async fn relay_from_agent(&self, frame: fleet_proto::DataFrame) -> Result<bool> {
         relay::forward_to_sidecar(&self.channels, frame).await
     }
@@ -674,30 +906,38 @@ impl Coordinator {
         }
     }
 
-    /// Note a disconnecting sidecar principal.
+    /// Note a disconnecting sidecar subject.
     ///
-    /// v1 deliberately does **not** force-release the principal's leases here:
+    /// v1 deliberately does **not** force-release the subject's leases here:
     /// a lease outlives a single connection and expires via the sweep
     /// (architecture §6). Any relay channels the sidecar had open are torn down
     /// when its writer task drops and the agent reports `SessionClosed`.
-    pub fn drop_sidecar(&self, principal: &Principal) {
-        debug!(%principal, "sidecar disconnected");
+    pub fn drop_sidecar(&self, subject: &Subject) {
+        debug!(%subject, "sidecar disconnected");
     }
 
-    /// Append an audit row at the current time.
+    /// Append an audit row at the current time, in `org`.
+    ///
+    /// Every audit row is written through an [`crate::state::OrgDb`], so it
+    /// lands in exactly one tenant's log by construction.
+    #[allow(clippy::too_many_arguments)]
     async fn audit(
         &self,
+        org: &OrgId,
         action: &str,
-        principal: Option<&str>,
+        subject: Option<&str>,
+        node: Option<&str>,
         board: Option<&str>,
         lease: Option<LeaseId>,
         detail: Option<&str>,
     ) -> Result<()> {
         self.db
+            .scoped(org.clone())
             .append_audit(&AuditEntry {
                 ts: self.now_i64(),
-                principal,
+                subject,
                 action,
+                node,
                 board,
                 lease,
                 detail,
@@ -714,10 +954,11 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::config::SigningKeySource;
+    use crate::state::DEFAULT_ORG_ID;
     use ed25519_dalek::{Verifier, VerifyingKey};
     use fleet_core::policy::Policy;
     use fleet_proto::board::PowerKind;
-    use fleet_proto::ids::AgentId;
+    use fleet_proto::ids::{AgentId, SubjectKind};
     use fleet_proto::lease::{Constraint, Priority};
     use fleet_proto::token::SignedToken;
     use std::collections::HashMap;
@@ -749,12 +990,25 @@ mod tests {
             policy: Policy::default(),
             pinned_agents: HashMap::new(),
             sweep_interval_secs: 5,
+            default_org: OrgId(DEFAULT_ORG_ID.to_owned()),
         }
     }
 
-    fn board(id: &str, agent: &str) -> Board {
+    fn org(name: &str) -> OrgId {
+        OrgId(name.to_owned())
+    }
+
+    fn user(org_name: &str, id: &str) -> Subject {
+        Subject::new(org(org_name), SubjectKind::User, id)
+    }
+
+    fn board_ref(org_name: &str, agent: &str, name: &str) -> BoardRef {
+        BoardRef::new(org(org_name), AgentId(agent.to_owned()), name)
+    }
+
+    fn board(org_name: &str, id: &str, agent: &str) -> Board {
         Board {
-            id: BoardId(id.to_owned()),
+            id: board_ref(org_name, agent, id),
             agent: AgentId(agent.to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
             tags: vec!["nrf52".to_owned()],
@@ -764,19 +1018,71 @@ mod tests {
         }
     }
 
-    async fn coordinator(clock: Arc<TestClock>) -> Coordinator {
+    /// A coordinator with one board in the default org and the given
+    /// memberships already provisioned.
+    async fn coordinator_with(
+        clock: Arc<TestClock>,
+        boards: &[Board],
+        members: &[(&str, &str, Role)],
+    ) -> Coordinator {
         let mut sched = Scheduler::new(Policy::default());
-        sched.upsert_board(board("b1", "agent-a"));
+        for b in boards {
+            sched.upsert_board(b.clone());
+        }
         let db = Db::connect_in_memory().await.unwrap();
+        for (org_name, id, role) in members {
+            db.ensure_user_member(&org(org_name), id, *role)
+                .await
+                .unwrap();
+            // Boards/leases reference their node row.
+            for b in boards {
+                if b.id.org.0 == *org_name {
+                    db.scoped(org(org_name))
+                        .ensure_node(&b.agent, 1000)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
         let signer = Ed25519Signer::from_seed(&TEST_SEED);
         Coordinator::new(config(), sched, db, signer, clock)
     }
 
+    async fn coordinator(clock: Arc<TestClock>) -> Coordinator {
+        coordinator_with(
+            clock,
+            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[
+                (DEFAULT_ORG_ID, "alice", Role::Member),
+                (DEFAULT_ORG_ID, "bob", Role::Member),
+                (DEFAULT_ORG_ID, "op", Role::Admin),
+            ],
+        )
+        .await
+    }
+
     fn lease_req(board: &str) -> LeaseRequest {
         LeaseRequest {
-            select: Constraint::Board(BoardId(board.to_owned())),
+            select: Constraint::Board(BoardName(board.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
+        }
+    }
+
+    /// Ask for a lease as `subject` and return the grant.
+    async fn grant_lease(
+        coord: &Coordinator,
+        subject: &Subject,
+        board: &str,
+    ) -> fleet_proto::lease::LeaseGrant {
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(subject, SidecarToCoord::Lease(lease_req(board)), &tx)
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::Lease(g) => g,
+            other => panic!("expected Lease, got {other:?}"),
         }
     }
 
@@ -786,7 +1092,7 @@ mod tests {
     async fn lease_lifecycle_through_coordinator() {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator(clock.clone()).await;
-        let alice = Principal("alice".to_owned());
+        let alice = user(DEFAULT_ORG_ID, "alice");
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
 
         // Request -> Granted.
@@ -798,7 +1104,7 @@ mod tests {
             CoordToSidecar::Lease(g) => g,
             other => panic!("expected Lease, got {other:?}"),
         };
-        assert_eq!(grant.board, BoardId("b1".to_owned()));
+        assert_eq!(grant.board, board_ref(DEFAULT_ORG_ID, "agent-a", "b1"));
         assert_eq!(grant.expires, 1000 + 600);
 
         // The minted token verifies under the agent's public key.
@@ -811,8 +1117,9 @@ mod tests {
         assert_eq!(claims.lease, grant.lease);
         assert_eq!(claims.board, grant.board);
 
-        // Lease persisted.
-        assert_eq!(coord.db().open_lease_count().await.unwrap(), 1);
+        // Lease persisted, in the caller's org.
+        let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
+        assert_eq!(scoped.open_lease_count().await.unwrap(), 1);
 
         // Extend.
         coord
@@ -845,10 +1152,10 @@ mod tests {
             CoordToSidecar::Released { lease } => assert_eq!(lease, grant.lease),
             other => panic!("expected Released, got {other:?}"),
         }
-        assert_eq!(coord.db().open_lease_count().await.unwrap(), 0);
+        assert_eq!(scoped.open_lease_count().await.unwrap(), 0);
 
         // Audit log recorded grant/extend/release at minimum.
-        assert!(coord.db().audit_count().await.unwrap() >= 3);
+        assert!(scoped.audit_count().await.unwrap() >= 3);
     }
 
     #[tokio::test]
@@ -860,7 +1167,7 @@ mod tests {
         // alice grabs b1.
         coord
             .handle_sidecar_message(
-                &Principal("alice".to_owned()),
+                &user(DEFAULT_ORG_ID, "alice"),
                 SidecarToCoord::Lease(lease_req("b1")),
                 &tx,
             )
@@ -871,7 +1178,7 @@ mod tests {
         // bob is queued.
         coord
             .handle_sidecar_message(
-                &Principal("bob".to_owned()),
+                &user(DEFAULT_ORG_ID, "bob"),
                 SidecarToCoord::Lease(lease_req("b1")),
                 &tx,
             )
@@ -890,7 +1197,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
             .handle_sidecar_message(
-                &Principal("alice".to_owned()),
+                &user(DEFAULT_ORG_ID, "alice"),
                 SidecarToCoord::Extend { lease: LeaseId(99) },
                 &tx,
             )
@@ -902,26 +1209,396 @@ mod tests {
         ));
     }
 
-    /// Inventory reconciliation: a registered agent's online board enters the
-    /// scheduler (becomes leasable + appears in `list`), and an offline board
-    /// is dropped. This is the gap that blocked acceptance.
+    /// **The bug this task exists to fix.** Revision 1's `open_channel` ignored
+    /// its principal and minted a full-ops capability token for any lease id,
+    /// so any authenticated client got flash/debug on any board. Assert not
+    /// merely that an error comes back, but that **no token was minted** — i.e.
+    /// the agent was never commanded to open a session.
     #[tokio::test]
-    async fn inventory_populates_scheduler_and_list() {
-        use fleet_proto::agent_api::{
-            BoardPresence, BoardStatus, ProbeInventory,
+    async fn other_subject_cannot_open_channel_and_no_token_is_minted() {
+        use crate::registry::{AgentHandle, AgentMessage};
+
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        coord
+            .agents()
+            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .await;
+
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+
+        // bob — a legitimate member of the same org, but not the holder.
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "bob"),
+                SidecarToCoord::OpenChannel {
+                    lease: grant.lease,
+                    kind: fleet_proto::ChannelKind::Data,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::Error { message } => assert_eq!(message, "no such lease"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        // No OpenSession reached the agent => no capability token exists.
+        assert!(
+            arx.try_recv().is_err(),
+            "a refused open_channel must not mint or deliver a token"
+        );
+        assert!(coord.channels().is_empty().await);
+
+        // The holder, by contrast, succeeds.
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::OpenChannel {
+                    lease: grant.lease,
+                    kind: fleet_proto::ChannelKind::Data,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::ChannelOpened { .. }
+        ));
+        assert!(matches!(
+            arx.recv().await.unwrap(),
+            AgentMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
+        ));
+    }
+
+    /// An org admin may open a channel on a member's lease (§6.5's "or an org
+    /// admin"), and the audit line records the override.
+    #[tokio::test]
+    async fn org_admin_may_open_channel_on_members_lease() {
+        use crate::registry::{AgentHandle, AgentMessage};
+
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        coord
+            .agents()
+            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .await;
+
+        let grant = grant_lease(&coord, &user(DEFAULT_ORG_ID, "alice"), "b1").await;
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "op"),
+                SidecarToCoord::OpenChannel {
+                    lease: grant.lease,
+                    kind: fleet_proto::ChannelKind::Data,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::ChannelOpened { .. }
+        ));
+        assert!(matches!(
+            arx.recv().await.unwrap(),
+            AgentMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn other_subject_cannot_extend_or_release() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+
+        let bob = user(DEFAULT_ORG_ID, "bob");
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        for msg in [
+            SidecarToCoord::Extend { lease: grant.lease },
+            SidecarToCoord::Release { lease: grant.lease },
+        ] {
+            coord.handle_sidecar_message(&bob, msg, &tx).await.unwrap();
+            match rx.recv().await.unwrap() {
+                CoordToSidecar::Error { message } => assert_eq!(message, "no such lease"),
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+        // The lease is untouched: still open, still alice's, still expiring at
+        // its original time.
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .open_lease_count()
+                .await
+                .unwrap(),
+            1
+        );
+        let sched = coord.scheduler().lock().await;
+        assert_eq!(sched.lease_holder(grant.lease), Some(&alice));
+        let BoardState::Leased { expires, .. } = &sched
+            .board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1"))
+            .unwrap()
+            .state
+        else {
+            panic!("still leased");
         };
+        assert_eq!(*expires, 1000 + 600);
+    }
+
+    /// Cross-org: a subject in another org sees nothing and can do nothing,
+    /// even with the same user id.
+    #[tokio::test]
+    async fn cross_org_subject_is_isolated() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[
+                board("org-a", "b1", "node-a"),
+                board("org-b", "b1", "node-b"),
+            ],
+            &[
+                ("org-a", "alice", Role::Admin),
+                ("org-b", "alice", Role::Admin),
+            ],
+        )
+        .await;
+        let alice_a = user("org-a", "alice");
+        let alice_b = user("org-b", "alice");
+        let grant = grant_lease(&coord, &alice_a, "b1").await;
+        assert_eq!(grant.board.org, org("org-a"));
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+
+        // `ctl list` shows only org B's board to org B's alice.
+        coord
+            .handle_sidecar_message(&alice_b, SidecarToCoord::ListBoards, &tx)
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::BoardList(boards) => {
+                assert_eq!(boards.len(), 1);
+                assert_eq!(boards[0].board.org, org("org-b"));
+            }
+            other => panic!("expected BoardList, got {other:?}"),
+        }
+
+        // `ctl who` shows org A's lease to org A only.
+        coord
+            .handle_sidecar_message(&alice_b, SidecarToCoord::Who, &tx)
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::LeaseTable(rows) => assert!(rows.is_empty()),
+            other => panic!("expected LeaseTable, got {other:?}"),
+        }
+        coord
+            .handle_sidecar_message(&alice_a, SidecarToCoord::Who, &tx)
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::LeaseTable(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected LeaseTable, got {other:?}"),
+        }
+
+        // Lease verbs on the other org's lease are indistinguishable from
+        // "no such lease".
+        for msg in [
+            SidecarToCoord::Extend { lease: grant.lease },
+            SidecarToCoord::Release { lease: grant.lease },
+            SidecarToCoord::OpenChannel {
+                lease: grant.lease,
+                kind: fleet_proto::ChannelKind::Data,
+            },
+        ] {
+            coord
+                .handle_sidecar_message(&alice_b, msg, &tx)
+                .await
+                .unwrap();
+            match rx.recv().await.unwrap() {
+                CoordToSidecar::Error { message } => assert_eq!(message, "no such lease"),
+                other => panic!("expected Error, got {other:?}"),
+            }
+        }
+
+        // org A's log is invisible to org B even though both are admins.
+        coord
+            .handle_sidecar_message(
+                &alice_b,
+                SidecarToCoord::Logs {
+                    board: None,
+                    follow: false,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::LogLines(lines) => assert!(lines.is_empty()),
+            other => panic!("expected LogLines, got {other:?}"),
+        }
+    }
+
+    /// `ctl logs` is admin-only.
+    #[tokio::test]
+    async fn logs_require_admin() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "alice"),
+                SidecarToCoord::Logs {
+                    board: None,
+                    follow: false,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::Error { message } => assert_eq!(message, "not authorized"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "op"),
+                SidecarToCoord::Logs {
+                    board: None,
+                    follow: false,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::LogLines(_)
+        ));
+    }
+
+    /// A non-member (and, by construction, any non-user subject) gets nothing.
+    #[tokio::test]
+    async fn non_member_and_workload_subjects_are_denied() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+
+        let strangers = [
+            user(DEFAULT_ORG_ID, "mallory"),
+            Subject::new(org(DEFAULT_ORG_ID), SubjectKind::Workload, "ci"),
+            Subject::new(org(DEFAULT_ORG_ID), SubjectKind::Node, "rpi-1"),
+        ];
+        for s in strangers {
+            for msg in [
+                SidecarToCoord::ListBoards,
+                SidecarToCoord::Who,
+                SidecarToCoord::Lease(lease_req("b1")),
+                SidecarToCoord::PowerCycle {
+                    board: BoardName("b1".to_owned()),
+                },
+            ] {
+                coord.handle_sidecar_message(&s, msg, &tx).await.unwrap();
+                match rx.recv().await.unwrap() {
+                    CoordToSidecar::Error { message } => assert_eq!(message, "not authorized"),
+                    other => panic!("expected Error for {s}, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// Power-cycling another org's board is refused, and looks exactly like a
+    /// board that does not exist.
+    #[tokio::test]
+    async fn cross_org_power_cycle_is_refused() {
+        use crate::registry::{AgentHandle, AgentMessage};
+
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board("org-a", "b1", "node-a")],
+            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Admin)],
+        )
+        .await;
+        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        coord
+            .agents()
+            .insert(AgentId("node-a".to_owned()), AgentHandle::new(atx))
+            .await;
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user("org-b", "bob"),
+                SidecarToCoord::PowerCycle {
+                    board: BoardName("b1".to_owned()),
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::Error { message } => assert_eq!(message, "no such board b1"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(
+            arx.try_recv().is_err(),
+            "no command may reach another org's node"
+        );
+
+        // The owning org's member may.
+        coord
+            .handle_sidecar_message(
+                &user("org-a", "alice"),
+                SidecarToCoord::PowerCycle {
+                    board: BoardName("b1".to_owned()),
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::PowerCycled { .. }
+        ));
+        assert!(matches!(
+            arx.recv().await.unwrap(),
+            AgentMessage::Command(fleet_proto::CoordinatorCommand::PowerCycle { .. })
+        ));
+    }
+
+    /// Inventory reconciliation: a registered agent's online board enters the
+    /// scheduler (becomes leasable + appears in `list`), an offline board is
+    /// dropped, and the board row is **actually persisted** — asserting on the
+    /// warn-swallowed persistence path is exactly where a foreign-key bug would
+    /// otherwise hide.
+    #[tokio::test]
+    async fn inventory_populates_scheduler_db_and_list() {
+        use fleet_proto::agent_api::{BoardPresence, BoardStatus, ProbeInventory};
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         // Fresh coordinator with NO pre-seeded boards.
-        let sched = Scheduler::new(Policy::default());
-        let db = Db::connect_in_memory().await.unwrap();
-        let signer = Ed25519Signer::from_seed(&TEST_SEED);
-        let coord = Coordinator::new(config(), sched, db, signer, clock);
+        let coord = coordinator_with(
+            clock,
+            &[],
+            &[(DEFAULT_ORG_ID, "op", Role::Admin)],
+        )
+        .await;
         let agent_id = AgentId("agent-a".to_owned());
 
         let inv = ProbeInventory {
             boards: vec![
                 BoardStatus {
-                    board: BoardId("online-1".to_owned()),
+                    board: BoardName("online-1".to_owned()),
                     serial: "S-ON".to_owned(),
                     presence: BoardPresence::Online,
                     chip: "nRF52840_xxAA".to_owned(),
@@ -930,7 +1607,7 @@ mod tests {
                     power: PowerKind::None,
                 },
                 BoardStatus {
-                    board: BoardId("offline-1".to_owned()),
+                    board: BoardName("offline-1".to_owned()),
                     serial: "S-OFF".to_owned(),
                     presence: BoardPresence::Offline,
                     chip: "STM32F4".to_owned(),
@@ -946,21 +1623,38 @@ mod tests {
             .await
             .unwrap();
 
-        // The online board is in the scheduler, owned by the agent; the offline
-        // one is not.
+        // The online board is in the scheduler, owned by the agent and keyed
+        // into the default org; the offline one is not.
         {
             let sched = coord.scheduler().lock().await;
-            let board = sched.board(&BoardId("online-1".to_owned())).unwrap();
+            let key = board_ref(DEFAULT_ORG_ID, "agent-a", "online-1");
+            let board = sched.board(&key).unwrap();
             assert_eq!(board.agent, agent_id);
             assert_eq!(board.chip, "nRF52840_xxAA");
-            assert!(sched.board(&BoardId("offline-1".to_owned())).is_none());
+            assert!(sched
+                .board(&board_ref(DEFAULT_ORG_ID, "agent-a", "offline-1"))
+                .is_none());
         }
+
+        // …and it reached the database, node row and all.
+        let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
+        assert!(
+            scoped
+                .has_board(&board_ref(DEFAULT_ORG_ID, "agent-a", "online-1"))
+                .await
+                .unwrap(),
+            "the board row must be persisted, not silently dropped by a FK failure"
+        );
+        assert_eq!(
+            coord.db().org_of_node(&agent_id).await.unwrap(),
+            Some(org(DEFAULT_ORG_ID))
+        );
 
         // `ctl list` (ListBoards) returns the online board as available.
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
             .handle_sidecar_message(
-                &Principal("op".to_owned()),
+                &user(DEFAULT_ORG_ID, "op"),
                 SidecarToCoord::ListBoards,
                 &tx,
             )
@@ -969,7 +1663,10 @@ mod tests {
         match rx.recv().await.unwrap() {
             CoordToSidecar::BoardList(boards) => {
                 assert_eq!(boards.len(), 1);
-                assert_eq!(boards[0].board, BoardId("online-1".to_owned()));
+                assert_eq!(
+                    boards[0].board,
+                    board_ref(DEFAULT_ORG_ID, "agent-a", "online-1")
+                );
                 assert_eq!(
                     boards[0].availability,
                     fleet_proto::admin::BoardAvailability::Available

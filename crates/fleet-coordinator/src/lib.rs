@@ -30,6 +30,7 @@
 //! [`sweep`] is the background expiry task.
 
 pub mod auth;
+pub mod authz;
 pub mod clock;
 pub mod config;
 pub mod core;
@@ -47,11 +48,12 @@ use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;
 
 pub use crate::auth::Ed25519Signer;
+pub use crate::authz::AuthzError;
 pub use crate::clock::{now_epoch_secs, Clock, SharedClock, SystemClock};
 pub use crate::config::{CoordinatorConfig, SigningKeySource};
 pub use crate::core::{Coordinator, SharedCoordinator};
 pub use crate::error::{CoordinatorError, Result};
-pub use crate::state::Db;
+pub use crate::state::{Db, OrgDb};
 
 use fleet_core::scheduler::Scheduler;
 

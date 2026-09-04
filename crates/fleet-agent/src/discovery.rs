@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 
-use fleet_proto::{BoardId, BoardPresence, BoardStatus, DiscoveredProbe, ProbeInventory};
+use fleet_proto::{BoardName, BoardPresence, BoardStatus, DiscoveredProbe, ProbeInventory};
 
 use crate::config::BoardsConfig;
 
@@ -70,7 +70,7 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
             matched_serials.push(&board.serial);
         }
         board_statuses.push(BoardStatus {
-            board: BoardId(board.id.clone()),
+            board: BoardName(board.id.clone()),
             serial: board.serial.clone(),
             presence: if present {
                 BoardPresence::Online
@@ -234,7 +234,7 @@ impl ProbeLister for ProbeRsListLister {
 
 /// Whether `board` is leasable given an inventory snapshot (present + declared).
 #[must_use]
-pub fn is_leasable(inventory: &ProbeInventory, board: &BoardId) -> bool {
+pub fn is_leasable(inventory: &ProbeInventory, board: &BoardName) -> bool {
     inventory
         .boards
         .iter()
@@ -305,9 +305,9 @@ chip = "c2"
     #[test]
     fn is_leasable_requires_online() {
         let inv = reconcile(&boards(), &[probe("AAA")]);
-        assert!(is_leasable(&inv, &BoardId("b1".into())));
-        assert!(!is_leasable(&inv, &BoardId("b2".into())));
-        assert!(!is_leasable(&inv, &BoardId("nope".into())));
+        assert!(is_leasable(&inv, &BoardName("b1".into())));
+        assert!(!is_leasable(&inv, &BoardName("b2".into())));
+        assert!(!is_leasable(&inv, &BoardName("nope".into())));
     }
 
     fn probe_ids(serial: &str, vid: u16, pid: u16) -> DiscoveredProbe {
@@ -327,7 +327,7 @@ chip = "c2"
         let inv = reconcile(&boards(), &[inaccessible_probe("AAA")]);
         let b1 = inv.boards.iter().find(|b| b.board.0 == "b1").unwrap();
         assert_eq!(b1.presence, BoardPresence::Offline);
-        assert!(!is_leasable(&inv, &BoardId("b1".into())));
+        assert!(!is_leasable(&inv, &BoardName("b1".into())));
     }
 
     #[test]

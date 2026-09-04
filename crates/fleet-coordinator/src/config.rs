@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use fleet_core::policy::Policy;
-use fleet_proto::ids::AgentId;
+use fleet_proto::ids::{AgentId, OrgId};
 
 use crate::error::{CoordinatorError, Result};
 
@@ -50,11 +50,18 @@ pub struct CoordinatorConfig {
     /// Lease scheduling policy.
     pub policy: Policy,
     /// Pinned agents: maps a cert SHA-256 fingerprint to the expected
-    /// [`AgentId`]. A connection whose principal/fingerprint is in this map is
-    /// treated as an agent; everything else is a sidecar.
+    /// [`AgentId`]. A connection whose fingerprint is in this map is treated
+    /// as an agent; everything else resolves to a sidecar `Subject`.
     pub pinned_agents: HashMap<String, AgentId>,
     /// How often (seconds) the expiry sweep runs.
     pub sweep_interval_secs: u64,
+    /// The org every authenticated subject is assigned to.
+    ///
+    /// Single-tenant stopgap: until GitHub login exists (a separate task) the
+    /// mTLS resolution seam in [`crate::server`] puts every caller in this org.
+    /// The authorization layer is org-generic regardless, so swapping the seam
+    /// changes nothing downstream.
+    pub default_org: OrgId,
 }
 
 impl CoordinatorConfig {
@@ -79,6 +86,11 @@ impl CoordinatorConfig {
         if self.sweep_interval_secs == 0 {
             return Err(CoordinatorError::Config(
                 "sweep_interval_secs must be non-zero".to_owned(),
+            ));
+        }
+        if self.default_org.0.is_empty() {
+            return Err(CoordinatorError::Config(
+                "default_org must be non-empty".to_owned(),
             ));
         }
         Ok(())
@@ -108,6 +120,7 @@ mod tests {
             policy: Policy::default(),
             pinned_agents: HashMap::new(),
             sweep_interval_secs: 5,
+            default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
         }
     }
 
@@ -127,6 +140,13 @@ mod tests {
     fn zero_sweep_interval_rejected() {
         let mut c = cfg();
         c.sweep_interval_secs = 0;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn empty_default_org_rejected() {
+        let mut c = cfg();
+        c.default_org = OrgId(String::new());
         assert!(c.validate().is_err());
     }
 

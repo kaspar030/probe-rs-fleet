@@ -20,7 +20,7 @@ use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{AgentId, BoardId, Principal};
+use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Role, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
@@ -107,6 +107,7 @@ fn coordinator_config() -> CoordinatorConfig {
         pinned_agents: std::collections::HashMap::new(),
         sweep_interval_secs: 5,
         advertise_addr: None,
+        default_org: OrgId("default".to_owned()),
     }
 }
 
@@ -150,6 +151,11 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     let token_pubkey = signer.public_key_bytes();
     let sched = Scheduler::new(Policy::default());
     let db = Db::connect_in_memory().await.unwrap();
+    // The single-user bootstrap the mTLS resolution seam performs on connect.
+    db.ensure_user_member(&OrgId("default".to_owned()), "dev", Role::Admin)
+        .await
+        .unwrap();
+    let dev = Subject::new(OrgId("default".to_owned()), SubjectKind::User, "dev");
     let coord = Arc::new(Coordinator::new(
         coordinator_config(),
         sched,
@@ -184,7 +190,14 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     }
 
     // Wait for the agent's inventory to populate the scheduler.
-    let board_id = BoardId("nrf52840-dk-1".to_owned());
+    // The coordinator keys the board by (org, node, name); the sidecar asks for
+    // it by node-local name.
+    let board_name = BoardName("nrf52840-dk-1".to_owned());
+    let board_id = BoardRef::new(
+        OrgId("default".to_owned()),
+        AgentId("agent-a".to_owned()),
+        "nrf52840-dk-1",
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         {
@@ -201,11 +214,12 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     let (sidecar_side, coord_sidecar_side) = tokio::io::duplex(16 * 1024);
     {
         let coord = Arc::clone(&coord);
+        let dev = dev.clone();
         tokio::spawn(async move {
             let _ = fleet_coordinator::server::handle_sidecar_for_test(
                 coord,
                 coord_sidecar_side,
-                Principal("dev".to_owned()),
+                dev.clone(),
             )
             .await;
         });
@@ -218,7 +232,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // Lease the board.
     let grant = session
         .lease(&LeaseRequest {
-            select: Constraint::Board(board_id.clone()),
+            select: Constraint::Board(board_name.clone()),
             duration_secs: 600,
             priority: Priority::Interactive,
         })
@@ -259,11 +273,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // The board shows up as leased in the operator inventory.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CoordToSidecar>(8);
     coord
-        .handle_sidecar_message(
-            &Principal("op".to_owned()),
-            SidecarToCoord::ListBoards,
-            &tx,
-        )
+        .handle_sidecar_message(&dev, SidecarToCoord::ListBoards, &tx)
         .await
         .unwrap();
     match rx.recv().await.unwrap() {

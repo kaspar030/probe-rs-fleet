@@ -1,38 +1,42 @@
 //! Time-based lease sharing cache.
 //!
 //! A lease is *not* tied to a single `probe-rs` invocation (see
-//! `docs/architecture.md` §6): a principal claims a board and holds it across
+//! `docs/architecture.md` §6): a subject claims a board and holds it across
 //! many invocations so remote DX feels local. This cache lets repeated sidecar
 //! invocations reuse an existing lease instead of re-leasing on every
 //! `probe-rs run`.
 //!
-//! Entries are keyed by `(selector fingerprint, principal)` so that two
+//! Entries are keyed by `(selector fingerprint, subject key)` so that two
 //! different selectors — or two different callers — never share a lease. The
+//! subject key is `(org, kind, id)`, so two same-named users in different orgs
+//! never collide either. The
 //! cache is pure logic with an injected clock; persistence (e.g. a file under
 //! `$XDG_RUNTIME_DIR/probe-rs-fleet/leases`) is a separate concern layered on
 //! top and is intentionally not implemented here.
 
 use std::collections::HashMap;
 
-use fleet_proto::ids::Principal;
+use fleet_proto::ids::SubjectKey;
 use fleet_proto::lease::{Constraint, LeaseGrant};
 
-/// Cache key: a stable fingerprint of the selector plus the calling principal.
+/// Cache key: a stable fingerprint of the selector plus the calling subject.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     /// Canonical, stable string form of the board selector.
     pub selector: String,
-    /// The principal that holds the lease.
-    pub principal: Principal,
+    /// The stable identity of the subject that holds the lease. Deliberately
+    /// the `SubjectKey`, not the whole `Subject`: a group change must not
+    /// invalidate a cached lease.
+    pub subject: SubjectKey,
 }
 
 impl CacheKey {
-    /// Build a key from a board [`Constraint`] and [`Principal`].
+    /// Build a key from a board [`Constraint`] and a [`SubjectKey`].
     #[must_use]
-    pub fn new(select: &Constraint, principal: &Principal) -> Self {
+    pub fn new(select: &Constraint, subject: &SubjectKey) -> Self {
         Self {
             selector: fingerprint(select),
-            principal: principal.clone(),
+            subject: subject.clone(),
         }
     }
 }
@@ -89,7 +93,7 @@ impl CachedLease {
     }
 }
 
-/// An in-memory cache of leases keyed by selector + principal.
+/// An in-memory cache of leases keyed by selector + subject.
 #[derive(Debug, Default)]
 pub struct LeaseCache {
     entries: HashMap<CacheKey, CachedLease>,
@@ -102,12 +106,12 @@ impl LeaseCache {
         Self::default()
     }
 
-    /// Insert (or replace) a lease for the given selector + principal.
-    pub fn insert(&mut self, select: &Constraint, principal: &Principal, lease: CachedLease) {
-        self.entries.insert(CacheKey::new(select, principal), lease);
+    /// Insert (or replace) a lease for the given selector + subject.
+    pub fn insert(&mut self, select: &Constraint, subject: &SubjectKey, lease: CachedLease) {
+        self.entries.insert(CacheKey::new(select, subject), lease);
     }
 
-    /// Fetch a still-valid lease for the selector + principal at `now_secs`.
+    /// Fetch a still-valid lease for the selector + subject at `now_secs`.
     ///
     /// Returns `None` if there is no entry, or if the entry has expired (or is
     /// within its refresh margin). Expired entries are evicted on access.
@@ -115,10 +119,10 @@ impl LeaseCache {
     pub fn get(
         &mut self,
         select: &Constraint,
-        principal: &Principal,
+        subject: &SubjectKey,
         now_secs: u64,
     ) -> Option<&CachedLease> {
-        let key = CacheKey::new(select, principal);
+        let key = CacheKey::new(select, subject);
         match self.entries.get(&key) {
             Some(entry) if entry.is_valid(now_secs) => self.entries.get(&key),
             Some(_) => {
@@ -130,8 +134,8 @@ impl LeaseCache {
     }
 
     /// Remove a lease (e.g. on explicit release), returning it if present.
-    pub fn remove(&mut self, select: &Constraint, principal: &Principal) -> Option<CachedLease> {
-        self.entries.remove(&CacheKey::new(select, principal))
+    pub fn remove(&mut self, select: &Constraint, subject: &SubjectKey) -> Option<CachedLease> {
+        self.entries.remove(&CacheKey::new(select, subject))
     }
 
     /// Drop every entry that is no longer valid at `now_secs`.
@@ -155,27 +159,39 @@ impl LeaseCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::ids::{AgentId, BoardId, LeaseId};
+    use fleet_proto::ids::{AgentId, BoardName, BoardRef, LeaseId, OrgId, Subject, SubjectKind};
+
+    fn subject(holder: &str) -> Subject {
+        subject_in("default", holder)
+    }
+
+    fn subject_in(org: &str, holder: &str) -> Subject {
+        Subject::new(OrgId(org.to_owned()), SubjectKind::User, holder)
+    }
 
     fn grant(expires: u64, holder: &str) -> LeaseGrant {
         LeaseGrant {
             lease: LeaseId(1),
-            board: BoardId("nrf52840-dk-3".to_owned()),
+            board: BoardRef::new(
+                OrgId("default".to_owned()),
+                AgentId("agent-1".to_owned()),
+                "nrf52840-dk-3",
+            ),
             agent: AgentId("agent-1".to_owned()),
-            holder: Principal(holder.to_owned()),
+            holder: subject(holder),
             expires,
             token: vec![1, 2, 3],
         }
     }
 
     fn board_sel() -> Constraint {
-        Constraint::Board(BoardId("nrf52840-dk-3".to_owned()))
+        Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
     }
 
     #[test]
     fn insert_then_get_when_valid() {
         let mut cache = LeaseCache::new();
-        let p = Principal("dev".to_owned());
+        let p = subject("dev").key();
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         // now well before expiry minus margin.
         let got = cache.get(&board_sel(), &p, 500);
@@ -186,7 +202,7 @@ mod tests {
     #[test]
     fn expired_entry_is_evicted_on_get() {
         let mut cache = LeaseCache::new();
-        let p = Principal("dev".to_owned());
+        let p = subject("dev").key();
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         // now past expiry.
         assert!(cache.get(&board_sel(), &p, 2000).is_none());
@@ -203,20 +219,32 @@ mod tests {
     }
 
     #[test]
-    fn key_includes_principal() {
+    fn key_includes_subject() {
         let mut cache = LeaseCache::new();
-        let alice = Principal("alice".to_owned());
-        let bob = Principal("bob".to_owned());
+        let alice = subject("alice").key();
+        let bob = subject("bob").key();
         cache.insert(&board_sel(), &alice, CachedLease::new(grant(1000, "alice")));
         // bob shares the selector but must NOT see alice's lease.
         assert!(cache.get(&board_sel(), &bob, 500).is_none());
         assert!(cache.get(&board_sel(), &alice, 500).is_some());
     }
 
+    /// Two same-named users in different orgs must not share a cached lease:
+    /// the key is the full `SubjectKey`, org included.
+    #[test]
+    fn key_includes_org() {
+        let mut cache = LeaseCache::new();
+        let alice_a = subject_in("org-a", "alice").key();
+        let alice_b = subject_in("org-b", "alice").key();
+        cache.insert(&board_sel(), &alice_a, CachedLease::new(grant(1000, "alice")));
+        assert!(cache.get(&board_sel(), &alice_b, 500).is_none());
+        assert!(cache.get(&board_sel(), &alice_a, 500).is_some());
+    }
+
     #[test]
     fn key_includes_selector() {
         let mut cache = LeaseCache::new();
-        let p = Principal("dev".to_owned());
+        let p = subject("dev").key();
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         let other = Constraint::Chip("STM32F407".to_owned());
         assert!(cache.get(&other, &p, 500).is_none());
@@ -232,7 +260,7 @@ mod tests {
     #[test]
     fn remove_returns_entry() {
         let mut cache = LeaseCache::new();
-        let p = Principal("dev".to_owned());
+        let p = subject("dev").key();
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         let removed = cache.remove(&board_sel(), &p);
         assert!(removed.is_some());
@@ -242,7 +270,7 @@ mod tests {
     #[test]
     fn evict_expired_drops_only_stale() {
         let mut cache = LeaseCache::new();
-        let p = Principal("dev".to_owned());
+        let p = subject("dev").key();
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         cache.insert(
             &Constraint::Chip("c".to_owned()),

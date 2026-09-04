@@ -99,7 +99,8 @@ async fn handle_enroll_inner(
     let secret_hash = hash_secret(&req.secret);
     let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
 
-    let Some((principal, kind)) = coord.db().consume_enroll_token(&secret_hash, now).await? else {
+    let Some((org, principal, kind)) = coord.db().consume_enroll_token(&secret_hash, now).await?
+    else {
         return Ok(EnrollResponse::Rejected {
             reason: "invalid, expired, or already-used enrollment secret".to_owned(),
         });
@@ -119,7 +120,7 @@ async fn handle_enroll_inner(
         let fingerprint = fleet_tls::cert_fingerprint(&der);
         coord
             .db()
-            .insert_agent_pin(&fingerprint, &principal, now)
+            .insert_agent_pin(&org, &fingerprint, &principal, now)
             .await?;
     }
 

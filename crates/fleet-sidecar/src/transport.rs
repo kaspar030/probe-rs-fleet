@@ -400,10 +400,10 @@ mod tests {
         let cfg = FleetConfig {
             coordinator: "c:1".to_owned(),
             auth: Auth::Token("t".to_owned()),
-            select: fleet_proto::lease::Constraint::Board(fleet_proto::ids::BoardId(
+            select: fleet_proto::lease::Constraint::Board(fleet_proto::ids::BoardName(
                 "b".to_owned(),
             )),
-            principal: None,
+            subject_id: None,
         };
         let err = client_config(&cfg).unwrap_err();
         assert!(matches!(err, TransportError::Tls(_)));
@@ -413,10 +413,19 @@ mod tests {
     /// hand-rolled coordinator peer: Hello/Welcome, `Lease`, `OpenChannel`, then
     /// a client byte-splice round-trip in both directions.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::too_many_lines)]
     async fn session_leases_opens_channel_and_splices() {
-        use fleet_proto::ids::{AgentId, BoardId, Principal};
+        use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
         use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
         use fleet_proto::LeaseId;
+
+        // The coordinator answers with a fleet-unique board key; the request
+        // side stays node-local.
+        let board_ref = BoardRef::new(
+            OrgId("default".to_owned()),
+            AgentId("a".to_owned()),
+            "b1",
+        );
 
         let (sidecar_side, coord_side) = tokio::io::duplex(8192);
         let (sc_reader, sc_writer) = tokio::io::split(sidecar_side);
@@ -424,6 +433,7 @@ mod tests {
 
         // Coordinator peer task: Welcome -> Lease grant -> ChannelOpened ->
         // echo any Data frame back on the same channel.
+        let board_ref_for_peer = board_ref.clone();
         let coord = tokio::spawn(async move {
             // Hello -> Welcome.
             match read_frame::<_, SidecarToCoord>(&mut coord_reader).await.unwrap() {
@@ -450,9 +460,13 @@ mod tests {
                 &mut coord_writer,
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
-                    board: BoardId("b1".to_owned()),
+                    board: board_ref_for_peer.clone(),
                     agent: AgentId("a".to_owned()),
-                    holder: Principal("p".to_owned()),
+                    holder: Subject::new(
+                        OrgId("default".to_owned()),
+                        SubjectKind::User,
+                        "p",
+                    ),
                     expires: 9999,
                     token: vec![0xab, 0xcd],
                 }),
@@ -494,13 +508,13 @@ mod tests {
         let session = CoordSession::start(sc_reader, sc_writer).await.unwrap();
         let grant = session
             .lease(&LeaseRequest {
-                select: Constraint::Board(BoardId("b1".to_owned())),
+                select: Constraint::Board(BoardName("b1".to_owned())),
                 duration_secs: 600,
                 priority: Priority::Interactive,
             })
             .await
             .unwrap();
-        assert_eq!(grant.board, BoardId("b1".to_owned()));
+        assert_eq!(grant.board, board_ref);
         let channel = session
             .open_channel(grant.lease, ChannelKind::Data)
             .await

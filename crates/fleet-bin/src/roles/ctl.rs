@@ -10,7 +10,7 @@
 
 use anyhow::{Context, Result};
 
-use fleet_proto::ids::BoardId;
+use fleet_proto::ids::BoardName;
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 use crate::cli::{CtlArgs, CtlClientArgs, CtlCommand};
@@ -95,7 +95,8 @@ fn load_client_fallback(profile: &str) -> Option<crate::config::ClientConfig> {
 /// - `tag=<t>` → [`Constraint::Tags`] with a single tag (repeatable on the
 ///   wire; the CLI takes one token, callers can refine later),
 /// - `chip=<c>` → [`Constraint::Chip`],
-/// - anything else → [`Constraint::Board`] (a bare board id).
+/// - anything else → [`Constraint::Board`] (a bare, node-local board name; the
+///   coordinator resolves it within the caller's org).
 #[must_use]
 pub fn parse_selector(selector: &str) -> Constraint {
     if let Some(tag) = selector.strip_prefix("tag=") {
@@ -103,7 +104,7 @@ pub fn parse_selector(selector: &str) -> Constraint {
     } else if let Some(chip) = selector.strip_prefix("chip=") {
         Constraint::Chip(chip.to_owned())
     } else {
-        Constraint::Board(BoardId(selector.to_owned()))
+        Constraint::Board(BoardName(selector.to_owned()))
     }
 }
 
@@ -202,13 +203,16 @@ impl CtlClient {
                 if boards.is_empty() {
                     println!("no boards in the fleet");
                 } else {
-                    println!("{:<24} {:<16} {:<16} {:<12} HOLDER", "BOARD", "AGENT", "CHIP", "STATE");
+                    // BOARD is now the fleet key "<org>/<node>/<name>", so it
+                    // is wider than revision 1's bare id.
+                    println!("{:<32} {:<16} {:<16} {:<12} HOLDER", "BOARD", "AGENT", "CHIP", "STATE");
                     for b in boards {
                         let state = format!("{:?}", b.availability);
-                        let holder = b.holder.map_or_else(String::new, |h| h.0);
+                        // Render the holder as its stable key ("<org>/<kind>:<id>").
+                        let holder = b.holder.map_or_else(String::new, |h| h.key().to_string());
                         println!(
-                            "{:<24} {:<16} {:<16} {:<12} {}",
-                            b.board.0, b.agent.0, b.chip, state, holder
+                            "{:<32} {:<16} {:<16} {:<12} {}",
+                            b.board, b.agent.0, b.chip, state, holder
                         );
                     }
                 }
@@ -230,7 +234,7 @@ impl CtlClient {
             CoordToSidecar::Lease(grant) => {
                 println!(
                     "leased {} (lease {}) on agent {} until {} (epoch)",
-                    grant.board.0, grant.lease.0, grant.agent.0, grant.expires
+                    grant.board, grant.lease.0, grant.agent.0, grant.expires
                 );
                 Ok(())
             }
@@ -244,7 +248,7 @@ impl CtlClient {
     }
 
     /// `ctl release <board>`.
-    async fn release(&self, board: &BoardId) -> Result<()> {
+    async fn release(&self, board: &BoardName) -> Result<()> {
         use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
         // Resolve the lease holding `board` via the board list, then release it.
         let (mut reader, mut writer) = self.connect().await?;
@@ -254,20 +258,20 @@ impl CtlClient {
         let lease = match read_frame::<_, CoordToSidecar>(&mut reader).await? {
             CoordToSidecar::BoardList(boards) => boards
                 .into_iter()
-                .find(|b| &b.board == board)
+                .find(|b| b.board.name == board.0)
                 .and_then(|b| b.lease),
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
             other => anyhow::bail!("unexpected reply: {other:?}"),
         };
         let Some(lease) = lease else {
-            anyhow::bail!("board {} is not currently leased", board.0);
+            anyhow::bail!("board {board} is not currently leased");
         };
         write_frame(&mut writer, &SidecarToCoord::Release { lease })
             .await
             .context("sending release request")?;
         match read_frame::<_, CoordToSidecar>(&mut reader).await? {
             CoordToSidecar::Released { lease } => {
-                println!("released lease {} on {}", lease.0, board.0);
+                println!("released lease {} on {board}", lease.0);
                 Ok(())
             }
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
@@ -276,7 +280,7 @@ impl CtlClient {
     }
 
     /// `ctl power-cycle <board>`.
-    async fn power_cycle(&self, board: &BoardId) -> Result<()> {
+    async fn power_cycle(&self, board: &BoardName) -> Result<()> {
         use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
         let (mut reader, mut writer) = self.connect().await?;
         write_frame(
@@ -289,7 +293,7 @@ impl CtlClient {
         .context("sending power-cycle request")?;
         match read_frame::<_, CoordToSidecar>(&mut reader).await? {
             CoordToSidecar::PowerCycled { board } => {
-                println!("power-cycled {}", board.0);
+                println!("power-cycled {board}");
                 Ok(())
             }
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
@@ -309,11 +313,14 @@ impl CtlClient {
                 if holders.is_empty() {
                     println!("no active leases");
                 } else {
-                    println!("{:<8} {:<24} {:<16} EXPIRES", "LEASE", "BOARD", "HOLDER");
+                    println!("{:<8} {:<32} {:<24} EXPIRES", "LEASE", "BOARD", "HOLDER");
                     for h in holders {
                         println!(
-                            "{:<8} {:<24} {:<16} {}",
-                            h.lease.0, h.board.0, h.holder.0, h.expires
+                            "{:<8} {:<32} {:<24} {}",
+                            h.lease.0,
+                            h.board,
+                            h.holder.key(),
+                            h.expires
                         );
                     }
                 }
@@ -325,7 +332,7 @@ impl CtlClient {
     }
 
     /// `ctl logs [board] [--follow]`.
-    async fn logs(&self, board: Option<&BoardId>, follow: bool) -> Result<()> {
+    async fn logs(&self, board: Option<&BoardName>, follow: bool) -> Result<()> {
         use fleet_coordinator::proto::{read_frame, write_frame, CoordToSidecar, SidecarToCoord};
         let (mut reader, mut writer) = self.connect().await?;
         write_frame(
@@ -389,11 +396,11 @@ pub async fn run(args: CtlArgs) -> Result<()> {
             };
             client.lease(&request).await
         }
-        CtlCommand::Release { board } => client.release(&BoardId(board)).await,
-        CtlCommand::PowerCycle { board } => client.power_cycle(&BoardId(board)).await,
+        CtlCommand::Release { board } => client.release(&BoardName(board)).await,
+        CtlCommand::PowerCycle { board } => client.power_cycle(&BoardName(board)).await,
         CtlCommand::Who => client.who().await,
         CtlCommand::Logs { board, follow } => {
-            client.logs(board.map(BoardId).as_ref(), follow).await
+            client.logs(board.map(BoardName).as_ref(), follow).await
         }
     }
 }
@@ -406,7 +413,7 @@ mod tests {
     fn bare_id_is_a_board_constraint() {
         assert_eq!(
             parse_selector("nrf52840-dk-3"),
-            Constraint::Board(BoardId("nrf52840-dk-3".to_owned()))
+            Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
         );
     }
 

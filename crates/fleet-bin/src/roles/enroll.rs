@@ -125,7 +125,16 @@ pub async fn mint_token(
     .unwrap_or(i64::MAX);
     let expires_at = now.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
 
-    db.insert_enroll_token(&secret_hash, principal_id, kind_str, now, expires_at)
+    // Enrollment mints an identity inside one org; a single-user deployment
+    // uses the coordinator's configured default.
+    db.insert_enroll_token(
+        &coord_cfg.default_org,
+        &secret_hash,
+        principal_id,
+        kind_str,
+        now,
+        expires_at,
+    )
         .await
         .context("recording enrollment token")?;
 

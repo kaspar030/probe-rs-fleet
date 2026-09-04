@@ -1,40 +1,192 @@
--- Coordinator persistent state: boards seen, leases, and the audit log.
+-- Coordinator persistent state, architecture revision 2 (§6.1).
+--
+-- Every object belongs to an org. Multi-tenancy here is a **security boundary
+-- between paying customers**, not a tidiness property, so:
+--   * every table a caller can reach carries `org_id`;
+--   * the Rust `Db` API exposes those tables only through an `OrgDb` handle
+--     that interpolates one org into every WHERE clause, so an unscoped query
+--     is not expressible from outside `state.rs`;
+--   * `PRAGMA foreign_keys = ON` is set on connect, so the REFERENCES below
+--     are enforced rather than decorative.
+--
+-- The database is wiped for revision 2: this file replaces the revision-1
+-- schema wholesale, there is no ALTER-TABLE migration path and none is wanted.
 
--- Every board the coordinator has ever observed (latest snapshot per id).
-CREATE TABLE IF NOT EXISTS boards (
+-- ---------------------------------------------------------------------------
+-- Identity
+-- ---------------------------------------------------------------------------
+
+-- An org. A personal org (an org of one) is created on first login; there is
+-- deliberately no user-owned/org-owned branch, so no code path can forget the
+-- org check.
+CREATE TABLE org (
     id          TEXT    NOT NULL PRIMARY KEY,
-    agent       TEXT    NOT NULL,
-    chip        TEXT    NOT NULL,
-    tags        TEXT    NOT NULL,          -- newline-joined strings
-    exclusive   INTEGER NOT NULL,          -- 0/1
-    state       TEXT    NOT NULL,          -- coarse state label
-    first_seen  INTEGER NOT NULL,          -- epoch seconds
-    last_seen   INTEGER NOT NULL           -- epoch seconds
+    slug        TEXT    NOT NULL UNIQUE,
+    kind        TEXT    NOT NULL,              -- 'personal' | 'team'
+    created_at  INTEGER NOT NULL               -- epoch seconds
 );
 
--- Leases granted by the scheduler. `closed_at` is NULL while active.
-CREATE TABLE IF NOT EXISTS leases (
-    lease       INTEGER NOT NULL PRIMARY KEY,
-    board       TEXT    NOT NULL,
-    agent       TEXT    NOT NULL,
-    holder      TEXT    NOT NULL,
-    granted_at  INTEGER NOT NULL,          -- epoch seconds
-    expires     INTEGER NOT NULL,          -- epoch seconds
-    closed_at   INTEGER,                   -- epoch seconds, NULL while active
+-- A human. `github_user_id` is the immutable numeric id; `login` is cached for
+-- display only and must never be used as an identity key (it can be renamed
+-- and reused by someone else).
+CREATE TABLE user (
+    id              TEXT    NOT NULL PRIMARY KEY,
+    personal_org_id TEXT    NOT NULL REFERENCES org(id),
+    github_user_id  INTEGER,
+    login           TEXT,
+    email           TEXT,
+    created_at      INTEGER NOT NULL           -- epoch seconds
+);
+
+-- Org membership. Two roles only (architecture §6.5): `member` may add a node
+-- and use the org's boards; `admin` additionally acts on other members' leases
+-- and reads the audit log.
+--
+-- Note membership is defined for users only: a `node` or `workload` subject has
+-- no row here and is therefore denied by construction until grants land.
+CREATE TABLE member (
+    org_id  TEXT NOT NULL REFERENCES org(id),
+    user_id TEXT NOT NULL REFERENCES user(id),
+    role    TEXT NOT NULL,                     -- 'admin' | 'member'
+    PRIMARY KEY (org_id, user_id)
+);
+
+-- ---------------------------------------------------------------------------
+-- Inventory
+-- ---------------------------------------------------------------------------
+
+-- A machine offering probes to the fleet. `token_hash` and `adopt_policy` are
+-- placeholders for the bearer-auth and adoption tasks respectively; nothing
+-- writes them yet.
+CREATE TABLE node (
+    id            TEXT    NOT NULL PRIMARY KEY,
+    org_id        TEXT    NOT NULL REFERENCES org(id),
+    owner_user_id TEXT    REFERENCES user(id),
+    name          TEXT    NOT NULL,
+    tags          TEXT    NOT NULL DEFAULT '', -- newline-joined
+    token_hash    TEXT,
+    adopt_policy  TEXT    NOT NULL DEFAULT 'manual',
+    last_seen     INTEGER,                     -- epoch seconds
+    created_at    INTEGER NOT NULL,            -- epoch seconds
+    UNIQUE (org_id, name)
+);
+
+-- A leasable board. Keyed (org_id, node_id, name) per §6.1: a bare name is only
+-- unique within one node of one org, so revision 1's global board id is gone.
+CREATE TABLE board (
+    org_id     TEXT    NOT NULL REFERENCES org(id),
+    node_id    TEXT    NOT NULL REFERENCES node(id),
+    name       TEXT    NOT NULL,
+    chip       TEXT    NOT NULL,
+    tags       TEXT    NOT NULL,               -- newline-joined
+    exclusive  INTEGER NOT NULL,               -- 0/1
+    state      TEXT    NOT NULL,               -- coarse state label
+    first_seen INTEGER NOT NULL,               -- epoch seconds
+    last_seen  INTEGER NOT NULL,               -- epoch seconds
+    PRIMARY KEY (org_id, node_id, name)
+);
+
+-- ---------------------------------------------------------------------------
+-- Authorization (tables only; evaluation and minting are separate tasks)
+-- ---------------------------------------------------------------------------
+
+-- Sharing: `grant bob --select 'tag=nrf52' --ops flash,attach`. The table exists
+-- so the Subject shape it keys off is fixed now; evaluation is a separate task.
+-- `subject` holds a rendered SubjectKey ("<org>/<kind>:<id>").
+CREATE TABLE grant (
+    id       TEXT    NOT NULL PRIMARY KEY,
+    org_id   TEXT    NOT NULL REFERENCES org(id),
+    subject  TEXT    NOT NULL,
+    selector TEXT    NOT NULL,
+    ops      TEXT    NOT NULL,                 -- newline-joined AllowedOp labels
+    expires  INTEGER                           -- epoch seconds, NULL = no expiry
+);
+
+-- Pre-minted, org-scoped, revocable auth keys for unattended node enrollment.
+-- Created by the bearer-auth task; nothing mints them yet.
+CREATE TABLE auth_key (
+    key_hash   TEXT    NOT NULL PRIMARY KEY,   -- lowercase hex SHA-256
+    org_id     TEXT    NOT NULL REFERENCES org(id),
+    tags       TEXT    NOT NULL DEFAULT '',    -- newline-joined
+    single_use INTEGER NOT NULL DEFAULT 1,     -- 0/1
+    expires    INTEGER,                        -- epoch seconds
+    created_by TEXT,
+    created_at INTEGER NOT NULL                -- epoch seconds
+);
+
+-- ---------------------------------------------------------------------------
+-- Leases and audit
+-- ---------------------------------------------------------------------------
+
+-- Leases granted by the scheduler. `closed_at` is NULL while active. The board
+-- is identified by its full (org, node, name) key; `holder` is a rendered
+-- SubjectKey.
+--
+-- Note there is deliberately **no** foreign key onto `board`. Board rows are a
+-- best-effort snapshot of what nodes report (a failed `record_board` is warned,
+-- not fatal, because the scheduler — not this table — is the source of truth for
+-- live lease state). Referencing them would make a transient snapshot failure
+-- turn a successful lease grant into a hard error, losing the lease record and
+-- the audit trail with it. Tenant scoping does not depend on that FK: it comes
+-- from `org_id` plus the `OrgDb` handle, both of which are enforced.
+CREATE TABLE leases (
+    lease        INTEGER NOT NULL PRIMARY KEY,
+    org_id       TEXT    NOT NULL REFERENCES org(id),
+    node_id      TEXT    NOT NULL,
+    board_name   TEXT    NOT NULL,
+    holder       TEXT    NOT NULL,
+    granted_at   INTEGER NOT NULL,             -- epoch seconds
+    expires      INTEGER NOT NULL,             -- epoch seconds
+    closed_at    INTEGER,                      -- epoch seconds, NULL while active
     close_reason TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_leases_open ON leases (closed_at);
+CREATE INDEX idx_leases_open ON leases (org_id, closed_at);
 
 -- Append-only audit log of security-relevant actions.
-CREATE TABLE IF NOT EXISTS audit_log (
-    id          INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-    ts          INTEGER NOT NULL,          -- epoch seconds
-    principal   TEXT,
-    action      TEXT    NOT NULL,
-    board       TEXT,
-    lease       INTEGER,
-    detail      TEXT
+--
+-- `board` holds the **node-local** board name (scoped by org_id + node_id),
+-- not a rendered BoardRef, so `ctl logs <board>` filters on the same string the
+-- caller typed. `subject` is a rendered SubjectKey.
+CREATE TABLE audit_log (
+    id      INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    ts      INTEGER NOT NULL,                  -- epoch seconds
+    org_id  TEXT    NOT NULL REFERENCES org(id),
+    subject TEXT,
+    action  TEXT    NOT NULL,
+    node_id TEXT,
+    board   TEXT,
+    lease   INTEGER,
+    detail  TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log (ts);
+CREATE INDEX idx_audit_org_ts ON audit_log (org_id, ts);
+
+-- ---------------------------------------------------------------------------
+-- Revision-1 mTLS bootstrap enrollment
+-- ---------------------------------------------------------------------------
+--
+-- The bearer-auth / private-CA-deletion task deletes both of these tables along
+-- with the enrollment stack that uses them. Until it lands they stay, now
+-- org-scoped so nothing here is a tenancy hole in the meantime.
+
+-- One-time bootstrap secrets minted by `coordinator enroll`. The secret itself
+-- is never stored; only its lowercase-hex SHA-256.
+CREATE TABLE enroll_tokens (
+    secret_hash TEXT    NOT NULL PRIMARY KEY,
+    org_id      TEXT    NOT NULL REFERENCES org(id),
+    principal   TEXT    NOT NULL,              -- cert CN to issue
+    kind        TEXT    NOT NULL,              -- 'agent' | 'client'
+    created_at  INTEGER NOT NULL,              -- epoch seconds
+    expires_at  INTEGER NOT NULL,              -- epoch seconds
+    consumed_at INTEGER                        -- epoch seconds, NULL until used
+);
+
+-- Agent pins recorded on successful enrollment: issued cert fingerprint -> the
+-- agent id it may claim.
+CREATE TABLE agent_pins (
+    fingerprint TEXT    NOT NULL PRIMARY KEY,  -- lowercase hex SHA-256 of cert DER
+    org_id      TEXT    NOT NULL REFERENCES org(id),
+    agent_id    TEXT    NOT NULL,
+    created_at  INTEGER NOT NULL               -- epoch seconds
+);

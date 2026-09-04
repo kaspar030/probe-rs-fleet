@@ -416,16 +416,14 @@ impl Scheduler {
         by: &SubjectKey,
         now: u64,
     ) -> Result<Option<GrantedLease>, LeaseAuthError> {
-        {
-            let info = self.leases.get(&lease).ok_or(LeaseAuthError::Unknown)?;
-            if info.holder.key() != *by {
-                return Err(LeaseAuthError::NotHolder);
-            }
+        match self.leases.get(&lease) {
+            None => return Err(LeaseAuthError::Unknown),
+            Some(info) if info.holder.key() != *by => return Err(LeaseAuthError::NotHolder),
+            Some(_) => {}
         }
-        let info = self
-            .leases
-            .remove(&lease)
-            .expect("lease presence checked above");
+        let Some(info) = self.leases.remove(&lease) else {
+            return Err(LeaseAuthError::Unknown);
+        };
         if let Some(board) = self.boards.get_mut(&info.board) {
             board.state = BoardState::Idle;
         }

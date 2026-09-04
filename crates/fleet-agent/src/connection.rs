@@ -473,7 +473,7 @@ mod tests {
     use crate::probers::{ProbeRsBackend, Session};
     use ed25519_dalek::{Signer, SigningKey};
     use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
-    use fleet_proto::{BoardId, ChannelId, LeaseId};
+    use fleet_proto::{ChannelId, LeaseId};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -520,10 +520,20 @@ kind = "none"
         .unwrap()
     }
 
+    /// The fleet-unique key the coordinator mints for one of this node's
+    /// boards; the token is scoped to it and the agent matches it verbatim.
+    fn board_ref(name: &str) -> fleet_proto::BoardRef {
+        fleet_proto::BoardRef::new(
+            fleet_proto::OrgId("default".to_owned()),
+            fleet_proto::AgentId("pi-1".to_owned()),
+            name,
+        )
+    }
+
     fn signed_token(lease: u64, board: &str, ops: Vec<AllowedOp>, expires: u64) -> Vec<u8> {
         let token = CapabilityToken {
             lease: LeaseId(lease),
-            board: BoardId(board.to_owned()),
+            board: board_ref(board),
             allowed_ops: ops,
             expires,
         };
@@ -603,7 +613,7 @@ kind = "none"
             &mut coord_writer,
             &CoordToAgent::Command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".to_owned()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,

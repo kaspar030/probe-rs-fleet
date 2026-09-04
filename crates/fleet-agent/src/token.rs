@@ -14,7 +14,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use fleet_proto::token::{
     AllowedOp, CapabilityToken, SignedToken, TokenError, TokenVerifier,
 };
-use fleet_proto::{BoardId, LeaseId};
+use fleet_proto::{BoardRef, LeaseId};
 
 /// Verifies capability tokens against the coordinator's ed25519 public key.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ impl Ed25519Verifier {
         &self,
         signed: &SignedToken,
         expected_lease: LeaseId,
-        expected_board: &BoardId,
+        expected_board: &BoardRef,
         op: AllowedOp,
         now: u64,
     ) -> Result<CapabilityToken, TokenError> {
@@ -93,7 +93,7 @@ pub fn verify_wire(
     verifier: &Ed25519Verifier,
     wire: &[u8],
     expected_lease: LeaseId,
-    expected_board: &BoardId,
+    expected_board: &BoardRef,
     op: AllowedOp,
     now: u64,
 ) -> Result<CapabilityToken, TokenError> {
@@ -105,6 +105,28 @@ pub fn verify_wire(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    use fleet_proto::ids::{AgentId, OrgId};
+
+    /// The fleet-unique board key a token is scoped to. The agent treats it as
+    /// opaque for matching: it compares the whole `(org, node, name)` triple,
+    /// so a token minted for another org's same-named board does not verify.
+    fn board() -> BoardRef {
+        BoardRef::new(
+            OrgId("acme".to_owned()),
+            AgentId("rpi-1".to_owned()),
+            "nrf52840-dk-3",
+        )
+    }
+
+    /// A board key that differs only in its org — the multi-tenancy case the
+    /// flat `BoardId` could not express.
+    fn other_org_board() -> BoardRef {
+        BoardRef::new(
+            OrgId("evil".to_owned()),
+            AgentId("rpi-1".to_owned()),
+            "nrf52840-dk-3",
+        )
+    }
 
     /// A fixed 32-byte ed25519 secret seed used as a shared test vector. Both
     /// the coordinator's signer tests and these verifier tests must agree on
@@ -140,7 +162,7 @@ mod tests {
     fn token() -> CapabilityToken {
         CapabilityToken {
             lease: LeaseId(7),
-            board: BoardId("nrf52840-dk-3".into()),
+            board: board(),
             allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],
             expires: 2_000_000_000,
         }
@@ -154,7 +176,7 @@ mod tests {
             .authorize(
                 &signed,
                 LeaseId(7),
-                &BoardId("nrf52840-dk-3".into()),
+                &board(),
                 AllowedOp::Flash,
                 1_000_000_000,
             )
@@ -195,7 +217,7 @@ mod tests {
             .authorize(
                 &signed,
                 LeaseId(7),
-                &BoardId("nrf52840-dk-3".into()),
+                &board(),
                 AllowedOp::Flash,
                 2_000_000_001,
             )
@@ -211,7 +233,7 @@ mod tests {
             .authorize(
                 &signed,
                 LeaseId(8),
-                &BoardId("nrf52840-dk-3".into()),
+                &board(),
                 AllowedOp::Flash,
                 1_000_000_000,
             )
@@ -220,14 +242,14 @@ mod tests {
     }
 
     #[test]
-    fn wrong_board_is_rejected() {
+    fn a_same_named_board_in_another_org_is_rejected() {
         let signed = sign(&token());
         let v = verifier();
         let err = v
             .authorize(
                 &signed,
                 LeaseId(7),
-                &BoardId("other".into()),
+                &other_org_board(),
                 AllowedOp::Flash,
                 1_000_000_000,
             )
@@ -243,7 +265,7 @@ mod tests {
             .authorize(
                 &signed,
                 LeaseId(7),
-                &BoardId("nrf52840-dk-3".into()),
+                &board(),
                 AllowedOp::Erase,
                 1_000_000_000,
             )
@@ -260,7 +282,7 @@ mod tests {
             &v,
             &wire,
             LeaseId(7),
-            &BoardId("nrf52840-dk-3".into()),
+            &board(),
             AllowedOp::Attach,
             1_000_000_000,
         )

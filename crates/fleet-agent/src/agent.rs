@@ -18,7 +18,8 @@ use tokio::sync::Mutex;
 
 use fleet_proto::token::AllowedOp;
 use fleet_proto::{
-    AgentReport, BoardId, ChannelId, ChannelKind, CoordinatorCommand, LeaseId, PowerAction,
+    AgentReport, BoardName, BoardRef, ChannelId, ChannelKind, CoordinatorCommand, LeaseId,
+    PowerAction,
     PowerKind, ProbeInventory,
 };
 
@@ -32,7 +33,7 @@ use crate::token::Ed25519Verifier;
 /// An open data-plane session bound to a lease/board/channel.
 struct ActiveSession {
     lease: LeaseId,
-    board: BoardId,
+    board: BoardName,
     session: Box<dyn Session>,
 }
 
@@ -42,7 +43,7 @@ struct ActiveSession {
 /// `probe-rs serve` [`Session`], but shares the same lease/board lifecycle.
 struct GdbSession {
     lease: LeaseId,
-    board: BoardId,
+    board: BoardName,
     connection: GdbConnection,
 }
 
@@ -167,7 +168,7 @@ impl<B: ProbeRsBackend> Agent<B> {
             .boards
             .iter()
             .map(|b| BoardStatus {
-                board: BoardId(b.id.clone()),
+                board: BoardName(b.id.clone()),
                 serial: b.serial.clone(),
                 presence: BoardPresence::Online,
                 chip: b.chip.clone(),
@@ -191,14 +192,14 @@ impl<B: ProbeRsBackend> Agent<B> {
         self.outbox.lock().await.push(report);
     }
 
-    fn board_spec(&self, board: &BoardId) -> Result<&BoardSpec> {
+    fn board_spec(&self, board: &BoardName) -> Result<&BoardSpec> {
         self.boards
             .board(board)
             .ok_or_else(|| AgentError::UnknownBoard(board.0.clone()))
     }
 
     /// Resolve the power controller for a board.
-    fn power_for(&self, board: &BoardId) -> Result<Box<dyn PowerControl>> {
+    fn power_for(&self, board: &BoardName) -> Result<Box<dyn PowerControl>> {
         let spec = self.board_spec(board)?;
         Ok((self.power_factory)(&spec.power.to_power_kind()))
     }
@@ -230,16 +231,23 @@ impl<B: ProbeRsBackend> Agent<B> {
     }
 
     /// Verify the token and open a session of the requested [`ChannelKind`].
+    ///
+    /// The coordinator addresses the board by its fleet-unique [`BoardRef`],
+    /// which is what the capability token is scoped to; the agent compares that
+    /// key verbatim (so a token minted for another org's same-named board does
+    /// not verify) and uses only its node-local name half to look the board up
+    /// in `boards.toml`.
     async fn on_open_session(
         &self,
         lease: LeaseId,
-        board: &BoardId,
+        board: &BoardRef,
         token_wire: &[u8],
         channel: ChannelId,
         kind: ChannelKind,
     ) -> Result<()> {
+        let local = board.board_name();
         // Board must be declared.
-        let spec = self.board_spec(board)?.clone();
+        let spec = self.board_spec(&local)?.clone();
 
         // Verify the capability token locally before doing anything else. The
         // required capability depends on the channel kind: a gdb tunnel needs
@@ -253,10 +261,10 @@ impl<B: ProbeRsBackend> Agent<B> {
 
         match kind {
             ChannelKind::Data => {
-                self.open_data_session(lease, board, token_wire, channel, &spec)
+                self.open_data_session(lease, &local, token_wire, channel, &spec)
                     .await
             }
-            ChannelKind::Gdb => self.open_gdb_session(lease, board, channel, &spec).await,
+            ChannelKind::Gdb => self.open_gdb_session(lease, &local, channel, &spec).await,
         }
     }
 
@@ -264,7 +272,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     async fn open_data_session(
         &self,
         lease: LeaseId,
-        board: &BoardId,
+        board: &BoardName,
         token_wire: &[u8],
         channel: ChannelId,
         spec: &BoardSpec,
@@ -302,7 +310,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     async fn open_gdb_session(
         &self,
         lease: LeaseId,
-        board: &BoardId,
+        board: &BoardName,
         channel: ChannelId,
         spec: &BoardSpec,
     ) -> Result<()> {
@@ -364,7 +372,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     async fn on_release_lease(
         &self,
         lease: LeaseId,
-        board: &BoardId,
+        board: &BoardName,
         erase: bool,
     ) -> Result<()> {
         // Kill any session(s) tied to this lease (data plane and gdb tunnels).
@@ -378,7 +386,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     }
 
     /// Cleanup a board: power-cycle and optionally note erase.
-    async fn cleanup_board(&self, board: &BoardId, erase: bool) -> Result<()> {
+    async fn cleanup_board(&self, board: &BoardName, erase: bool) -> Result<()> {
         let power = self.power_for(board)?;
         power.cycle().await?;
         self.emit(AgentReport::PowerEvent {
@@ -402,7 +410,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     }
 
     /// Explicit operator power-cycle.
-    async fn on_power_cycle(&self, board: &BoardId) -> Result<()> {
+    async fn on_power_cycle(&self, board: &BoardName) -> Result<()> {
         let power = self.power_for(board)?;
         power.cycle().await?;
         self.emit(AgentReport::PowerEvent {
@@ -426,7 +434,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     /// # Errors
     ///
     /// Propagates power/backend errors.
-    pub async fn fault_board(&self, board: &BoardId, reason: String) -> Result<()> {
+    pub async fn fault_board(&self, board: &BoardName, reason: String) -> Result<()> {
         let channels = self.channels_for_board(board).await;
         for channel in channels {
             self.on_kill_session(channel).await?;
@@ -463,7 +471,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     }
 
     /// All channels (data plane + gdb tunnels) tied to `board`.
-    async fn channels_for_board(&self, board: &BoardId) -> Vec<ChannelId> {
+    async fn channels_for_board(&self, board: &BoardName) -> Vec<ChannelId> {
         let mut channels: Vec<ChannelId> = self
             .sessions
             .lock()
@@ -574,10 +582,21 @@ port = 2
         .unwrap()
     }
 
+    /// The fleet-unique key the coordinator would mint for one of this node's
+    /// boards. The agent never constructs one in production — it only compares
+    /// the key the coordinator sent against the one inside the token.
+    fn board_ref(name: &str) -> BoardRef {
+        BoardRef::new(
+            fleet_proto::ids::OrgId("default".to_owned()),
+            fleet_proto::ids::AgentId("pi-1".to_owned()),
+            name,
+        )
+    }
+
     fn signed_token(lease: u64, board: &str, ops: Vec<AllowedOp>, expires: u64) -> Vec<u8> {
         let token = CapabilityToken {
             lease: LeaseId(lease),
-            board: BoardId(board.to_owned()),
+            board: board_ref(board),
             allowed_ops: ops,
             expires,
         };
@@ -609,7 +628,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -629,7 +648,7 @@ port = 2
         let err = agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -649,7 +668,7 @@ port = 2
         let err = agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -668,7 +687,7 @@ port = 2
         let err = agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("ghost".into()),
+                board: board_ref("ghost"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -686,7 +705,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -698,7 +717,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::ReleaseLease {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: BoardName("b1".into()),
                 erase: false,
             })
             .await
@@ -725,7 +744,7 @@ port = 2
         let agent = make_agent(backend.clone());
         agent
             .handle_command(CoordinatorCommand::PowerCycle {
-                board: BoardId("b1".into()),
+                board: BoardName("b1".into()),
             })
             .await
             .unwrap();
@@ -767,7 +786,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -775,7 +794,7 @@ port = 2
             .await
             .unwrap();
         agent
-            .fault_board(&BoardId("b1".into()), "probe lost".to_owned())
+            .fault_board(&BoardName("b1".into()), "probe lost".to_owned())
             .await
             .unwrap();
         assert_eq!(agent.active_session_count().await, 0);
@@ -806,7 +825,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Gdb,
@@ -828,7 +847,7 @@ port = 2
         let err = agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Gdb,
@@ -848,7 +867,7 @@ port = 2
         let err = agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -867,7 +886,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token,
                 channel: ChannelId(1),
                 kind: ChannelKind::Gdb,
@@ -892,7 +911,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token: signed_token(7, "b1", vec![AllowedOp::Attach], 2_000),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
@@ -902,7 +921,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: board_ref("b1"),
                 token: signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000),
                 channel: ChannelId(2),
                 kind: ChannelKind::Gdb,
@@ -915,7 +934,7 @@ port = 2
         agent
             .handle_command(CoordinatorCommand::ReleaseLease {
                 lease: LeaseId(7),
-                board: BoardId("b1".into()),
+                board: BoardName("b1".into()),
                 erase: false,
             })
             .await
