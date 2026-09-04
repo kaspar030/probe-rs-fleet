@@ -367,6 +367,13 @@ mod tests {
         }
     }
 
+    /// A pending registration in exactly the shape `Inspect` returns.
+    ///
+    /// `org` is `Some`, and that is load-bearing rather than convenient: the
+    /// coordinator reports the **approver's** org on every decision, including
+    /// `Inspect`, so the human is told which org they are granting access in
+    /// *before* they confirm. `node_approval.rs`'s
+    /// `an_inspection_names_the_org_the_machine_would_join` pins that end.
     fn pending(name: &str) -> NodeApprovalResponse {
         NodeApprovalResponse {
             user_code: "ABCD-1234".to_owned(),
@@ -380,6 +387,36 @@ mod tests {
             state: "pending".to_owned(),
             collides_with: None,
         }
+    }
+
+    /// Which org the machine would join is part of the decision the ceremony
+    /// asks the human to make — a person may hold sessions for several orgs —
+    /// so it must appear on the screen they read *before* confirming, not only
+    /// in the outcome afterwards.
+    #[test]
+    fn the_description_names_the_org_before_the_confirmation() {
+        let rendered = describe_pending(&pending("rpi-lab-3"), 1_041, false);
+        assert!(rendered.contains("join org 'acme'"), "{rendered}");
+
+        // A collision is reported against that same org.
+        let mut p = pending("rpi-lab-3");
+        p.collides_with = Some("acme/rpi-lab-3".to_owned());
+        assert!(
+            describe_pending(&p, 1_041, false).contains("org 'acme' ALREADY HAS"),
+            "the collision must name the org too"
+        );
+    }
+
+    /// A coordinator that sends no org (an older one) must degrade to a hedge
+    /// rather than inventing a name — the approver can still see the node name
+    /// and source IP, and "your org" is honest about what is not known.
+    #[test]
+    fn a_missing_org_degrades_to_a_hedge_not_a_guess() {
+        let mut p = pending("rpi-lab-3");
+        p.org = None;
+        let rendered = describe_pending(&p, 1_041, false);
+        assert!(rendered.contains("join org 'your org'"), "{rendered}");
+        assert!(rendered.contains("cannot see it from here"), "{rendered}");
     }
 
     /// A malformed code must fail locally, before any request: the user typed

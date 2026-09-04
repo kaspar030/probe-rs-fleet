@@ -1366,6 +1366,17 @@ async fn node_register_start(
 /// Outcomes are relayed verbatim, exactly as `/auth/device/poll` documents:
 /// these describe *the caller's own* pending registration, which it created, so
 /// naming them is not an oracle about anybody else's credential.
+///
+/// **`access_denied` is not guaranteed to be observed.** The sweep deletes
+/// consumed rows, and a denial marks the row consumed, so a sweep landing
+/// between the denial and the machine's next poll downgrades the answer to
+/// `expired_token` — the agent then reports the code as expired for a machine
+/// that was in fact explicitly denied. Accepted: the sweep interval is short
+/// relative to the poll interval so it is rare, the remediation is identical
+/// either way, and keeping denied rows around purely to improve one log line
+/// would mean an unauthenticated caller can pin rows against
+/// `max_pending_nodes` until their TTL. Do not treat `access_denied` as a
+/// reliable signal.
 async fn node_register_poll(
     State(coord): State<Arc<Coordinator>>,
     Json(request): Json<NodeRegisterPollRequest>,
@@ -1390,10 +1401,15 @@ async fn node_register_poll(
         .await
     {
         Ok(Some(pending)) => pending,
-        // Unknown *or* expired: a row past its TTL is filtered out by the
-        // query, so report the expiry the caller can act on. An unknown secret
-        // reaching here is a client bug or a probe; both get `invalid_grant`
-        // below via the state check.
+        // Unknown, expired, or swept: all `expired_token`, deliberately and
+        // uniformly. The lookup filters by TTL, so a live row past its expiry
+        // and a row the sweep has already deleted arrive here identically — and
+        // a well-formed `prfnd1_` secret nobody issued is indistinguishable
+        // from one whose row aged out. The plan's outcome table said
+        // `unknown → invalid_grant`; this is the deliberate deviation, because
+        // the distinction is not knowable after a sweep and the agent's
+        // remediation ("run `agent up` again for a fresh code") is the same for
+        // all three.
         Ok(None) => {
             return reject(StatusCode::UNAUTHORIZED, "expired_token");
         }
@@ -1551,6 +1567,13 @@ pub(crate) async fn decide_pending_node(
         }
     };
 
+    // `org` is the **approver's** org on every decision, including `Inspect`
+    // — not the pending row's, which is NULL until the approval binds it. The
+    // whole response is approver-relative already (`collides_with` is resolved
+    // against this org), and "which org am I granting hardware access in" is
+    // part of the decision the ceremony asks the human to make: a person may
+    // hold sessions for several orgs, and the inspect screen is the only place
+    // that question gets answered before they answer it.
     let describe = |pending: &crate::state::PendingNode, state: &str| NodeApprovalResponse {
         user_code: fleet_auth::user_code::display(&pending.user_code),
         node_name: pending.node_name.clone(),
@@ -1559,7 +1582,7 @@ pub(crate) async fn decide_pending_node(
         source_ip: pending.source_ip.clone(),
         created_at: pending.created_at,
         expires: pending.expires,
-        org: pending.org.as_ref().map(|o| o.0.clone()),
+        org: Some(org.0.clone()),
         state: state.to_owned(),
         collides_with: collides_with.clone(),
     };
@@ -1622,11 +1645,9 @@ pub(crate) async fn decide_pending_node(
         NodeApprovalDecision::Deny => "denied",
         NodeApprovalDecision::Inspect => pending.state_label(),
     };
-    let mut response = describe(&pending, state);
-    if matches!(decision, NodeApprovalDecision::Approve) {
-        response.org = Some(org.0.clone());
-    }
-    Json(response).into_response()
+    // No org fixup here: `describe` already reports the approver's org on every
+    // decision.
+    Json(describe(&pending, state)).into_response()
 }
 
 /// Audit an inspection.
@@ -1734,7 +1755,8 @@ const NODE_APPROVE_PAGE: &str = concat!(
     "address, and ask you to confirm. Approve only if you started that\n",
     "enrollment: approving grants the machine access to hardware in your org,\n",
     "and you cannot see it from here.</p>\n",
-    "<p>Not logged in yet? <pre>probe-rs-fleet login</pre></p>\n",
+    "<p>Not logged in yet?</p>\n",
+    "<pre>probe-rs-fleet login</pre>\n",
     "<p>This page is informational: nothing you do here approves anything.</p>\n",
     "</body>\n</html>\n",
 );

@@ -391,7 +391,14 @@ pub mod api {
         pub created_at: i64,
         /// When it expires (epoch seconds).
         pub expires: i64,
-        /// The org it was bound to, once approved.
+        /// The org this registration would join, or joined: **the approver's**
+        /// org, on every decision including `Inspect`.
+        ///
+        /// Not the pending row's `org_id`, which is `NULL` until an approval
+        /// binds it — answering "which org am I granting hardware access in?"
+        /// only *after* the decision would put it on the wrong side of the
+        /// confirmation. The whole response is approver-relative for the same
+        /// reason `collides_with` is.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub org: Option<String>,
         /// `pending` | `approved` | `denied`.

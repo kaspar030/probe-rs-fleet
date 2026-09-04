@@ -134,6 +134,11 @@ pub async fn sweep_once(coord: &Coordinator) {
     // what returns capacity to `max_pending_nodes` after an abandoned or
     // hostile burst. Consumed rows go too: a redeemed or denied code can never
     // be used again, so keeping it buys nothing.
+    //
+    // One visible consequence, accepted: a *denied* row is a consumed row, so a
+    // sweep between the denial and the machine's next poll turns its
+    // `access_denied` into `expired_token`. The remediation is the same either
+    // way; see `http::node_register_poll`, which says so at the other end.
     match coord.db().delete_expired_pending_nodes(now_i64).await {
         Ok(0) => {}
         Ok(n) => debug!(count = n, "spent pending node registrations swept"),

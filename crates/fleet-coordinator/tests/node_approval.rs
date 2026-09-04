@@ -421,6 +421,47 @@ async fn a_code_is_accepted_however_a_human_spells_it() {
     assert_eq!(status, 200, "{confusable}: {body}");
 }
 
+/// The org an approval would bind the machine into must be on the **inspect**
+/// response, not just the outcome.
+///
+/// This is the regression test for a bug the CLI's unit test could not catch:
+/// `describe` originally reported the *pending row's* `org_id`, which is NULL
+/// until an approval binds it, so the one screen the ceremony exists to inform
+/// omitted the very thing it was asking the human to decide. A person may hold
+/// sessions for several orgs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_inspection_names_the_org_the_machine_would_join() {
+    let fleet = TestCoordinator::start().await;
+    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let bob = fleet.seed_session("other", "bob", Role::Member).await;
+    let grant = start(&fleet, "rpi").await;
+
+    // Before any decision, and therefore while the row's own `org_id` is still
+    // NULL, the response already names the approver's org.
+    let (status, body) = decide(&fleet, &alice, &grant.user_code, "inspect", false).await;
+    assert_eq!(status, 200, "body: {body}");
+    let seen: NodeApprovalResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(seen.state, "pending");
+    assert_eq!(
+        seen.org.as_deref(),
+        Some("acme"),
+        "inspect must say which org the machine would join"
+    );
+
+    // It is the *approver's* org, not a property of the row: a member of
+    // another org inspecting the same code is told about their own.
+    let (status, body) = decide(&fleet, &bob, &grant.user_code, "inspect", false).await;
+    assert_eq!(status, 200, "body: {body}");
+    let seen: NodeApprovalResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(seen.org.as_deref(), Some("other"));
+
+    // Denial reports it too, so the outcome line can name the org that refused.
+    let (status, body) = decide(&fleet, &alice, &grant.user_code, "deny", false).await;
+    assert_eq!(status, 200, "body: {body}");
+    let denied: NodeApprovalResponse = serde_json::from_str(&body).unwrap();
+    assert_eq!(denied.org.as_deref(), Some("acme"));
+}
+
 /// The informational page: unauthenticated, stateless, and **reflecting
 /// nothing**. The moment it echoes input it is an injection surface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -581,13 +622,17 @@ async fn a_bogus_device_secret_is_one_uniform_rejection() {
         assert!(body.contains("invalid_grant"), "body: {body}");
     }
 
-    // A well-formed device secret nobody issued: the row is unknown, which is
-    // indistinguishable from expired by design.
+    // A well-formed device secret nobody issued. Reported as `expired_token`,
+    // not `invalid_grant`: after a sweep an unissued secret and one whose row
+    // aged out are indistinguishable, so the route answers them uniformly (see
+    // `node_register_poll`, which documents the deviation from the plan's
+    // outcome table).
     let unissued = OpaqueToken::mint(TokenKind::NodeDevice).to_secret_string();
     let (status, body) = fleet
         .http("POST", "/node/register/poll", Some(poll_body(&unissued)))
         .await;
     assert_eq!(status, 401, "body: {body}");
+    assert!(body.contains("expired_token"), "body: {body}");
 }
 
 /// The degraded `ConnectInfo` path, asserted rather than assumed: this harness
