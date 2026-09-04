@@ -1023,7 +1023,6 @@ mod tests {
     use fleet_proto::ids::{AgentId, SubjectKind};
     use fleet_proto::lease::{Constraint, Priority};
     use fleet_proto::token::SignedToken;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_SEED: [u8; 32] = [
@@ -1041,18 +1040,10 @@ mod tests {
 
     fn config() -> CoordinatorConfig {
         CoordinatorConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            advertise_addr: None,
-            tls_cert: "c".into(),
-            tls_key: "k".into(),
-            client_ca: "ca".into(),
-            client_ca_key: "ca-key".into(),
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(TEST_SEED),
-            policy: Policy::default(),
-            pinned_agents: HashMap::new(),
-            sweep_interval_secs: 5,
-            default_org: OrgId(DEFAULT_ORG_ID.to_owned()),
+            default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+            ..CoordinatorConfig::default()
         }
     }
 

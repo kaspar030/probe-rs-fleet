@@ -55,6 +55,9 @@ fleet-tls.workspace = true
 fleet-core.workspace = true
 rcgen.workspace = true
 http.workspace = true
+hyper.workspace = true
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+http-body-util.workspace = true
 
 [lints]
 workspace = true

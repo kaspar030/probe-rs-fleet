@@ -145,7 +145,7 @@ pub enum SelectorError {
     /// The pinned server-certificate hash was not 64 hex characters.
     ///
     /// Rejected rather than ignored: silently dropping a malformed pin would
-    /// downgrade a deliberately pinned deployment to WebPKI verification.
+    /// downgrade a deliberately pinned deployment to `WebPKI` verification.
     #[error("invalid {}: expected 64 hex characters", env::SERVER_CERT_SHA256)]
     InvalidPin,
 }
@@ -331,7 +331,7 @@ mod tests {
     }
 
     /// A malformed pin is an error, not a shrug: ignoring it would quietly
-    /// downgrade a pinned self-hosted deployment to WebPKI verification.
+    /// downgrade a pinned self-hosted deployment to `WebPKI` verification.
     #[test]
     fn malformed_pin_is_an_error() {
         let env = MapEnv::new(&[

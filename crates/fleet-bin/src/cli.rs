@@ -43,7 +43,7 @@ pub enum Command {
     /// Usually reached via a `probe-rs` symlink, but also available explicitly:
     /// `probe-rs-fleet sidecar -- <probe-rs args…>`.
     Sidecar(SidecarArgs),
-    /// Admin / UX CLI: talk to the coordinator over mTLS.
+    /// Admin / UX CLI: talk to the coordinator over its `/client` WebSocket.
     Ctl(CtlArgs),
 }
 
@@ -65,13 +65,13 @@ pub struct CoordinatorArgs {
 /// `coordinator` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CoordinatorCommand {
-    /// Scaffold a ready-to-run coordinator: generate signing seed, TLS
-    /// material, and a populated config under the XDG paths.
+    /// Scaffold a ready-to-run coordinator: generate the signing seed and a
+    /// populated config under the XDG paths.
     Init(InitArgs),
-    /// Issue a one-time bootstrap enrollment token for a principal. The token
-    /// is redeemed by `agent init` / `ctl init` for a CA-signed client cert;
-    /// runtime auth stays mTLS.
-    Enroll(EnrollArgs),
+    /// Mint an org-scoped auth key for unattended node enrollment.
+    AuthKey(AuthKeyArgs),
+    /// Mint a user session token directly (INTERIM).
+    UserToken(UserTokenArgs),
 }
 
 /// Arguments for `coordinator init`.
@@ -83,63 +83,95 @@ pub struct InitArgs {
     /// Override the data directory for keys/seed/db (default: XDG data dir).
     #[arg(long)]
     pub data_dir: Option<std::path::PathBuf>,
-    /// DNS hostname(s) to place in the server cert SANs (repeatable).
+    /// The externally reachable base URL clients and nodes will dial
+    /// (`https://fleet.example`).
     ///
-    /// Defaults to `localhost` when none are given.
+    /// Behind a reverse proxy this is *not* derivable from `listen_addr`: the
+    /// coordinator listens on loopback and the world reaches it at a name it
+    /// never sees. Defaults to `http://127.0.0.1:7000` for a local trial.
     #[arg(long)]
-    pub hostname: Vec<String>,
-    /// IP address(es) to place in the server cert SANs (repeatable).
-    ///
-    /// Defaults to `127.0.0.1` when none are given.
-    #[arg(long)]
-    pub ip: Vec<std::net::IpAddr>,
+    pub public_url: Option<String>,
     /// Overwrite existing files instead of refusing.
     #[arg(long)]
     pub force: bool,
 }
 
-/// The kind of principal an enrollment token is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum EnrollKind {
-    /// An agent principal. Recorded in the token store; the issued cert is
-    /// auto-pinned to this agent id on enrollment.
-    Agent,
-    /// A non-agent client principal (ctl / sidecar user). No pinning needed.
-    Client,
-}
-
-/// Arguments for `coordinator enroll`.
+/// Arguments for `coordinator auth-key`.
 ///
-/// Generates a one-time bootstrap token (printed as one opaque string) that an
-/// `agent init` / `ctl init` redeems for a CA-signed client cert. Runtime auth
-/// stays mTLS; the token is bootstrap-only.
+/// **Interim.** Once the GitHub device flow lands (a later task), an operator
+/// will normally get a node enrolled through `fleet login` + `agent init`
+/// instead; this verb remains as the unattended / air-gapped escape hatch.
+///
+/// The key is a pure bearer credential: anyone holding it can enroll a node into
+/// the named org until it expires or is used. It is printed once.
 #[derive(Debug, Args)]
-pub struct EnrollArgs {
-    /// Principal id to issue a cert for (becomes the cert CN and, for agents,
-    /// the agent id).
-    pub principal_id: String,
-    /// Whether this enrollment is for an agent or a generic client.
-    #[arg(long, value_enum, default_value_t = EnrollKind::Client)]
-    pub kind: EnrollKind,
-    /// Time-to-live of the bootstrap token, in seconds (default 3600).
-    #[arg(long, default_value_t = 3600)]
-    pub ttl: u64,
-    /// Advertised coordinator address (`host:port`) to embed into the token.
-    ///
-    /// Overrides `advertise_addr` from `coordinator.toml` and the
-    /// `listen_addr` fallback. REQUIRED when the coordinator's `listen_addr`
-    /// is a wildcard (`0.0.0.0` / `::`), since clients cannot dial a wildcard
-    /// address. Example: `--coordinator-addr 192.168.1.163:7000`.
+pub struct AuthKeyArgs {
+    /// Org the enrolled nodes join. Defaults to the coordinator's
+    /// `default_org`.
     #[arg(long)]
-    pub coordinator_addr: Option<String>,
+    pub org: Option<String>,
+    /// Selection tag to stamp onto enrolled nodes (repeatable).
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Time-to-live in seconds (default 24h). 0 means no expiry.
+    #[arg(long, default_value_t = 86_400)]
+    pub ttl: u64,
+    /// Allow the key to enroll more than one node.
+    ///
+    /// Convenient for provisioning a rack; correspondingly worse if it leaks.
+    #[arg(long)]
+    pub multi_use: bool,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
     #[arg(long)]
     pub config_dir: Option<std::path::PathBuf>,
-    /// Override the data directory (default: XDG data dir). Used to locate the
-    /// server cert and the `SQLite` database.
+}
+
+/// Arguments for `coordinator user-token`.
+///
+/// **Interim.** This mints a session token from a shell on the coordinator host,
+/// bypassing any login flow. It exists so the fleet is usable before the GitHub
+/// device flow lands, and it should not become the way people log in.
+#[derive(Debug, Args)]
+pub struct UserTokenArgs {
+    /// The user's login (the subject id the token authenticates as).
+    pub login: String,
+    /// Org to place the user in. Defaults to the coordinator's `default_org`.
     #[arg(long)]
-    pub data_dir: Option<std::path::PathBuf>,
+    pub org: Option<String>,
+    /// Role to grant in that org.
+    ///
+    /// `admin` by default: this verb is the self-hosted operator's bootstrap,
+    /// run by someone with a shell on the coordinator host who therefore
+    /// already has total authority. Use `--role member` for teammates.
+    #[arg(long, value_enum, default_value_t = RoleArg::Admin)]
+    pub role: RoleArg,
+    /// Time-to-live in seconds. Defaults to the coordinator's
+    /// `session_ttl_secs`.
+    #[arg(long)]
+    pub ttl: Option<u64>,
+    /// Override the config directory (default: XDG config dir). Used to locate
+    /// `coordinator.toml`.
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// An org role, for the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum RoleArg {
+    /// May add a node and use the org's boards.
+    Member,
+    /// Additionally acts on other members' leases and reads the audit log.
+    Admin,
+}
+
+impl From<RoleArg> for fleet_proto::ids::Role {
+    fn from(r: RoleArg) -> Self {
+        match r {
+            RoleArg::Member => fleet_proto::ids::Role::Member,
+            RoleArg::Admin => fleet_proto::ids::Role::Admin,
+        }
+    }
 }
 
 /// Arguments for the `agent` role.
@@ -163,9 +195,8 @@ pub struct AgentArgs {
 /// `agent` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
-    /// Redeem an enrollment token for a CA-signed client cert and scaffold a
-    /// ready-to-run agent config (`agent.toml` + `boards.toml`) under the
-    /// per-profile XDG paths.
+    /// Redeem an auth key for a node token and scaffold a ready-to-run agent
+    /// config (`agent.toml` + `boards.toml`) under the per-profile XDG paths.
     Init(AgentInitArgs),
     /// List the agent profiles that have a config under the XDG config dir.
     Profiles,
@@ -174,17 +205,31 @@ pub enum AgentCommand {
 /// Arguments for `agent init`.
 #[derive(Debug, Args)]
 pub struct AgentInitArgs {
-    /// The enrollment token printed by `coordinator enroll … --kind agent`.
-    ///
-    /// Carries the coordinator address, server-cert pin, and one-time secret.
+    /// Base URL of the coordinator (`https://fleet.example`). A bare
+    /// `host:port` is accepted and assumes https.
     #[arg(long)]
-    pub token: String,
+    pub fleet_url: String,
+    /// The auth key printed by `coordinator auth-key`.
+    #[arg(long)]
+    pub auth_key: String,
+    /// This node's name within its org. Defaults to the machine's hostname.
+    ///
+    /// Advisory: it names the row, it does not grant anything. The coordinator
+    /// derives the node id from it and authenticates by token thereafter.
+    #[arg(long)]
+    pub node_name: Option<String>,
+    /// Selection tag to report for this node (repeatable).
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Pin the coordinator's server certificate by its SHA-256 (64 hex chars).
+    ///
+    /// For a self-hosted coordinator with no publicly trusted certificate.
+    /// Without it the coordinator is verified against the public web PKI roots.
+    #[arg(long)]
+    pub server_cert_sha256: Option<String>,
     /// Override the config directory (default: XDG config dir).
     #[arg(long)]
     pub config_dir: Option<std::path::PathBuf>,
-    /// Override the data directory for issued creds (default: XDG data dir).
-    #[arg(long)]
-    pub data_dir: Option<std::path::PathBuf>,
     /// Override where `boards.toml` is written (default: profile config dir).
     #[arg(long)]
     pub boards_path: Option<std::path::PathBuf>,
@@ -208,18 +253,20 @@ pub struct SidecarArgs {
 /// Shared connection flags for the `ctl` client.
 #[derive(Debug, Args)]
 pub struct CtlClientArgs {
-    /// `host:port` of the coordinator to connect to.
+    /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
     #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR", global = true)]
     pub coordinator: Option<String>,
-    /// Client certificate chain (PEM).
-    #[arg(long, env = "PROBE_RS_FLEET_CERT", global = true)]
-    pub cert: Option<std::path::PathBuf>,
-    /// Client private key (PEM).
-    #[arg(long, env = "PROBE_RS_FLEET_KEY", global = true)]
-    pub key: Option<std::path::PathBuf>,
-    /// CA used to verify the coordinator's server cert (PEM).
-    #[arg(long, env = "PROBE_RS_FLEET_CA", global = true)]
-    pub ca: Option<std::path::PathBuf>,
+    /// The bearer session token.
+    #[arg(long, env = "PROBE_RS_FLEET_TOKEN", global = true)]
+    pub token: Option<String>,
+    /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
+    /// self-hosted deployment with no publicly trusted certificate.
+    #[arg(
+        long,
+        env = "PROBE_RS_FLEET_SERVER_CERT_SHA256",
+        global = true
+    )]
+    pub server_cert_sha256: Option<String>,
     /// Profile to select (per-profile client config/data subdir). An explicit
     /// `--config`/credential flag takes precedence over the profile.
     #[arg(long, env = "PROBE_RS_FLEET_PROFILE", default_value = crate::paths::DEFAULT_PROFILE, global = true)]
@@ -238,9 +285,8 @@ pub struct CtlArgs {
 /// `ctl` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CtlCommand {
-    /// Redeem an enrollment token for a CA-signed client cert and write
-    /// `client.toml` so both `ctl` and the `probe-rs` sidecar shim discover the
-    /// coordinator + credentials.
+    /// Write `client.toml` so both `ctl` and the `probe-rs` sidecar shim
+    /// discover the coordinator and the session token.
     Init(CtlInitArgs),
     /// List the client profiles that have a config under the XDG config dir.
     Profiles,
@@ -278,25 +324,27 @@ pub enum CtlCommand {
 
 /// Arguments for `ctl init`.
 ///
-/// The coordinator endpoint, server-cert pin, and one-time secret all come from
-/// the enrollment token; the shared `--coordinator`/`--cert`/`--key`/`--ca`
-/// flags are ignored by `init`.
+/// Writes `client.toml` (0600) from an already-minted session token; the shared
+/// `--coordinator` / `--token` flags are ignored by `init` in favour of the
+/// explicit ones below.
 #[derive(Debug, Args)]
 pub struct CtlInitArgs {
-    /// The enrollment token printed by `coordinator enroll … --kind client`.
+    /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
+    #[arg(long)]
+    pub fleet_url: String,
+    /// The session token printed by `coordinator user-token`.
     #[arg(long)]
     pub token: String,
+    /// Pin the coordinator's server certificate by its SHA-256 (64 hex chars).
+    #[arg(long)]
+    pub server_cert_sha256: Option<String>,
     /// Override the config directory (default: XDG config dir).
     #[arg(long)]
     pub config_dir: Option<std::path::PathBuf>,
-    /// Override the data directory for issued creds (default: XDG data dir).
-    #[arg(long)]
-    pub data_dir: Option<std::path::PathBuf>,
     /// Overwrite existing files instead of refusing.
     #[arg(long)]
     pub force: bool,
 }
-
 
 /// What argv0 inspection decided the process should do.
 #[derive(Debug, PartialEq, Eq)]
@@ -387,8 +435,12 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         roles::init::run(init)?;
                         Ok(ExitCode::SUCCESS)
                     }
-                    Some(CoordinatorCommand::Enroll(enroll)) => {
-                        roles::enroll::run(enroll).await?;
+                    Some(CoordinatorCommand::AuthKey(args)) => {
+                        roles::admin::auth_key(args).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    Some(CoordinatorCommand::UserToken(args)) => {
+                        roles::admin::user_token(args).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                     None => {
@@ -517,17 +569,14 @@ mod tests {
             "probe-rs-fleet",
             "coordinator",
             "init",
-            "--hostname",
-            "coord.example",
-            "--ip",
-            "10.0.0.1",
+            "--public-url",
+            "https://fleet.example",
             "--force",
         ]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
                 Some(CoordinatorCommand::Init(init)) => {
-                    assert_eq!(init.hostname, vec!["coord.example".to_owned()]);
-                    assert_eq!(init.ip, vec!["10.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
+                    assert_eq!(init.public_url.as_deref(), Some("https://fleet.example"));
                     assert!(init.force);
                 }
                 other => panic!("expected init, got {other:?}"),
@@ -549,40 +598,85 @@ mod tests {
     }
 
     #[test]
-    fn parses_coordinator_enroll() {
+    fn parses_coordinator_auth_key() {
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
             "coordinator",
-            "enroll",
-            "rpi-lab-1",
-            "--kind",
-            "agent",
+            "auth-key",
+            "--org",
+            "acme",
+            "--tag",
+            "nrf52",
             "--ttl",
             "600",
+            "--multi-use",
         ]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
-                Some(CoordinatorCommand::Enroll(e)) => {
-                    assert_eq!(e.principal_id, "rpi-lab-1");
-                    assert_eq!(e.kind, EnrollKind::Agent);
-                    assert_eq!(e.ttl, 600);
+                Some(CoordinatorCommand::AuthKey(k)) => {
+                    assert_eq!(k.org.as_deref(), Some("acme"));
+                    assert_eq!(k.tag, vec!["nrf52".to_owned()]);
+                    assert_eq!(k.ttl, 600);
+                    assert!(k.multi_use);
                 }
-                other => panic!("expected enroll, got {other:?}"),
+                other => panic!("expected auth-key, got {other:?}"),
             },
             other => panic!("expected coordinator, got {other:?}"),
         }
     }
 
+    /// Single-use and a bounded TTL are the defaults: a key that enrolls a rack
+    /// forever should have to be asked for.
     #[test]
-    fn enroll_defaults_to_client_kind() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "enroll", "alice"]));
+    fn auth_key_defaults_are_single_use_and_expiring() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "auth-key"]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
-                Some(CoordinatorCommand::Enroll(e)) => {
-                    assert_eq!(e.kind, EnrollKind::Client);
-                    assert_eq!(e.ttl, 3600);
+                Some(CoordinatorCommand::AuthKey(k)) => {
+                    assert!(!k.multi_use);
+                    assert_eq!(k.ttl, 86_400);
+                    assert!(k.org.is_none());
                 }
-                other => panic!("expected enroll, got {other:?}"),
+                other => panic!("expected auth-key, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    /// The interim bootstrap verb defaults to `admin`: the first token minted
+    /// on a self-hosted coordinator must be able to administer the fleet.
+    #[test]
+    fn parses_coordinator_user_token() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "user-token", "alice"]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::UserToken(t)) => {
+                    assert_eq!(t.login, "alice");
+                    assert_eq!(t.role, RoleArg::Admin);
+                    assert!(t.ttl.is_none());
+                }
+                other => panic!("expected user-token, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "coordinator",
+            "user-token",
+            "bob",
+            "--role",
+            "member",
+            "--org",
+            "acme",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::UserToken(t)) => {
+                    assert_eq!(t.role, RoleArg::Member);
+                    assert_eq!(t.org.as_deref(), Some("acme"));
+                }
+                other => panic!("expected user-token, got {other:?}"),
             },
             other => panic!("expected coordinator, got {other:?}"),
         }
@@ -596,15 +690,19 @@ mod tests {
             "--profile",
             "lab1",
             "init",
-            "--token",
-            "prffe1_abc",
+            "--fleet-url",
+            "https://fleet.example",
+            "--auth-key",
+            "prffk1_abc",
         ]));
         match cli.command {
             Command::Agent(a) => {
                 assert_eq!(a.profile, "lab1");
                 match a.command {
                     Some(AgentCommand::Init(init)) => {
-                        assert_eq!(init.token, "prffe1_abc");
+                        assert_eq!(init.fleet_url, "https://fleet.example");
+                        assert_eq!(init.auth_key, "prffk1_abc");
+                        assert!(init.node_name.is_none());
                     }
                     other => panic!("expected agent init, got {other:?}"),
                 }
@@ -630,15 +728,18 @@ mod tests {
             "--profile",
             "ci",
             "init",
+            "--fleet-url",
+            "https://fleet.example",
             "--token",
-            "prffe1_xyz",
+            "prfs1_xyz",
         ]));
         match cli.command {
             Command::Ctl(a) => {
                 assert_eq!(a.client.profile, "ci");
                 match a.command {
                     CtlCommand::Init(init) => {
-                        assert_eq!(init.token, "prffe1_xyz");
+                        assert_eq!(init.fleet_url, "https://fleet.example");
+                        assert_eq!(init.token, "prfs1_xyz");
                     }
                     other => panic!("expected ctl init, got {other:?}"),
                 }
@@ -706,16 +807,19 @@ mod tests {
 
     #[test]
     fn ctl_client_flags_parse() {
+        let pin = "ab".repeat(32);
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet", "ctl",
-            "--coordinator", "coord.example:443",
-            "--cert", "c.pem", "--key", "k.pem", "--ca", "ca.pem",
+            "--coordinator", "https://coord.example",
+            "--token", "prfs1_abc",
+            "--server-cert-sha256", &pin,
             "who",
         ]));
         match cli.command {
             Command::Ctl(a) => {
-                assert_eq!(a.client.coordinator.as_deref(), Some("coord.example:443"));
-                assert_eq!(a.client.cert.as_deref(), Some(Path::new("c.pem")));
+                assert_eq!(a.client.coordinator.as_deref(), Some("https://coord.example"));
+                assert_eq!(a.client.token.as_deref(), Some("prfs1_abc"));
+                assert_eq!(a.client.server_cert_sha256.as_deref(), Some(pin.as_str()));
                 assert!(matches!(a.command, CtlCommand::Who));
             }
             other => panic!("expected ctl, got {other:?}"),

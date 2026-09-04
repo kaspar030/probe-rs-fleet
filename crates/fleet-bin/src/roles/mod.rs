@@ -6,18 +6,18 @@
 //! - [`coordinator`] → [`fleet_coordinator::run`]
 //! - [`agent`] → [`fleet_agent::connection::run`]
 //! - [`sidecar`] → [`fleet_sidecar::run`]
-//! - [`ctl`] → a thin mTLS client of the coordinator
+//! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
+//!   coordinator client the tree has
 //!
 //! The daemon roles (`coordinator`, `agent`) race their service against
 //! [`crate::signal::shutdown`] for graceful termination.
 
+pub mod admin;
 pub mod agent;
 pub mod agent_init;
-pub mod bootstrap;
 pub mod coordinator;
 pub mod ctl;
 pub mod ctl_init;
-pub mod enroll;
 pub mod init;
 pub mod sidecar;
 

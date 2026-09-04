@@ -67,7 +67,7 @@ impl CoordSession {
     /// Dial the coordinator's `/client` route and complete the Hello handshake.
     ///
     /// The bearer token rides the `WebSocket` upgrade; there is no client
-    /// certificate. Trust configuration (WebPKI roots, or the optional pinned
+    /// certificate. Trust configuration (`WebPKI` roots, or the optional pinned
     /// server-cert hash) is shared with every other outbound connection in the
     /// tree via `fleet_tls::client_trust_config`.
     ///
@@ -136,10 +136,7 @@ impl CoordSession {
         let sink = Arc::clone(&data_sink);
         tokio::spawn(async move {
             loop {
-                let event = match rx.recv().await {
-                    Ok(e) => e,
-                    Err(_) => break,
-                };
+                let Ok(event) = rx.recv().await else { break };
                 let bytes = match event {
                     WireEvent::Binary(bytes) => bytes,
                     // Liveness only; the coordinator pings an idle connection so
@@ -193,6 +190,24 @@ impl CoordSession {
             .recv()
             .await
             .ok_or_else(|| TransportError::Connect("connection closed".to_owned()))
+    }
+
+    /// Send one operator request and await its reply.
+    ///
+    /// The door `ctl` uses. Before revision 2 `ctl` hand-rolled a second
+    /// coordinator client — its own TLS config, its own `server_name`, its own
+    /// Hello handshake — which is how three near-identical dial paths drifted
+    /// apart. There is now one client, and `ctl` is a caller of it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] if the connection fails.
+    pub async fn request(
+        &self,
+        msg: SidecarToCoord,
+    ) -> Result<CoordToSidecar, TransportError> {
+        self.send(msg).await?;
+        self.next_ctrl().await
     }
 
     /// Request a lease for `request`, returning the grant.

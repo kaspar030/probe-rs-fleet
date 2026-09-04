@@ -65,15 +65,17 @@ pub fn upgrade_url(base: &str, path: &str) -> Result<String, WireError> {
     let uri: http::Uri = with_scheme
         .parse()
         .map_err(|e| WireError::Protocol(format!("invalid coordinator URL: {e}")))?;
+    // No scheme at all means the caller passed a bare `host:port`, which the
+    // `with_scheme` step above already prefixed with https — so this arm is
+    // unreachable in practice and defaults to TLS rather than to plaintext.
     let ws_scheme = match uri.scheme_str() {
-        Some("https" | "wss") => "wss",
         Some("http" | "ws") => "ws",
+        Some("https" | "wss") | None => "wss",
         Some(other) => {
             return Err(WireError::Protocol(format!(
                 "unsupported coordinator URL scheme `{other}`"
             )))
         }
-        None => "wss",
     };
     let authority = uri
         .authority()

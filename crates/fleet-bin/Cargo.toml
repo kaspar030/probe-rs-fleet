@@ -15,9 +15,8 @@ path = "src/main.rs"
 fleet-proto = { workspace = true }
 fleet-core = { workspace = true }
 fleet-tls = { workspace = true }
-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
-tokio-rustls = { workspace = true }
+fleet-auth = { workspace = true, features = ["client"] }
+fleet-wire = { workspace = true, features = ["tungstenite"] }
 fleet-agent = { workspace = true }
 fleet-coordinator = { workspace = true }
 fleet-sidecar = { workspace = true }
@@ -30,12 +29,16 @@ anyhow = { workspace = true }
 toml = { workspace = true }
 serde = { workspace = true }
 directories = { workspace = true }
-rcgen = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+fleet-coordinator = { workspace = true }
+fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+fleet-core = { workspace = true }
+axum = { workspace = true }
 
 [lints]
 workspace = true

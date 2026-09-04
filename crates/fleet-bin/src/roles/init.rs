@@ -1,18 +1,19 @@
 //! The `coordinator init` subcommand: scaffold a ready-to-run coordinator.
 //!
-//! Generates a fresh signing seed, a development client CA, a coordinator
-//! server cert/key signed by that CA, and a populated `coordinator.toml`
-//! pointing at all of it — under the coordinator's per-role config/data subdir
+//! Generates a fresh ed25519 signing seed and a populated `coordinator.toml`
+//! pointing at it, under the coordinator's per-role config/data subdir
 //! (`<config>/coordinator/`, `<data>/coordinator/`) or explicit overrides.
 //! Secrets are written with `0600` permissions on unix.
+//!
+//! **No TLS material is generated any more.** The private CA is gone with mTLS
+//! (architecture §6.2), and the expected deployment terminates TLS at a reverse
+//! proxy in front of the coordinator (§3.5), so there is nothing for `init` to
+//! mint. A self-hosted operator who wants the coordinator to terminate TLS
+//! itself supplies a certificate and adds the commented-out `[tls]` block.
 
-use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
-};
 
 use fleet_core::policy::Policy;
 
@@ -22,19 +23,20 @@ use crate::secrets::{generate_seed_hex, toml_path, write_public, write_secret};
 
 /// Names of the files `init` writes, relative to the config / data dirs.
 const SIGNING_SEED_FILE: &str = "signing.seed";
-const CLIENT_CA_CERT_FILE: &str = "client-ca.pem";
-const CLIENT_CA_KEY_FILE: &str = "client-ca-key.pem";
-const SERVER_CERT_FILE: &str = "coordinator-cert.pem";
-const SERVER_KEY_FILE: &str = "coordinator-key.pem";
 const SQLITE_FILE: &str = "coordinator.sqlite";
 const CONFIG_FILE: &str = "coordinator.toml";
+
+/// The default listen address: loopback, because the expected deployment is
+/// behind a proxy on the same host and binding a public interface should be a
+/// deliberate act rather than a default.
+const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:7000";
 
 /// Run `coordinator init`.
 ///
 /// # Errors
 ///
-/// Returns an error if directories cannot be created, key/cert generation
-/// fails, or (without `--force`) any target file already exists.
+/// Returns an error if directories cannot be created, key generation fails, or
+/// (without `--force`) any target file already exists.
 pub fn run(args: InitArgs) -> Result<()> {
     let config_dir = match args.config_dir {
         Some(dir) => dir,
@@ -45,17 +47,6 @@ pub fn run(args: InitArgs) -> Result<()> {
         None => paths::coordinator_data_dir()?,
     };
 
-    let hostnames = if args.hostname.is_empty() {
-        vec!["localhost".to_owned()]
-    } else {
-        args.hostname
-    };
-    let ips = if args.ip.is_empty() {
-        vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
-    } else {
-        args.ip
-    };
-
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
     std::fs::create_dir_all(&data_dir)
@@ -63,59 +54,35 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     let config_path = config_dir.join(CONFIG_FILE);
     let seed_path = data_dir.join(SIGNING_SEED_FILE);
-    let ca_cert_path = data_dir.join(CLIENT_CA_CERT_FILE);
-    let ca_key_path = data_dir.join(CLIENT_CA_KEY_FILE);
-    let server_cert_path = data_dir.join(SERVER_CERT_FILE);
-    let server_key_path = data_dir.join(SERVER_KEY_FILE);
     let sqlite_path = data_dir.join(SQLITE_FILE);
 
     // Idempotency guard: refuse to clobber existing files unless --force.
     if !args.force {
-        let existing: Vec<&Path> = [
-            config_path.as_path(),
-            seed_path.as_path(),
-            ca_cert_path.as_path(),
-            ca_key_path.as_path(),
-            server_cert_path.as_path(),
-            server_key_path.as_path(),
-        ]
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect();
+        let existing: Vec<&Path> = [config_path.as_path(), seed_path.as_path()]
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
         if !existing.is_empty() {
             let list = existing
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join("\n  ");
-            bail!(
-                "refusing to overwrite existing file(s); pass --force to regenerate:\n  {list}"
-            );
+            bail!("refusing to overwrite existing file(s); pass --force to regenerate:\n  {list}");
         }
     }
 
-    // 1. Signing seed: 32 random bytes -> 64 lowercase hex chars.
+    // Signing seed: 32 random bytes -> 64 lowercase hex chars.
     let seed_hex = generate_seed_hex();
     write_secret(&seed_path, seed_hex.as_bytes())
         .with_context(|| format!("writing signing seed {}", seed_path.display()))?;
 
-    // 2. TLS material: a client CA and a server cert signed by it.
-    let tls = generate_tls_material(&hostnames, &ips).context("generating TLS material")?;
-    write_public(&ca_cert_path, tls.ca_cert.as_bytes())
-        .with_context(|| format!("writing CA cert {}", ca_cert_path.display()))?;
-    write_secret(&ca_key_path, tls.ca_key.as_bytes())
-        .with_context(|| format!("writing CA key {}", ca_key_path.display()))?;
-    write_public(&server_cert_path, tls.server_cert.as_bytes())
-        .with_context(|| format!("writing server cert {}", server_cert_path.display()))?;
-    write_secret(&server_key_path, tls.server_key.as_bytes())
-        .with_context(|| format!("writing server key {}", server_key_path.display()))?;
+    let public_url = args
+        .public_url
+        .unwrap_or_else(|| format!("http://{DEFAULT_LISTEN_ADDR}"));
 
-    // 3. Populated config pointing at the generated material.
     let config_toml = render_coordinator_config(
-        &server_cert_path,
-        &server_key_path,
-        &ca_cert_path,
-        &ca_key_path,
+        &public_url,
         &sqlite_path,
         &seed_path,
         &Policy::default(),
@@ -123,72 +90,14 @@ pub fn run(args: InitArgs) -> Result<()> {
     write_public(&config_path, config_toml.as_bytes())
         .with_context(|| format!("writing config {}", config_path.display()))?;
 
-    print_summary(
-        &config_path,
-        &seed_path,
-        &ca_cert_path,
-        &ca_key_path,
-        &server_cert_path,
-        &server_key_path,
-        &sqlite_path,
-    );
+    print_summary(&config_path, &seed_path, &sqlite_path, &public_url);
 
     Ok(())
 }
 
-/// Generated TLS material: a client CA and a server cert signed by it.
-struct TlsMaterial {
-    ca_cert: String,
-    ca_key: String,
-    server_cert: String,
-    server_key: String,
-}
-
-/// Generate a self-signed client CA and a coordinator server cert (with the
-/// given SANs) signed by that CA, all in one pass.
-fn generate_tls_material(hostnames: &[String], ips: &[IpAddr]) -> Result<TlsMaterial> {
-    // Client CA.
-    let mut ca_params =
-        CertificateParams::new(Vec::<String>::new()).context("building CA params")?;
-    ca_params
-        .distinguished_name
-        .push(DnType::CommonName, "probe-rs-fleet client CA");
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_key = KeyPair::generate().context("generating CA key")?;
-    let ca_cert = ca_params.self_signed(&ca_key).context("self-signing CA")?;
-
-    // Coordinator server cert, signed by the CA.
-    let mut params =
-        CertificateParams::new(hostnames.to_vec()).context("building server params")?;
-    for ip in ips {
-        params.subject_alt_names.push(SanType::IpAddress(*ip));
-    }
-    let cn = hostnames.first().map_or("localhost", String::as_str);
-    params.distinguished_name.push(DnType::CommonName, cn);
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::KeyEncipherment,
-    ];
-    let server_key = KeyPair::generate().context("generating server key")?;
-    let server_cert = params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .context("signing server cert")?;
-
-    Ok(TlsMaterial {
-        ca_cert: ca_cert.pem(),
-        ca_key: ca_key.serialize_pem(),
-        server_cert: server_cert.pem(),
-        server_key: server_key.serialize_pem(),
-    })
-}
-
 /// Render a populated `coordinator.toml` referencing the generated files.
 fn render_coordinator_config(
-    tls_cert: &Path,
-    tls_key: &Path,
-    client_ca: &Path,
-    client_ca_key: &Path,
+    public_url: &str,
     sqlite_path: &Path,
     signing_key_path: &Path,
     policy: &Policy,
@@ -206,29 +115,20 @@ fn render_coordinator_config(
 # Generated by `probe-rs-fleet coordinator init`. Paths are absolute and point
 # at the material generated alongside this file.
 
-# TCP address the coordinator listens on for inbound mTLS connections.
-listen_addr = "0.0.0.0:7000"
-
-# Address (`host:port`) that agents / clients should DIAL to reach this
-# coordinator. This is embedded into enrollment tokens by `coordinator enroll`.
+# TCP address the coordinator listens on.
 #
-# It MUST be a routable address — NOT the wildcard `0.0.0.0` / `::` that
-# `listen_addr` typically uses. When unset, `coordinator enroll` falls back to
-# `listen_addr` and ERRORS if that is a wildcard. Set this to the coordinator's
-# LAN / public address (or pass `--coordinator-addr <host:port>` to `enroll`).
-# advertise_addr = "192.168.1.10:7000"
+# Loopback by default: the expected deployment puts an HTTPS reverse proxy in
+# front (which terminates TLS and routes /agent, /client, /auth/* and /healthz),
+# so the coordinator itself need not be reachable from outside the host.
+listen_addr = "{DEFAULT_LISTEN_ADDR}"
 
-# Coordinator server certificate chain + private key (PEM).
-tls_cert = {tls_cert}
-tls_key = {tls_key}
-
-# CA used to verify client (agent / sidecar) certificates (PEM).
-client_ca = {client_ca}
-
-# Client CA private key (PEM). Used to sign CSRs during bootstrap enrollment
-# (`coordinator enroll` issues a one-time token; `agent/ctl init` redeem it for
-# a CA-signed client cert). Keep this 0600.
-client_ca_key = {client_ca_key}
+# The externally reachable base URL agents and clients DIAL to reach this
+# coordinator — what you pass to `agent init --fleet-url` / `ctl init
+# --fleet-url`.
+#
+# Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
+# listens on loopback and the world reaches it at a name it never sees.
+public_url = {public_url}
 
 # SQLite database file (created on first run).
 sqlite_path = {sqlite_path}
@@ -240,29 +140,37 @@ signing_key_path = {signing_key_path}
 # How often (seconds) the lease-expiry sweep runs.
 # sweep_interval_secs = 5
 
+# WebSocket keepalive. A reverse proxy reaps idle connections on a timeout we do
+# not control, and a lab node's connection is idle most of the time, so this is
+# load-bearing rather than cosmetic. `pong_timeout_secs` must exceed
+# `ping_interval_secs`, or every idle connection is dropped before it can answer.
+# ping_interval_secs = 20
+# pong_timeout_secs  = 60
+
+# How long (seconds) a user session token is valid before it must be refreshed.
+# session_ttl_secs = 43200
+
+# How old (seconds) a node token may get before the coordinator pushes a
+# replacement down the established connection. The old token stays valid until
+# the node acknowledges the new one, so a lost push costs a retry, not a visit.
+# node_token_rotate_secs = 604800
+
+# Coordinator-terminated TLS. OMIT THIS TABLE when a reverse proxy terminates
+# TLS (the expected deployment) — the coordinator then serves plain HTTP on
+# loopback. Set both paths for a self-hosted deployment with no proxy:
+#
+# [tls]
+# cert = "/path/to/fullchain.pem"
+# key  = "/path/to/privkey.pem"
+#
+# With a self-signed certificate, clients need its SHA-256:
+#   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
+# and pass it as `--server-cert-sha256` to `agent init` / `ctl init`.
+
 # Lease scheduling policy (defaults shown).
 [policy]
-{policy_block}
-# Pinned agents: map a client certificate fingerprint to the agent id it is
-# allowed to claim. NOTE: enrollment now records agent pins automatically in
-# the database (`coordinator enroll <id> --kind agent` -> `agent init` issues a
-# CA-signed cert whose fingerprint is auto-pinned), so this section is
-# OPTIONAL — use it only to pre-seed pins by hand. The key is the LOWERCASE HEX
-# SHA-256 of the agent certificate's DER bytes — no `sha256:` prefix, no colons
-# (exactly what `fleet_tls::cert_fingerprint` produces). Reproduce it with:
-#
-#   openssl x509 -in agent.pem -outform der | openssl dgst -sha256
-#
-# (or `openssl x509 -in agent.pem -noout -fingerprint -sha256`, then strip the
-# colons and lowercase). Example (64 hex chars):
-#
-#   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" = "agent-01"
-[pinned_agents]
-"#,
-        tls_cert = toml_path(tls_cert),
-        tls_key = toml_path(tls_key),
-        client_ca = toml_path(client_ca),
-        client_ca_key = toml_path(client_ca_key),
+{policy_block}"#,
+        public_url = toml::Value::String(public_url.to_owned()),
         sqlite_path = toml_path(sqlite_path),
         signing_key_path = toml_path(signing_key_path),
     );
@@ -270,33 +178,31 @@ signing_key_path = {signing_key_path}
 }
 
 /// Print a summary of what was written and the next steps.
-fn print_summary(
-    config_path: &Path,
-    seed_path: &Path,
-    ca_cert_path: &Path,
-    ca_key_path: &Path,
-    server_cert_path: &Path,
-    server_key_path: &Path,
-    sqlite_path: &Path,
-) {
+fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, public_url: &str) {
     println!("Created coordinator scaffold:");
-    println!("  config         {}", config_path.display());
-    println!("  signing seed   {}", seed_path.display());
-    println!("  client CA cert {}", ca_cert_path.display());
-    println!("  client CA key  {}", ca_key_path.display());
-    println!("  server cert    {}", server_cert_path.display());
-    println!("  server key     {}", server_key_path.display());
-    println!("  sqlite (db)    {} (created on first run)", sqlite_path.display());
+    println!("  config       {}", config_path.display());
+    println!("  signing seed {}", seed_path.display());
+    println!(
+        "  sqlite (db)  {} (created on first run)",
+        sqlite_path.display()
+    );
+    println!("  public URL   {public_url}");
     println!();
     println!("Next steps:");
     println!("  1. Start the coordinator (no --config needed):");
     println!("       probe-rs-fleet coordinator");
-    println!("  2. Issue a one-time enrollment token for an agent or client:");
-    println!("       probe-rs-fleet coordinator enroll <id> --kind agent");
-    println!("       probe-rs-fleet coordinator enroll <user> --kind client");
-    println!("     The token is bootstrap-only; runtime auth stays mTLS. Redeem it");
-    println!("     on the target host with `agent init`/`ctl init` (the issued");
-    println!("     agent cert is auto-pinned in the coordinator database).");
+    println!("  2. Mint yourself a session token and point `ctl` at the fleet:");
+    println!("       probe-rs-fleet coordinator user-token <your-login>");
+    println!("       probe-rs-fleet ctl init --fleet-url {public_url} --token <token>");
+    println!("  3. Mint an auth key and enroll a node with it:");
+    println!("       probe-rs-fleet coordinator auth-key");
+    println!("       # on the node:");
+    println!("       probe-rs-fleet agent init --fleet-url {public_url} --auth-key <key>");
+    println!();
+    println!("Note: `user-token` and `auth-key` are INTERIM verbs — they mint");
+    println!("credentials from a shell on this host, bypassing any login flow.");
+    println!("They will become the unattended escape hatch once `fleet login`");
+    println!("(GitHub device flow) lands.");
 }
 
 #[cfg(test)]
@@ -308,28 +214,32 @@ mod tests {
         run(InitArgs {
             config_dir: Some(dir.join("config")),
             data_dir: Some(dir.join("data")),
-            hostname: vec!["localhost".to_owned()],
-            ip: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            public_url: Some("https://fleet.example".to_owned()),
             force,
         })
     }
 
     #[test]
-    fn init_writes_all_files() {
+    fn init_writes_config_and_seed_and_no_tls_material() {
         let tmp = tempfile::tempdir().unwrap();
         init_into(tmp.path(), false).unwrap();
 
         let config = tmp.path().join("config");
         let data = tmp.path().join("data");
         assert!(config.join(CONFIG_FILE).exists(), "missing {CONFIG_FILE}");
-        for f in [
-            SIGNING_SEED_FILE,
-            CLIENT_CA_CERT_FILE,
-            CLIENT_CA_KEY_FILE,
-            SERVER_CERT_FILE,
-            SERVER_KEY_FILE,
+        assert!(data.join(SIGNING_SEED_FILE).exists());
+
+        // The private CA is gone: `init` must not mint any certificate material.
+        for stale in [
+            "client-ca.pem",
+            "client-ca-key.pem",
+            "coordinator-cert.pem",
+            "coordinator-key.pem",
         ] {
-            assert!(data.join(f).exists(), "missing {f}");
+            assert!(
+                !data.join(stale).exists(),
+                "{stale} must not be generated any more"
+            );
         }
     }
 
@@ -340,10 +250,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         init_into(tmp.path(), false).unwrap();
         let data = tmp.path().join("data");
-        for f in [SIGNING_SEED_FILE, CLIENT_CA_KEY_FILE, SERVER_KEY_FILE] {
-            let mode = std::fs::metadata(data.join(f)).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "{f} perms = {:o}", mode & 0o777);
-        }
+        let mode = std::fs::metadata(data.join(SIGNING_SEED_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "seed perms = {:o}", mode & 0o777);
     }
 
     #[test]
@@ -354,7 +265,28 @@ mod tests {
         let cfg = config::load_coordinator_config(&config_path).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.listen_addr.port(), 7000);
-        assert!(cfg.pinned_agents.is_empty());
+        assert!(cfg.listen_addr.ip().is_loopback());
+        assert_eq!(cfg.public_url, "https://fleet.example");
+        // The `[tls]` block is commented out: plain HTTP behind a proxy is the
+        // default, and generating a certificate nobody asked for is how you end
+        // up with a self-signed cert in production.
+        assert!(cfg.tls.is_none());
+    }
+
+    #[test]
+    fn public_url_defaults_to_the_loopback_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        run(InitArgs {
+            config_dir: Some(tmp.path().join("config")),
+            data_dir: Some(tmp.path().join("data")),
+            public_url: None,
+            force: false,
+        })
+        .unwrap();
+        let cfg =
+            config::load_coordinator_config(&tmp.path().join("config").join(CONFIG_FILE)).unwrap();
+        assert_eq!(cfg.public_url, "http://127.0.0.1:7000");
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -380,7 +312,9 @@ mod tests {
     fn defaults_to_coordinator_subdir_under_xdg() {
         use crate::test_support::ENV_LOCK;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");
         let prev_data = std::env::var_os("XDG_DATA_HOME");
@@ -399,8 +333,7 @@ mod tests {
         let result = run(InitArgs {
             config_dir: None,
             data_dir: None,
-            hostname: vec!["localhost".to_owned()],
-            ip: vec![IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            public_url: None,
             force: false,
         });
 
@@ -418,19 +351,11 @@ mod tests {
             "config must land under coordinator/ subdir: {}",
             config.join(CONFIG_FILE).display()
         );
-        for f in [
-            SIGNING_SEED_FILE,
-            CLIENT_CA_CERT_FILE,
-            CLIENT_CA_KEY_FILE,
-            SERVER_CERT_FILE,
-            SERVER_KEY_FILE,
-        ] {
-            assert!(
-                data.join(f).exists(),
-                "{f} must land under coordinator/ subdir: {}",
-                data.join(f).display()
-            );
-        }
+        assert!(
+            data.join(SIGNING_SEED_FILE).exists(),
+            "seed must land under coordinator/ subdir: {}",
+            data.join(SIGNING_SEED_FILE).display()
+        );
     }
 
     fn restore_env(key: &str, prev: Option<std::ffi::OsString>) {
@@ -439,37 +364,5 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
-    }
-
-    #[test]
-    fn fingerprint_format_matches_fleet_tls() {
-        use rustls::pki_types::CertificateDer;
-
-        // Mint a CA + leaf the same way `init` does, then assert the fingerprint
-        // format matches exactly what `fleet_tls::cert_fingerprint` produces and
-        // what the generated config's [pinned_agents] comment documents.
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params
-            .distinguished_name
-            .push(DnType::CommonName, "probe-rs-fleet client CA");
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-        let mut params =
-            CertificateParams::new(vec!["agent-01.fleet.test".to_owned()]).unwrap();
-        params.distinguished_name.push(DnType::CommonName, "agent-01");
-        let leaf_key = KeyPair::generate().unwrap();
-        let leaf = params.signed_by(&leaf_key, &ca_cert, &ca_key).unwrap();
-
-        let der = CertificateDer::from(leaf.der().to_vec());
-        let fp = fleet_tls::cert_fingerprint(&der);
-        assert_eq!(fp.len(), 64, "fingerprint must be 64 hex chars");
-        assert!(!fp.contains(':'), "no colons");
-        assert!(!fp.contains("sha256"), "no sha256: prefix");
-        assert!(
-            fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "lowercase hex only"
-        );
     }
 }

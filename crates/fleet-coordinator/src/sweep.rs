@@ -142,7 +142,6 @@ mod tests {
     use fleet_proto::board::{Board, BoardState, PowerKind};
     use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Role, Subject, SubjectKind};
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 
@@ -161,18 +160,10 @@ mod tests {
 
     fn config() -> CoordinatorConfig {
         CoordinatorConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            advertise_addr: None,
-            tls_cert: "c".into(),
-            tls_key: "k".into(),
-            client_ca: "ca".into(),
-            client_ca_key: "ca-key".into(),
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(SEED),
-            policy: Policy::default(),
-            pinned_agents: HashMap::new(),
-            sweep_interval_secs: 1,
             default_org: org(),
+            ..CoordinatorConfig::default()
         }
     }
 

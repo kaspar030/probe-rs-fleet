@@ -190,18 +190,22 @@ mod tests {
 
     #[test]
     fn empty_sqlite_path_rejected() {
-        let mut c = CoordinatorConfig::default();
-        c.sqlite_path = PathBuf::new();
+        let c = CoordinatorConfig {
+            sqlite_path: PathBuf::new(),
+            ..CoordinatorConfig::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn tls_table_needs_both_paths() {
-        let mut c = CoordinatorConfig::default();
-        c.tls = Some(TlsConfig {
-            cert: "cert.pem".into(),
-            key: PathBuf::new(),
-        });
+        let mut c = CoordinatorConfig {
+            tls: Some(TlsConfig {
+                cert: "cert.pem".into(),
+                key: PathBuf::new(),
+            }),
+            ..CoordinatorConfig::default()
+        };
         assert!(c.validate().is_err());
         c.tls = Some(TlsConfig {
             cert: "cert.pem".into(),
@@ -230,9 +234,11 @@ mod tests {
     /// plausible and drops every idle node.
     #[test]
     fn pong_timeout_must_exceed_ping_interval() {
-        let mut c = CoordinatorConfig::default();
-        c.ping_interval_secs = 30;
-        c.pong_timeout_secs = 30;
+        let mut c = CoordinatorConfig {
+            ping_interval_secs: 30,
+            pong_timeout_secs: 30,
+            ..CoordinatorConfig::default()
+        };
         assert!(c.validate().is_err());
         c.pong_timeout_secs = 31;
         assert!(c.validate().is_ok());
@@ -240,19 +246,25 @@ mod tests {
 
     #[test]
     fn empty_public_url_or_default_org_rejected() {
-        let mut c = CoordinatorConfig::default();
-        c.public_url = "  ".to_owned();
+        let c = CoordinatorConfig {
+            public_url: "  ".to_owned(),
+            ..CoordinatorConfig::default()
+        };
         assert!(c.validate().is_err());
 
-        let mut c = CoordinatorConfig::default();
-        c.default_org = OrgId(String::new());
+        let c = CoordinatorConfig {
+            default_org: OrgId(String::new()),
+            ..CoordinatorConfig::default()
+        };
         assert!(c.validate().is_err());
     }
 
     #[test]
     fn rotation_policy_follows_the_configured_age() {
-        let mut c = CoordinatorConfig::default();
-        c.node_token_rotate_secs = 3600;
+        let c = CoordinatorConfig {
+            node_token_rotate_secs: 3600,
+            ..CoordinatorConfig::default()
+        };
         assert_eq!(c.rotation_policy().max_age_secs, 3600);
     }
 }

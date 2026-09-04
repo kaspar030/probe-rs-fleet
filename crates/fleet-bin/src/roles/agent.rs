@@ -31,7 +31,7 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
     tracing::info!(
         agent_id = %agent_config.agent_id,
-        coordinator = %agent_config.coordinator_endpoint,
+        coordinator = %agent_config.fleet_url,
         boards = boards.boards.len(),
         "starting agent"
     );

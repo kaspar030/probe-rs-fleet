@@ -334,7 +334,7 @@ impl AgentConfig {
     /// The pinned coordinator server-certificate hash, decoded.
     ///
     /// Validated at load time, so a malformed pin cannot reach the dialer and
-    /// silently downgrade to WebPKI verification.
+    /// silently downgrade to `WebPKI` verification.
     #[must_use]
     pub fn server_pin(&self) -> Option<[u8; 32]> {
         self.server_cert_sha256
@@ -663,7 +663,7 @@ boards_path = "/etc/fleet/boards.toml"
     }
 
     /// A malformed pin must be rejected at load, not at dial time: silently
-    /// ignoring it would downgrade a deliberately pinned deployment to WebPKI
+    /// ignoring it would downgrade a deliberately pinned deployment to `WebPKI`
     /// verification, which for a self-signed coordinator means "nothing works"
     /// or, worse, "anything with a public cert works".
     #[test]

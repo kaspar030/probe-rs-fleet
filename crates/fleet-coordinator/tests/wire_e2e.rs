@@ -1,10 +1,13 @@
 //! End-to-end "live wire" integration test.
 //!
-//! This is the software acceptance gate for the postcard-rpc control plane +
-//! data-plane relay (task 1941): it wires a real agent dial-out connection and a
-//! real sidecar relay client to the coordinator's genuine `handle_agent` /
-//! `handle_sidecar` pumps over in-memory duplex streams (no TLS), and proves a
-//! byte travels sidecar -> coordinator -> agent -> backend -> back.
+//! This wires a real agent dial-out connection and a real sidecar relay client
+//! to the coordinator's genuine `handle_agent` / `handle_sidecar` pumps over
+//! in-memory wire pairs (no HTTP, no TLS), and proves a byte travels
+//! sidecar -> coordinator -> agent -> backend -> back.
+//!
+//! `ws_e2e.rs` is the same property over a *real* `WebSocket` against a real
+//! router; this one keeps the pumps testable without an HTTP layer, so a
+//! failure here localises to the relay rather than to the transport.
 //!
 //! The hardware end-to-end (real Pi + nRF52840) is the separate ST-D gate.
 
@@ -97,17 +100,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn coordinator_config() -> CoordinatorConfig {
     CoordinatorConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
-        tls_cert: "c".into(),
-        tls_key: "k".into(),
-        client_ca: "ca".into(),
-        client_ca_key: "ca-key".into(),
         sqlite_path: ":memory:".into(),
         signing_key: SigningKeySource::Seed(SEED),
-        policy: Policy::default(),
-        pinned_agents: std::collections::HashMap::new(),
-        sweep_interval_secs: 5,
-        advertise_addr: None,
         default_org: OrgId("default".to_owned()),
+        ..CoordinatorConfig::default()
     }
 }
 
@@ -115,10 +111,8 @@ fn agent_config(token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
     let toml = format!(
         r#"
 agent_id = "agent-a"
-coordinator_endpoint = "c:1"
-tls_cert = "/c.pem"
-tls_key = "/k.pem"
-tls_ca = "/ca.pem"
+fleet_url = "https://coordinator.example:7000"
+node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 coordinator_token_pubkey = "{}"
 boards_path = "/boards.toml"
 heartbeat_secs = 30
@@ -151,7 +145,8 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     let token_pubkey = signer.public_key_bytes();
     let sched = Scheduler::new(Policy::default());
     let db = Db::connect_in_memory().await.unwrap();
-    // The single-user bootstrap the mTLS resolution seam performs on connect.
+    // The membership `coordinator user-token` provisions when it mints a
+    // session: without it, `authz::require_role` denies a perfectly valid token.
     db.ensure_user_member(&OrgId("default".to_owned()), "dev", Role::Admin)
         .await
         .unwrap();
@@ -168,13 +163,14 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     let agent = Arc::new(Agent::new(agent_config(&token_pubkey), boards(), Arc::new(EchoBackend)).unwrap());
     agent.seed_inventory_from_boards().await;
 
-    let (agent_side, coord_agent_side) = tokio::io::duplex(16 * 1024);
+    let (coord_tx, coord_rx, agent_tx, agent_rx) = fleet_wire::mock::pair();
     {
         let coord = Arc::clone(&coord);
         tokio::spawn(async move {
             let _ = fleet_coordinator::server::handle_agent_for_test(
                 coord,
-                coord_agent_side,
+                Box::new(coord_tx),
+                Box::new(coord_rx),
                 AgentId("agent-a".to_owned()),
             )
             .await;
@@ -182,10 +178,15 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     }
     {
         let agent = Arc::clone(&agent);
-        let config = agent_config(&token_pubkey);
+        let mut config = agent_config(&token_pubkey);
         tokio::spawn(async move {
-            let (r, w) = tokio::io::split(agent_side);
-            let _ = fleet_agent::connection::serve_connection(&agent, &config, r, w).await;
+            let _ = fleet_agent::connection::serve_connection(
+                &agent,
+                &mut config,
+                Box::new(agent_tx),
+                Box::new(agent_rx),
+            )
+            .await;
         });
     }
 
@@ -211,21 +212,21 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     }
 
     // --- Sidecar relay client over duplex B ---
-    let (sidecar_side, coord_sidecar_side) = tokio::io::duplex(16 * 1024);
+    let (coord_tx, coord_rx, sc_tx, sc_rx) = fleet_wire::mock::pair();
     {
         let coord = Arc::clone(&coord);
         let dev = dev.clone();
         tokio::spawn(async move {
             let _ = fleet_coordinator::server::handle_sidecar_for_test(
                 coord,
-                coord_sidecar_side,
+                Box::new(coord_tx),
+                Box::new(coord_rx),
                 dev.clone(),
             )
             .await;
         });
     }
-    let (sc_reader, sc_writer) = tokio::io::split(sidecar_side);
-    let session = fleet_sidecar::transport::CoordSession::start(sc_reader, sc_writer)
+    let session = fleet_sidecar::transport::CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
 

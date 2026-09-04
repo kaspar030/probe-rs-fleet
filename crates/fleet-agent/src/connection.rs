@@ -107,7 +107,7 @@ fn jittered(delay: Duration) -> Duration {
     let noise = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::from(d.subsec_nanos()));
-    let millis = delay.as_millis().min(u128::from(u64::MAX)) as u64;
+    let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     if millis == 0 {
         return delay;
     }
@@ -203,7 +203,7 @@ async fn connect_and_serve<B: ProbeRsBackend + 'static>(
         pin: config.server_pin(),
     })
     .await
-    .map_err(classify_dial_error)?;
+    .map_err(|e| classify_dial_error(&e))?;
 
     // The dial succeeded, so this token works: the previous one is dead weight
     // and keeping it would widen the window in which a stale credential is on
@@ -218,7 +218,7 @@ async fn connect_and_serve<B: ProbeRsBackend + 'static>(
 /// Distinguish "the coordinator refused our credential" from "the network
 /// failed", because the remediation is completely different and a bare 401 in a
 /// log is exactly the thing an operator cannot act on.
-fn classify_dial_error(e: WireError) -> AgentError {
+fn classify_dial_error(e: &WireError) -> AgentError {
     let text = e.to_string();
     if text.contains("401") || text.contains("403") || text.contains("Unauthorized") {
         return AgentError::CredentialRejected(text);
@@ -828,9 +828,10 @@ kind = "none"
 
         // The ack arrives ...
         let ack = loop {
-            match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
-                AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }) => break rotation_id,
-                _ => {}
+            if let AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }) =
+                fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap()
+            {
+                break rotation_id;
             }
         };
         assert_eq!(ack, 7);

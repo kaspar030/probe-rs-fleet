@@ -385,6 +385,10 @@ impl Db {
     /// # Errors
     ///
     /// Returns a database error if the write fails.
+    // One argument per column, and the columns are the auth key's whole
+    // definition; bundling them into a struct here would only move the same
+    // eight fields one level down.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_auth_key(
         &self,
         org: &OrgId,

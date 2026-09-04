@@ -60,7 +60,6 @@ use crate::core::Coordinator;
 use crate::state::AuditEntry;
 
 /// Build the coordinator's router.
-#[must_use]
 pub fn router(coord: Arc<Coordinator>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
@@ -141,7 +140,12 @@ async fn authenticate_request(
     Ok((auth, subject))
 }
 
-/// Log or audit a failed authentication, then produce the uniform 401.
+/// Log or audit a failed authentication, then produce the uniform rejection.
+///
+/// 401 vs. 403 is decided by the *route*, not by the credential: a wrong-kind
+/// credential gets a 403 because the caller's problem is the door it knocked on.
+/// That distinction leaks nothing — it is a function of the token prefix, which
+/// the caller supplied — whereas within each status the body is uniform.
 fn reject_authentication(e: &AuthError) -> Response {
     // No org is resolvable for any of these: the credential matched no row (or
     // no row was even looked up). Logged, not audited — see the module docs.
@@ -150,6 +154,11 @@ fn reject_authentication(e: &AuthError) -> Response {
         // A storage failure is our fault, not the caller's; still a 401 to the
         // caller (no oracle), but it must be visible as an operational problem.
         warn!(%detail, "credential store failed during authentication");
+    }
+    if matches!(e, AuthError::WrongKind { .. }) {
+        // An auth key presented as a connection credential lands here: it is
+        // redeemed at `POST /auth/token`, never presented on an upgrade.
+        return reject(StatusCode::FORBIDDEN, "forbidden");
     }
     reject(StatusCode::UNAUTHORIZED, "unauthorized")
 }

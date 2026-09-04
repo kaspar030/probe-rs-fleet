@@ -1,19 +1,21 @@
-//! The `agent init` subcommand: redeem an enrollment token for a CA-signed
-//! client cert and scaffold a ready-to-run agent config (`agent.toml` + a
-//! starter `boards.toml`) under the per-profile XDG paths.
+//! The `agent init` subcommand: redeem an auth key for a node token and
+//! scaffold a ready-to-run agent config (`agent.toml` + a starter
+//! `boards.toml`) under the per-profile XDG paths.
 //!
-//! Run on the Raspberry Pi after `coordinator enroll <agent-id> --kind agent`
-//! has printed a token. The token carries the coordinator address, a server-
-//! cert pin, and a one-time secret. `init` generates a keypair + CSR locally
-//! (the private key never leaves this host), redeems the secret over a pinned
-//! bootstrap TLS connection, writes the returned cert/key/CA into the profile
-//! data dir, derives `agent_id` from the issued cert CN (matching the pin the
-//! coordinator records automatically), and writes a populated `agent.toml`.
+//! Run on the Raspberry Pi after `coordinator auth-key` has printed a key. It
+//! POSTs the key to `<fleet-url>/auth/token`, receives a node token and the
+//! coordinator's capability-token public key, and writes `agent.toml` (0600 —
+//! it holds a bearer credential).
+//!
+//! There is no key material, no CSR, and no certificate any more. The honest
+//! trade: a node token is a pure bearer credential, so anyone who reads
+//! `agent.toml` can impersonate this node until the token rotates or the `node`
+//! row is deleted — unlike a private key that never left the host. Rotation
+//! (`CoordinatorCommand::RotateNodeToken`) is what bounds that window.
 
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
-use rustls::pki_types::CertificateDer;
 
 use fleet_agent::config::AgentConfig;
 
@@ -21,10 +23,6 @@ use crate::cli::AgentInitArgs;
 use crate::paths;
 use crate::secrets::{toml_path, write_public, write_secret};
 
-/// Issued credential filenames under the profile data dir.
-const AGENT_CERT_FILE: &str = "agent-cert.pem";
-const AGENT_KEY_FILE: &str = "agent-key.pem";
-const CLIENT_CA_FILE: &str = "client-ca.pem";
 const AGENT_CONFIG_FILE: &str = "agent.toml";
 const BOARDS_FILE: &str = "boards.toml";
 
@@ -32,86 +30,76 @@ const BOARDS_FILE: &str = "boards.toml";
 ///
 /// # Errors
 ///
-/// Returns an error if the token cannot be redeemed, any file cannot be
-/// written, the cert CN cannot be derived, or (without `--force`) a target file
-/// already exists.
+/// Returns an error if the auth key cannot be redeemed, any file cannot be
+/// written, or (without `--force`) a target file already exists.
 pub async fn run(args: AgentInitArgs, profile: String) -> Result<()> {
     let AgentInitArgs {
-        token,
+        fleet_url,
+        auth_key,
+        node_name,
+        tag,
+        server_cert_sha256,
         config_dir,
-        data_dir,
         boards_path,
         force,
     } = args;
+
+    let pin = match &server_cert_sha256 {
+        Some(hex) => Some(
+            fleet_tls::parse_fingerprint(hex)
+                .context("--server-cert-sha256 must be 64 hex characters")?,
+        ),
+        None => None,
+    };
 
     let config_dir = match config_dir {
         Some(dir) => dir,
         None => paths::agent_config_dir(&profile)?,
     };
-    let data_dir = match data_dir {
-        Some(dir) => dir,
-        None => paths::agent_data_dir(&profile)?,
-    };
-
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("creating config dir {}", config_dir.display()))?;
-    std::fs::create_dir_all(&data_dir)
-        .with_context(|| format!("creating data dir {}", data_dir.display()))?;
 
-    let cert_path = data_dir.join(AGENT_CERT_FILE);
-    let key_path = data_dir.join(AGENT_KEY_FILE);
-    let ca_path = data_dir.join(CLIENT_CA_FILE);
     let config_path = config_dir.join(AGENT_CONFIG_FILE);
     let boards_path = boards_path.unwrap_or_else(|| config_dir.join(BOARDS_FILE));
 
     // Idempotency guard.
-    if !force {
-        let existing: Vec<&Path> = [
-            cert_path.as_path(),
-            key_path.as_path(),
-            ca_path.as_path(),
-            config_path.as_path(),
-        ]
-        .into_iter()
-        .filter(|p| p.exists())
-        .collect();
-        if !existing.is_empty() {
-            let list = existing
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n  ");
-            bail!("refusing to overwrite existing file(s); pass --force to regenerate:\n  {list}");
-        }
+    if !force && config_path.exists() {
+        bail!(
+            "refusing to overwrite existing file; pass --force to re-enroll:\n  {}",
+            config_path.display()
+        );
     }
 
-    // Redeem the token: pinned bootstrap TLS -> local CSR -> CA-signed cert.
-    let enrolled = crate::roles::bootstrap::enroll(&token)
-        .await
-        .context("enrolling agent via bootstrap token")?;
+    let node_name = match node_name {
+        Some(name) => name,
+        None => default_node_name(),
+    };
 
-    // Write issued credentials (the key was generated locally).
-    write_public(&cert_path, enrolled.client_cert_pem.as_bytes())
-        .with_context(|| format!("writing agent cert {}", cert_path.display()))?;
-    write_secret(&key_path, enrolled.client_key_pem.as_bytes())
-        .with_context(|| format!("writing agent key {}", key_path.display()))?;
-    write_public(&ca_path, enrolled.ca_cert_pem.as_bytes())
-        .with_context(|| format!("writing CA {}", ca_path.display()))?;
+    let response =
+        fleet_auth::http_client::exchange_auth_key(&fleet_url, pin, &auth_key, &node_name, tag)
+            .await
+            .context("redeeming the auth key at <fleet-url>/auth/token")?;
 
-    // Derive agent_id from the issued cert's CN (source of truth, matches the
-    // coordinator's auto-pin).
-    let agent_id = agent_id_from_cert_file(&cert_path)?;
+    let node_id = response
+        .node_id
+        .clone()
+        .unwrap_or_else(|| node_name.clone());
+    let token_pubkey = response.coordinator_token_pubkey.clone().context(
+        "the coordinator did not return its capability-token public key; \
+         it is required to verify per-lease tokens",
+    )?;
 
     let config_toml = render_agent_config(
-        &agent_id,
-        &enrolled.coordinator_addr,
-        &cert_path,
-        &key_path,
-        &ca_path,
-        &enrolled.coordinator_token_pubkey,
+        &node_id,
+        &fleet_url,
+        &response.token,
+        server_cert_sha256.as_deref(),
+        &token_pubkey,
         &boards_path,
     );
-    write_public(&config_path, config_toml.as_bytes())
+    // 0600: this file holds the node's bearer credential. A world-readable
+    // bearer credential is equivalent to no credential at all.
+    write_secret(&config_path, config_toml.as_bytes())
         .with_context(|| format!("writing agent config {}", config_path.display()))?;
 
     // Validate the written config round-trips.
@@ -124,64 +112,71 @@ pub async fn run(args: AgentInitArgs, profile: String) -> Result<()> {
             .with_context(|| format!("writing boards scaffold {}", boards_path.display()))?;
     }
 
-    print_summary(&agent_id, &config_path, &boards_path, &cert_path, &key_path, &ca_path);
+    print_summary(&node_id, &response.org, &config_path, &boards_path);
     Ok(())
 }
 
-/// Derive the agent id (cert CN) from an issued cert PEM file.
-fn agent_id_from_cert_file(cert_path: &Path) -> Result<String> {
-    let pem = std::fs::read(cert_path)
-        .with_context(|| format!("reading cert {}", cert_path.display()))?;
-    let der = rustls_pemfile_first_cert(&pem)
-        .with_context(|| format!("no certificate found in {}", cert_path.display()))?;
-    let agent_id = fleet_tls::agent_id_from_cert(&der)
-        .with_context(|| format!("deriving agent id from cert {}", cert_path.display()))?;
-    Ok(agent_id.0)
-}
-
-/// Extract the first certificate's DER from PEM bytes.
-fn rustls_pemfile_first_cert(pem: &[u8]) -> Result<CertificateDer<'static>> {
-    let mut reader = std::io::BufReader::new(pem);
-    let first = rustls_pemfile::certs(&mut reader)
-        .next()
-        .context("no certificate found in PEM")?;
-    first.context("parsing PEM certificate")
+/// The machine's hostname, or a neutral placeholder.
+///
+/// Advisory only: it names the `node` row, it does not grant anything.
+fn default_node_name() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "node".to_owned())
 }
 
 /// Render a populated `agent.toml`.
 fn render_agent_config(
-    agent_id: &str,
-    coordinator: &str,
-    cert: &Path,
-    key: &Path,
-    ca: &Path,
+    node_id: &str,
+    fleet_url: &str,
+    node_token: &str,
+    pin: Option<&str>,
     token_pubkey: &str,
     boards_path: &Path,
 ) -> String {
+    let pin_block = pin.map_or_else(
+        || {
+            "\n# Optional: pin the coordinator's server certificate by its SHA-256, for a\n\
+             # self-hosted deployment with no publicly trusted certificate.\n\
+             # server_cert_sha256 = \"<64 hex chars>\"\n"
+                .to_owned()
+        },
+        |p| {
+            format!(
+                "\n# Pinned coordinator server certificate (self-hosted deployment).\n\
+                 server_cert_sha256 = {}\n",
+                toml::Value::String(p.to_owned())
+            )
+        },
+    );
     format!(
         r"# probe-rs-fleet agent config
 #
-# Generated by `probe-rs-fleet agent init`. Paths are absolute and point at the
-# credentials issued during bootstrap enrollment. The agent is discovered at
-# the per-profile XDG path
+# Generated by `probe-rs-fleet agent init`. Discovered at the per-profile XDG
+# path
 #   ~/.config/probe-rs-fleet/agent/<profile>/agent.toml
 # unless overridden with --config / PROBE_RS_FLEET_AGENT_CONFIG.
+#
+# THIS FILE HOLDS A BEARER CREDENTIAL and is written 0600. Anyone who can read
+# `node_token` can act as this node until the token rotates or the node's row is
+# deleted on the coordinator.
 
-# This agent's id. Derived from the issued client cert CN, which the
-# coordinator pins automatically.
-agent_id = {agent_id}
+# This node's id, as assigned by the coordinator at enrollment.
+#
+# Advisory: the coordinator identifies this node by the token it presents, and
+# refuses the connection if this field contradicts it.
+agent_id = {node_id}
 
-# `host:port` of the coordinator to dial out to (runtime is mTLS).
-coordinator_endpoint = {coordinator}
+# Base URL of the coordinator to dial out to.
+fleet_url = {fleet_url}
 
-# Client mTLS certificate chain + private key (issued via bootstrap enrollment;
-# the private key was generated locally and never left this host).
-tls_cert = {tls_cert}
-tls_key = {tls_key}
-
-# CA used to verify the coordinator's server certificate (PEM).
-tls_ca = {tls_ca}
-
+# This node's bearer token. The coordinator rotates it over the established
+# connection; the agent rewrites this file when it does.
+node_token = {node_token}
+{pin_block}
 # Hex-encoded ed25519 public key of the coordinator's token signer. Returned by
 # enrollment; used to verify per-lease capability tokens.
 coordinator_token_pubkey = {token_pubkey}
@@ -195,11 +190,9 @@ boards_path = {boards_path}
 # Erase the target's flash on lease release (default false).
 # erase_on_release = false
 ",
-        agent_id = toml::Value::String(agent_id.to_owned()),
-        coordinator = toml::Value::String(coordinator.to_owned()),
-        tls_cert = toml_path(cert),
-        tls_key = toml_path(key),
-        tls_ca = toml_path(ca),
+        node_id = toml::Value::String(node_id.to_owned()),
+        fleet_url = toml::Value::String(fleet_url.to_owned()),
+        node_token = toml::Value::String(node_token.to_owned()),
         token_pubkey = toml::Value::String(token_pubkey.to_owned()),
         boards_path = toml_path(boards_path),
     )
@@ -234,23 +227,58 @@ fn starter_boards_toml() -> String {
 }
 
 /// Print a summary + next steps.
-fn print_summary(
-    agent_id: &str,
-    config_path: &Path,
-    boards_path: &Path,
-    cert_path: &Path,
-    key_path: &Path,
-    ca_path: &Path,
-) {
-    println!("Initialised agent '{agent_id}':");
-    println!("  config      {}", config_path.display());
-    println!("  boards      {}", boards_path.display());
-    println!("  cert        {}", cert_path.display());
-    println!("  key         {}", key_path.display());
-    println!("  ca          {}", ca_path.display());
+fn print_summary(node_id: &str, org: &str, config_path: &Path, boards_path: &Path) {
+    println!("Enrolled node '{node_id}' in org '{org}':");
+    println!("  config  {} (0600)", config_path.display());
+    println!("  boards  {}", boards_path.display());
     println!();
     println!("Next steps:");
     println!("  1. Edit {} to declare your boards.", boards_path.display());
     println!("  2. Start the agent:");
     println!("       probe-rs-fleet agent --profile <name>");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_config_round_trips_through_agent_config() {
+        let rendered = render_agent_config(
+            "default/rpi-lab-1",
+            "https://fleet.example",
+            "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            None,
+            &"ab".repeat(32),
+            Path::new("/etc/fleet/boards.toml"),
+        );
+        let cfg = AgentConfig::from_str(&rendered).unwrap();
+        assert_eq!(cfg.agent_id, "default/rpi-lab-1");
+        assert_eq!(cfg.fleet_url, "https://fleet.example");
+        assert!(cfg.node_token.starts_with("prfn1_"));
+        assert!(cfg.server_pin().is_none());
+        assert!(cfg.previous_node_token.is_none());
+    }
+
+    #[test]
+    fn rendered_config_carries_a_pin_when_given() {
+        let pin = "cd".repeat(32);
+        let rendered = render_agent_config(
+            "default/rpi",
+            "https://fleet.example",
+            "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            Some(&pin),
+            &"ab".repeat(32),
+            Path::new("/b.toml"),
+        );
+        let cfg = AgentConfig::from_str(&rendered).unwrap();
+        assert_eq!(cfg.server_pin(), Some([0xcdu8; 32]));
+    }
+
+    /// The node name is a label, not a credential, so a machine with no
+    /// resolvable hostname must still enroll rather than failing.
+    #[test]
+    fn default_node_name_is_never_empty() {
+        assert!(!default_node_name().is_empty());
+    }
 }

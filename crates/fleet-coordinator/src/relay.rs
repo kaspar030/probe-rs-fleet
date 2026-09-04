@@ -306,24 +306,25 @@ mod tests {
         assert!(!close_channel(&table, Some(&agent), channel).await);
     }
 
-    /// Relay smoke test over real `tokio::io::duplex` pairs: bytes written by a
-    /// "sidecar" task travel through the codec + relay and arrive verbatim at
-    /// the "agent" reader, and vice-versa.
+    /// Relay smoke test over a real wire pair: bytes forwarded to a "sidecar"
+    /// travel through the codec + relay and arrive verbatim at the "agent"
+    /// reader. The relay itself is transport-agnostic — it moves frames between
+    /// two mpsc handles and never touches a socket — so this exercises the
+    /// codec boundary either side of it.
     #[tokio::test]
-    async fn relay_over_duplex_streams() {
-        use crate::proto::{read_frame, write_frame};
-
+    async fn relay_over_a_wire_pair() {
         let table = ChannelTable::new();
         let channel = table.allocate().await;
 
-        // Agent side: a duplex whose far half the agent's writer task drains.
-        let (mut agent_stream, mut agent_remote) = tokio::io::duplex(4096);
+        // Agent side: a wire pair whose far half stands in for the node.
+        let (mut agent_wire_tx, _agent_wire_rx, _peer_tx, mut agent_remote) =
+            fleet_wire::mock::pair();
         let (agent_tx, mut agent_msg_rx) = mpsc::channel::<AgentMessage>(16);
-        // Writer task: drains AgentMessage -> writes DataFrame onto the stream.
+        // Writer task: drains AgentMessage -> writes DataFrame onto the wire.
         let writer = tokio::spawn(async move {
             while let Some(msg) = agent_msg_rx.recv().await {
                 if let AgentMessage::Data(frame) = msg {
-                    write_frame(&mut agent_stream, &frame).await.unwrap();
+                    fleet_wire::send(&mut agent_wire_tx, &frame).await.unwrap();
                 }
             }
         });
@@ -350,7 +351,7 @@ mod tests {
         assert!(forward_to_agent(&table, &agent, payload.clone())
             .await
             .unwrap());
-        let received: DataFrame = read_frame(&mut agent_remote).await.unwrap();
+        let received: DataFrame = fleet_wire::recv(&mut agent_remote).await.unwrap();
         assert_eq!(received, payload);
 
         drop(agent);

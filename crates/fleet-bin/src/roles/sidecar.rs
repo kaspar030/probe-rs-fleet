@@ -48,9 +48,9 @@ pub async fn run(probe_rs_args: Vec<OsString>, profile: &str) -> Result<ExitCode
 /// Populate the sidecar's coordinator / credential env vars from `client.toml`
 /// for any key not already present in the environment.
 ///
-/// `client.toml` is shared with `ctl`, but the sidecar selector reads a
-/// different set of env var names (`_CLIENT_CERT` / `_CLIENT_KEY`) than `ctl`
-/// (`_CERT` / `_KEY`); we map `client.toml` into the sidecar's names here.
+/// `client.toml` is shared with `ctl`; since revision 2 both read the same three
+/// values, so this is a straight bridge rather than the name translation it used
+/// to be.
 fn inject_client_config_env(profile: &str) {
     let Ok(path) = crate::paths::client_config_path(profile) else {
         return;
@@ -62,10 +62,11 @@ fn inject_client_config_env(profile: &str) {
         return;
     };
 
-    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", &cfg.coordinator);
-    set_env_if_absent("PROBE_RS_FLEET_CLIENT_CERT", &cfg.cert.display().to_string());
-    set_env_if_absent("PROBE_RS_FLEET_CLIENT_KEY", &cfg.key.display().to_string());
-    set_env_if_absent("PROBE_RS_FLEET_CA", &cfg.ca.display().to_string());
+    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", &cfg.fleet_url);
+    set_env_if_absent("PROBE_RS_FLEET_TOKEN", &cfg.token);
+    if let Some(pin) = &cfg.server_cert_sha256 {
+        set_env_if_absent("PROBE_RS_FLEET_SERVER_CERT_SHA256", pin);
+    }
 }
 
 /// Set an env var only if it is not already present (and non-empty).

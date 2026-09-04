@@ -34,7 +34,7 @@ pub fn split(ws: WebSocket) -> (AxumTx, AxumRx) {
 ///
 /// axum funnels everything through `axum::Error`, so the benign-close cases have
 /// to be recovered from the source chain rather than matched on a variant.
-fn map_err(e: axum::Error) -> WireError {
+fn map_err(e: &axum::Error) -> WireError {
     let text = e.to_string();
     if text.contains("Connection closed normally")
         || text.contains("connection closed")
@@ -51,18 +51,18 @@ impl WireTx for AxumTx {
         self.sink
             .send(Message::Binary(bytes.into()))
             .await
-            .map_err(map_err)
+            .map_err(|e| map_err(&e))
     }
 
     async fn send_ping(&mut self) -> Result<(), WireError> {
         self.sink
             .send(Message::Ping(Vec::new().into()))
             .await
-            .map_err(map_err)
+            .map_err(|e| map_err(&e))
     }
 
     async fn close(&mut self) -> Result<(), WireError> {
-        match self.sink.close().await.map_err(map_err) {
+        match self.sink.close().await.map_err(|e| map_err(&e)) {
             Ok(()) | Err(WireError::Closed) => Ok(()),
             Err(e) => Err(e),
         }
@@ -76,7 +76,7 @@ impl WireRx for AxumRx {
             let Some(msg) = self.stream.next().await else {
                 return Ok(WireEvent::Closed);
             };
-            match msg.map_err(map_err)? {
+            match msg.map_err(|e| map_err(&e))? {
                 Message::Binary(bytes) => return Ok(WireEvent::Binary(bytes.into())),
                 Message::Pong(_) => return Ok(WireEvent::Pong),
                 Message::Close(_) => return Ok(WireEvent::Closed),
