@@ -81,7 +81,7 @@ pub struct CoordinatorConfig {
     pub listen_addr: SocketAddr,
     /// The externally reachable base URL of this coordinator
     /// (`https://fleet.example`), as handed to operators for
-    /// `agent init --fleet-url` / `ctl init --fleet-url`.
+    /// `login --fleet-url` / `agent init --fleet-url`.
     ///
     /// This is not derivable from [`listen_addr`](Self::listen_addr): behind a
     /// proxy the coordinator listens on `127.0.0.1:7000` and the world reaches

@@ -149,7 +149,7 @@ pub enum AgentReport {
         /// coordinator compares it with the token-derived id and closes the
         /// connection on a mismatch (a node claiming another node's id is not a
         /// benign typo); routing and authorization use the token-derived id
-        /// regardless. `agent.toml` writes this field from the `node_id` the
+        /// regardless. The agent fills this field from the `node_id` the
         /// token exchange returned.
         agent: AgentId,
         /// Wire protocol version this agent speaks.

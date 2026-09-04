@@ -83,7 +83,7 @@ struct CoordinatorConfigToml {
     /// is behind a reverse proxy on the same host.
     listen_addr: SocketAddr,
     /// The externally reachable base URL operators hand to `agent init` /
-    /// `ctl init`. Not derivable from `listen_addr` behind a proxy.
+    /// `login`. Not derivable from `listen_addr` behind a proxy.
     public_url: String,
     /// Coordinator-terminated TLS. Omit it when a proxy terminates TLS (the
     /// hosted deployment) and the coordinator serves plain HTTP on loopback.

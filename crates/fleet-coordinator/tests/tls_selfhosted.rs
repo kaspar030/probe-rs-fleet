@@ -15,7 +15,7 @@
 //!
 //! It also covers the pin, which is the one surviving piece of the deleted
 //! certificate-pinning code: a self-hosted coordinator has no publicly trusted
-//! certificate, so the operator passes its SHA-256 to `agent init` / `ctl init`.
+//! certificate, so the operator passes its SHA-256 to `agent init` / `login`.
 
 mod common;
 

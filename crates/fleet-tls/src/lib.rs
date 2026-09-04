@@ -263,7 +263,7 @@ pub fn parse_fingerprint(hex: &str) -> Option<[u8; 32]> {
 /// bootstrap mechanism — there is no bootstrap handshake — but the way a
 /// self-hosted deployment without public DNS establishes trust: the operator
 /// reads the fingerprint off the coordinator host and passes it to
-/// `agent init --server-cert-sha256` / `ctl init`.
+/// `agent init --server-cert-sha256` / `login --server-cert-sha256`.
 ///
 /// It accepts self-signed / leaf-only chains and ignores the server name and
 /// intermediates; the pin is the sole check.
