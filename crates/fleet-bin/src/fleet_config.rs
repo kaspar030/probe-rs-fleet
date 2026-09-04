@@ -236,8 +236,7 @@ pub fn save_atomic(path: &Path, file: &FleetFile) -> Result<()> {
             .with_context(|| format!("creating fleet config dir {}", dir.display()))?;
     }
     let tmp = tmp_path(path);
-    write_secret(&tmp, text.as_bytes())
-        .with_context(|| format!("writing {}", tmp.display()))?;
+    write_secret(&tmp, text.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| {
         format!(
             "renaming {} onto {} (fleet config write)",
@@ -430,10 +429,7 @@ mod tests {
             loaded.user.as_ref().unwrap().session_token,
             file.user.as_ref().unwrap().session_token
         );
-        assert_eq!(
-            loaded.node.as_ref().unwrap().node_id,
-            "gh-4242/rpi-lab-1"
-        );
+        assert_eq!(loaded.node.as_ref().unwrap().node_id, "gh-4242/rpi-lab-1");
     }
 
     /// The laptop case, and the reason every writer is read-modify-write: a

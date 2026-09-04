@@ -1,0 +1,118 @@
+# probe-rs-fleet — fleets/<name>.toml reference (per-fleet configuration)
+#
+# ONE FILE PER FLEET, at
+#   $XDG_CONFIG_HOME/probe-rs-fleet/fleets/<name>.toml
+#   (i.e. ~/.config/probe-rs-fleet/fleets/<name>.toml)
+#
+# Select a fleet with `--fleet <name>` or PROBE_RS_FLEET; the default is
+# `default`. `probe-rs-fleet fleets` lists the ones this machine has.
+#
+# You do not normally write this file by hand. It is managed by:
+#   probe-rs-fleet login       → writes [user]
+#   probe-rs-fleet agent init  → writes [node]
+# Both preserve the other's table.
+#
+# ---------------------------------------------------------------------------
+# THIS FILE HOLDS BEARER CREDENTIALS. It is written 0600.
+# ---------------------------------------------------------------------------
+#
+# Anyone who can read [user].session_token can act as you until it expires.
+# Anyone who can read [node].node_token can act as this node until the token
+# rotates or the node's row is deleted on the coordinator.
+#
+# ---------------------------------------------------------------------------
+# Why one file per fleet, and why the two tokens do NOT merge
+# ---------------------------------------------------------------------------
+#
+# A laptop is routinely both a user and a node. The previous layout (one config
+# tree per role, subdivided per profile) could not express that: it needed two
+# unrelated enrollments, two identities, and two trees, with nothing tying them
+# to the same fleet. Here it is one file with two optional tables:
+#
+#   laptop     → [user] AND [node]
+#   headless Pi→ [node] only
+#   CI runner  → neither (its token comes from the environment)
+#
+# The two tokens stay DISTINCT CREDENTIALS. Merging them — "one identity per
+# machine" — would make a compromised Pi, a device sitting on a shelf that
+# anyone walking past can reach, equivalent to a compromised user account.
+# The node token is machine-scoped and survives reboots; the session token is
+# human-scoped and short-lived.
+
+
+# ---------------------------------------------------------------------------
+# Fleet-wide
+# ---------------------------------------------------------------------------
+
+# Base URL of this fleet's coordinator. A bare `host:port` is accepted and
+# assumes https.
+url = "https://fleet.example.com"
+
+# Optional: pin the coordinator's server certificate by its SHA-256, for a
+# self-hosted deployment with no publicly trusted certificate. Without it the
+# coordinator is verified against the usual public web PKI roots.
+#
+# Read the fingerprint with:
+#   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
+# server_cert_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+# ---------------------------------------------------------------------------
+# [user] — written by `probe-rs-fleet login`
+# ---------------------------------------------------------------------------
+#
+# Read by `ctl` and by the `probe-rs` sidecar shim. Explicit flags and env vars
+# (PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN) take precedence over it.
+
+[user]
+# Your bearer session token. Short-lived; `ctl` refreshes it as it nears expiry
+# and writes the replacement back here.
+session_token = "prfs1_…"
+
+# The org ID this session belongs to.
+#
+# For a personal org this is `gh-<github_user_id>` — the IMMUTABLE NUMERIC id,
+# not your login. GitHub logins can be renamed and then claimed by someone else,
+# so keying identity off the name is a documented account-takeover vector: the
+# person who takes your old login would be provisioned into your org.
+org = "gh-4242"
+
+# Your GitHub login, cached for display only. Nothing keys off it.
+login = "kaspar"
+
+# When the session token expires (epoch seconds), if known.
+expires = 1788600000
+
+
+# ---------------------------------------------------------------------------
+# [node] — written by `probe-rs-fleet agent init`, refreshed by the agent
+# ---------------------------------------------------------------------------
+#
+# Present only if this machine offers probes to the fleet. Node-local settings
+# that are NOT credentials (board inventory, heartbeat, power wiring) live in
+# ~/.config/probe-rs-fleet/node/ instead — they describe the machine, not the
+# fleet, so they are not duplicated when it joins a second one.
+
+[node]
+# This node's bearer token. The coordinator rotates it over the established
+# connection and the agent rewrites this table when it does — which is why every
+# writer here is read-modify-write: a rotation must not clobber [user].
+node_token = "prfn1_…"
+
+# The node id the coordinator assigned at enrollment. Advisory: the coordinator
+# identifies this node by the token it presents and refuses the connection if
+# this field contradicts it.
+node_id = "gh-4242/rpi-lab-1"
+
+# Hex-encoded ed25519 public key of the coordinator's capability-token signer,
+# returned by enrollment. Used to verify the per-lease tokens the agent is
+# handed, so a node cannot be told to serve a board it has no token for.
+coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+# The token this one replaced, retained until a connection with `node_token`
+# succeeds. This closes the one rotation window the ack-then-retire scheme
+# cannot: if the ACK is lost after the node wrote the new token, the node holds
+# the new one while the coordinator still holds the old. Retrying once with this
+# recovers without server state — and without it, that case needs someone
+# standing next to the Pi.
+# previous_node_token = "prfn1_…"

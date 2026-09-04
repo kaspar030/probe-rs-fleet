@@ -1,0 +1,42 @@
+# probe-rs-fleet — node.toml reference (node-local, non-credential settings)
+#
+# Discovered at
+#   $XDG_CONFIG_HOME/probe-rs-fleet/node/node.toml
+#   (i.e. ~/.config/probe-rs-fleet/node/node.toml)
+#
+# `probe-rs-fleet agent init` scaffolds a commented version of this file.
+#
+# ---------------------------------------------------------------------------
+# Why this is NOT per fleet
+# ---------------------------------------------------------------------------
+#
+# Everything here is a fact about THIS MACHINE — which probes are attached, how
+# they are powered, how chatty its heartbeat is — and stays true whichever fleet
+# it is enrolled in. Making it per-fleet would duplicate it for nothing and let
+# the copies drift.
+#
+# The node's CREDENTIAL is the opposite: it is per-fleet by definition, and
+# lives in the [node] table of ~/.config/probe-rs-fleet/fleets/<name>.toml
+# (0600). See examples/fleet.toml.
+#
+# There are no credentials in this file, so it is written world-readable.
+#
+# Every key below is optional; an absent file is equivalent to an empty one.
+
+# Path to this node's board inventory (see examples/boards.toml).
+# Default: ~/.config/probe-rs-fleet/node/boards.toml
+# boards_path = "/etc/probe-rs-fleet/boards.toml"
+
+# How often (seconds) the agent heartbeats to the coordinator. Default: 15.
+#
+# The heartbeat is also what keeps the persistent dial-out connection alive
+# through a reverse proxy that reaps idle WebSockets, so raising it far is not
+# free.
+# heartbeat_secs = 15
+
+# Erase the target's flash when a lease is released. Default: false.
+#
+# Off by default because it is destructive and slow, and a shared lab board is
+# usually reflashed by the next lease anyway. Turn it on where one tenant's
+# firmware must not be readable by the next.
+# erase_on_release = false

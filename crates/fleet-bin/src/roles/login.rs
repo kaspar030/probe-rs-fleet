@@ -85,11 +85,8 @@ pub async fn run(args: LoginArgs) -> Result<()> {
                  the first time"
             )
         })?;
-    let pin_hex = server_cert_sha256.or_else(|| {
-        existing
-            .as_ref()
-            .and_then(|f| f.server_cert_sha256.clone())
-    });
+    let pin_hex =
+        server_cert_sha256.or_else(|| existing.as_ref().and_then(|f| f.server_cert_sha256.clone()));
     if let Some(pin) = &pin_hex {
         anyhow::ensure!(
             fleet_tls::parse_fingerprint(pin).is_some(),
@@ -181,7 +178,8 @@ async fn device_flow(url: &str, pin: Option<[u8; 32]>, no_browser: bool) -> Resu
                     expires: response.expires,
                 });
             }
-            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => match code.as_str() {
+            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => match code.as_str()
+            {
                 "authorization_pending" => {}
                 // Back off additively, as RFC 8628 §3.5 requires: GitHub counts
                 // a too-fast poll against us, and answering `slow_down` by

@@ -1,11 +1,23 @@
 //! Interim admin verbs: `coordinator auth-key` and `coordinator user-token`.
 //!
 //! Both mint a credential directly from a shell on the coordinator host,
-//! bypassing any login flow. They exist so the fleet is usable *before* the
-//! GitHub device flow lands (a later task), and they are marked interim in their
-//! help text and in a runtime warning so they do not quietly become the way
-//! people log in. Once `fleet login` exists these become the unattended /
-//! air-gapped escape hatch, not the front door.
+//! bypassing the login flow. Now that `probe-rs-fleet login` exists they are the
+//! **unattended / air-gapped escape hatch**, not the front door, and they stay
+//! marked interim in their help text and in a runtime warning.
+//!
+//! # `user-token` and `login` mint different identities
+//!
+//! Worth knowing before mixing them. `login` keys a user off the immutable
+//! GitHub numeric id (`user.id = "gh-<id>"`, see `Db::upsert_github_user`);
+//! `user-token` has no GitHub identity to work from and keys off the login
+//! string it was handed (`user.id = "alice"`). So `coordinator user-token alice`
+//! and alice's own `login` are **two distinct subjects for one human**: a lease
+//! held under one cannot be extended or released by the other, because
+//! `authz::require_lease_control` keys off `SubjectKey`.
+//!
+//! That is tolerable for an interim admin verb — but it is the kind of thing
+//! that gets filed as a bug by whoever hits it first, so it is written down
+//! here rather than discovered.
 //!
 //! Both open the coordinator's database directly rather than talking to a
 //! running coordinator: the operator running them already has a shell on the
@@ -55,10 +67,12 @@ fn now() -> i64 {
 /// consulted at creation (`ON CONFLICT DO NOTHING`), so nothing later corrects
 /// it.
 ///
-/// TODO(3447): once the device flow mints personal orgs on first login, this
-/// should stop being a CLI-shaped guess. A team org ought to be created by an
+/// Personal orgs are now created by `login` (keyed off the GitHub numeric id),
+/// so what these verbs create is normally a **team** org; the `personal`
+/// fallback only applies to the unnamed default org, which is the bootstrap
+/// org every deployment starts with. A team org still ought to be created by an
 /// explicit `coordinator org create` rather than as a side effect of minting a
-/// credential for it.
+/// credential for it — that is a UX gap, not a correctness one.
 fn org_kind(explicit: bool) -> &'static str {
     if explicit {
         "team"
@@ -77,7 +91,7 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     warn!(
         "`coordinator auth-key` is an INTERIM verb: it mints a node-enrollment \
          credential from a shell on this host. It will become the unattended \
-         escape hatch once `fleet login` lands."
+         escape hatch now that `probe-rs-fleet login` exists."
     );
 
     let (db, default_org, _) = open_db(args.config_dir).await?;
@@ -146,7 +160,8 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     warn!(
         "`coordinator user-token` is an INTERIM verb: it mints a session token \
          from a shell on this host, bypassing any login flow. It should not \
-         become the way people log in \u{2014} `fleet login` (GitHub device flow) is."
+         become the way people log in — `probe-rs-fleet login` (GitHub device \
+         flow) is."
     );
 
     let (db, default_org, default_ttl) = open_db(args.config_dir).await?;
@@ -177,7 +192,7 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     println!("  expires: {expires} (epoch seconds)");
     println!();
     println!("Point `ctl` and the probe-rs shim at the fleet with it:");
-    println!("  probe-rs-fleet ctl init --fleet-url <url> --token <token>");
+    println!("  probe-rs-fleet login --fleet-url <url> --token <token>");
     println!();
     println!("This token is a bearer credential and is not stored anywhere (only its");
     println!("hash). Copy it now.");

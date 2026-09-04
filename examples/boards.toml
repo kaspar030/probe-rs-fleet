@@ -1,8 +1,9 @@
 # probe-rs-fleet — boards.toml reference (agent-local board inventory)
 #
 # Maps physical probe serials to leasable boards for ONE agent. The agent
-# reconciles discovered probes against these declarations. The path is set by
-# `boards_path` in agent.toml (default ~/.config/probe-rs-fleet/boards.toml).
+# reconciles discovered probes against these declarations. The default path is
+# ~/.config/probe-rs-fleet/node/boards.toml; override it with `boards_path` in
+# node.toml (see examples/node.toml).
 #
 # `probe-rs-fleet agent init` scaffolds a commented version of this file; edit
 # it to declare each board attached to the Pi.

@@ -142,7 +142,10 @@ async fn device_code(State(state): State<Arc<StubState>>, body: String) -> Json<
     }))
 }
 
-async fn access_token(State(state): State<Arc<StubState>>, body: String) -> Json<serde_json::Value> {
+async fn access_token(
+    State(state): State<Arc<StubState>>,
+    body: String,
+) -> Json<serde_json::Value> {
     let pairs = form_pairs(&body);
     for (k, v) in &pairs {
         if k == "client_id" {
@@ -217,7 +220,9 @@ async fn a_completed_device_flow_yields_a_working_session_token() {
     let gh_config = github.config();
     let fleet = TestCoordinator::start_with(move |c| c.github = Some(gh_config)).await;
 
-    let (status, body) = fleet.http("POST", "/auth/device/start", Some("{}".to_owned())).await;
+    let (status, body) = fleet
+        .http("POST", "/auth/device/start", Some("{}".to_owned()))
+        .await;
     assert_eq!(status, 200, "{body}");
     let start: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(start["user_code"], "WDJB-MJHT");
@@ -291,7 +296,10 @@ async fn first_login_creates_a_personal_org_and_the_second_reuses_it() {
     let second: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(second["org"], first["org"]);
     assert_eq!(second["login"], "kaspar-renamed");
-    assert_ne!(second["token"], first["token"], "each login mints its own token");
+    assert_ne!(
+        second["token"], first["token"],
+        "each login mints its own token"
+    );
 
     let orgs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org WHERE id LIKE 'gh-%'")
         .fetch_one(fleet.db().pool_for_test())

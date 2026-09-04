@@ -123,11 +123,13 @@ fn render_coordinator_config(
 listen_addr = "{DEFAULT_LISTEN_ADDR}"
 
 # The externally reachable base URL agents and clients DIAL to reach this
-# coordinator — what you pass to `agent init --fleet-url` / `ctl init
-# --fleet-url`.
+# coordinator — what you pass to `login --fleet-url` / `agent init --fleet-url`.
 #
 # Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
 # listens on loopback and the world reaches it at a name it never sees.
+#
+# This is NOT an OAuth callback origin: the GitHub device flow has no
+# redirect_uri, so nothing here is registered with GitHub.
 public_url = {public_url}
 
 # SQLite database file (created on first run).
@@ -165,7 +167,33 @@ signing_key_path = {signing_key_path}
 #
 # With a self-signed certificate, clients need its SHA-256:
 #   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
-# and pass it as `--server-cert-sha256` to `agent init` / `ctl init`.
+# and pass it as `--server-cert-sha256` to `login` / `agent init`.
+
+# The GitHub OAuth app backing `probe-rs-fleet login`.
+#
+# Omitting this block is a SUPPORTED deployment, not a broken one: an air-gapped
+# or development fleet bootstraps with `coordinator user-token` instead, and the
+# device-flow routes then answer 503 `device_flow_unconfigured` — a named code
+# the CLI turns into "ask the operator, or use `coordinator user-token`".
+#
+# To enable login: register an OAuth app at
+# https://github.com/settings/developers with "Enable Device Flow" TICKED.
+# There is NO callback URL to configure — the device flow has no redirect_uri.
+#
+# The coordinator brokers the flow, so the client id/secret never leave this
+# host and the user's GitHub access token never leaves this process.
+#
+# [github]
+# client_id = "Iv1.0123456789abcdef"
+# # Only if your app requires one (OAuth Apps do not, for the device flow):
+# # client_secret = "…"
+# # Scope to request. Empty is correct for identity-only login: `GET /user`
+# # needs none, and asking for more than you use is hard for a user to undo.
+# # scope = ""
+# # Endpoint overrides, for GitHub Enterprise. Defaults shown.
+# # device_code_url  = "https://github.com/login/device/code"
+# # access_token_url = "https://github.com/login/oauth/access_token"
+# # api_base         = "https://api.github.com"
 
 # Lease scheduling policy (defaults shown).
 [policy]
@@ -189,20 +217,26 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("  public URL   {public_url}");
     println!();
     println!("Next steps:");
-    println!("  1. Start the coordinator (no --config needed):");
+    println!("  1. Register a GitHub OAuth app with DEVICE FLOW ENABLED and put");
+    println!("     its client id in the [github] block of the config above.");
+    println!("     (There is no callback URL to fill in.)");
+    println!("  2. Start the coordinator (no --config needed):");
     println!("       probe-rs-fleet coordinator");
-    println!("  2. Mint yourself a session token and point `ctl` at the fleet:");
-    println!("       probe-rs-fleet coordinator user-token <your-login>");
-    println!("       probe-rs-fleet ctl init --fleet-url {public_url} --token <token>");
-    println!("  3. Mint an auth key and enroll a node with it:");
+    println!("  3. Log in from your laptop:");
+    println!("       probe-rs-fleet login --fleet-url {public_url}");
+    println!("  4. Mint an auth key and enroll a node with it:");
     println!("       probe-rs-fleet coordinator auth-key");
     println!("       # on the node:");
     println!("       probe-rs-fleet agent init --fleet-url {public_url} --auth-key <key>");
     println!();
-    println!("Note: `user-token` and `auth-key` are INTERIM verbs — they mint");
-    println!("credentials from a shell on this host, bypassing any login flow.");
-    println!("They will become the unattended escape hatch once `fleet login`");
-    println!("(GitHub device flow) lands.");
+    println!("Without a GitHub app (air-gapped, or a quick trial), skip step 1 and");
+    println!("bootstrap with the INTERIM verb instead:");
+    println!("       probe-rs-fleet coordinator user-token <your-login>");
+    println!("       probe-rs-fleet login --fleet-url {public_url} --token <token>");
+    println!();
+    println!("Note: `user-token` and `auth-key` mint credentials from a shell on");
+    println!("this host, bypassing the login flow. They are the unattended /");
+    println!("air-gapped escape hatch, not the front door.");
 }
 
 #[cfg(test)]

@@ -13,7 +13,8 @@ still open. It is deliberately concrete about how the pieces map onto the real
 
 > **What revision 2 supersedes.** Everything about a coordinator-run client CA,
 > CSR issuance, client certificates, cert-fingerprint pinning, `agent_pins`, and
-> the `coordinator enroll` → `agent init` / `ctl init` token dance is **dropped**,
+> the `coordinator enroll` → `agent init` / `ctl init` token dance is **dropped**
+> (`ctl init` is deleted; `login` replaces it),
 > not amended. Where an older section is preserved below for its probe-rs ground
 > truth (notably §4.2), only its credential wiring changes. Capability tokens
 > (§6.3) are **unchanged** — they were always orthogonal to connection auth.
@@ -188,8 +189,10 @@ database default to `~/.local/share/probe-rs-fleet/coordinator/`.
   `0600`);
 - writes a populated `coordinator.toml`: `listen_addr` (loopback by default,
   since an HTTPS reverse proxy fronts it), `public_url` (the externally
-  reachable origin, used for OAuth redirect construction), the GitHub OAuth app
-  credentials, and the lease policy.
+  reachable origin handed to clients and nodes), the GitHub OAuth app's
+  `[github]` block, and the lease policy. Omitting `[github]` is a supported
+  deployment (air-gapped, or development): the device-flow routes then answer a
+  named `503` and `coordinator user-token` remains the bootstrap path.
 
 It no longer generates a client CA, a server cert, or a server key: TLS is the
 reverse proxy's job (§3.5). `init` refuses to overwrite existing files unless
@@ -222,12 +225,24 @@ url = "https://fleet.example.com"
 
 [user]                 # present once `login` has run
 session_token = "…"    # short-TTL bearer, refreshable
-org = "kaspar"
+org = "gh-4242"        # the org **id**, not the login (see below)
+login = "kaspar"       # cached for display only
+expires = 1788600000
 
 [node]                 # present once `share` / `agent up` has run
 node_token = "…"       # long-lived machine bearer, auto-rotating
-node_id = "kaspar-laptop"
+node_id = "gh-4242/kaspar-laptop"
+coordinator_token_pubkey = "…"   # verifies per-lease capability tokens
 ```
+
+**`org` is `gh-<github_user_id>`, never the login.** This is load-bearing, not
+cosmetic. Org creation is `ON CONFLICT DO NOTHING`, so if a personal org were
+keyed by login slug then: bob renames on GitHub → alice claims the freed `bob`
+login → alice logs in → the create no-ops → **alice is provisioned into bob's
+org**. GitHub documents login reuse as exactly this account-takeover vector.
+`user.id` and `org.id` are therefore both derived from the immutable numeric id;
+`org.slug` and `user.login` are display columns, refreshed on every login and
+consulted by nothing.
 
 A laptop that both consumes and provides simply has **both tables**. A headless
 Pi has only `[node]`. A CI runner has neither (it exchanges a workload token per
@@ -235,17 +250,39 @@ job). `--fleet <name>` / `PROBE_RS_FLEET` select among several fleets; `default`
 is used otherwise. Credentials are stored `0600`; the two tokens stay **distinct**
 by design (§6.4).
 
-This replaces `agent.toml`'s credential fields and the whole of `client.toml`.
-Node-local, non-credential settings (`boards.toml`, power config) stay where
-they are.
+This replaces `agent.toml` and `client.toml` entirely — both files are deleted.
+`AgentConfig` is no longer a file format at all: the `agent` role assembles it
+from the fleet file's `[node]` table plus node-local settings.
+
+Node-local, non-credential settings move to `~/.config/probe-rs-fleet/node/`
+(`node.toml` for boards path / heartbeat / erase-on-release, `boards.toml` for
+the inventory). They describe the *machine*, not the fleet, so they are not
+per-fleet and are not duplicated when a machine joins a second one.
+
+Credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`; the selector
+vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) are unchanged. `PROBE_RS_FLEET_PROFILE`
+is gone, replaced by `PROBE_RS_FLEET` (a fleet name).
+
+**Writers are read-modify-write plus atomic rename.** A laptop has two
+independent writers — `login` refreshing `[user]`, a running agent persisting a
+rotated `[node]` token — so each patches only its own table. The residual race
+is a lost update, recoverable by re-running the command; there is no file
+locking in v1. The asymmetry justifies the cost: re-running `login` is a browser
+tab, whereas clobbering a node credential is a physical visit to the Pi.
+
+There is **no migration path** from the revision-1 trees. The database is wiped
+for revision 2; the documented upgrade is to delete
+`~/.config/probe-rs-fleet/{agent,client}/`.
 
 #### End-to-end deployment flow (revision 2)
 
 ```sh
 # 1. On the coordinator host: scaffold signing keys + config.
 probe-rs-fleet coordinator init --public-url https://fleet.example.com
-#    Set GitHub OAuth app id/secret in coordinator.toml, then start it
-#    behind your HTTPS reverse proxy.
+#    Register a GitHub OAuth app with **Device Flow enabled**, put its
+#    client_id in coordinator.toml's [github] block, then start the
+#    coordinator behind your HTTPS reverse proxy. (No callback URL is
+#    needed — see §6.4.)
 probe-rs-fleet coordinator
 
 # 2. On your laptop: log in. Opens a browser (or prints a code when headless).
@@ -367,9 +404,9 @@ and exposed explicitly via `ctl`.
 
 #### Config & scaffolding (`agent up`, revision 2)
 
-The node's credential lives in the **per-fleet config** (§4.1), not in a
-per-profile `agent.toml`. Node-local settings (`boards.toml`, power control)
-remain at `~/.config/probe-rs-fleet/node/`.
+The node's credential lives in the **per-fleet config** (§4.1); `agent.toml` is
+deleted. Node-local settings live at `~/.config/probe-rs-fleet/node/`
+(`node.toml`, `boards.toml`) — they describe the machine, not the fleet.
 
 `probe-rs-fleet agent up` registers this machine as a node and starts serving.
 It obtains a node token by whichever of these applies, in order:
@@ -545,6 +582,30 @@ probe-rs-fleet login
   → session token cached in the per-fleet config
 ```
 
+**No callback origin is involved.** The device flow (RFC 8628) has no
+`redirect_uri` at all, so §10's unresolved "where does the hosted control plane
+run" question does not gate login and nothing hardcodes a hostname. Register the
+OAuth app with **Device Flow enabled**; there is no callback URL to fill in.
+
+**The coordinator brokers; the CLI never talks to GitHub.** The OAuth app's
+client id/secret stay server-side, the user's GitHub *access token* never leaves
+the coordinator (it is spent on one `GET /user` and discarded), and a
+self-hosted deployment can use its own OAuth app without anyone rebuilding the
+CLI. Brokering is stateless — the `device_code` round-trips through the client —
+so a coordinator restart mid-login is survivable and there is no expiry sweep.
+
+Two risks that come with the ceremony, accepted rather than fixed in v1 (there
+is no rate limiting in the coordinator yet):
+
+- **Quota exhaustion.** `/auth/device/start` is necessarily unauthenticated, so
+  anyone who can reach it can burn the OAuth app's device-code rate limit and
+  block logins. No credential is exposed.
+- **Remote phishing** (RFC 8628 §5.4). An attacker starts a flow and
+  social-engineers a victim into typing the `user_code`; the attacker's poll then
+  returns a session token *as the victim*. This is inherent to every device flow
+  — the mitigation is the warning GitHub shows on its own approval page, plus
+  short session TTLs.
+
 | Principal | Bootstrap | Ceremony |
 |---|---|---|
 | **User** (laptop) | `login` — GitHub device flow | browser, once |
@@ -560,7 +621,9 @@ systems**, and v1 needs both verifiers:
 - *User login* is **OAuth2, not OIDC** — no discovery document, no ID token, no
   JWKS. The device flow yields an access token; identity comes from calling
   `GET /user`. Store `github_user_id` (the immutable numeric id), **never** the
-  login name, which can be renamed and reused.
+  login name, which can be renamed and reused. Concretely: `user.id` and
+  `org.id` are `gh-<github_user_id>`; `login` and `org.slug` are display columns
+  (§4.1).
 - *CI* is **real OIDC** — a signed JWT with a JWKS endpoint and claims
   `repository`, `repository_owner`, `ref`, `job_workflow_ref`. No secret ever
   enters the runner.
@@ -797,9 +860,10 @@ at the edges) so token and grant evaluation is unit-testable without a network.
    possibly per lease for isolation. Confirm per-lease vs per-board-reused.
 5. **Sidecar install UX.** argv0 `probe-rs` shim on PATH vs explicit
    `fleet sidecar run -- …` wrapper. Which install story do you want?
-6. **Where the hosted control plane runs**, and therefore the GitHub OAuth app's
-   registered callback origin. Must be answered before `login` hardcodes
-   anything.
+6. **Where the hosted control plane runs.** Still open — but it no longer gates
+   `login`: the device flow has no `redirect_uri`, so there is no callback
+   origin to register and nothing is hardcoded (§6.4). The only hostname
+   involved is the coordinator's own `public_url`, which is configuration.
 7. **Data-plane latency budget.** All traffic relays through the coordinator; if
    remote debugging proves unusably slow at WAN RTT, direct workstation↔node
    brokering (with relay as fallback) stops being an optimisation and becomes

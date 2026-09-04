@@ -36,11 +36,7 @@ use crate::secrets::write_public;
 ///
 /// Returns an error if the auth key cannot be redeemed, any file cannot be
 /// written, or (without `--force`) the fleet already has a `[node]` credential.
-pub async fn run(
-    args: AgentInitArgs,
-    fleet: &str,
-    config_dir: Option<PathBuf>,
-) -> Result<()> {
+pub async fn run(args: AgentInitArgs, fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
     let AgentInitArgs {
         fleet_url,
         auth_key,
@@ -215,7 +211,10 @@ fn print_summary(
     println!("  boards      {}", boards_path.display());
     println!();
     println!("Next steps:");
-    println!("  1. Edit {} to declare your boards.", boards_path.display());
+    println!(
+        "  1. Edit {} to declare your boards.",
+        boards_path.display()
+    );
     println!("  2. Start the agent:");
     println!("       probe-rs-fleet agent --fleet {fleet}");
 }

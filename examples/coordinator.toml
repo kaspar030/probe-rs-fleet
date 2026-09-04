@@ -31,16 +31,25 @@
 # The coordinator then listens on loopback and speaks plain HTTP. Set `[tls]`
 # below only when you are self-hosting with no proxy.
 #
-# Bootstrap:
-#   1. coordinator init
-#   2. coordinator user-token <you>          (prints a session token) [INTERIM]
-#      ctl init --fleet-url <url> --token <token>
-#   3. coordinator auth-key                  (prints an auth key)     [INTERIM]
+# Bootstrap (the normal path):
+#   1. Register a GitHub OAuth app with DEVICE FLOW ENABLED. There is no
+#      callback URL to fill in: the device flow has no redirect_uri.
+#   2. Put its client id in the [github] block below.
+#   3. coordinator init && coordinator
+#   4. On your laptop: probe-rs-fleet login --fleet-url <url>
+#      → first login creates your user and a personal org of one.
+#   5. For a node: coordinator auth-key   (prints an auth key)
 #      on the node: agent init --fleet-url <url> --auth-key <key>
 #
-# Both minting verbs are marked INTERIM: they create credentials from a shell on
-# this host, bypassing any login flow. Once the GitHub device flow lands they
-# become the unattended / air-gapped escape hatch rather than the front door.
+# Bootstrap without GitHub (air-gapped, or development):
+#   coordinator user-token <you>            (prints a session token) [INTERIM]
+#   probe-rs-fleet login --fleet-url <url> --token <token>
+#
+# `user-token` is INTERIM: it creates a credential from a shell on this host,
+# bypassing any login flow, and it keys the user by the login string you type
+# rather than by a GitHub id — so `user-token alice` and alice's own `login` are
+# two DIFFERENT subjects, and a lease held under one cannot be released by the
+# other. It is the escape hatch, not the front door.
 
 # ---------------------------------------------------------------------------
 # Required keys
@@ -54,8 +63,10 @@
 listen_addr = "127.0.0.1:7000"
 
 # The externally reachable base URL agents and clients DIAL to reach this
-# coordinator — what you pass to `agent init --fleet-url` / `ctl init
-# --fleet-url`.
+# coordinator — what you pass to `login --fleet-url` / `agent init --fleet-url`.
+#
+# NOT an OAuth callback origin: the device flow has no redirect_uri, so nothing
+# here needs to be registered with GitHub.
 #
 # Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
 # listens on loopback and the world reaches it at a name it never sees.
@@ -139,8 +150,9 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 #
 #   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
 #
-# and pass it as `--server-cert-sha256 <64 hex chars>` to `agent init` /
-# `ctl init`. This is the one surviving piece of the deleted pinning code.
+# and pass it as `--server-cert-sha256 <64 hex chars>` to `login` / `agent
+# init`. It is recorded in the fleet file and used thereafter. This is the one
+# surviving piece of the deleted pinning code.
 
 # Lease scheduling policy. Omit the whole block to accept all defaults (shown).
 [policy]
@@ -157,3 +169,40 @@ max_duration_interactive = 14400
 max_concurrent_per_subject = 2
 # Default TTL (seconds) applied when a request omits a duration. Default: 900.
 default_ttl_secs = 900
+
+# ---------------------------------------------------------------------------
+# GitHub OAuth app (optional): what backs `probe-rs-fleet login`
+# ---------------------------------------------------------------------------
+#
+# Omitting this whole block is a SUPPORTED deployment, not a broken one: an
+# air-gapped or development fleet bootstraps with `coordinator user-token`
+# instead. The device-flow routes then answer 503 with the code
+# `device_flow_unconfigured`, and the CLI turns that into a sentence telling the
+# user to ask you for an app or use the escape hatch.
+#
+# Register the app at https://github.com/settings/developers with
+#   "Enable Device Flow" TICKED.
+# There is NO callback URL to configure: the device flow has no redirect_uri.
+#
+# The coordinator brokers the flow; the CLI never talks to GitHub. So these
+# credentials stay on this host, and the user's GitHub access token never leaves
+# this process (it is spent on one `GET /user` and discarded).
+
+# [github]
+# # The OAuth app's client id. Not a secret — it travels in the device-flow
+# # request — but without it there is no flow.
+# client_id = "Iv1.0123456789abcdef"
+#
+# # Only if your app requires one. OAuth Apps do not need a secret for the
+# # device flow; some GitHub App configurations do.
+# # client_secret = "…"
+#
+# # Scope to request. Empty (the default) is correct for identity-only login:
+# # `GET /user` needs no scope, and asking for more than you use is a permission
+# # the user cannot easily take back.
+# # scope = ""
+#
+# # Endpoint overrides, for GitHub Enterprise (or a test stub). Defaults shown.
+# # device_code_url  = "https://github.com/login/device/code"
+# # access_token_url = "https://github.com/login/oauth/access_token"
+# # api_base         = "https://api.github.com"

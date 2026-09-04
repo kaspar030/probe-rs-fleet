@@ -109,7 +109,10 @@ impl TestCoordinator {
     pub async fn seed_session(&self, org: &str, login: &str, role: Role) -> String {
         let org = OrgId(org.to_owned());
         self.db().ensure_org(&org, "personal").await.unwrap();
-        self.db().ensure_user_member(&org, login, role).await.unwrap();
+        self.db()
+            .ensure_user_member(&org, login, role)
+            .await
+            .unwrap();
         let token = OpaqueToken::mint(TokenKind::Session);
         let now = i64::try_from(self.coord.now()).unwrap();
         self.db()

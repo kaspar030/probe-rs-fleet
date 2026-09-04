@@ -168,9 +168,8 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         std::env::temp_dir().join(format!("probe-rs-fleet-agent-{}", std::process::id()));
     let backend = Arc::new(ProcessBackend::new(runtime_dir));
 
-    let agent = Arc::new(
-        Agent::new(agent_config.clone(), boards, backend).context("constructing agent")?,
-    );
+    let agent =
+        Arc::new(Agent::new(agent_config.clone(), boards, backend).context("constructing agent")?);
 
     // Seed the agent's inventory from `boards.toml` so the boards are advertised
     // to the coordinator on registration and become leasable. (A concrete probe
@@ -241,7 +240,10 @@ mod tests {
         )
         .unwrap();
         let s = load_node_settings(&path).unwrap();
-        assert_eq!(s.boards_path.unwrap(), PathBuf::from("/etc/fleet/boards.toml"));
+        assert_eq!(
+            s.boards_path.unwrap(),
+            PathBuf::from("/etc/fleet/boards.toml")
+        );
         assert_eq!(s.heartbeat_secs, Some(30));
         assert!(s.erase_on_release);
     }
