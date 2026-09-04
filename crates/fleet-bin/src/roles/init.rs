@@ -225,7 +225,8 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("  3. Log in from your laptop:");
     println!("       probe-rs-fleet login --fleet-url {public_url}");
     println!("  4. Mint an auth key and enroll a node with it:");
-    println!("       probe-rs-fleet coordinator auth-key");
+    println!("       # on your laptop, after step 3:");
+    println!("       probe-rs-fleet auth-key create --tag lab");
     println!("       # on the node:");
     println!("       probe-rs-fleet agent up --fleet-url {public_url} --auth-key <key>");
     println!();
@@ -236,7 +237,10 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!();
     println!("Note: `user-token` and `auth-key` mint credentials from a shell on");
     println!("this host, bypassing the login flow. They are the unattended /");
-    println!("air-gapped escape hatch, not the front door.");
+    println!("air-gapped escape hatch, not the front door. `coordinator auth-key`");
+    println!("is no longer *needed* for step 4 — any member mints one over the API");
+    println!("with `probe-rs-fleet auth-key create` — but it still works with no");
+    println!("login at all, and it is the only way to mint a key that never expires.");
 }
 
 #[cfg(test)]

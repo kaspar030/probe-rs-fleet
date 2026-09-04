@@ -166,10 +166,109 @@ pub mod api {
         pub device_code: String,
     }
 
+    /// A request to `POST /auth/keys`, the authenticated auth-key surface.
+    ///
+    /// One route with an `action` tag rather than REST verbs, mirroring
+    /// `grant_type` on [`TokenRequest`]: one handler, one client helper, and no
+    /// key handle in a URL path (which proxies log).
+    ///
+    /// **The caller authenticates with `Authorization: Bearer <session token>`,
+    /// not with a token in the body.** `/auth/token`'s grants are precisely
+    /// *about* a credential in the body; this is an ordinary authenticated API
+    /// call, so it goes through the coordinator's one authentication path and
+    /// the org is taken from the session — a minted key can never exceed the
+    /// caller's org.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "action", rename_all = "snake_case")]
+    pub enum AuthKeyRequest {
+        /// Mint an org-scoped node-enrollment key.
+        Create {
+            /// Selection tags to stamp onto nodes enrolled with the key.
+            #[serde(default)]
+            tags: Vec<String>,
+            /// Time-to-live in seconds. Zero (never expires) is refused over
+            /// the API, and the value is capped by the coordinator.
+            ttl_secs: u64,
+            /// Allow the key to enroll more than one node.
+            #[serde(default)]
+            multi_use: bool,
+        },
+        /// List the caller's org's auth keys (hashes only).
+        List {},
+        /// Revoke keys whose hash starts with `prefix`.
+        Revoke {
+            /// Hash prefix, from a [`AuthKeyList`]. At least 8 hex characters.
+            prefix: String,
+        },
+    }
+
+    /// A freshly minted auth key. **The only time the secret exists.**
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AuthKeyCreated {
+        /// The key itself (`prffk1_…`). Stored nowhere, only its hash.
+        pub key: String,
+        /// Lowercase-hex SHA-256 of the key — the handle for revocation.
+        pub key_hash: String,
+        /// The org the key enrolls nodes into (the caller's own).
+        pub org: String,
+        /// Selection tags stamped onto nodes enrolled with it.
+        pub tags: Vec<String>,
+        /// Whether redeeming the key consumes it.
+        pub single_use: bool,
+        /// Expiry (epoch seconds). Always set on this path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expires: Option<i64>,
+    }
+
+    /// One auth key as a listing shows it. Hash-only, never a secret.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AuthKeyInfo {
+        /// Lowercase-hex SHA-256 of the key.
+        pub key_hash: String,
+        /// Selection tags stamped onto nodes enrolled with it.
+        pub tags: Vec<String>,
+        /// Whether redeeming the key consumes it.
+        pub single_use: bool,
+        /// Expiry (epoch seconds), or `None` for a key that never expires.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub expires: Option<i64>,
+        /// When the key was consumed (epoch seconds), if it was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub consumed_at: Option<i64>,
+        /// When the key was minted (epoch seconds).
+        pub created_at: i64,
+        /// The user who minted it, or `None` for a shell-minted key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub created_by: Option<String>,
+    }
+
+    /// The org's auth keys, newest first.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AuthKeyList {
+        /// The org listed (the caller's own).
+        pub org: String,
+        /// The keys, newest first.
+        pub keys: Vec<AuthKeyInfo>,
+    }
+
+    /// The outcome of a revocation.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct AuthKeyRevoked {
+        /// The org the keys were revoked from.
+        pub org: String,
+        /// The hashes deleted.
+        pub revoked: Vec<String>,
+    }
+
     /// A rejected token exchange.
     ///
     /// Deliberately coarse: the body never distinguishes "unknown" from
     /// "expired" (no oracle). Detail lives in the coordinator's audit log.
+    ///
+    /// `/auth/keys` reuses this shape, including for `ambiguous_prefix`: the
+    /// candidate hashes are *not* on the wire, because [`ErrorResponse`] is the
+    /// one rejection body and widening it would touch every caller. The CLI
+    /// turns the code into "run `auth-key list` and use a longer prefix".
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ErrorResponse {
         /// A short machine-readable code (`invalid_grant`, `invalid_request`).

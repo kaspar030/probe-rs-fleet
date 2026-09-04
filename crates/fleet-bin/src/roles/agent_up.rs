@@ -6,7 +6,9 @@
 //! become a node; `agent up` walks them:
 //!
 //! 1. an existing `[node]` credential in the fleet file → just reconnect;
-//! 2. `--auth-key` → redeem it (the unattended / disk-image path);
+//! 2. `--auth-key` → redeem it (the unattended / disk-image path; the key comes
+//!    from `probe-rs-fleet auth-key create` on a machine that is logged in, or
+//!    from `coordinator auth-key` on the coordinator host);
 //! 3. an existing `[user]` session → self-register silently (what `share`
 //!    does);
 //! 4. otherwise → an error naming `--auth-key`.
@@ -25,8 +27,9 @@
 //! is the GitHub *device* flow, which by design has no `redirect_uri` and no
 //! cookie session), so an approval page cannot yet know who is looking at it.
 //! Until then, a headless machine with no credential of any kind uses
-//! `--auth-key`, and the error in [`bootstrap`] says exactly that rather than
-//! failing obscurely.
+//! `--auth-key` — which, since `probe-rs-fleet auth-key create`, any member can
+//! mint from their own laptop — and the error in [`bootstrap`] says exactly
+//! that rather than failing obscurely.
 //!
 //! There is no key material, no CSR, and no certificate any more. The honest
 //! trade: a node token is a pure bearer credential, so anyone who reads the
@@ -142,8 +145,12 @@ pub async fn bootstrap(
          \x20   probe-rs-fleet login --fleet {fleet} --fleet-url <url>\n\
          \x20   probe-rs-fleet agent up --fleet {fleet}\n\
          \n\
-         ...or enroll unattended with a key from `coordinator auth-key`:\n\
+         ...or enroll unattended with a key. Mint one on a machine where you are\n\
+         logged in — no shell on the coordinator needed:\n\
+         \x20   probe-rs-fleet auth-key create --tag lab\n\
+         ...then, here:\n\
          \x20   probe-rs-fleet agent up --fleet {fleet} --fleet-url <url> --auth-key <key>\n\
+         (Self-hosted, with a shell on the coordinator: `coordinator auth-key`.)\n\
          \n\
          (Interactive URL + short-code approval, for a headless machine with no key,\n\
          is not implemented yet — see task 3451.)"

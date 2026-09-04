@@ -5,6 +5,11 @@
 //! `probe-rs-fleet share` exist they are the **unattended / air-gapped escape
 //! hatch**, not the front door.
 //!
+//! Since `probe-rs-fleet auth-key create` landed, that is true of the auth-key
+//! verbs too: a member with a login mints over the authenticated API, needing
+//! no shell here. These stay for the self-hosted operator, for the air-gapped
+//! case, and for the one thing the API refuses — a key that never expires.
+//!
 //! `auth-key` is joined here by `auth-keys` (list) and `auth-key-revoke`.
 //! Those are not conveniences: auth keys are the weak link in the credential
 //! model — long-lived bearer secrets that end up in strangers' CI config and
@@ -96,8 +101,9 @@ fn org_kind(explicit: bool) -> &'static str {
 pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     warn!(
         "`coordinator auth-key` mints a node-enrollment credential from a shell \
-         on this host. It is the unattended / air-gapped escape hatch, not the \
-         normal path: a machine with a login uses `probe-rs-fleet share`."
+         on this host. It is the self-hosted / air-gapped escape hatch, not the \
+         normal path: a member with a login runs `probe-rs-fleet auth-key \
+         create`, and a machine with a login runs `probe-rs-fleet share`."
     );
 
     let (db, default_org, _) = open_db(args.config_dir).await?;
@@ -176,8 +182,8 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
     println!("Auth keys for org '{org}' ({} total):", keys.len());
     println!();
     println!(
-        "  {:<16}  {:<10}  {:<12}  {:<12}  TAGS",
-        "HASH PREFIX", "SINGLE-USE", "EXPIRES", "STATE"
+        "  {:<16}  {:<10}  {:<12}  {:<12}  {:<16}  TAGS",
+        "HASH PREFIX", "SINGLE-USE", "EXPIRES", "STATE", "CREATED BY"
     );
     for key in &keys {
         let prefix: String = key.key_hash.chars().take(16).collect();
@@ -192,8 +198,11 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
         } else {
             "live"
         };
+        // `(shell)` rather than blank: now that members can mint over the API,
+        // an operator reading this wants to know which keys are theirs.
+        let created_by = key.created_by.as_deref().unwrap_or("(shell)");
         println!(
-            "  {prefix:<16}  {:<10}  {expires:<12}  {state:<12}  {}",
+            "  {prefix:<16}  {:<10}  {expires:<12}  {state:<12}  {created_by:<16}  {}",
             key.single_use,
             key.tags.join(",")
         );

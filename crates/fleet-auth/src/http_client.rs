@@ -1,6 +1,8 @@
-//! The HTTP client for `POST /auth/token` (feature `client`).
+//! The HTTP client for the coordinator's `/auth/*` JSON surface (feature
+//! `client`).
 //!
-//! `share`, `agent up --auth-key` and a session-token refresh each need to make
+//! `share`, `agent up --auth-key`, `auth-key create` and a session-token
+//! refresh each need to make
 //! exactly one HTTP request, and `agent up` runs on the Pi — so this stack is inside the
 //! hard cross-compilation constraint that forced `ring` over `aws-lc-rs`.
 //!
@@ -27,8 +29,8 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
 use crate::api::{
-    DevicePollRequest, DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest,
-    TokenResponse,
+    AuthKeyCreated, AuthKeyList, AuthKeyRequest, AuthKeyRevoked, DevicePollRequest,
+    DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest, TokenResponse,
 };
 
 /// How long a token exchange may take before it is abandoned.
@@ -125,16 +127,22 @@ pub async fn exchange(
     pin: Option<[u8; 32]>,
     request: &TokenRequest,
 ) -> Result<TokenResponse, ClientError> {
-    post_json(&token_uri(base_url)?, pin, request).await
+    post_json(&token_uri(base_url)?, pin, None, request).await
 }
 
 /// POST `request` as JSON to `uri` and decode the response as `R`.
 ///
-/// Shared by `/auth/token` and the two `/auth/device/*` routes so all three go
-/// through one trust path, one timeout and one error mapping.
+/// Shared by `/auth/token`, the two `/auth/device/*` routes and `/auth/keys` so
+/// all four go through one trust path, one timeout and one error mapping.
+///
+/// `bearer`, when present, is sent as `Authorization: Bearer …`. That is how
+/// `/auth/keys` authenticates: it is an ordinary authenticated API call, unlike
+/// the `/auth/token` grants, whose credential is the *subject* of the request
+/// and therefore lives in the body.
 async fn post_json<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
     uri: &http::Uri,
     pin: Option<[u8; 32]>,
+    bearer: Option<&str>,
     request: &Q,
 ) -> Result<R, ClientError> {
     let body = serde_json::to_vec(request)
@@ -148,11 +156,15 @@ async fn post_json<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
         .build();
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
 
-    let req = http::Request::builder()
+    let mut builder = http::Request::builder()
         .method(http::Method::POST)
         .uri(uri.clone())
         .header(http::header::CONTENT_TYPE, "application/json")
-        .header(http::header::ACCEPT, "application/json")
+        .header(http::header::ACCEPT, "application/json");
+    if let Some(bearer) = bearer {
+        builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {bearer}"));
+    }
+    let req = builder
         .body(Full::new(Bytes::from(body)))
         .map_err(|e| ClientError::Transport(e.to_string()))?;
 
@@ -280,6 +292,7 @@ pub async fn device_start(
     post_json(
         &route_uri(base_url, "/auth/device/start")?,
         pin,
+        None,
         &DeviceStartRequest::default(),
     )
     .await
@@ -303,8 +316,84 @@ pub async fn device_poll(
     post_json(
         &route_uri(base_url, "/auth/device/poll")?,
         pin,
+        None,
         &DevicePollRequest {
             device_code: device_code.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Mint an org-scoped auth key with the caller's `[user]` session
+/// (architecture §6.4). This is what `probe-rs-fleet auth-key create` sends.
+///
+/// The key inherits the **session's** org: there is no org field on the wire,
+/// so a minted key can never exceed the caller's own org. Membership is
+/// sufficient, consistent with "membership is enough to add a node".
+///
+/// # Errors
+///
+/// See [`exchange`]. A non-member is refused with `403 forbidden`; a zero or
+/// over-cap TTL with `400 invalid_request`.
+pub async fn create_auth_key(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+    tags: Vec<String>,
+    ttl_secs: u64,
+    multi_use: bool,
+) -> Result<AuthKeyCreated, ClientError> {
+    post_json(
+        &route_uri(base_url, "/auth/keys")?,
+        pin,
+        Some(session_token),
+        &AuthKeyRequest::Create {
+            tags,
+            ttl_secs,
+            multi_use,
+        },
+    )
+    .await
+}
+
+/// List the caller's org's auth keys (hashes only — never a secret).
+///
+/// # Errors
+///
+/// See [`exchange`].
+pub async fn list_auth_keys(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+) -> Result<AuthKeyList, ClientError> {
+    post_json(
+        &route_uri(base_url, "/auth/keys")?,
+        pin,
+        Some(session_token),
+        &AuthKeyRequest::List {},
+    )
+    .await
+}
+
+/// Revoke auth keys by hash prefix.
+///
+/// # Errors
+///
+/// See [`exchange`]. An ambiguous prefix is a `409 ambiguous_prefix` and
+/// deletes nothing; an unknown one a `404 not_found`; a caller who neither
+/// minted the key nor administers the org a `403 forbidden`.
+pub async fn revoke_auth_key(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+    prefix: &str,
+) -> Result<AuthKeyRevoked, ClientError> {
+    post_json(
+        &route_uri(base_url, "/auth/keys")?,
+        pin,
+        Some(session_token),
+        &AuthKeyRequest::Revoke {
+            prefix: prefix.to_owned(),
         },
     )
     .await
@@ -355,6 +444,22 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "http://127.0.0.1:7000/auth/device/poll"
+        );
+    }
+
+    #[test]
+    fn auth_keys_route_shares_the_base_normalisation() {
+        assert_eq!(
+            route_uri("fleet.example:7000/", "/auth/keys")
+                .unwrap()
+                .to_string(),
+            "https://fleet.example:7000/auth/keys"
+        );
+        assert_eq!(
+            route_uri("http://127.0.0.1:7000", "/auth/keys")
+                .unwrap()
+                .to_string(),
+            "http://127.0.0.1:7000/auth/keys"
         );
     }
 

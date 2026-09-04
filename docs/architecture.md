@@ -134,6 +134,7 @@ Routes:
 | `GET /client` (WS upgrade) | ctl + sidecar | leases, relay channels, admin surface |
 | `POST /auth/device/*` | `login` | GitHub device-flow start/poll (§6.4) |
 | `POST /auth/token` | CI, nodes | token exchange (workload OIDC, auth keys) |
+| `POST /auth/keys` | org members | mint / list / revoke the org's auth keys (§6.4) |
 | `GET /healthz` | proxy | liveness |
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
@@ -201,6 +202,13 @@ reverse proxy's job (§3.5). `init` refuses to overwrite existing files unless
 **`coordinator enroll` is demoted.** It survives only as the **auth-key minter**
 for unattended nodes (§6.4) and as an admin escape hatch; it is no longer on the
 normal path for either users or CI. Its old CSR-issuing behaviour is gone.
+
+Since `POST /auth/keys` landed, minting an auth key **no longer requires a shell
+on the coordinator host at all**: any org member mints one with
+`probe-rs-fleet auth-key create`, authenticated by their `[user]` session. The
+`coordinator auth-key` / `auth-keys` / `auth-key-revoke` verbs remain for the
+self-hosted operator, for the air-gapped case, and for the one thing the API
+refuses — a key that never expires.
 
 #### Per-fleet config layout (revision 2)
 
@@ -301,9 +309,13 @@ probe-rs-fleet ctl lease --select 'tag=nrf52'
 #    (NOT YET IMPLEMENTED — task 3451. Use 5b until then.)
 probe-rs-fleet agent up --fleet-url https://fleet.example.com
 
-# 5b. …or, for an unattended image, a pre-minted auth key:
-probe-rs-fleet coordinator auth-key --org acme --tags lab,nrf52 --ttl 24h
+# 5b. …or, for an unattended image, a pre-minted auth key. Mint it on your
+#     laptop with the login from step 2 — no shell on the coordinator:
+probe-rs-fleet auth-key create --tag lab --tag nrf52 --ttl 24h
 probe-rs-fleet agent up --auth-key prffk1_…
+#     Self-hosted, or air-gapped, or for a key that never expires, the same
+#     thing from a shell on the coordinator host:
+probe-rs-fleet coordinator auth-key --org acme --tag lab --ttl 24h
 
 # 6. Give a colleague access to some of your boards.
 probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
@@ -430,6 +442,15 @@ It obtains a node token by whichever of these applies, in order:
 > cookies, which contradicts §6.4 and reopens §10 Q6. Until 3451 lands, a
 > headless machine with no credential uses `--auth-key`, and `agent up` says so
 > rather than failing silently.
+>
+> **User-mintable auth keys (task 3454) change rung 3's urgency, not its
+> value.** Rung 4's key no longer requires a shell on the coordinator: a member
+> mints one on their laptop with `probe-rs-fleet auth-key create` and pastes it
+> into the Pi, so headless enrollment is now possible for a hosted customer
+> without 3451. What rung 3 still buys that this does not: nothing long-lived is
+> copy-pasted, and the credential is bound at approval time. Whether 3451 ships
+> is therefore a judgement about that advantage, not about whether a customer
+> can enroll a Pi at all.
 >
 > One **deliberate deviation** from the order above: an explicit `--auth-key`
 > beats an existing `[user]` session. Passing it is a deliberate act — a
@@ -679,6 +700,33 @@ is no rate limiting in the coordinator yet):
 | **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token` | zero secrets |
 | **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
 
+**Auth keys are mintable by any member, over the API** (`POST /auth/keys`,
+`probe-rs-fleet auth-key create|list|revoke`). This closes the last surviving
+piece of the revision-1 operator-rooted funnel: minting used to require a shell
+on the coordinator host, which a hosted customer does not have, so "node,
+unattended" was unreachable for them while "node, headless" is deferred (§4.2
+rung 3). Three decisions, recorded:
+
+- **Membership is sufficient to mint and to list**, consistent with "membership
+  is enough to add a node" in §6.5. A key grants nothing a member could not
+  already do with `share`; it only lets them do it on a machine they are not
+  sitting at.
+- **A key can never exceed the caller's org**, structurally rather than by
+  checking: the org is read from the authenticated session, and there is no org
+  field on the wire and no `--org` flag.
+- **API-minted keys must expire**, TTL capped at 30 days; `ttl_secs = 0` is a
+  `400`. Auth keys are the weak link in the credential model — long-lived bearer
+  secrets that end up in CI config and disk images. A forever-key minted from a
+  shell is an operator's informed choice (`coordinator auth-key --ttl 0` still
+  allows it); a hosted member's is not.
+
+**Revocation follows the lease-ownership rule of §6.5:** the key's creator may
+revoke it, and an org admin may revoke any of the org's keys — including the
+shell-minted ones, whose `created_by` is `NULL` and which would otherwise be
+unrevokable over the API. A prefix shorter than 8 hex characters is refused
+before the delete, because the underlying `LIKE` on an empty prefix would match
+every key in the org; an ambiguous prefix is a `409` that deletes nothing.
+
 One exchange endpoint, several proofs. Note that **GitHub is two identity
 systems**, and v1 needs both verifiers:
 
@@ -730,10 +778,13 @@ The model, deliberately minimal:
 - **Deny by default.** Every request resolves to a `Subject` and is checked
   against the target object's org before anything else.
 - **Two roles per org**, `admin` and `member`. Membership alone is enough to add
-  a node and to use the org's boards (decided; finer roles can come later
-  without a data migration).
+  a node, to use the org's boards, and to mint an org-scoped auth key (decided;
+  finer roles can come later without a data migration).
 - **Ownership checks**, unconditionally: a lease may be extended, released, or
-  channel-opened only by its holder (or an org admin).
+  channel-opened only by its holder (or an org admin). **Auth-key revocation
+  over `POST /auth/keys` follows the same rule** (§6.4): the creator, or an org
+  admin — the latter also covering keys minted from a shell, which have no
+  recorded creator.
 - **Grants** carry sharing: `grant { subject, selector, ops[], expires }`, where
   the selector is the existing tag/chip constraint language. `grant bob --select
   'tag=nrf52' --ops flash,attach` is the "give access to other people" path, and

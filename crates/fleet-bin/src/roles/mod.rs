@@ -10,6 +10,7 @@
 //!   coordinator client the tree has
 //! - [`login`] → the GitHub device flow, brokered by the coordinator
 //! - [`share`] → self-register this machine as a node with the login it has
+//! - [`auth_key`] → mint/list/revoke this org's auth keys with that same login
 //! - [`agent_up`] → the §4.2 credential ladder, then [`agent`]
 //! - [`node_setup`] → the enrollment mechanics [`share`] and [`agent_up`] share
 //!
@@ -23,6 +24,7 @@
 pub mod admin;
 pub mod agent;
 pub mod agent_up;
+pub mod auth_key;
 pub mod coordinator;
 pub mod ctl;
 pub mod init;

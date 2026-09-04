@@ -40,9 +40,17 @@ pub const DEFAULT_ORG_ID: &str = "default";
 
 /// One `auth_key` row as `SQLite` hands it back.
 ///
-/// Named rather than written inline so the six-tuple does not become an
+/// Named rather than written inline so the seven-tuple does not become an
 /// unreadable annotation at the query site.
-type AuthKeyRow = (String, String, i64, Option<i64>, Option<i64>, i64);
+type AuthKeyRow = (
+    String,
+    String,
+    i64,
+    Option<i64>,
+    Option<i64>,
+    i64,
+    Option<String>,
+);
 
 /// A handle to the coordinator's `SQLite` database. Cheap to clone (wraps a pool).
 #[derive(Debug, Clone)]
@@ -69,6 +77,13 @@ pub struct AuthKeyListing {
     pub consumed_at: Option<i64>,
     /// When the key was minted (epoch seconds).
     pub created_at: i64,
+    /// The user who minted the key, or `None` when it was minted from a shell
+    /// on the coordinator host (`coordinator auth-key`).
+    ///
+    /// Load-bearing, not decorative: `POST /auth/keys` lets the *creator*
+    /// revoke their own key, and an org admin revoke any key including the
+    /// shell-minted ones this column leaves `NULL`.
+    pub created_by: Option<String>,
 }
 
 impl Db {
@@ -516,7 +531,7 @@ impl Db {
     /// Returns a database error if the query fails.
     pub async fn list_auth_keys(&self, org: &OrgId) -> Result<Vec<AuthKeyListing>> {
         let rows: Vec<AuthKeyRow> = sqlx::query_as(
-            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at
+            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at, created_by
              FROM auth_key WHERE org_id = ?1 ORDER BY created_at DESC",
         )
         .bind(org.0.as_str())
@@ -525,13 +540,16 @@ impl Db {
         Ok(rows
             .into_iter()
             .map(
-                |(key_hash, tags, single_use, expires, consumed_at, created_at)| AuthKeyListing {
-                    key_hash,
-                    tags: split_tags(&tags),
-                    single_use: single_use != 0,
-                    expires,
-                    consumed_at,
-                    created_at,
+                |(key_hash, tags, single_use, expires, consumed_at, created_at, created_by)| {
+                    AuthKeyListing {
+                        key_hash,
+                        tags: split_tags(&tags),
+                        single_use: single_use != 0,
+                        expires,
+                        consumed_at,
+                        created_at,
+                        created_by,
+                    }
                 },
             )
             .collect())
@@ -1830,9 +1848,17 @@ mod tests {
         db.ensure_org(&o, "personal").await.unwrap();
         db.ensure_org(&other, "team").await.unwrap();
 
-        db.insert_auth_key(&o, "aaaa1111", &["lab".to_owned()], true, Some(9_999), None, 1000)
-            .await
-            .unwrap();
+        db.insert_auth_key(
+            &o,
+            "aaaa1111",
+            &["lab".to_owned()],
+            true,
+            Some(9_999),
+            Some("alice"),
+            1000,
+        )
+        .await
+        .unwrap();
         db.insert_auth_key(&o, "bbbb2222", &[], false, None, None, 1001)
             .await
             .unwrap();
@@ -1849,6 +1875,11 @@ mod tests {
         assert!(keys[0].expires.is_none());
         assert_eq!(keys[1].tags, vec!["lab".to_owned()]);
         assert_eq!(keys[1].expires, Some(9_999));
+        // `created_by` round-trips: it is what lets the API let a creator revoke
+        // their own key, and distinguishes a shell-minted key (NULL) from a
+        // member-minted one.
+        assert_eq!(keys[1].created_by.as_deref(), Some("alice"));
+        assert!(keys[0].created_by.is_none());
 
         let deleted = db.delete_auth_keys_by_prefix(&o, "aaaa").await.unwrap();
         assert_eq!(deleted, vec!["aaaa1111".to_owned()]);

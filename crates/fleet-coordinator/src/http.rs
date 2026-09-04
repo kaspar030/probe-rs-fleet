@@ -6,6 +6,7 @@
 //! | `GET /agent` | nodes | `WebSocket` upgrade → the agent control plane |
 //! | `GET /client` | users, workloads | `WebSocket` upgrade → the sidecar/ctl plane |
 //! | `POST /auth/token` | node enrollment, session refresh | JSON token exchange |
+//! | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys |
 //! | `POST /auth/device/start` | anyone | begin a GitHub device flow |
 //! | `POST /auth/device/poll` | anyone | redeem a device code for a session token |
 //!
@@ -90,8 +91,8 @@ use axum::{Json, Router};
 use tracing::{debug, info, warn};
 
 use fleet_auth::api::{
-    DevicePollRequest, DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest,
-    TokenResponse,
+    AuthKeyCreated, AuthKeyInfo, AuthKeyList, AuthKeyRequest, AuthKeyRevoked, DevicePollRequest,
+    DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest, TokenResponse,
 };
 use fleet_auth::github::{self, DevicePoll, GithubApp, GithubEndpoints};
 use fleet_auth::{AuthError, Authenticated, OpaqueToken, TokenKind};
@@ -108,6 +109,7 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         .route("/agent", get(agent_ws))
         .route("/client", get(client_ws))
         .route("/auth/token", post(auth_token))
+        .route("/auth/keys", post(auth_keys))
         .route("/auth/device/start", post(auth_device_start))
         .route("/auth/device/poll", post(auth_device_poll))
         .with_state(coord)
@@ -564,6 +566,279 @@ async fn refresh_session(coord: &Coordinator, session_token: &str) -> Response {
     })
     .into_response()
 }
+
+/// The longest TTL `POST /auth/keys` will mint (30 days).
+///
+/// Auth keys are the weak link in the credential model: long-lived bearer
+/// secrets that end up in CI config and disk images. A never-expiring key minted
+/// from a shell on the coordinator host is an operator's informed choice
+/// (`coordinator auth-key --ttl 0` still allows it); a hosted org member's is
+/// not, so this path refuses `ttl_secs = 0` and caps the rest. A config knob is
+/// a trivial follow-up; a documented constant keeps the config surface flat.
+const MAX_API_AUTH_KEY_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// `POST /auth/keys` — mint, list and revoke the caller's org's auth keys
+/// (architecture §6.4).
+///
+/// This is the hosted counterpart of `coordinator auth-key`: a customer with a
+/// `[user]` session and no shell on our host can still enroll a headless node.
+///
+/// Two properties make it safe to let a plain member mint:
+///
+/// * **the org comes from the session, never from the request**, so a minted key
+///   can never exceed the caller's own org; and
+/// * membership is checked, and membership is already sufficient to add a node
+///   (§6.4/§6.5) — an auth key adds nothing a member could not do with `share`,
+///   except do it on a machine they are not sitting at.
+async fn auth_keys(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(request): Json<AuthKeyRequest>,
+) -> Response {
+    let (auth, subject) = match authenticate_request(&coord, &headers, &[TokenKind::Session]).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let org = OrgId(auth.org_id.clone());
+    let now_i64 = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+
+    // Membership, mirroring `self_register`: a valid session whose membership
+    // was revoked must not keep minting enrollment credentials.
+    match coord.db().role_of(&org, &auth.id).await {
+        Ok(Some(_role)) => {}
+        Ok(None) => {
+            let _ = coord
+                .db()
+                .scoped(org.clone())
+                .append_audit(&AuditEntry {
+                    ts: now_i64,
+                    subject: Some(auth.id.as_str()),
+                    action: "auth_key.denied",
+                    node: None,
+                    board: None,
+                    lease: None,
+                    detail: Some("not a member of the org the session belongs to"),
+                })
+                .await;
+            warn!(org = %org, subject = %auth.id, "auth-key request by a non-member");
+            return reject(StatusCode::FORBIDDEN, "forbidden");
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to resolve membership");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    }
+
+    match request {
+        AuthKeyRequest::Create {
+            tags,
+            ttl_secs,
+            multi_use,
+        } => create_auth_key(&coord, &org, &auth.id, tags, ttl_secs, multi_use, now_i64).await,
+        AuthKeyRequest::List {} => list_auth_keys(&coord, &org).await,
+        AuthKeyRequest::Revoke { prefix } => {
+            revoke_auth_key(&coord, &org, &auth.id, &subject, &prefix, now_i64).await
+        }
+    }
+}
+
+/// Mint an auth key for `org` on behalf of `user_id`.
+///
+/// The secret exists exactly once, in this response: only its SHA-256 is
+/// stored. `created_by` is finally populated on this path, which is what lets
+/// the creator revoke their own key later.
+async fn create_auth_key(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    tags: Vec<String>,
+    ttl_secs: u64,
+    multi_use: bool,
+    now: i64,
+) -> Response {
+    // A forever-key over the API is refused rather than silently capped: the
+    // caller asked for something this path does not do, and quietly giving them
+    // a 30-day key would be discovered a month later.
+    if ttl_secs == 0 || ttl_secs > MAX_API_AUTH_KEY_TTL_SECS {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let expires = now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+
+    let mut tags = tags;
+    tags.sort_unstable();
+    tags.dedup();
+
+    let token = OpaqueToken::mint(TokenKind::AuthKey);
+    if let Err(e) = coord
+        .db()
+        .insert_auth_key(
+            org,
+            token.hash().as_str(),
+            &tags,
+            !multi_use,
+            Some(expires),
+            Some(user_id),
+            now,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to record an auth key");
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    }
+
+    // Subject is the **user**, as in `self_register` and unlike
+    // `redeem_auth_key`: a human's authority created this credential, and that
+    // is the fact worth being able to look up later.
+    let detail = format!(
+        "minted by {user_id} (single_use={}, tags=[{}])",
+        !multi_use,
+        tags.join(",")
+    );
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now,
+            subject: Some(user_id),
+            action: "auth_key.mint",
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some(&detail),
+        })
+        .await;
+    info!(org = %org, subject = %user_id, key = %token.hash().short(), "auth key minted");
+
+    Json(AuthKeyCreated {
+        key: token.to_secret_string(),
+        key_hash: token.hash().as_str().to_owned(),
+        org: org.0.clone(),
+        tags,
+        single_use: !multi_use,
+        expires: Some(expires),
+    })
+    .into_response()
+}
+
+/// List `org`'s auth keys. Hash-only, so the listing is never a credential.
+async fn list_auth_keys(coord: &Coordinator, org: &OrgId) -> Response {
+    let keys = match coord.db().list_auth_keys(org).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!(error = %e, "failed to list auth keys");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+    Json(AuthKeyList {
+        org: org.0.clone(),
+        keys: keys
+            .into_iter()
+            .map(|k| AuthKeyInfo {
+                key_hash: k.key_hash,
+                tags: k.tags,
+                single_use: k.single_use,
+                expires: k.expires,
+                consumed_at: k.consumed_at,
+                created_at: k.created_at,
+                created_by: k.created_by,
+            })
+            .collect(),
+    })
+    .into_response()
+}
+
+/// Revoke `org`'s auth keys by hash prefix.
+///
+/// Authorization mirrors lease ownership (§6.5): the **creator** may revoke
+/// their own key, an **org admin** may revoke any of the org's keys — including
+/// the shell-minted ones whose `created_by` is `NULL`, which would otherwise be
+/// unrevokable from here.
+async fn revoke_auth_key(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    subject: &Subject,
+    prefix: &str,
+    now: i64,
+) -> Response {
+    let prefix = prefix.trim().to_ascii_lowercase();
+    // Load-bearing, not hygiene: `delete_auth_keys_by_prefix` with an empty
+    // prefix is `LIKE '%'`, i.e. every key in the org. A short or non-hex
+    // prefix cannot address a key on purpose, so it is refused outright.
+    if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+
+    let keys = match coord.db().list_auth_keys(org).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!(error = %e, "failed to list auth keys");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+    let matches: Vec<_> = keys
+        .iter()
+        .filter(|k| k.key_hash.starts_with(&prefix))
+        .collect();
+    let target = match matches.len() {
+        0 => return reject(StatusCode::NOT_FOUND, "not_found"),
+        1 => matches[0],
+        // Unlike `roles::admin::auth_key_revoke`, the candidates are *not*
+        // named: that verb has the database locally, this one is on the far
+        // side of a deliberately coarse `ErrorResponse`. The CLI turns this
+        // code into "run `auth-key list` and use a longer prefix".
+        _ => return reject(StatusCode::CONFLICT, "ambiguous_prefix"),
+    };
+
+    let owned = target.created_by.as_deref() == Some(user_id);
+    if !owned && !crate::authz::is_org_admin(coord.db(), subject).await {
+        let _ = coord
+            .db()
+            .scoped(org.clone())
+            .append_audit(&AuditEntry {
+                ts: now,
+                subject: Some(user_id),
+                action: "auth_key.revoke.denied",
+                node: None,
+                board: None,
+                lease: None,
+                detail: Some("neither the key's creator nor an org admin"),
+            })
+            .await;
+        warn!(org = %org, subject = %user_id, "auth-key revocation by a non-owner");
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    let revoked = match coord.db().delete_auth_keys_by_prefix(org, &prefix).await {
+        Ok(revoked) => revoked,
+        Err(e) => {
+            warn!(error = %e, "failed to revoke an auth key");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+    let detail = format!("revoked by {user_id}: {}", revoked.join(","));
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now,
+            subject: Some(user_id),
+            action: "auth_key.revoke",
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some(&detail),
+        })
+        .await;
+    info!(org = %org, subject = %user_id, count = revoked.len(), "auth keys revoked");
+
+    Json(AuthKeyRevoked {
+        org: org.0.clone(),
+        revoked,
+    })
+    .into_response()
+}
+
 
 /// Provision the org/user/member chain and mint a user session token.
 ///

@@ -209,16 +209,35 @@ impl TestCoordinator {
     /// Issue a plain HTTP request against the coordinator, returning
     /// `(status, body)`.
     pub async fn http(&self, method: &str, path: &str, body: Option<String>) -> (u16, String) {
+        self.http_auth(method, path, None, body).await
+    }
+
+    /// As [`TestCoordinator::http`], with an optional `Authorization: Bearer`.
+    ///
+    /// `/auth/keys` authenticates with a header rather than a body field, and
+    /// the only other bearer-capable helper here ([`TestCoordinator::upgrade_status`])
+    /// is `WebSocket`-only.
+    pub async fn http_auth(
+        &self,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<String>,
+    ) -> (u16, String) {
         use http_body_util::BodyExt as _;
         use hyper_util::client::legacy::Client;
         use hyper_util::rt::TokioExecutor;
 
         let client: Client<_, http_body_util::Full<hyper::body::Bytes>> =
             Client::builder(TokioExecutor::new()).build_http();
-        let req = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(format!("{}{path}", self.base_url))
-            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(http::header::CONTENT_TYPE, "application/json");
+        if let Some(bearer) = bearer {
+            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let req = builder
             .body(http_body_util::Full::new(hyper::body::Bytes::from(
                 body.unwrap_or_default(),
             )))

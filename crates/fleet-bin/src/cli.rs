@@ -51,6 +51,9 @@ pub enum Command {
     /// Offer this machine's probes to the fleet, using the login you already
     /// have. No token, no coordinator shell.
     Share(ShareArgs),
+    /// Mint, list and revoke this org's node-enrollment auth keys, using the
+    /// login you already have.
+    AuthKey(AuthKeyCliArgs),
     /// List the fleets this machine has a config for.
     Fleets,
 }
@@ -148,9 +151,12 @@ pub struct InitArgs {
 
 /// Arguments for `coordinator auth-key`.
 ///
-/// The **unattended / air-gapped escape hatch**, not the front door: a laptop
-/// with a login runs `probe-rs-fleet share` and a headless node runs
-/// `agent up`, neither of which needs a key.
+/// The **self-hosted / air-gapped escape hatch**, not the front door: a laptop
+/// with a login runs `probe-rs-fleet share`, a headless node runs `agent up`
+/// with a key its owner minted using `probe-rs-fleet auth-key create`, and
+/// neither needs a shell on the coordinator host. What is still only available
+/// here: minting with no login at all, and `--ttl 0` (a key that never
+/// expires), which the API path refuses.
 ///
 /// Auth keys are the weak link in the model — long-lived credentials that end
 /// up in strangers' CI config and disk images — so they are org-scoped, TTL'd,
@@ -295,6 +301,106 @@ pub struct ShareArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
+/// Arguments for `probe-rs-fleet auth-key`.
+///
+/// The **hosted** counterpart of `coordinator auth-key`: it mints over the
+/// authenticated API with the `[user]` session in the fleet file, so a customer
+/// who has only ever run `probe-rs-fleet login` can enroll a headless node
+/// (architecture §6.4). `coordinator auth-key` remains the self-hosted
+/// operator's shell-on-the-host escape hatch.
+///
+/// The key inherits the caller's org from their session and can never exceed
+/// it: there is no `--org` flag here, and there deliberately is not one.
+#[derive(Debug, Args)]
+pub struct AuthKeyCliArgs {
+    /// The auth-key verb.
+    #[command(subcommand)]
+    pub command: AuthKeyCommand,
+}
+
+/// `auth-key` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum AuthKeyCommand {
+    /// Mint an auth key for this org (printed once).
+    Create(AuthKeyCreateArgs),
+    /// List this org's auth keys, by hash prefix.
+    List(AuthKeyListArgs),
+    /// Revoke an auth key by hash prefix.
+    Revoke(AuthKeyRevokeCliArgs),
+}
+
+/// Arguments for `probe-rs-fleet auth-key create`.
+///
+/// Two deliberate deviations from the issue's sketch, both for consistency with
+/// the existing `coordinator auth-key`:
+///
+/// * single use is the **default**; `--multi-use` opts out (`--single-use` is
+///   accepted as an explicit no-op so the sketch's spelling is not an error);
+/// * `--tag` is repeatable and **not** comma-split, so `--tags lab,nrf52` is
+///   one tag named `lab,nrf52`. Write `--tag lab --tag nrf52`. Neither existing
+///   `--tag` splits, and two verbs that mint the same object must not disagree
+///   about what a tag is.
+#[derive(Debug, Args)]
+pub struct AuthKeyCreateArgs {
+    /// Selection tag to stamp onto nodes enrolled with this key (repeatable;
+    /// not comma-split — pass `--tag` twice).
+    #[arg(long, visible_alias = "tags")]
+    pub tag: Vec<String>,
+    /// Time-to-live: bare seconds, or a suffixed duration (`30m`, `24h`, `7d`).
+    ///
+    /// Unlike `coordinator auth-key`, a never-expiring key is not offered here:
+    /// the coordinator refuses one on this path and caps the TTL at 30 days.
+    #[arg(long, default_value = "24h")]
+    pub ttl: String,
+    /// Allow the key to enroll more than one node.
+    ///
+    /// Convenient for provisioning a rack; correspondingly worse if it leaks.
+    #[arg(long)]
+    pub multi_use: bool,
+    /// Explicitly single-use. The default; accepted so the spelling is not an
+    /// error.
+    #[arg(long, conflicts_with = "multi_use")]
+    pub single_use: bool,
+    /// The fleet whose `[user]` session authorises the mint.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet auth-key list`.
+#[derive(Debug, Args)]
+pub struct AuthKeyListArgs {
+    /// The fleet whose `[user]` session authorises the listing.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet auth-key revoke`.
+///
+/// Named `…CliArgs` because `AuthKeyRevokeArgs` belongs to
+/// `coordinator auth-key-revoke` and must keep its name.
+#[derive(Debug, Args)]
+pub struct AuthKeyRevokeCliArgs {
+    /// Hash prefix of the key to revoke, from `probe-rs-fleet auth-key list`
+    /// (at least 8 hex characters).
+    pub prefix: String,
+    /// The fleet whose `[user]` session authorises the revocation.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+
 /// A probe adoption policy, for the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum AdoptArg {
@@ -354,7 +460,8 @@ pub struct AgentUpArgs {
     /// file already knows where the coordinator is.
     #[arg(long)]
     pub fleet_url: Option<String>,
-    /// An auth key from `coordinator auth-key` (the unattended/image path).
+    /// An auth key from `probe-rs-fleet auth-key create` (or, self-hosted,
+    /// `coordinator auth-key`) — the unattended/image path.
     #[arg(long)]
     pub auth_key: Option<String>,
     /// This node's name within its org. Defaults to the machine's hostname.
@@ -598,6 +705,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     roles::share::run(args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
+                Command::AuthKey(args) => {
+                    roles::auth_key::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
                 Command::Fleets => {
                     roles::list_fleets()?;
                     Ok(ExitCode::SUCCESS)
@@ -708,6 +819,116 @@ mod tests {
             },
             other => panic!("expected coordinator, got {other:?}"),
         }
+    }
+
+    /// The hosted verb: `auth-key create|list|revoke`, minting with the login
+    /// you already have rather than a shell on the coordinator.
+    #[test]
+    fn parses_auth_key_create_list_revoke() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "auth-key",
+            "create",
+            "--tag",
+            "lab",
+            "--tag",
+            "nrf52",
+            "--ttl",
+            "7d",
+            "--multi-use",
+            "--fleet",
+            "lab1",
+        ]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => {
+                    assert_eq!(c.tag, vec!["lab".to_owned(), "nrf52".to_owned()]);
+                    assert_eq!(c.ttl, "7d");
+                    assert!(c.multi_use);
+                    assert_eq!(c.fleet, "lab1");
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "list"]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::List(_) => {}
+                other => panic!("expected list, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "revoke", "aabbccdd"]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Revoke(r) => assert_eq!(r.prefix, "aabbccdd"),
+                other => panic!("expected revoke, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+    }
+
+    /// Defaults match `coordinator auth-key`'s: single use, 24h. There is no
+    /// `--org` — the org comes from the session, and a key can never exceed it.
+    #[test]
+    fn auth_key_create_defaults_are_single_use_and_expiring() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => {
+                    assert!(!c.multi_use, "single use by default");
+                    assert_eq!(c.ttl, "24h");
+                    assert!(c.tag.is_empty());
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+    }
+
+    /// `--tags` is a plain visible alias for `--tag`, **not** a comma-splitter:
+    /// `coordinator auth-key --tag a,b` means one tag, and two verbs that mint
+    /// the same object must not disagree about what a tag is.
+    #[test]
+    fn auth_key_tags_alias_does_not_split_on_commas() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "auth-key",
+            "create",
+            "--tags",
+            "lab,nrf52",
+        ]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => assert_eq!(c.tag, vec!["lab,nrf52".to_owned()]),
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+    }
+
+    /// `--single-use` is the default spelled out; pairing it with `--multi-use`
+    /// is a contradiction clap must catch.
+    #[test]
+    fn auth_key_single_use_and_multi_use_conflict() {
+        assert!(Cli::try_parse_from(os(&[
+            "probe-rs-fleet",
+            "auth-key",
+            "create",
+            "--single-use",
+        ]))
+        .is_ok());
+        assert!(Cli::try_parse_from(os(&[
+            "probe-rs-fleet",
+            "auth-key",
+            "create",
+            "--single-use",
+            "--multi-use",
+        ]))
+        .is_err());
     }
 
     #[test]
