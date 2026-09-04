@@ -127,9 +127,14 @@ impl Coordinator {
     /// The org a node's inventory and boards belong to.
     ///
     /// Resolved from the `node` table, falling back to the configured default
-    /// org (single-user deployment, until bearer auth and `share` land). A node
-    /// whose org cannot be resolved has its inventory **rejected**, never
-    /// defaulted into someone else's tenant.
+    /// org. A node whose org cannot be resolved *because the lookup failed* has
+    /// its inventory rejected, never defaulted into someone else's tenant.
+    ///
+    /// TODO(adoption, task 3448): the `Ok(None)` fallback below is what makes
+    /// first-connect adoption work today, and with a single org it is harmless.
+    /// It is **not** the intended end state — once a second org exists an
+    /// unknown node silently lands in `default_org`. The adoption-policy task
+    /// replaces it with an explicit adopt/reject decision per node.
     async fn org_of_node(&self, node: &AgentId) -> Option<OrgId> {
         match self.db.org_of_node(node).await {
             Ok(Some(org)) => Some(org),
@@ -437,21 +442,29 @@ impl Coordinator {
     ///
     /// The request wire stays node-local (so `PROBE_RS_FLEET_BOARD=nrf52840-dk-3`
     /// keeps working); the coordinator is the only thing that turns a name into
-    /// a fleet key, and it can only do so inside one org. An absent board and a
-    /// board in another org are both `None`, deliberately indistinguishable.
-    /// An ambiguous name (the same name on two of the org's nodes) is also
-    /// refused rather than resolved arbitrarily.
-    async fn resolve_board(&self, subject: &Subject, name: &BoardName) -> Option<BoardRef> {
+    /// a fleet key, and it can only do so inside one org.
+    ///
+    /// Returns [`BoardLookup::NotFound`] for both an absent board and one in
+    /// another org — deliberately indistinguishable. An ambiguous name (the
+    /// same name on two of the caller's *own* nodes) is reported as such: every
+    /// candidate is already inside the caller's org, so naming them leaks
+    /// nothing, and a bare "no such board" would badly mislead.
+    async fn resolve_board(&self, subject: &Subject, name: &BoardName) -> BoardLookup {
         let sched = self.scheduler.lock().await;
         let mut matching = sched
             .boards()
             .filter(|b| b.id.org == subject.org && b.id.name == name.0)
             .map(|b| b.id.clone());
-        let first = matching.next()?;
-        if matching.next().is_some() {
-            return None;
+        let Some(first) = matching.next() else {
+            return BoardLookup::NotFound;
+        };
+        let mut nodes: Vec<AgentId> = vec![first.node.clone()];
+        nodes.extend(matching.map(|b| b.node));
+        if nodes.len() > 1 {
+            nodes.sort();
+            return BoardLookup::Ambiguous(nodes);
         }
-        Some(first)
+        BoardLookup::Found(first)
     }
 
     /// Build the operator board-inventory reply (`ctl list`), scoped to the
@@ -568,10 +581,22 @@ impl Coordinator {
         {
             return Ok(Self::denied());
         }
-        let Some(board_ref) = self.resolve_board(subject, board).await else {
-            return Ok(CoordToSidecar::Error {
-                message: format!("no such board {board}"),
-            });
+        let board_ref = match self.resolve_board(subject, board).await {
+            BoardLookup::Found(b) => b,
+            BoardLookup::NotFound => {
+                return Ok(CoordToSidecar::Error {
+                    message: format!("no such board {board}"),
+                })
+            }
+            BoardLookup::Ambiguous(nodes) => {
+                let nodes: Vec<&str> = nodes.iter().map(|n| n.0.as_str()).collect();
+                return Ok(CoordToSidecar::Error {
+                    message: format!(
+                        "ambiguous board name {board}: present on nodes {}",
+                        nodes.join(", ")
+                    ),
+                });
+            }
         };
         // Belt and braces: the resolved board must live in the caller's org.
         if authz::same_org(subject, &board_ref.org).is_err() {
@@ -948,6 +973,22 @@ impl Coordinator {
 
 /// A shared, cheaply-cloneable coordinator handle.
 pub type SharedCoordinator = Arc<Coordinator>;
+
+/// The outcome of resolving a node-local board name inside one org.
+///
+/// `NotFound` covers both "no such board" and "a board in another org": the
+/// caller must not be able to tell those apart, or the reply enumerates other
+/// tenants. `Ambiguous` is safe to report in detail — every candidate is
+/// already in the caller's own org.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoardLookup {
+    /// Exactly one board in the caller's org carries this name.
+    Found(BoardRef),
+    /// No such board in the caller's org.
+    NotFound,
+    /// Several of the caller's own nodes carry a board of this name.
+    Ambiguous(Vec<AgentId>),
+}
 
 #[cfg(test)]
 mod tests {
@@ -1354,6 +1395,75 @@ mod tests {
         assert_eq!(*expires, 1000 + 600);
     }
 
+    /// B1 regression at the coordinator level: a chip constraint from another
+    /// org must not be granted one of this org's boards, and **no lease row may
+    /// land in either tenant's table**. Asserting on the DB matters because the
+    /// scheduler and the persistence layer are scoped independently.
+    #[tokio::test]
+    async fn cross_org_chip_request_grants_nothing_and_persists_nothing() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        // Only org-A owns hardware; org-B has a member but no boards.
+        let coord = coordinator_with(
+            clock,
+            &[board("org-a", "b1", "node-a")],
+            &[("org-a", "alice", Role::Member), ("org-b", "mallory", Role::Admin)],
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        let mallory = user("org-b", "mallory");
+        coord
+            .handle_sidecar_message(
+                &mallory,
+                SidecarToCoord::Lease(LeaseRequest {
+                    select: Constraint::Chip("nRF52840_xxAA".to_owned()),
+                    duration_secs: 600,
+                    priority: Priority::Interactive,
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::Queued { .. } => {}
+            CoordToSidecar::Lease(g) => {
+                panic!("cross-org lease granted on {} — tenancy breach", g.board)
+            }
+            other => panic!("expected Queued, got {other:?}"),
+        }
+
+        // Nothing persisted, in either tenant.
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org("org-a"))
+                .open_lease_count()
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org("org-b"))
+                .open_lease_count()
+                .await
+                .unwrap(),
+            0
+        );
+
+        // org-A's board is untouched and still leasable by its own org.
+        {
+            let sched = coord.scheduler().lock().await;
+            assert_eq!(
+                sched.board(&board_ref("org-a", "node-a", "b1")).unwrap().state,
+                BoardState::Idle
+            );
+        }
+        let grant = grant_lease(&coord, &user("org-a", "alice"), "b1").await;
+        assert_eq!(grant.board.org, org("org-a"));
+    }
+
     /// Cross-org: a subject in another org sees nothing and can do nothing,
     /// even with the same user id.
     #[tokio::test]
@@ -1514,6 +1624,45 @@ mod tests {
                     other => panic!("expected Error for {s}, got {other:?}"),
                 }
             }
+        }
+    }
+
+    /// An ambiguous board name (two of the caller's *own* nodes carry it) is
+    /// reported as ambiguous, not as "no such board" — naming the caller's own
+    /// nodes leaks nothing, and the bare not-found reply would badly mislead.
+    #[tokio::test]
+    async fn ambiguous_board_name_is_reported_as_such() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[
+                board("org-a", "dk", "node-1"),
+                board("org-a", "dk", "node-2"),
+            ],
+            &[("org-a", "alice", Role::Member)],
+        )
+        .await;
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user("org-a", "alice"),
+                SidecarToCoord::PowerCycle {
+                    board: BoardName("dk".to_owned()),
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::Error { message } => {
+                assert!(
+                    message.starts_with("ambiguous board name dk"),
+                    "got {message:?}"
+                );
+                assert!(message.contains("node-1") && message.contains("node-2"));
+            }
+            other => panic!("expected Error, got {other:?}"),
         }
     }
 

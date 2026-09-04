@@ -43,7 +43,7 @@
 use std::collections::BTreeMap;
 
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{AgentId, BoardName, BoardRef, LeaseId, Subject, SubjectKey};
+use fleet_proto::ids::{AgentId, BoardName, BoardRef, LeaseId, OrgId, Subject, SubjectKey};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 /// Why a lease operation was refused by the scheduler.
@@ -149,12 +149,20 @@ pub struct Scheduler {
     next_seq: u64,
 }
 
-/// Does `board` satisfy `constraint`? (Ignores board state — see
-/// [`Scheduler::is_candidate`] for the Idle check.)
-fn matches(board: &Board, constraint: &Constraint) -> bool {
+/// Does `board` satisfy `constraint` **for a caller in `org`**?
+///
+/// The org is a required parameter rather than a separate check the caller may
+/// forget: a board belongs to exactly one org, and matching one from another
+/// org is never correct. Ignores board state — see [`Scheduler::is_candidate`]
+/// for the Idle check.
+fn matches(board: &Board, org: &OrgId, constraint: &Constraint) -> bool {
+    if board.id.org != *org {
+        return false;
+    }
     match constraint {
         // The request side carries a node-local name (the caller does not know
-        // the node); a board matches when its name half matches.
+        // the node); a board matches when its name half matches, within the
+        // caller's org.
         Constraint::Board(BoardName(name)) => &board.id.name == name,
         Constraint::Tags(tags) => tags.iter().all(|t| board.tags.contains(t)),
         Constraint::Chip(chip) => &board.chip == chip,
@@ -254,17 +262,20 @@ impl Scheduler {
         Some((&info.board, &board.agent))
     }
 
-    /// Is `board` a grant candidate for `constraint`? (Idle and matching.)
-    fn is_candidate(board: &Board, constraint: &Constraint) -> bool {
-        board.state == BoardState::Idle && matches(board, constraint)
+    /// Is `board` a grant candidate for a caller in `org`? (Idle and matching.)
+    fn is_candidate(board: &Board, org: &OrgId, constraint: &Constraint) -> bool {
+        board.state == BoardState::Idle && matches(board, org, constraint)
     }
 
-    /// Find the first idle board (by [`BoardRef`] order, i.e.
+    /// Find the first idle board in `org` (by [`BoardRef`] order, i.e.
     /// `(org, node, name)`) matching `constraint`.
-    fn find_idle(&self, constraint: &Constraint) -> Option<BoardRef> {
+    ///
+    /// Scoped to one org by construction: a lease is never granted on another
+    /// tenant's hardware, whatever the constraint says.
+    fn find_idle(&self, org: &OrgId, constraint: &Constraint) -> Option<BoardRef> {
         self.boards
             .values()
-            .find(|b| Self::is_candidate(b, constraint))
+            .find(|b| Self::is_candidate(b, org, constraint))
             .map(|b| b.id.clone())
     }
 
@@ -323,8 +334,13 @@ impl Scheduler {
     ///
     /// If the subject is at or above its concurrency cap, the request is
     /// queued rather than rejected, so it drains naturally when the subject
-    /// releases a board. Otherwise the first matching idle board is granted; if
-    /// none is free the request is queued FIFO.
+    /// releases a board. Otherwise the first matching idle board **in the
+    /// subject's org** is granted; if none is free the request is queued FIFO.
+    ///
+    /// Candidate boards are restricted to `subject.org`, so a tag/chip/name
+    /// constraint can never reach another tenant's hardware — not even to
+    /// deny-of-service it by holding it, and not even when the caller's own org
+    /// has no board of that name.
     ///
     /// The caller is responsible for having resolved `subject` (org included);
     /// the scheduler only ever compares subjects, it never invents one.
@@ -337,7 +353,7 @@ impl Scheduler {
         let at_cap = self.active_for(&subject.key()) >= self.policy.max_concurrent_per_subject;
 
         if !at_cap {
-            if let Some(board_id) = self.find_idle(&request.select) {
+            if let Some(board_id) = self.find_idle(&subject.org, &request.select) {
                 let dur = self.policy.cap_duration(request.priority, request.duration_secs);
                 let grant = self.grant(&board_id, subject, request.priority, now + dur);
                 return LeaseDecision::Granted(grant);
@@ -485,9 +501,14 @@ impl Scheduler {
     /// Promote the best eligible waiter onto a now-idle board.
     ///
     /// "Best" = highest priority, then earliest enqueue (`seq`) within a class.
-    /// A waiter is eligible if its constraint matches the board and its holder
-    /// is under the concurrency cap. Mutates state and returns the grant, or
-    /// `None` if the board is missing/not idle or no waiter matched.
+    /// A waiter is eligible if it is **in the board's org**, its constraint
+    /// matches the board, and its holder is under the concurrency cap. Mutates
+    /// state and returns the grant, or `None` if the board is missing/not idle
+    /// or no waiter matched.
+    ///
+    /// The org check is what stops a queued cross-org waiter from being handed
+    /// a board freed by release or expiry — the back door onto the same
+    /// hardware that [`Scheduler::request_lease`] closes at the front.
     fn promote_one(&mut self, board_id: &BoardRef, now: u64) -> Option<GrantedLease> {
         let board = self.boards.get(board_id)?;
         if board.state != BoardState::Idle {
@@ -499,7 +520,7 @@ impl Scheduler {
             .iter()
             .enumerate()
             .filter(|(_, w)| {
-                matches(board, &w.request.select)
+                matches(board, &w.holder.org, &w.request.select)
                     && self.active_for(&w.holder.key()) < self.policy.max_concurrent_per_subject
             })
             .max_by(|(_, a), (_, b)| {
@@ -745,7 +766,10 @@ mod tests {
     #[test]
     fn same_id_different_org_is_a_different_subject() {
         let mut s = sched();
-        s.upsert_board(board("b1", "nrf52", &[]));
+        // The board belongs to org-b, so alice@org-b legitimately holds it.
+        let mut b = board("b1", "nrf52", &[]);
+        b.id = board_ref("org-b", "b1");
+        s.upsert_board(b);
         let g = match s.request_lease(
             subject_in("org-b", "alice"),
             req(by_board("b1"), 100, Priority::Ci),
@@ -754,6 +778,7 @@ mod tests {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
+        // Same id, different org: still someone else.
         let intruder = subject_in("org-a", "alice").key();
         assert_eq!(
             s.extend_lease(g.lease, &intruder, 50),
@@ -790,6 +815,11 @@ mod tests {
         let mut s = Scheduler::new(policy);
         s.upsert_board(board("b1", "nrf52", &[]));
         s.upsert_board(board("b2", "nrf52", &[]));
+        // A board of the *other* org, so the cross-org assertion below tests the
+        // concurrency cap rather than accidentally testing tenant isolation.
+        let mut other = board("b3", "nrf52", &[]);
+        other.id = board_ref("other-org", "b3");
+        s.upsert_board(other);
 
         let g1 = match s.request_lease(
             subject("p1"),
@@ -806,7 +836,8 @@ mod tests {
             0,
         );
         assert_eq!(d2, LeaseDecision::Queued { position: 0 });
-        // A same-named subject in another org is NOT capped by p1's lease.
+        // A same-named subject in another org is NOT capped by p1's lease (and
+        // is served from its own org's board).
         let d3 = s.request_lease(
             subject_in("other-org", "p1"),
             req(Constraint::Chip("nrf52".into()), 100, Priority::Ci),
@@ -978,5 +1009,127 @@ mod tests {
         assert_eq!(board_id, &board_ref(ORG, "b1"));
         assert_eq!(agent, &AgentId("agent-1".to_owned()));
         assert!(s.lease_target(LeaseId(999)).is_none());
+    }
+
+    /// B1 regression: a chip/tag constraint must not reach across orgs. org-A
+    /// owns the only nrf52 board; an org-B subject asking for that chip must be
+    /// queued, and org-A's board must stay Idle.
+    #[test]
+    fn cross_org_chip_constraint_does_not_grant() {
+        let mut s = sched();
+        let mut b = board("b1", "nrf52", &[]);
+        b.id = board_ref("org-a", "b1");
+        s.upsert_board(b);
+
+        let d = s.request_lease(
+            subject_in("org-b", "mallory"),
+            req(Constraint::Chip("nrf52".into()), 100, Priority::Ci),
+            0,
+        );
+        assert_eq!(d, LeaseDecision::Queued { position: 0 });
+        assert_eq!(
+            s.board(&board_ref("org-a", "b1")).unwrap().state,
+            BoardState::Idle,
+            "another org's board must not be leased out"
+        );
+    }
+
+    /// The same hole via a board-name constraint: org-B has no `b1`, so a bare
+    /// name must not resolve onto org-A's `b1`.
+    #[test]
+    fn cross_org_board_name_constraint_does_not_grant() {
+        let mut s = sched();
+        let mut b = board("b1", "nrf52", &[]);
+        b.id = board_ref("org-a", "b1");
+        s.upsert_board(b);
+
+        let d = s.request_lease(
+            subject_in("org-b", "mallory"),
+            req(by_board("b1"), 100, Priority::Ci),
+            0,
+        );
+        assert_eq!(d, LeaseDecision::Queued { position: 0 });
+        assert_eq!(
+            s.board(&board_ref("org-a", "b1")).unwrap().state,
+            BoardState::Idle
+        );
+    }
+
+    /// B1 regression, promotion path: a queued cross-org waiter must never be
+    /// promoted onto a board freed by release or by expiry.
+    #[test]
+    fn cross_org_waiter_is_not_promoted() {
+        let mut s = sched();
+        let mut b = board("b1", "nrf52", &[]);
+        b.id = board_ref("org-a", "b1");
+        s.upsert_board(b);
+
+        let alice = subject_in("org-a", "alice");
+        let LeaseDecision::Granted(g) =
+            s.request_lease(alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+        else {
+            panic!("expected grant");
+        };
+        // org-B queues behind it, at the highest priority so it would win any
+        // fair contest that did not consider the org.
+        let d = s.request_lease(
+            subject_in("org-b", "mallory"),
+            req(by_board("b1"), 100, Priority::Interactive),
+            0,
+        );
+        assert_eq!(d, LeaseDecision::Queued { position: 0 });
+
+        // Release: the board must come back Idle, with nobody promoted.
+        let promoted = s
+            .release_lease(g.lease, &alice.key(), 10)
+            .expect("holder may release");
+        assert!(
+            promoted.is_none(),
+            "a cross-org waiter must not be promoted onto a freed board"
+        );
+        assert_eq!(
+            s.board(&board_ref("org-a", "b1")).unwrap().state,
+            BoardState::Idle
+        );
+
+        // Expiry takes the same path; re-lease then let it lapse.
+        let LeaseDecision::Granted(g2) =
+            s.request_lease(alice.clone(), req(by_board("b1"), 100, Priority::Ci), 20)
+        else {
+            panic!("expected grant");
+        };
+        let result = s.expire(g2.expires + 1);
+        assert_eq!(result.freed.len(), 1);
+        assert!(
+            result.granted.is_empty(),
+            "expiry must not promote a cross-org waiter either"
+        );
+        assert_eq!(
+            s.board(&board_ref("org-a", "b1")).unwrap().state,
+            BoardState::Idle
+        );
+    }
+
+    /// The legitimate case still works: a same-org waiter is promoted normally.
+    #[test]
+    fn same_org_waiter_is_still_promoted() {
+        let mut s = sched();
+        let mut b = board("b1", "nrf52", &[]);
+        b.id = board_ref("org-a", "b1");
+        s.upsert_board(b);
+
+        let alice = subject_in("org-a", "alice");
+        let bob = subject_in("org-a", "bob");
+        let LeaseDecision::Granted(g) =
+            s.request_lease(alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+        else {
+            panic!("expected grant");
+        };
+        let _ = s.request_lease(bob.clone(), req(by_board("b1"), 100, Priority::Ci), 0);
+        let promoted = s
+            .release_lease(g.lease, &alice.key(), 10)
+            .expect("holder may release")
+            .expect("same-org waiter promoted");
+        assert_eq!(promoted.holder, bob);
     }
 }
