@@ -35,6 +35,42 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
+/// The GitHub OAuth app the coordinator brokers the device flow with.
+///
+/// **OAuth2, not OIDC.** GitHub user login has no discovery document, no ID
+/// token and no JWKS; the device flow yields an *access token* and identity
+/// comes from `GET /user`. (GitHub Actions workload identity *is* real OIDC —
+/// a different verifier, a different task.)
+///
+/// There is deliberately **no callback origin here**: the device flow has no
+/// `redirect_uri` at all (RFC 8628), so §10's unresolved "where does the hosted
+/// control plane run" question does not block login. The only hostname involved
+/// is this coordinator's own [`CoordinatorConfig::public_url`].
+///
+/// The three endpoint URLs are configurable so the integration tests can point
+/// the flow at a loopback stub — the only way to exercise it without GitHub.
+#[derive(Debug, Clone)]
+pub struct GithubConfig {
+    /// The OAuth app's client id. Not a secret (it appears in the device-flow
+    /// request), but without it there is no flow.
+    pub client_id: String,
+    /// The OAuth app's client secret, when the app requires one.
+    ///
+    /// OAuth Apps do not need it for the device flow; some GitHub App
+    /// configurations do. It never leaves this process.
+    pub client_secret: Option<String>,
+    /// The OAuth scope requested. Empty is correct for identity-only login:
+    /// `GET /user` needs no scope, and asking for more than we use is a
+    /// permission the user cannot get back.
+    pub scope: String,
+    /// `POST` endpoint that starts a device flow.
+    pub device_code_url: String,
+    /// `POST` endpoint that redeems a device code for an access token.
+    pub access_token_url: String,
+    /// Base URL of the GitHub REST API (`GET {api_base}/user`).
+    pub api_base: String,
+}
+
 /// Full coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
@@ -82,6 +118,13 @@ pub struct CoordinatorConfig {
     /// from its own row, so a node token cannot be replayed into another tenant
     /// (see `http::authenticate_request`).
     pub default_org: OrgId,
+    /// The GitHub OAuth app backing `probe-rs-fleet login`.
+    ///
+    /// `None` is a supported deployment, not a broken one: an air-gapped or
+    /// development fleet bootstraps with `coordinator user-token` instead. The
+    /// `/auth/device/*` routes then answer a named `503`
+    /// (`device_flow_unconfigured`) so the CLI can say *why*.
+    pub github: Option<GithubConfig>,
 }
 
 impl CoordinatorConfig {
@@ -132,6 +175,25 @@ impl CoordinatorConfig {
                 "default_org must be non-empty".to_owned(),
             ));
         }
+        if let Some(gh) = &self.github {
+            // A `[github]` table with no client id would make `login` fail at
+            // GitHub with an opaque error, far from the mistake.
+            if gh.client_id.trim().is_empty() {
+                return Err(CoordinatorError::Config(
+                    "github.client_id must be non-empty when a [github] table is present"
+                        .to_owned(),
+                ));
+            }
+            for (label, value) in [
+                ("github.device_code_url", &gh.device_code_url),
+                ("github.access_token_url", &gh.access_token_url),
+                ("github.api_base", &gh.api_base),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(CoordinatorError::Config(format!("{label} must be non-empty")));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -172,6 +234,7 @@ impl Default for CoordinatorConfig {
             session_ttl_secs: 12 * 60 * 60,
             node_token_rotate_secs: fleet_auth::RotationPolicy::DEFAULT.max_age_secs,
             default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+            github: None,
         }
     }
 }
@@ -266,5 +329,51 @@ mod tests {
             ..CoordinatorConfig::default()
         };
         assert_eq!(c.rotation_policy().max_age_secs, 3600);
+    }
+
+    /// A `[github]` table without a client id is a configuration that starts
+    /// cleanly and then fails at GitHub with an opaque error, so it is rejected
+    /// here instead.
+    #[test]
+    fn github_table_requires_a_client_id_and_endpoints() {
+        let good = GithubConfig {
+            client_id: "Iv1.abc".to_owned(),
+            client_secret: None,
+            scope: String::new(),
+            device_code_url: "https://github.com/login/device/code".to_owned(),
+            access_token_url: "https://github.com/login/oauth/access_token".to_owned(),
+            api_base: "https://api.github.com".to_owned(),
+        };
+        let c = CoordinatorConfig {
+            github: Some(good.clone()),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_ok());
+
+        let c = CoordinatorConfig {
+            github: Some(GithubConfig {
+                client_id: "  ".to_owned(),
+                ..good.clone()
+            }),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_err());
+
+        let c = CoordinatorConfig {
+            github: Some(GithubConfig {
+                api_base: String::new(),
+                ..good
+            }),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    /// No `[github]` table is a supported deployment (air-gapped / dev), not an
+    /// invalid one.
+    #[test]
+    fn github_is_optional() {
+        assert!(CoordinatorConfig::default().github.is_none());
+        assert!(CoordinatorConfig::default().validate().is_ok());
     }
 }

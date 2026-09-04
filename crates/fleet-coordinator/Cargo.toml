@@ -12,7 +12,7 @@ fleet-proto.workspace = true
 fleet-core.workspace = true
 fleet-tls.workspace = true
 fleet-wire.workspace = true
-fleet-auth.workspace = true
+fleet-auth = { workspace = true, features = ["client"] }
 
 tokio.workspace = true
 tokio-rustls.workspace = true
@@ -48,7 +48,6 @@ tokio = { workspace = true, features = ["test-util"] }
 fleet-agent.workspace = true
 fleet-sidecar.workspace = true
 fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
-fleet-auth = { workspace = true, features = ["client"] }
 tokio-tungstenite.workspace = true
 async-trait.workspace = true
 fleet-tls.workspace = true

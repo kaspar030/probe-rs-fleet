@@ -18,11 +18,11 @@
 //! ```
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use fleet_proto::{BoardName, PowerKind};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Errors arising from configuration parsing and validation.
 #[derive(Debug, thiserror::Error)]
@@ -219,20 +219,32 @@ impl BoardsConfig {
     }
 }
 
-fn default_heartbeat_secs() -> u64 {
+/// The heartbeat interval `fleet-bin` applies when `node.toml` omits one.
+#[must_use]
+pub fn default_heartbeat_secs() -> u64 {
     15
 }
 
 /// Agent runtime configuration (separate from `boards.toml`).
 ///
-/// Parsed from the agent's own config TOML. Carries connection identity, the
-/// coordinator's token-verification public key, and policy knobs.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+/// # Not a file format
+///
+/// Revision 2 deleted `agent.toml`: a node's credential now lives in the
+/// `[node]` table of its fleet file and its non-credential settings in
+/// `~/.config/probe-rs-fleet/node/node.toml`, both owned by `fleet-bin`. This
+/// struct is therefore a plain **parameter struct** that `fleet-bin` assembles,
+/// not something with a `Deserialize` impl and a source path.
+///
+/// That is the point: this crate has no business knowing where credentials are
+/// stored, and giving it a file path was what made the old "one config tree per
+/// role" layout hard to unpick. Persisting a rotated token is now a
+/// [`NodeTokenStore`] the binary supplies.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
     /// This node's id, as returned by the token exchange at `agent init`.
     ///
     /// **Advisory.** The coordinator identifies this node by the token it
-    /// presents, not by this field; it is written here so logs and
+    /// presents, not by this field; it is carried here so logs and
     /// `AgentReport::Register` are legible, and the coordinator refuses the
     /// connection if it contradicts the token.
     pub agent_id: String,
@@ -241,8 +253,8 @@ pub struct AgentConfig {
     pub fleet_url: String,
     /// This node's bearer token (`prfn1_…`).
     ///
-    /// Rotated by the coordinator over the established connection; see
-    /// [`AgentConfig::persist_node_token`].
+    /// Rotated by the coordinator over the established connection; the new value
+    /// is written down through a [`NodeTokenStore`].
     pub node_token: String,
     /// The node token this one replaced, kept until a connection with
     /// `node_token` succeeds.
@@ -252,72 +264,91 @@ pub struct AgentConfig {
     /// token, the node holds the new token while the coordinator still holds the
     /// old. Retrying once with the previous token recovers without any server
     /// state, and without it that case would need a physical visit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_node_token: Option<String>,
     /// Optional pinned coordinator server-certificate SHA-256 (64 hex chars),
     /// for a self-hosted deployment with no publicly trusted certificate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_cert_sha256: Option<String>,
     /// Hex-encoded ed25519 public key of the coordinator's token signer.
     pub coordinator_token_pubkey: String,
     /// Path to `boards.toml`.
-    pub boards_path: String,
+    pub boards_path: PathBuf,
     /// Heartbeat interval, seconds.
-    #[serde(default = "default_heartbeat_secs")]
     pub heartbeat_secs: u64,
     /// Whether to erase the target's flash on lease release.
-    #[serde(default)]
     pub erase_on_release: bool,
-    /// The file this configuration was read from, so a rotated token can be
-    /// written back. `None` when the config was parsed from a string.
-    #[serde(skip)]
-    pub source_path: Option<std::path::PathBuf>,
+}
+
+/// Where a rotated node token is written down.
+///
+/// The coordinator rotates node tokens over the established connection, and the
+/// agent must persist the replacement **before** acking it — an ack the node
+/// cannot honour after a restart is how a Pi bricks itself. Where "persist"
+/// writes to is `fleet-bin`'s business (today: the `[node]` table of the fleet
+/// file, read-modify-write so a concurrent `login` is not clobbered), so this
+/// crate takes the capability rather than a path.
+pub trait NodeTokenStore: Send + Sync {
+    /// Record `new_token` as the current token, retaining `previous` for the
+    /// one-shot fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message if the write fails. The caller does not
+    /// ack the rotation in that case, so the coordinator keeps the old token
+    /// valid and the node stays reachable.
+    fn persist(&self, new_token: &str, previous: Option<&str>) -> Result<(), String>;
+
+    /// Forget the retained previous token once the current one has proven
+    /// itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message if the write fails.
+    fn clear_previous(&self) -> Result<(), String>;
+}
+
+/// A [`NodeTokenStore`] that discards writes.
+///
+/// For tests and for any caller that genuinely has nowhere to persist to. Note
+/// what it costs in production: a rotation would be acked and then forgotten
+/// across a restart, which is exactly the failure the previous-token fallback
+/// exists to survive — so this is deliberately *not* the default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NullTokenStore;
+
+impl NodeTokenStore for NullTokenStore {
+    fn persist(&self, _new_token: &str, _previous: Option<&str>) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn clear_previous(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 impl AgentConfig {
-    /// Parse and validate from TOML text.
+    /// Validate an assembled configuration.
+    ///
+    /// Called by `fleet-bin` after building the struct from the fleet file plus
+    /// `node.toml`, so a malformed pin or pubkey fails at startup rather than at
+    /// the dial (where it would silently downgrade to `WebPKI` verification).
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Parse`] on malformed TOML and
-    /// [`ConfigError::Invalid`] if a required string is empty or the pubkey is
-    /// not valid hex of the right length.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(text: &str) -> Result<Self, ConfigError> {
-        let cfg: Self = toml::from_str(text)?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    /// Read, parse, and validate from a file path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigError::Read`] on I/O failure, then as [`from_str`].
-    ///
-    /// [`from_str`]: AgentConfig::from_str
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
-        let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        let mut cfg = Self::from_str(&text)?;
-        cfg.source_path = Some(path.to_path_buf());
-        Ok(cfg)
-    }
-
-    fn validate(&self) -> Result<(), ConfigError> {
+    /// Returns [`ConfigError::Invalid`] if a required string is empty, the pin
+    /// is not 64 hex characters, or the pubkey is not valid 32-byte hex.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         for (name, value) in [
             ("agent_id", &self.agent_id),
             ("fleet_url", &self.fleet_url),
             ("node_token", &self.node_token),
             ("coordinator_token_pubkey", &self.coordinator_token_pubkey),
-            ("boards_path", &self.boards_path),
         ] {
             if value.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!("{name} must not be empty")));
             }
+        }
+        if self.boards_path.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid("boards_path must not be empty".to_owned()));
         }
         if let Some(pin) = &self.server_cert_sha256 {
             if fleet_tls::parse_fingerprint(pin).is_none() {
@@ -342,41 +373,6 @@ impl AgentConfig {
             .and_then(fleet_tls::parse_fingerprint)
     }
 
-    /// Persist a rotated node token back to the config file, atomically.
-    ///
-    /// Written to a temporary file in the same directory and renamed, so a crash
-    /// mid-write cannot leave a truncated credential — which on a headless node
-    /// would mean a physical visit. The previous token is retained for the
-    /// one-shot retry described on
-    /// [`previous_node_token`](AgentConfig::previous_node_token).
-    ///
-    /// The file is created 0600: it holds a bearer credential, and a bearer
-    /// credential readable by other users on the host is equivalent to no
-    /// credential at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ConfigError::Read`] if the config has no known source path or
-    /// the write fails, and [`ConfigError::Invalid`] if it cannot be rendered.
-    pub fn persist_node_token(&mut self, new_token: &str) -> Result<(), ConfigError> {
-        let previous = std::mem::replace(&mut self.node_token, new_token.to_owned());
-        self.previous_node_token = Some(previous);
-        self.write_back()
-    }
-
-    /// Forget the previous token once the current one has proven itself.
-    ///
-    /// # Errors
-    ///
-    /// As [`AgentConfig::persist_node_token`].
-    pub fn clear_previous_token(&mut self) -> Result<(), ConfigError> {
-        if self.previous_node_token.is_none() {
-            return Ok(());
-        }
-        self.previous_node_token = None;
-        self.write_back()
-    }
-
     /// Swap in the previous token for a one-shot retry after an auth rejection.
     ///
     /// Returns `false` when there is no previous token to fall back to.
@@ -386,33 +382,6 @@ impl AgentConfig {
         };
         self.previous_node_token = Some(std::mem::replace(&mut self.node_token, previous));
         true
-    }
-
-    fn write_back(&self) -> Result<(), ConfigError> {
-        let path = self
-            .source_path
-            .clone()
-            .ok_or_else(|| ConfigError::Invalid("agent config has no source path".to_owned()))?;
-        let rendered = toml::to_string_pretty(self)
-            .map_err(|e| ConfigError::Invalid(format!("rendering agent config: {e}")))?;
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let tmp = dir.join(format!(
-            ".{}.tmp",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("agent.toml")
-        ));
-        let read_err = |source| ConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        };
-        std::fs::write(&tmp, rendered).map_err(read_err)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
-                .map_err(read_err)?;
-        }
-        std::fs::rename(&tmp, &path).map_err(read_err)?;
-        Ok(())
     }
 
     /// Decode the coordinator's token public key into 32 raw bytes.
@@ -622,24 +591,27 @@ chip = "c1"
         assert!(cfg.board(&BoardName("nope".into())).is_none());
     }
 
-    const AGENT_CFG: &str = r#"
-agent_id = "default/pi-lab-1"
-fleet_url = "https://fleet.example:7000"
-node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-boards_path = "/etc/fleet/boards.toml"
-"#;
+    fn agent_cfg() -> AgentConfig {
+        AgentConfig {
+            agent_id: "gh-4242/pi-lab-1".to_owned(),
+            fleet_url: "https://fleet.example:7000".to_owned(),
+            node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            previous_node_token: None,
+            server_cert_sha256: None,
+            coordinator_token_pubkey:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
+            boards_path: PathBuf::from("/etc/fleet/boards.toml"),
+            heartbeat_secs: default_heartbeat_secs(),
+            erase_on_release: false,
+        }
+    }
 
     #[test]
-    fn agent_config_parses_with_defaults() {
-        let cfg = AgentConfig::from_str(AGENT_CFG).unwrap();
-        assert_eq!(cfg.agent_id, "default/pi-lab-1");
-        assert_eq!(cfg.fleet_url, "https://fleet.example:7000");
-        assert_eq!(cfg.heartbeat_secs, 15);
-        assert!(!cfg.erase_on_release);
-        assert!(cfg.previous_node_token.is_none());
-        assert!(cfg.server_pin().is_none());
+    fn an_assembled_config_validates() {
+        let cfg = agent_cfg();
+        cfg.validate().unwrap();
         assert_eq!(cfg.heartbeat_interval(), Duration::from_secs(15));
+        assert!(cfg.server_pin().is_none());
         let key = cfg.coordinator_token_pubkey_bytes().unwrap();
         assert_eq!(key[0], 0x01);
         assert_eq!(key[31], 0xef);
@@ -647,75 +619,58 @@ boards_path = "/etc/fleet/boards.toml"
 
     #[test]
     fn agent_config_rejects_bad_pubkey() {
-        let bad = AGENT_CFG.replace(
-            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "xyz",
-        );
-        let err = AgentConfig::from_str(&bad).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid(_)));
+        let cfg = AgentConfig {
+            coordinator_token_pubkey: "xyz".to_owned(),
+            ..agent_cfg()
+        };
+        assert!(matches!(cfg.validate().unwrap_err(), ConfigError::Invalid(_)));
     }
 
     #[test]
     fn agent_config_rejects_empty_field() {
-        let bad = AGENT_CFG.replace("default/pi-lab-1", "");
-        let err = AgentConfig::from_str(&bad).unwrap_err();
+        let cfg = AgentConfig {
+            agent_id: String::new(),
+            ..agent_cfg()
+        };
+        let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("agent_id")));
+
+        let cfg = AgentConfig {
+            boards_path: PathBuf::new(),
+            ..agent_cfg()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid(m) if m.contains("boards_path")));
     }
 
-    /// A malformed pin must be rejected at load, not at dial time: silently
+    /// A malformed pin must be rejected at startup, not at dial time: silently
     /// ignoring it would downgrade a deliberately pinned deployment to `WebPKI`
     /// verification, which for a self-signed coordinator means "nothing works"
     /// or, worse, "anything with a public cert works".
     #[test]
     fn agent_config_rejects_a_malformed_pin() {
-        let bad = format!("{AGENT_CFG}server_cert_sha256 = \"nope\"\n");
-        let err = AgentConfig::from_str(&bad).unwrap_err();
+        let cfg = AgentConfig {
+            server_cert_sha256: Some("nope".to_owned()),
+            ..agent_cfg()
+        };
+        let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(m) if m.contains("server_cert_sha256")));
 
-        let good = format!("{AGENT_CFG}server_cert_sha256 = \"{}\"\n", "ab".repeat(32));
-        let cfg = AgentConfig::from_str(&good).unwrap();
+        let cfg = AgentConfig {
+            server_cert_sha256: Some("ab".repeat(32)),
+            ..agent_cfg()
+        };
+        cfg.validate().unwrap();
         assert_eq!(cfg.server_pin(), Some([0xabu8; 32]));
-    }
-
-    /// Rotation persists the new token and keeps the old one, then forgets it
-    /// once the new one has proven itself. The file is rewritten atomically and
-    /// stays 0600, because it holds a bearer credential.
-    #[test]
-    fn node_token_rotation_round_trips_through_the_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.toml");
-        std::fs::write(&path, AGENT_CFG).unwrap();
-
-        let mut cfg = AgentConfig::from_path(&path).unwrap();
-        let original = cfg.node_token.clone();
-        cfg.persist_node_token("prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
-            .unwrap();
-
-        let reloaded = AgentConfig::from_path(&path).unwrap();
-        assert_eq!(
-            reloaded.node_token,
-            "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-        );
-        assert_eq!(reloaded.previous_node_token.as_deref(), Some(original.as_str()));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "a bearer credential must not be world-readable");
-        }
-
-        let mut reloaded = reloaded;
-        reloaded.clear_previous_token().unwrap();
-        let again = AgentConfig::from_path(&path).unwrap();
-        assert!(again.previous_node_token.is_none());
     }
 
     /// The one-shot fallback: if the coordinator never saw the ack, the node
     /// must be able to reconnect with the token the coordinator still holds.
+    /// This is a pure in-memory swap now \u2014 where the tokens are *written* is the
+    /// binary's business (see [`NodeTokenStore`]).
     #[test]
     fn falling_back_swaps_current_and_previous() {
-        let mut cfg = AgentConfig::from_str(AGENT_CFG).unwrap();
+        let mut cfg = agent_cfg();
         assert!(!cfg.fall_back_to_previous_token(), "nothing to fall back to");
 
         cfg.previous_node_token = Some("prfn1_old".to_owned());

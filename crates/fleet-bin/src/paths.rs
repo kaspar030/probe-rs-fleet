@@ -1,25 +1,36 @@
 //! XDG-default path resolution for fleet config and data.
 //!
-//! These helpers resolve the standard locations a fleet role looks in when no
-//! explicit `--config` (or env override) is supplied. The layout is **per
-//! role** and, for the agent and client roles, **per profile**:
+//! # One file per fleet, not one tree per role
+//!
+//! Revision 2 replaces the per-role, per-profile trees
+//! (`<config>/agent/<profile>/agent.toml`, `<config>/client/<profile>/client.toml`)
+//! with **one file per fleet**:
+//!
+//! ```text
+//! ~/.config/probe-rs-fleet/
+//!   fleets/<name>.toml     # url, pin, optional [user], optional [node]
+//!   node/                  # node-local, non-credential settings
+//!     node.toml
+//!     boards.toml
+//!   coordinator/           # the coordinator daemon (unchanged, not per-fleet)
+//!     coordinator.toml
+//! ```
+//!
+//! The old layout could not express a laptop that is both a user and a node: it
+//! needed two unrelated enrollments, two identities and two config trees, and
+//! nothing tied them to the same fleet. A fleet file holds both tables, so a
+//! laptop has `[user]` *and* `[node]`, a headless Pi has only `[node]`, and a CI
+//! runner has neither (its credential comes from the environment).
+//!
+//! The two credentials stay in **separate tables and are never merged**: a
+//! compromised Pi must not be equivalent to a compromised user.
+//!
+//! Selection precedence: `--fleet <name>` > `PROBE_RS_FLEET` > [`DEFAULT_FLEET`].
 //!
 //! - **config root** → `$XDG_CONFIG_HOME/probe-rs-fleet/`
 //!   (default `~/.config/probe-rs-fleet/`)
 //! - **data root** → `$XDG_DATA_HOME/probe-rs-fleet/`
 //!   (default `~/.local/share/probe-rs-fleet/`)
-//!
-//! Each role resolves under its own subfolder so multiple roles can coexist on
-//! one host without colliding:
-//!
-//! - coordinator → `<root>/coordinator/…` (NOT profiled)
-//! - agent → `<root>/agent/<profile>/…`
-//! - client (shared by ctl + sidecar) → `<root>/client/<profile>/…`
-//!
-//! The default profile is [`DEFAULT_PROFILE`]. Selection precedence (also
-//! documented in `docs/architecture.md`): an explicit `--config` /
-//! `--data-dir` wins, then `--profile` / `PROBE_RS_FLEET_PROFILE`, then the
-//! `default` profile.
 //!
 //! Resolution is delegated to the [`directories`] crate, which honours the XDG
 //! Base Directory environment variables on Linux and falls back to the
@@ -30,31 +41,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 
-/// The default profile name for the agent and client roles.
-pub const DEFAULT_PROFILE: &str = "default";
-
-/// A fleet role, used to derive a per-role config/data subfolder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    /// The coordinator daemon (not profiled).
-    Coordinator,
-    /// The agent role (profiled).
-    Agent,
-    /// The client role, shared by `ctl` and the `probe-rs` sidecar (profiled).
-    Client,
-}
-
-impl Role {
-    /// The subfolder name for this role.
-    #[must_use]
-    pub fn subdir(self) -> &'static str {
-        match self {
-            Role::Coordinator => "coordinator",
-            Role::Agent => "agent",
-            Role::Client => "client",
-        }
-    }
-}
+/// The fleet selected when neither `--fleet` nor `PROBE_RS_FLEET` is set.
+pub const DEFAULT_FLEET: &str = "default";
 
 /// Application qualifier / organisation / name used to derive the project dirs.
 ///
@@ -84,25 +72,7 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.data_dir().to_path_buf())
 }
 
-/// Per-role config directory: `<config>/<role>/`.
-///
-/// # Errors
-///
-/// Returns an error if no home directory can be determined.
-pub fn role_config_dir(role: Role) -> Result<PathBuf> {
-    Ok(config_dir()?.join(role.subdir()))
-}
-
-/// Per-role data directory: `<data>/<role>/`.
-///
-/// # Errors
-///
-/// Returns an error if no home directory can be determined.
-pub fn role_data_dir(role: Role) -> Result<PathBuf> {
-    Ok(data_dir()?.join(role.subdir()))
-}
-
-// --- coordinator (not profiled) ---------------------------------------------
+// --- coordinator (one per host, not per fleet) ------------------------------
 
 /// Coordinator config directory: `<config>/coordinator/`.
 ///
@@ -110,7 +80,7 @@ pub fn role_data_dir(role: Role) -> Result<PathBuf> {
 ///
 /// Returns an error if no home directory can be determined.
 pub fn coordinator_config_dir() -> Result<PathBuf> {
-    role_config_dir(Role::Coordinator)
+    Ok(config_dir()?.join("coordinator"))
 }
 
 /// Coordinator data directory: `<data>/coordinator/`.
@@ -119,7 +89,7 @@ pub fn coordinator_config_dir() -> Result<PathBuf> {
 ///
 /// Returns an error if no home directory can be determined.
 pub fn coordinator_data_dir() -> Result<PathBuf> {
-    role_data_dir(Role::Coordinator)
+    Ok(data_dir()?.join("coordinator"))
 }
 
 /// Default coordinator config path: `<config>/coordinator/coordinator.toml`.
@@ -131,92 +101,107 @@ pub fn coordinator_config_path() -> Result<PathBuf> {
     Ok(coordinator_config_dir()?.join("coordinator.toml"))
 }
 
-// --- agent (profiled) -------------------------------------------------------
+// --- fleets -----------------------------------------------------------------
 
-/// Agent config directory for `profile`: `<config>/agent/<profile>/`.
+/// Reject a fleet name that cannot safely become a filename.
 ///
-/// # Errors
-///
-/// Returns an error if no home directory can be determined.
-pub fn agent_config_dir(profile: &str) -> Result<PathBuf> {
-    Ok(role_config_dir(Role::Agent)?.join(profile))
+/// A fleet name is interpolated straight into `fleets/<name>.toml`, so `..` or a
+/// separator would let `--fleet ../../foo` read or clobber a file outside the
+/// config tree. Checked here, once, rather than at each call site.
+fn validate_fleet_name(name: &str) -> Result<()> {
+    anyhow::ensure!(!name.is_empty(), "fleet name must not be empty");
+    anyhow::ensure!(
+        !name.contains('/') && !name.contains('\\'),
+        "fleet name must not contain a path separator: {name:?}"
+    );
+    anyhow::ensure!(
+        name != "." && name != "..",
+        "fleet name must not be `.` or `..`"
+    );
+    anyhow::ensure!(
+        !name.starts_with('.'),
+        "fleet name must not start with `.`: {name:?}"
+    );
+    Ok(())
 }
 
-/// Agent data directory for `profile`: `<data>/agent/<profile>/`.
+/// The directory holding one TOML file per fleet: `<config>/fleets/`.
 ///
 /// # Errors
 ///
 /// Returns an error if no home directory can be determined.
-pub fn agent_data_dir(profile: &str) -> Result<PathBuf> {
-    Ok(role_data_dir(Role::Agent)?.join(profile))
+pub fn fleets_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("fleets"))
 }
 
-/// Default agent config path: `<config>/agent/<profile>/agent.toml`.
+/// The config file for one fleet: `<config>/fleets/<name>.toml`.
 ///
 /// # Errors
 ///
-/// Returns an error if no home directory can be determined.
-pub fn agent_config_path(profile: &str) -> Result<PathBuf> {
-    Ok(agent_config_dir(profile)?.join("agent.toml"))
+/// Returns an error if no home directory can be determined or `name` is not a
+/// usable filename.
+pub fn fleet_config_path(name: &str) -> Result<PathBuf> {
+    validate_fleet_name(name)?;
+    Ok(fleets_dir()?.join(format!("{name}.toml")))
 }
 
-// --- client (ctl / sidecar; profiled) ---------------------------------------
+// --- node-local settings (no credentials) -----------------------------------
 
-/// Client config directory for `profile`: `<config>/client/<profile>/`.
+/// Node-local settings directory: `<config>/node/`.
+///
+/// Not per-fleet and not a credential store: a machine's board inventory and
+/// power wiring are facts about the machine, the same whichever fleet it is
+/// enrolled in. The node's *token* lives in the fleet file.
 ///
 /// # Errors
 ///
 /// Returns an error if no home directory can be determined.
-pub fn client_config_dir(profile: &str) -> Result<PathBuf> {
-    Ok(role_config_dir(Role::Client)?.join(profile))
+pub fn node_config_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("node"))
 }
 
-/// Client data directory for `profile`: `<data>/client/<profile>/`.
+/// Node runtime settings: `<config>/node/node.toml`.
 ///
 /// # Errors
 ///
 /// Returns an error if no home directory can be determined.
-pub fn client_data_dir(profile: &str) -> Result<PathBuf> {
-    Ok(role_data_dir(Role::Client)?.join(profile))
+pub fn node_config_path() -> Result<PathBuf> {
+    Ok(node_config_dir()?.join("node.toml"))
 }
 
-/// Default client config path: `<config>/client/<profile>/client.toml`.
+/// The node's board inventory: `<config>/node/boards.toml`.
 ///
 /// # Errors
 ///
 /// Returns an error if no home directory can be determined.
-pub fn client_config_path(profile: &str) -> Result<PathBuf> {
-    Ok(client_config_dir(profile)?.join("client.toml"))
+pub fn node_boards_path() -> Result<PathBuf> {
+    Ok(node_config_dir()?.join("boards.toml"))
 }
 
-/// List the profiles that exist for `role`: subdirectories of
-/// `<config>/<role>/` that contain the role's config file. Returns names
-/// sorted. An absent role directory yields an empty list (not an error).
+/// List the fleets that have a config file, sorted.
+///
+/// An absent `fleets/` directory yields an empty list, not an error: having
+/// configured no fleets is the state every new install is in.
 ///
 /// # Errors
 ///
 /// Returns an error if no home directory can be determined.
-pub fn list_profiles(role: Role) -> Result<Vec<String>> {
-    let config_file = match role {
-        Role::Agent => "agent.toml",
-        Role::Client => "client.toml",
-        // The coordinator is not profiled.
-        Role::Coordinator => return Ok(Vec::new()),
-    };
-    let root = role_config_dir(role)?;
+pub fn list_fleets() -> Result<Vec<String>> {
+    let root = fleets_dir()?;
     let mut names = Vec::new();
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Ok(names);
     };
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
         }
-        if !entry.path().join(config_file).is_file() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        if let Some(name) = entry.file_name().to_str() {
-            names.push(name.to_owned());
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(stem.to_owned());
         }
     }
     names.sort();
@@ -229,8 +214,10 @@ mod tests {
     use crate::test_support::ENV_LOCK;
 
     #[test]
-    fn resolves_xdg_overrides_per_role_and_profile() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn resolves_xdg_overrides_for_fleets_node_and_coordinator() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let prev_config = std::env::var_os("XDG_CONFIG_HOME");
         let prev_data = std::env::var_os("XDG_DATA_HOME");
@@ -248,7 +235,8 @@ mod tests {
             PathBuf::from("/tmp/fleet-xdg-data/probe-rs-fleet")
         );
 
-        // Coordinator: per-role, not profiled.
+        // The coordinator keeps its own subdirectory: it is a host-level daemon,
+        // not a per-fleet client.
         assert_eq!(
             coordinator_config_path().unwrap(),
             PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/coordinator/coordinator.toml")
@@ -258,24 +246,24 @@ mod tests {
             PathBuf::from("/tmp/fleet-xdg-data/probe-rs-fleet/coordinator")
         );
 
-        // Agent: per-role, per-profile.
+        // One file per fleet.
         assert_eq!(
-            agent_config_path("default").unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/agent/default/agent.toml")
+            fleet_config_path("default").unwrap(),
+            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/fleets/default.toml")
         );
         assert_eq!(
-            agent_data_dir("lab1").unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-data/probe-rs-fleet/agent/lab1")
+            fleet_config_path("lab1").unwrap(),
+            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/fleets/lab1.toml")
         );
 
-        // Client: per-role, per-profile.
+        // Node-local settings are not per-fleet.
         assert_eq!(
-            client_config_path("default").unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/client/default/client.toml")
+            node_boards_path().unwrap(),
+            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/node/boards.toml")
         );
         assert_eq!(
-            client_data_dir("ci").unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-data/probe-rs-fleet/client/ci")
+            node_config_path().unwrap(),
+            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/node/node.toml")
         );
 
         match prev_config {
@@ -288,28 +276,45 @@ mod tests {
         }
     }
 
+    /// A fleet name becomes a filename, so a traversal in it must be refused
+    /// rather than resolved: `--fleet ../../coordinator/coordinator` would
+    /// otherwise be a write primitive outside the fleets directory.
     #[test]
-    fn list_profiles_finds_dirs_with_config() {
-        let tmp = tempfile::tempdir().unwrap();
-        let agent_root = tmp.path().join("agent");
-        std::fs::create_dir_all(agent_root.join("lab1")).unwrap();
-        std::fs::create_dir_all(agent_root.join("lab2")).unwrap();
-        std::fs::create_dir_all(agent_root.join("empty")).unwrap();
-        std::fs::write(agent_root.join("lab1").join("agent.toml"), "x").unwrap();
-        std::fs::write(agent_root.join("lab2").join("agent.toml"), "x").unwrap();
-        // `empty` has no agent.toml and must be skipped.
+    fn traversal_fleet_names_are_rejected() {
+        for bad in ["", "..", ".", "../x", "a/b", "a\\b", ".hidden"] {
+            assert!(
+                validate_fleet_name(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        for good in ["default", "lab1", "acme-ci", "a.b"] {
+            assert!(
+                validate_fleet_name(good).is_ok(),
+                "expected {good:?} to be accepted"
+            );
+        }
+    }
 
-        // Re-implement the directory scan against the temp root (the public
-        // helper resolves XDG paths; this asserts the scan/filter logic).
+    #[test]
+    fn list_fleets_finds_toml_stems() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("default.toml"), "x").unwrap();
+        std::fs::write(tmp.path().join("lab1.toml"), "x").unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "x").unwrap();
+        std::fs::create_dir(tmp.path().join("adir.toml")).unwrap();
+
+        // Re-implement the scan against the temp root (the public helper
+        // resolves XDG paths; this asserts the filter logic).
         let mut names = Vec::new();
-        for entry in std::fs::read_dir(&agent_root).unwrap().flatten() {
-            if entry.file_type().unwrap().is_dir()
-                && entry.path().join("agent.toml").is_file()
+        for entry in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_file()
+                && path.extension().and_then(|e| e.to_str()) == Some("toml")
             {
-                names.push(entry.file_name().to_str().unwrap().to_owned());
+                names.push(path.file_stem().unwrap().to_str().unwrap().to_owned());
             }
         }
         names.sort();
-        assert_eq!(names, vec!["lab1".to_owned(), "lab2".to_owned()]);
+        assert_eq!(names, vec!["default".to_owned(), "lab1".to_owned()]);
     }
 }

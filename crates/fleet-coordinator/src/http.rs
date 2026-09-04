@@ -6,10 +6,47 @@
 //! | `GET /agent` | nodes | `WebSocket` upgrade → the agent control plane |
 //! | `GET /client` | users, workloads | `WebSocket` upgrade → the sidecar/ctl plane |
 //! | `POST /auth/token` | node enrollment, session refresh | JSON token exchange |
+//! | `POST /auth/device/start` | anyone | begin a GitHub device flow |
+//! | `POST /auth/device/poll` | anyone | redeem a device code for a session token |
 //!
-//! `POST /auth/device/*` (the GitHub device flow) is a later task and is
-//! deliberately absent rather than stubbed: a route that exists and 501s is
-//! indistinguishable, to a client, from one that is broken.
+//! # The device routes
+//!
+//! The coordinator **brokers** the GitHub device flow: the CLI never talks to
+//! GitHub. The OAuth app's client id/secret stay server-side, the user's GitHub
+//! access token never leaves this process (only a fleet session token goes
+//! back), and a self-hosted deployment can point at its own OAuth app without
+//! anyone rebuilding the CLI.
+//!
+//! Brokering is **stateless** — there is no `device_flow` table. `/start`
+//! returns GitHub's `device_code` verbatim and `/poll` hands it back, so a
+//! coordinator restart mid-login is survivable and there is no expiry sweep to
+//! write. The device code is exactly the credential a device-flow client is
+//! meant to hold, and it is only redeemable with our `client_id`.
+//!
+//! With no `[github]` table configured both routes answer `503` with the named
+//! code `device_flow_unconfigured`. That is deliberately *not* a 404 and not
+//! silence: the "no route that 501s" rule above is about responses that are
+//! indistinguishable from broken, and a named code the CLI turns into "this
+//! coordinator has no GitHub app configured — ask the operator, or use
+//! `coordinator user-token`" is the opposite of that.
+//!
+//! Two accepted risks, recorded rather than fixed (there is no rate limiting
+//! anywhere in the coordinator today):
+//!
+//! * **Quota DoS.** `/auth/device/start` must be unauthenticated, so anyone who
+//!   can reach it can burn the OAuth app's device-code rate limit and block
+//!   logins. No credential is exposed. Acceptable for v1.
+//! * **Device-flow remote phishing** (RFC 8628 §5.4). An attacker starts a flow,
+//!   gets the `device_code`, and social-engineers a victim into typing the
+//!   `user_code`; the attacker's poll then returns a session token *as the
+//!   victim*. This is inherent to every device flow, not something the
+//!   statelessness above introduces. Documented in architecture §6.4.
+//!
+//! Poll outcomes keep the no-oracle discipline in the shape that fits: GitHub's
+//! `authorization_pending` / `slow_down` / `expired_token` / `access_denied` are
+//! relayed verbatim, because they describe the state of *our own* device code
+//! (which the caller supplied) rather than answering a question about somebody
+//! else's credential. Anything else collapses to `invalid_grant`.
 //!
 //! # Where a `Subject` comes from
 //!
@@ -52,7 +89,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use tracing::{debug, info, warn};
 
-use fleet_auth::api::{ErrorResponse, TokenRequest, TokenResponse};
+use fleet_auth::api::{
+    DevicePollRequest, DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest,
+    TokenResponse,
+};
+use fleet_auth::github::{self, DevicePoll, GithubApp, GithubEndpoints};
 use fleet_auth::{AuthError, Authenticated, OpaqueToken, TokenKind};
 use fleet_proto::ids::{AgentId, OrgId, Role, Subject, SubjectKind};
 
@@ -66,6 +107,8 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         .route("/agent", get(agent_ws))
         .route("/client", get(client_ws))
         .route("/auth/token", post(auth_token))
+        .route("/auth/device/start", post(auth_device_start))
+        .route("/auth/device/poll", post(auth_device_poll))
         .with_state(coord)
 }
 
@@ -328,6 +371,7 @@ async fn redeem_auth_key(
         org: org.0,
         expires: None,
         coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
+        login: None,
     })
     .into_response()
 }
@@ -373,17 +417,30 @@ async fn refresh_session(coord: &Coordinator, session_token: &str) -> Response {
         org: org.0,
         expires: u64::try_from(expires).ok(),
         coordinator_token_pubkey: None,
+        login: None,
     })
     .into_response()
 }
 
 /// Provision the org/user/member chain and mint a user session token.
 ///
-/// The interim admin path (`coordinator user-token`) and the future device flow
-/// both land here, so there is one place that knows a session token is useless
-/// without a `member` row: `authz::require_role` consults membership, and an
-/// authenticated non-member is denied by construction. Getting this wrong makes
-/// `ctl list` fail closed on a perfectly valid token.
+/// This is the **interim admin** path (`coordinator user-token`): it derives
+/// `user.id` from the login it was handed, because there is no GitHub identity
+/// to key off. The device flow deliberately does *not* come through here — it
+/// calls [`mint_session_for_user`] against a `gh-<id>`-keyed user that
+/// `Db::upsert_github_user` created. Going through `ensure_user_member` would
+/// create a second, login-keyed user row and defeat that.
+///
+/// A consequence worth stating: `coordinator user-token alice` and alice's own
+/// `probe-rs-fleet login` produce **two distinct subjects** for one human, so a
+/// lease held under one is not controllable by the other
+/// (`authz::require_lease_control` keys off `SubjectKey`). Tolerable for an
+/// interim verb; surprising if undocumented.
+///
+/// Membership matters here: a session token is useless without a `member` row,
+/// because `authz::require_role` consults membership and an authenticated
+/// non-member is denied by construction — `ctl list` would fail closed on a
+/// perfectly valid token.
 ///
 /// Order is load-bearing: `user.personal_org_id` and `session.user_id` are
 /// enforced foreign keys, so org → user → member → session.
@@ -398,16 +455,42 @@ pub async fn mint_session(
     role: Role,
     ttl_secs: u64,
 ) -> crate::error::Result<(String, i64)> {
-    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-    let expires = now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
-
     coord.db().ensure_org(org, "personal").await?;
     coord.db().ensure_user_member(org, login, role).await?;
+    mint_session_for_user(
+        coord,
+        org,
+        login,
+        ttl_secs,
+        "interim admin-minted session token",
+    )
+    .await
+}
+
+/// Mint a session token for an **already provisioned** user.
+///
+/// Insert + audit only: no org, user or member row is created, so the caller
+/// must have provisioned them (the foreign key on `session.user_id` turns a
+/// mistake here into a loud failure rather than a valid token belonging to
+/// nobody).
+///
+/// # Errors
+///
+/// Returns a database error if the insert fails.
+pub async fn mint_session_for_user(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    ttl_secs: u64,
+    audit_detail: &str,
+) -> crate::error::Result<(String, i64)> {
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    let expires = now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
 
     let token = OpaqueToken::mint(TokenKind::Session);
     coord
         .db()
-        .insert_session(token.hash().as_str(), org, login, now, expires)
+        .insert_session(token.hash().as_str(), org, user_id, now, expires)
         .await?;
 
     let _ = coord
@@ -415,16 +498,170 @@ pub async fn mint_session(
         .scoped(org.clone())
         .append_audit(&AuditEntry {
             ts: now,
-            subject: Some(login),
+            subject: Some(user_id),
             action: "session.mint",
             node: None,
             board: None,
             lease: None,
-            detail: Some("interim admin-minted session token"),
+            detail: Some(audit_detail),
         })
         .await;
 
     Ok((token.to_secret_string(), expires))
+}
+
+/// Build the GitHub OAuth client from configuration, or produce the named 503.
+fn github_app(coord: &Coordinator) -> Result<GithubApp, Response> {
+    let Some(cfg) = coord.config().github.as_ref() else {
+        warn!(
+            "a device-flow request arrived but no [github] table is configured; \
+             `probe-rs-fleet login` cannot work against this coordinator"
+        );
+        return Err(reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "device_flow_unconfigured",
+        ));
+    };
+    Ok(GithubApp {
+        client_id: cfg.client_id.clone(),
+        client_secret: cfg.client_secret.clone(),
+        scope: cfg.scope.clone(),
+        endpoints: GithubEndpoints {
+            device_code_url: cfg.device_code_url.clone(),
+            access_token_url: cfg.access_token_url.clone(),
+            api_base: cfg.api_base.clone(),
+        },
+    })
+}
+
+/// `POST /auth/device/start` — begin a GitHub device flow.
+///
+/// Necessarily unauthenticated: the whole point is that the caller has no
+/// credential yet.
+async fn auth_device_start(
+    State(coord): State<Arc<Coordinator>>,
+    Json(_request): Json<DeviceStartRequest>,
+) -> Response {
+    let app = match github_app(&coord) {
+        Ok(app) => app,
+        Err(response) => return response,
+    };
+    match github::start_device_flow(&app).await {
+        Ok(grant) => Json(DeviceStartResponse {
+            device_code: grant.device_code,
+            user_code: grant.user_code,
+            verification_uri: grant.verification_uri,
+            interval: grant.interval,
+            expires_in: grant.expires_in,
+        })
+        .into_response(),
+        Err(e) => {
+            warn!(error = %e, "failed to start a GitHub device flow");
+            reject(StatusCode::BAD_GATEWAY, "upstream_error")
+        }
+    }
+}
+
+/// `POST /auth/device/poll` — redeem a device code for a fleet session token.
+///
+/// On `Granted` the GitHub access token is used **here and discarded**: it is
+/// spent on one `GET /user` call, the numeric id provisions the user and its
+/// personal org, and only a fleet session token is returned.
+async fn auth_device_poll(
+    State(coord): State<Arc<Coordinator>>,
+    Json(request): Json<DevicePollRequest>,
+) -> Response {
+    let app = match github_app(&coord) {
+        Ok(app) => app,
+        Err(response) => return response,
+    };
+    if request.device_code.trim().is_empty() {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+
+    let access_token = match github::poll_device_flow(&app, &request.device_code).await {
+        Ok(DevicePoll::Granted { access_token }) => access_token,
+        // Relayed verbatim: these describe the caller's own device code, so the
+        // CLI can drive its poll loop. See the module docs on the no-oracle
+        // discipline.
+        Ok(DevicePoll::Pending) => {
+            return reject(StatusCode::UNAUTHORIZED, "authorization_pending")
+        }
+        Ok(DevicePoll::SlowDown { .. }) => {
+            return reject(StatusCode::TOO_MANY_REQUESTS, "slow_down")
+        }
+        Ok(DevicePoll::Expired) => return reject(StatusCode::UNAUTHORIZED, "expired_token"),
+        Ok(DevicePoll::Denied) => return reject(StatusCode::UNAUTHORIZED, "access_denied"),
+        Err(e) => {
+            warn!(error = %e, "GitHub device-flow poll failed");
+            return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+        }
+    };
+
+    let user = match github::fetch_user(&app, &access_token).await {
+        Ok(user) => user,
+        Err(e) => {
+            warn!(error = %e, "could not read the GitHub user behind a granted device flow");
+            return reject(StatusCode::BAD_GATEWAY, "upstream_error");
+        }
+    };
+
+    // The immutable numeric id is the identity; `login` is cached for display
+    // and refreshed here. Keying off the login would let a rename + re-claim
+    // land the new owner in the old owner's org (see `Db::upsert_github_user`).
+    let gh_id = match i64::try_from(user.id) {
+        Ok(id) => id,
+        Err(_) => return reject(StatusCode::BAD_GATEWAY, "upstream_error"),
+    };
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    let (user_id, org, created) = match coord
+        .db()
+        .upsert_github_user(gh_id, &user.login, user.email.as_deref(), now)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to provision the GitHub user");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    if created {
+        let _ = coord
+            .db()
+            .scoped(org.clone())
+            .append_audit(&AuditEntry {
+                ts: now,
+                subject: Some(user_id.as_str()),
+                action: "user.create",
+                node: None,
+                board: None,
+                lease: None,
+                detail: Some("github device flow: personal org created"),
+            })
+            .await;
+        info!(user = %user_id, org = %org, "provisioned a user and its personal org");
+    }
+
+    let ttl = coord.config().session_ttl_secs;
+    let (token, expires) =
+        match mint_session_for_user(&coord, &org, &user_id, ttl, "github device flow").await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to mint a session token after a device flow");
+                return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+            }
+        };
+
+    Json(TokenResponse {
+        token,
+        node_id: None,
+        org: org.0,
+        expires: u64::try_from(expires).ok(),
+        coordinator_token_pubkey: None,
+        login: Some(user.login),
+    })
+    .into_response()
 }
 
 #[cfg(test)]

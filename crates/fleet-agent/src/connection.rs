@@ -31,7 +31,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::agent::Agent;
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, NodeTokenStore};
 use crate::error::{AgentError, Result};
 use crate::probers::ProbeRsBackend;
 
@@ -160,9 +160,10 @@ fn should_fall_back(e: &AgentError, already_tried: bool) -> bool {
 /// process is asked to stop).
 ///
 /// The `config` is owned and mutable because a node token can be **rotated**
-/// mid-connection: the coordinator pushes a replacement, the agent persists it
-/// and acks, and the next dial uses the new one. See
-/// [`AgentConfig::persist_node_token`].
+/// mid-connection: the coordinator pushes a replacement, the agent writes it
+/// down through `store` and acks, and the next dial uses the new one. Where the
+/// token is written is `fleet-bin`'s business (see [`NodeTokenStore`]); this
+/// crate only knows it must be durable before the ack.
 ///
 /// # Errors
 ///
@@ -171,6 +172,7 @@ fn should_fall_back(e: &AgentError, already_tried: bool) -> bool {
 pub async fn run<B: ProbeRsBackend + 'static>(
     agent: Arc<Agent<B>>,
     config: AgentConfig,
+    store: Arc<dyn NodeTokenStore>,
 ) -> Result<()> {
     let mut config = config;
     let mut backoff = Backoff::default();
@@ -180,7 +182,7 @@ pub async fn run<B: ProbeRsBackend + 'static>(
 
     loop {
         let mut connected = false;
-        match connect_and_serve(&agent, &mut config, &mut connected).await {
+        match connect_and_serve(&agent, &mut config, &store, &mut connected).await {
             Ok(()) => {
                 // Clean disconnect: reset backoff and immediately retry.
                 backoff.reset(Duration::from_millis(500));
@@ -226,6 +228,7 @@ pub async fn run<B: ProbeRsBackend + 'static>(
 async fn connect_and_serve<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
     config: &mut AgentConfig,
+    store: &Arc<dyn NodeTokenStore>,
     connected: &mut bool,
 ) -> Result<()> {
     let (tx, rx) = dial(DialOpts {
@@ -241,11 +244,13 @@ async fn connect_and_serve<B: ProbeRsBackend + 'static>(
     // The dial succeeded, so this token works: the previous one is dead weight
     // and keeping it would widen the window in which a stale credential is on
     // disk.
-    if let Err(e) = config.clear_previous_token() {
-        tracing::debug!(error = %e, "could not clear the superseded node token");
+    if config.previous_node_token.take().is_some() {
+        if let Err(e) = store.clear_previous() {
+            tracing::debug!(error = %e, "could not clear the superseded node token");
+        }
     }
 
-    serve_connection(agent, config, Box::new(tx), Box::new(rx)).await
+    serve_connection(agent, config, store, Box::new(tx), Box::new(rx)).await
 }
 
 /// Distinguish "the coordinator refused our credential" from "the network
@@ -284,6 +289,7 @@ fn classify_dial_error(e: &WireError) -> AgentError {
 pub async fn serve_connection<B>(
     agent: &Arc<Agent<B>>,
     config: &mut AgentConfig,
+    store: &Arc<dyn NodeTokenStore>,
     tx: Box<dyn WireTx + Send>,
     rx: Box<dyn WireRx + Send>,
 ) -> Result<()>
@@ -358,7 +364,7 @@ where
                     Ok(WireEvent::Binary(bytes)) => {
                         match fleet_wire::decode::<CoordToAgent>(&bytes) {
                             Ok(CoordToAgent::Command(cmd)) => {
-                                handle_inbound_command(agent, config, &out_tx, &routes, cmd).await;
+                                handle_inbound_command(agent, config, store, &out_tx, &routes, cmd).await;
                             }
                             Ok(CoordToAgent::Data(data)) => {
                                 route_inbound_data(&routes, data).await;
@@ -445,6 +451,7 @@ async fn route_inbound_data(
 async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
     config: &mut AgentConfig,
+    store: &Arc<dyn NodeTokenStore>,
     out_tx: &mpsc::Sender<AgentToCoord>,
     routes: &Arc<Mutex<HashMap<ChannelId, mpsc::Sender<DataFrame>>>>,
     cmd: CoordinatorCommand,
@@ -457,7 +464,7 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
         rotation_id,
     } = &cmd
     {
-        rotate_token(config, out_tx, token, *rotation_id).await;
+        rotate_token(config, store, out_tx, token, *rotation_id).await;
         return;
     }
 
@@ -505,16 +512,21 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
 /// standing next to the Pi.
 async fn rotate_token(
     config: &mut AgentConfig,
+    store: &Arc<dyn NodeTokenStore>,
     out_tx: &mpsc::Sender<AgentToCoord>,
     token: &str,
     rotation_id: u64,
 ) {
-    if let Err(e) = config.persist_node_token(token) {
+    // Write first, then adopt in memory: if the store fails we must still be
+    // holding the token the coordinator considers current.
+    if let Err(e) = store.persist(token, Some(config.node_token.as_str())) {
         // Not acked: the coordinator keeps the old token, which we also still
         // hold in memory, so the connection survives and rotation is retried.
         tracing::warn!(error = %e, "failed to persist a rotated node token; not acking");
         return;
     }
+    let previous = std::mem::replace(&mut config.node_token, token.to_owned());
+    config.previous_node_token = Some(previous);
     if send_report(out_tx, AgentReport::TokenRotated { rotation_id })
         .await
         .is_err()
@@ -659,17 +671,39 @@ mod tests {
 
     fn agent_config() -> AgentConfig {
         let pubkey_hex = hex_encode(&SigningKey::from_bytes(&SEED).verifying_key().to_bytes());
-        let toml = format!(
-            r#"
-agent_id = "pi-1"
-fleet_url = "https://coordinator.example:7000"
-node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-coordinator_token_pubkey = "{pubkey_hex}"
-boards_path = "/boards.toml"
-heartbeat_secs = 1
-"#
-        );
-        AgentConfig::from_str(&toml).unwrap()
+        AgentConfig {
+            agent_id: "pi-1".to_owned(),
+            fleet_url: "https://coordinator.example:7000".to_owned(),
+            node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            previous_node_token: None,
+            server_cert_sha256: None,
+            coordinator_token_pubkey: pubkey_hex,
+            boards_path: std::path::PathBuf::from("/boards.toml"),
+            heartbeat_secs: 1,
+            erase_on_release: false,
+        }
+    }
+
+    /// An in-memory [`NodeTokenStore`], standing in for the fleet file that
+    /// `fleet-bin` supplies in production. It records what was written so a test
+    /// can assert the persist-before-ack ordering the real store exists for.
+    #[derive(Debug, Default)]
+    struct MemoryStore {
+        current: std::sync::Mutex<Option<String>>,
+        previous: std::sync::Mutex<Option<String>>,
+    }
+
+    impl NodeTokenStore for MemoryStore {
+        fn persist(&self, new_token: &str, previous: Option<&str>) -> std::result::Result<(), String> {
+            *self.current.lock().unwrap() = Some(new_token.to_owned());
+            *self.previous.lock().unwrap() = previous.map(ToOwned::to_owned);
+            Ok(())
+        }
+
+        fn clear_previous(&self) -> std::result::Result<(), String> {
+            *self.previous.lock().unwrap() = None;
+            Ok(())
+        }
     }
 
     fn boards() -> crate::config::BoardsConfig {
@@ -746,11 +780,18 @@ kind = "none"
         // wire pair; the test plays the coordinator on the other.
         let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
         let mut config = agent_config();
+        let store: Arc<dyn NodeTokenStore> = Arc::new(MemoryStore::default());
         let agent_task = {
             let agent = Arc::clone(&agent);
             tokio::spawn(async move {
-                let _ = serve_connection(&agent, &mut config, Box::new(agent_tx), Box::new(agent_rx))
-                    .await;
+                let _ = serve_connection(
+                    &agent,
+                    &mut config,
+                    &store,
+                    Box::new(agent_tx),
+                    Box::new(agent_rx),
+                )
+                .await;
             })
         };
 
@@ -833,11 +874,9 @@ kind = "none"
     /// a headless node.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rotation_persists_before_acking() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("agent.toml");
-        let cfg = agent_config();
-        std::fs::write(&path, toml::to_string_pretty(&cfg).unwrap()).unwrap();
-        let mut config = AgentConfig::from_path(&path).unwrap();
+        let memory = Arc::new(MemoryStore::default());
+        let store: Arc<dyn NodeTokenStore> = Arc::clone(&memory) as Arc<dyn NodeTokenStore>;
+        let mut config = agent_config();
         let original = config.node_token.clone();
 
         let backend = Arc::new(DuplexBackend {
@@ -849,9 +888,16 @@ kind = "none"
         let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
         let task = {
             let agent = Arc::clone(&agent);
+            let store = Arc::clone(&store);
             tokio::spawn(async move {
-                let _ = serve_connection(&agent, &mut config, Box::new(agent_tx), Box::new(agent_rx))
-                    .await;
+                let _ = serve_connection(
+                    &agent,
+                    &mut config,
+                    &store,
+                    Box::new(agent_tx),
+                    Box::new(agent_rx),
+                )
+                .await;
             })
         };
 
@@ -880,11 +926,16 @@ kind = "none"
         };
         assert_eq!(ack, 7);
 
-        // ... and by the time it did, the new token was already on disk, with
+        // ... and by the time it did, the new token was already persisted, with
         // the old one retained for the lost-ack retry.
-        let persisted = AgentConfig::from_path(&path).unwrap();
-        assert_eq!(persisted.node_token, new_token);
-        assert_eq!(persisted.previous_node_token.as_deref(), Some(original.as_str()));
+        assert_eq!(
+            memory.current.lock().unwrap().as_deref(),
+            Some(new_token)
+        );
+        assert_eq!(
+            memory.previous.lock().unwrap().as_deref(),
+            Some(original.as_str())
+        );
 
         task.abort();
     }

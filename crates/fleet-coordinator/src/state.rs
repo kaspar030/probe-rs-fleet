@@ -482,6 +482,137 @@ impl Db {
             .await?;
         Ok(row.map(|r| OrgId(r.0)))
     }
+
+    /// Resolve a GitHub user id to `(user id, personal org)`, if known.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn user_by_github_id(&self, gh_id: i64) -> Result<Option<(String, OrgId)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT id, personal_org_id FROM user WHERE github_user_id = ?1")
+                .bind(gh_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id, org)| (id, OrgId(org))))
+    }
+
+    /// Provision (or refresh) the user behind a completed GitHub device flow,
+    /// returning `(user id, personal org, created)`.
+    ///
+    /// # Identity is keyed off the immutable numeric id, never the login
+    ///
+    /// This is load-bearing, not stylistic. [`Db::ensure_org`] is `ON CONFLICT
+    /// DO NOTHING`, so if a personal org were keyed by login slug then: bob
+    /// renames on GitHub → alice claims the freed `bob` login → alice logs in →
+    /// `ensure_org("bob")` no-ops → **alice is provisioned into bob's org** and
+    /// can lease bob's boards. GitHub documents login reuse as exactly this
+    /// account-takeover vector.
+    ///
+    /// So `user.id` and `org.id` are both `gh-<github_user_id>`; `org.slug` and
+    /// `user.login` are cosmetic, refreshed on every login, and never consulted
+    /// as keys. `slug` is `UNIQUE`, hence the fallback chain in
+    /// [`unique_personal_slug`].
+    ///
+    /// The whole chain is written in one transaction, in FK order (org → user →
+    /// member): `user.personal_org_id` and `member.user_id` are enforced
+    /// references, and a half-provisioned user authenticates fine and then fails
+    /// *every* authorization check (`authz::require_role` consults membership).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if any write fails.
+    pub async fn upsert_github_user(
+        &self,
+        gh_id: i64,
+        login: &str,
+        email: Option<&str>,
+        now: i64,
+    ) -> Result<(String, OrgId, bool)> {
+        let user_id = format!("gh-{gh_id}");
+        let org = OrgId(user_id.clone());
+
+        let mut tx = self.pool.begin().await?;
+
+        let existing: Option<(String, String)> =
+            sqlx::query_as("SELECT id, personal_org_id FROM user WHERE github_user_id = ?1")
+                .bind(gh_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+
+        if let Some((id, existing_org)) = existing {
+            // Returning login: refresh the display columns only. Notably we do
+            // NOT move the user between orgs — a rename must not relocate
+            // anybody's leases.
+            sqlx::query("UPDATE user SET login = ?2, email = ?3 WHERE id = ?1")
+                .bind(id.as_str())
+                .bind(login)
+                .bind(email)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok((id, OrgId(existing_org), false));
+        }
+
+        let slug = unique_personal_slug(&mut tx, login, gh_id, &user_id).await?;
+        sqlx::query(
+            "INSERT INTO org (id, slug, kind, created_at)
+             VALUES (?1, ?2, 'personal', ?3)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(org.0.as_str())
+        .bind(slug.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO user (id, personal_org_id, github_user_id, login, email, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                github_user_id = excluded.github_user_id,
+                login = excluded.login,
+                email = excluded.email",
+        )
+        .bind(user_id.as_str())
+        .bind(org.0.as_str())
+        .bind(gh_id)
+        .bind(login)
+        .bind(email)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+        // Everyone is always in an org; yours is an org of one (§6.1). You are
+        // its admin — there is deliberately no user-owned/org-owned branch
+        // anywhere, so "my own boards" is just admin in my personal org.
+        sqlx::query(
+            "INSERT INTO member (org_id, user_id, role)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(org_id, user_id) DO NOTHING",
+        )
+        .bind(org.0.as_str())
+        .bind(user_id.as_str())
+        .bind(Role::Admin.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok((user_id, org, true))
+    }
+
+    /// The slug of an org, for display.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn org_slug(&self, org: &OrgId) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as("SELECT slug FROM org WHERE id = ?1")
+            .bind(org.0.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.0))
+    }
 }
 
 /// A [`Db`] handle scoped to exactly one org.
@@ -798,6 +929,53 @@ fn split_tags(joined: &str) -> Vec<String> {
         .map(str::to_owned)
         .collect()
 }
+
+/// Choose a free `org.slug` for a personal org.
+///
+/// Cosmetic — nothing keys off it (see [`Db::upsert_github_user`]) — but the
+/// column is `UNIQUE`, so a login already taken by an earlier account must fall
+/// back rather than fail the insert. Chain: `<login>` → `<login>-<gh_id>` → the
+/// org id itself, which is unique by construction.
+async fn unique_personal_slug(
+    tx: &mut sqlx::SqliteConnection,
+    login: &str,
+    gh_id: i64,
+    org_id: &str,
+) -> Result<String> {
+    let sanitised: String = login
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Trim the separators the map above can leave at the edges, so a login of
+    // `!!` does not become the slug `--` (or, worse, make `-<gh_id>` look like a
+    // deliberate name).
+    let sanitised = sanitised.trim_matches('-').to_owned();
+    let candidates = [
+        sanitised.clone(),
+        format!("{sanitised}-{gh_id}"),
+        org_id.to_owned(),
+    ];
+    for candidate in candidates {
+        if candidate.is_empty() || candidate.starts_with('-') {
+            continue;
+        }
+        let taken: Option<(String,)> = sqlx::query_as("SELECT id FROM org WHERE slug = ?1")
+            .bind(candidate.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+        if taken.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Ok(org_id.to_owned())
+}
+
 
 /// Derive a node's id from `(org, name)`.
 ///
@@ -1171,6 +1349,94 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
         assert!(db.insert_session("s1", &o, "ghost", 1000, 2000).await.is_err());
+    }
+
+    /// First login creates the user, its personal org and the admin membership;
+    /// a second login reuses all three.
+    #[tokio::test]
+    async fn first_github_login_provisions_a_personal_org_and_is_idempotent() {
+        let db = Db::connect_in_memory().await.unwrap();
+
+        let (user, personal, created) = db
+            .upsert_github_user(4242, "kaspar", Some("k@example.com"), 1_000)
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(user, "gh-4242");
+        assert_eq!(personal, OrgId("gh-4242".to_owned()));
+        assert_eq!(db.org_slug(&personal).await.unwrap().as_deref(), Some("kaspar"));
+        // Admin of your own org-of-one: there is no user-owned branch, so this
+        // membership is what makes "my boards" expressible at all.
+        assert_eq!(
+            db.role_of(&personal, &user).await.unwrap(),
+            Some(Role::Admin)
+        );
+
+        let (user2, personal2, created2) = db
+            .upsert_github_user(4242, "kaspar", None, 2_000)
+            .await
+            .unwrap();
+        assert!(!created2);
+        assert_eq!((user2, personal2), (user, personal));
+        let orgs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org WHERE kind = 'personal' AND id LIKE 'gh-%'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(orgs.0, 1);
+    }
+
+    /// The regression test this whole design exists for: a **renamed** login
+    /// still resolves to the same user and org, and the person who later takes
+    /// the freed login gets their own org rather than inheriting the first
+    /// one's. Keying identity off the login name is a documented GitHub
+    /// account-takeover vector.
+    #[tokio::test]
+    async fn a_renamed_login_cannot_be_used_to_take_over_an_org() {
+        let db = Db::connect_in_memory().await.unwrap();
+
+        let (bob, bob_org, _) = db.upsert_github_user(1, "bob", None, 1_000).await.unwrap();
+
+        // bob renames to `bob-old` on GitHub; same numeric id.
+        let (bob_again, bob_org_again, created) =
+            db.upsert_github_user(1, "bob-old", None, 1_100).await.unwrap();
+        assert!(!created);
+        assert_eq!((bob_again, bob_org_again.clone()), (bob.clone(), bob_org.clone()));
+
+        // alice now claims the freed `bob` login. Different numeric id, so a
+        // different user and a different org — and a distinct slug, since
+        // `org.slug` is UNIQUE and bob's row still holds `bob`.
+        let (alice, alice_org, created) =
+            db.upsert_github_user(2, "bob", None, 1_200).await.unwrap();
+        assert!(created);
+        assert_ne!(alice, bob);
+        assert_ne!(alice_org, bob_org);
+        assert_eq!(db.org_slug(&alice_org).await.unwrap().as_deref(), Some("bob-2"));
+        // alice is not a member of bob's org.
+        assert_eq!(db.role_of(&bob_org, &alice).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn github_user_lookup_and_session_minting() {
+        let db = Db::connect_in_memory().await.unwrap();
+        assert!(db.user_by_github_id(77).await.unwrap().is_none());
+        let (user, personal, _) = db.upsert_github_user(77, "zoe", None, 1_000).await.unwrap();
+        assert_eq!(
+            db.user_by_github_id(77).await.unwrap(),
+            Some((user.clone(), personal.clone()))
+        );
+        // The user row exists, so a session FK-references it successfully.
+        db.insert_session("h1", &personal, &user, 1_000, 2_000)
+            .await
+            .unwrap();
+    }
+
+    /// A login made entirely of characters the slug sanitiser strips must still
+    /// produce a usable (unique) slug rather than an empty one.
+    #[tokio::test]
+    async fn an_unsluggable_login_falls_back_to_the_org_id() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let (_, personal, _) = db.upsert_github_user(9, "", None, 1_000).await.unwrap();
+        assert_eq!(db.org_slug(&personal).await.unwrap().as_deref(), Some("gh-9"));
     }
 
     #[tokio::test]

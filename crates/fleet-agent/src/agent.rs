@@ -549,17 +549,17 @@ mod tests {
     }
 
     fn agent_config() -> AgentConfig {
-        let pubkey_hex = hex_encode(&signing_key().verifying_key().to_bytes());
-        let toml = format!(
-            r#"
-agent_id = "pi-1"
-fleet_url = "https://coordinator.example:7000"
-node_token = "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
-coordinator_token_pubkey = "{pubkey_hex}"
-boards_path = "/boards.toml"
-"#
-        );
-        AgentConfig::from_str(&toml).unwrap()
+        AgentConfig {
+            agent_id: "pi-1".to_owned(),
+            fleet_url: "https://coordinator.example:7000".to_owned(),
+            node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            previous_node_token: None,
+            server_cert_sha256: None,
+            coordinator_token_pubkey: hex_encode(&signing_key().verifying_key().to_bytes()),
+            boards_path: std::path::PathBuf::from("/boards.toml"),
+            heartbeat_secs: crate::config::default_heartbeat_secs(),
+            erase_on_release: false,
+        }
     }
 
     fn hex_encode(bytes: &[u8]) -> String {

@@ -37,6 +37,8 @@ pub mod token;
 pub mod verify;
 
 #[cfg(feature = "client")]
+pub mod github;
+#[cfg(feature = "client")]
 pub mod http_client;
 
 pub use rotation::{should_rotate, RotationPolicy};
@@ -92,6 +94,51 @@ pub mod api {
         /// `coordinator_token_pubkey`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub coordinator_token_pubkey: Option<String>,
+        /// The GitHub login the session belongs to, for the CLI's summary line.
+        ///
+        /// Display only — identity is keyed off the immutable numeric GitHub
+        /// user id, never this string (a login can be renamed and reused).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub login: Option<String>,
+    }
+
+    /// A request to begin the GitHub device flow.
+    ///
+    /// Empty today: the CLI supplies nothing, because the OAuth app's client id
+    /// and scope are the *coordinator's* (see `DeviceStartResponse`). The struct
+    /// exists so a future field (a requested scope, say) is an additive change
+    /// rather than a shape change.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct DeviceStartRequest {}
+
+    /// The device-code grant, relayed from GitHub.
+    ///
+    /// `device_code` is handed straight back to the CLI and returned to the
+    /// coordinator on each poll: brokering is **stateless**, so a coordinator
+    /// restart mid-login is survivable and there is no expiry sweep to write.
+    /// That is safe because the device code is exactly the credential the
+    /// device-flow client is meant to hold, it is only redeemable with the
+    /// coordinator's `client_id`, and the resulting GitHub access token never
+    /// leaves the coordinator.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DeviceStartResponse {
+        /// The opaque device code, presented back on each poll.
+        pub device_code: String,
+        /// The short code the human types into the browser.
+        pub user_code: String,
+        /// Where the human types it (`https://github.com/login/device`).
+        pub verification_uri: String,
+        /// Minimum seconds between polls.
+        pub interval: u64,
+        /// Seconds until the device code expires.
+        pub expires_in: u64,
+    }
+
+    /// A poll for the outcome of a device flow.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct DevicePollRequest {
+        /// The device code from [`DeviceStartResponse`].
+        pub device_code: String,
     }
 
     /// A rejected token exchange.

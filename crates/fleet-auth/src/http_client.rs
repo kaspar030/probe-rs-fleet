@@ -26,7 +26,10 @@ use hyper::body::Bytes;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
-use crate::api::{ErrorResponse, TokenRequest, TokenResponse};
+use crate::api::{
+    DevicePollRequest, DeviceStartRequest, DeviceStartResponse, ErrorResponse, TokenRequest,
+    TokenResponse,
+};
 
 /// How long a token exchange may take before it is abandoned.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -59,8 +62,13 @@ pub enum ClientError {
 
 /// Build the `/auth/token` URI from a coordinator base URL.
 fn token_uri(base_url: &str) -> Result<http::Uri, ClientError> {
+    route_uri(base_url, "/auth/token")
+}
+
+/// Build a coordinator URI for `route` (which must start with `/`).
+fn route_uri(base_url: &str, route: &str) -> Result<http::Uri, ClientError> {
     let normalised = normalise_base(base_url)?;
-    format!("{normalised}/auth/token")
+    format!("{normalised}{route}")
         .parse::<http::Uri>()
         .map_err(|e| ClientError::Url(e.to_string()))
 }
@@ -117,7 +125,18 @@ pub async fn exchange(
     pin: Option<[u8; 32]>,
     request: &TokenRequest,
 ) -> Result<TokenResponse, ClientError> {
-    let uri = token_uri(base_url)?;
+    post_json(&token_uri(base_url)?, pin, request).await
+}
+
+/// POST `request` as JSON to `uri` and decode the response as `R`.
+///
+/// Shared by `/auth/token` and the two `/auth/device/*` routes so all three go
+/// through one trust path, one timeout and one error mapping.
+async fn post_json<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
+    uri: &http::Uri,
+    pin: Option<[u8; 32]>,
+    request: &Q,
+) -> Result<R, ClientError> {
     let body = serde_json::to_vec(request)
         .map_err(|e| ClientError::Malformed(format!("encoding request: {e}")))?;
 
@@ -131,7 +150,7 @@ pub async fn exchange(
 
     let req = http::Request::builder()
         .method(http::Method::POST)
-        .uri(uri)
+        .uri(uri.clone())
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(http::header::ACCEPT, "application/json")
         .body(Full::new(Bytes::from(body)))
@@ -206,6 +225,55 @@ pub async fn refresh_session(
     .await
 }
 
+/// Ask the coordinator to begin a GitHub device flow on our behalf.
+///
+/// The CLI never talks to GitHub: the OAuth app's client id (and secret, if any)
+/// stay server-side, and the user's *GitHub* access token never leaves the
+/// coordinator — only a fleet session token comes back. A consequence worth the
+/// trade: a self-hosted coordinator can use its own OAuth app without anybody
+/// rebuilding this binary.
+///
+/// # Errors
+///
+/// See [`exchange`]. A coordinator with no `[github]` table answers `503` with
+/// code `device_flow_unconfigured`, surfaced as [`ClientError::Rejected`].
+pub async fn device_start(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+) -> Result<DeviceStartResponse, ClientError> {
+    post_json(
+        &route_uri(base_url, "/auth/device/start")?,
+        pin,
+        &DeviceStartRequest::default(),
+    )
+    .await
+}
+
+/// Poll the coordinator for the outcome of a device flow.
+///
+/// Pending / rate-limit / expiry / denial all arrive as
+/// [`ClientError::Rejected`] carrying GitHub's own code
+/// (`authorization_pending`, `slow_down`, `expired_token`, `access_denied`), so
+/// the caller can drive its poll loop by matching on `code`.
+///
+/// # Errors
+///
+/// See [`exchange`].
+pub async fn device_poll(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    device_code: &str,
+) -> Result<TokenResponse, ClientError> {
+    post_json(
+        &route_uri(base_url, "/auth/device/poll")?,
+        pin,
+        &DevicePollRequest {
+            device_code: device_code.to_owned(),
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,6 +303,22 @@ mod tests {
         assert_eq!(
             token_uri("https://fleet.example:7000").unwrap().to_string(),
             "https://fleet.example:7000/auth/token"
+        );
+    }
+
+    #[test]
+    fn device_routes_share_the_base_normalisation() {
+        assert_eq!(
+            route_uri("fleet.example:7000/", "/auth/device/start")
+                .unwrap()
+                .to_string(),
+            "https://fleet.example:7000/auth/device/start"
+        );
+        assert_eq!(
+            route_uri("http://127.0.0.1:7000", "/auth/device/poll")
+                .unwrap()
+                .to_string(),
+            "http://127.0.0.1:7000/auth/device/poll"
         );
     }
 
