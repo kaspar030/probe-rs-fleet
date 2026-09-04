@@ -26,6 +26,7 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
+use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::board::{Board, BoardState};
 use fleet_proto::ids::{AgentId, BoardRef, LeaseId, OrgId, Role, SubjectKey};
 
@@ -37,10 +38,37 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// The org every subject is assigned to until GitHub login exists.
 pub const DEFAULT_ORG_ID: &str = "default";
 
+/// One `auth_key` row as `SQLite` hands it back.
+///
+/// Named rather than written inline so the six-tuple does not become an
+/// unreadable annotation at the query site.
+type AuthKeyRow = (String, String, i64, Option<i64>, Option<i64>, i64);
+
 /// A handle to the coordinator's `SQLite` database. Cheap to clone (wraps a pool).
 #[derive(Debug, Clone)]
 pub struct Db {
     pool: SqlitePool,
+}
+
+/// One auth key as an operator sees it (`coordinator auth-keys`).
+///
+/// Deliberately hash-only: the secret was never stored, so a listing is safe to
+/// print, pipe and log. The hash prefix is what `coordinator auth-key-revoke`
+/// takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthKeyListing {
+    /// Lowercase-hex SHA-256 of the key. The only handle to it that exists.
+    pub key_hash: String,
+    /// Selection tags stamped onto nodes enrolled with this key.
+    pub tags: Vec<String>,
+    /// Whether redeeming the key consumes it.
+    pub single_use: bool,
+    /// Expiry (epoch seconds), or `None` for a key that never expires.
+    pub expires: Option<i64>,
+    /// When the key was consumed (epoch seconds), if it was.
+    pub consumed_at: Option<i64>,
+    /// When the key was minted (epoch seconds).
+    pub created_at: i64,
 }
 
 impl Db {
@@ -253,9 +281,10 @@ impl Db {
 
     /// Register (or refresh) a node in `org` and give it a token hash.
     ///
-    /// Used by `POST /auth/token` when an auth key is redeemed. The node id is
-    /// derived from `(org, name)` so re-running `agent init` on the same machine
-    /// re-enrolls it rather than creating a duplicate.
+    /// The auth-key path (`POST /auth/token`, `grant_type: "auth_key"`): the
+    /// node has no owning user and its adoption policy is the conservative
+    /// `declared`. See [`Db::register_node_full`] for the session-based
+    /// (`share`) path.
     ///
     /// # Errors
     ///
@@ -268,21 +297,59 @@ impl Db {
         tags: &[String],
         now: i64,
     ) -> Result<AgentId> {
+        self.register_node_full(org, name, token_hash, tags, None, AdoptPolicy::Declared, now)
+            .await
+    }
+
+    /// Register (or refresh) a node, recording its owner and adoption policy.
+    ///
+    /// The node id is derived from `(org, name)` so re-running `share` /
+    /// `agent up` on the same machine re-enrolls it rather than creating a
+    /// duplicate.
+    ///
+    /// `ON CONFLICT` **does** overwrite `owner_user_id` and `adopt_policy`: a
+    /// machine first enrolled with an auth key and later shared by its owner
+    /// (or vice versa) must converge on what the latest registration asked
+    /// for, rather than keeping a stale policy nobody can see. Note the
+    /// contrast with [`OrgDb::ensure_node`], which runs on every inventory
+    /// report and therefore must *not* touch either column.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    // One argument per column, and the columns are the node's whole
+    // registration; bundling them into a struct here would only move the same
+    // eight fields one level down (the same reasoning as `insert_auth_key`).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_node_full(
+        &self,
+        org: &OrgId,
+        name: &str,
+        token_hash: &str,
+        tags: &[String],
+        owner_user_id: Option<&str>,
+        adopt: AdoptPolicy,
+        now: i64,
+    ) -> Result<AgentId> {
         let node_id = node_id_for(org, name);
         sqlx::query(
-            "INSERT INTO node (id, org_id, name, tags, token_hash, token_issued_at, last_seen, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?6)
+            "INSERT INTO node (id, org_id, owner_user_id, name, tags, token_hash, token_issued_at, adopt_policy, last_seen, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?7)
              ON CONFLICT(id) DO UPDATE SET
+                owner_user_id = excluded.owner_user_id,
                 tags = excluded.tags,
                 token_hash = excluded.token_hash,
-                token_issued_at = excluded.token_issued_at",
+                token_issued_at = excluded.token_issued_at,
+                adopt_policy = excluded.adopt_policy",
         )
         .bind(node_id.0.as_str())
         .bind(org.0.as_str())
+        .bind(owner_user_id)
         .bind(name)
         .bind(tags.join("\n"))
         .bind(token_hash)
         .bind(now)
+        .bind(adopt.as_str())
         .execute(&self.pool)
         .await?;
         Ok(node_id)
@@ -437,6 +504,67 @@ impl Db {
         }))
     }
 
+    /// Every auth key in `org`, newest first.
+    ///
+    /// The secret is not stored (only its SHA-256), so what comes back is the
+    /// hash — which is exactly what makes a key listable at all: an operator
+    /// can see what exists, when it expires, and whether it has been used,
+    /// without the listing itself being a credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn list_auth_keys(&self, org: &OrgId) -> Result<Vec<AuthKeyListing>> {
+        let rows: Vec<AuthKeyRow> = sqlx::query_as(
+            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at
+             FROM auth_key WHERE org_id = ?1 ORDER BY created_at DESC",
+        )
+        .bind(org.0.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(key_hash, tags, single_use, expires, consumed_at, created_at)| AuthKeyListing {
+                    key_hash,
+                    tags: split_tags(&tags),
+                    single_use: single_use != 0,
+                    expires,
+                    consumed_at,
+                    created_at,
+                },
+            )
+            .collect())
+    }
+
+    /// Revoke auth keys whose hash starts with `prefix`, within `org`.
+    ///
+    /// Returns the hashes deleted. The caller is expected to refuse an
+    /// ambiguous prefix *before* calling; this returns the full set so that
+    /// refusal can name what it matched. Revocation is a `DELETE` for the same
+    /// reason node revocation is: it is trivially auditable, and there is no
+    /// tombstone to forget to check.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn delete_auth_keys_by_prefix(
+        &self,
+        org: &OrgId,
+        prefix: &str,
+    ) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "DELETE FROM auth_key WHERE org_id = ?1 AND key_hash LIKE ?2 || '%'
+             RETURNING key_hash",
+        )
+        .bind(org.0.as_str())
+        .bind(prefix)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+
     /// Atomically consume an auth key: single-use + TTL, in one statement.
     ///
     /// A single-use key is marked consumed; a multi-use key is left redeemable.
@@ -481,6 +609,65 @@ impl Db {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|r| OrgId(r.0)))
+    }
+
+    /// The user id that owns a node, if any.
+    ///
+    /// `Some` for a node created by `share` (the machine belongs to the human
+    /// who shared it, so "my laptop's boards" is expressible and revoking the
+    /// user cascades); `None` for a node enrolled with an auth key, which has
+    /// no owning human by construction.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn node_owner(&self, node: &AgentId) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT owner_user_id FROM node WHERE id = ?1")
+                .bind(node.0.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
+    /// A node's org **and** adoption policy in one query.
+    ///
+    /// One round trip because this is the inventory hot path: every report a
+    /// node sends needs both, and splitting them would double the database
+    /// traffic of a fleet's steady state.
+    ///
+    /// A row whose `adopt_policy` is not a value [`AdoptPolicy::from_label`]
+    /// recognises is an **error**, not a default: silently treating an
+    /// unparseable policy as `auto` would adopt probes nobody asked to share.
+    /// Migration `0004_adopt_policy.sql` rewrites the one such value that ever
+    /// existed (`'manual'`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails, or
+    /// [`CoordinatorError::State`](crate::error::CoordinatorError::State) if
+    /// the stored policy is unrecognised.
+    pub async fn node_org_and_policy(
+        &self,
+        node: &AgentId,
+    ) -> Result<Option<(OrgId, AdoptPolicy)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT org_id, adopt_policy FROM node WHERE id = ?1")
+                .bind(node.0.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        match row {
+            None => Ok(None),
+            Some((org, policy)) => {
+                let parsed = AdoptPolicy::from_label(&policy).ok_or_else(|| {
+                    crate::error::CoordinatorError::State(format!(
+                        "node {} has an unrecognised adopt_policy {policy:?}",
+                        node.0
+                    ))
+                })?;
+                Ok(Some((OrgId(org), parsed)))
+            }
+        }
     }
 
     /// Resolve a GitHub user id to `(user id, personal org)`, if known.
@@ -638,16 +825,25 @@ impl OrgDb<'_> {
     /// Boards reference `node(id)`, so this must run before any
     /// [`OrgDb::record_board`] for that node — otherwise every board insert
     /// fails the foreign key (silently, since board recording is best-effort).
-    /// This is also the minimal auto-adoption stub: a node that connects and
-    /// reports inventory is registered in the org it authenticated into.
+    ///
+    /// The insert names `adopt_policy` explicitly rather than letting the
+    /// column default apply: `0001_init.sql`'s default is the retired
+    /// placeholder `'manual'`, which [`AdoptPolicy::from_label`] rejects, so a
+    /// defaulted row would fail the policy lookup on the very next report.
+    /// `declared` is the conservative choice for a node we hold no explicit
+    /// registration for.
+    ///
+    /// **`ON CONFLICT` deliberately touches only `last_seen`.** This runs on
+    /// every inventory report; updating `adopt_policy` here would silently
+    /// reset a `share`-created node to `declared` the first time it connected.
     ///
     /// # Errors
     ///
     /// Returns a database error if the write fails.
     pub async fn ensure_node(&self, node: &AgentId, now: i64) -> Result<()> {
         sqlx::query(
-            "INSERT INTO node (id, org_id, name, last_seen, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)
+            "INSERT INTO node (id, org_id, name, adopt_policy, last_seen, created_at)
+             VALUES (?1, ?2, ?3, 'declared', ?4, ?4)
              ON CONFLICT(id) DO UPDATE SET last_seen = excluded.last_seen",
         )
         .bind(node.0.as_str())
@@ -979,10 +1175,10 @@ async fn unique_personal_slug(
 
 /// Derive a node's id from `(org, name)`.
 ///
-/// Deterministic on purpose: re-running `agent init` on the same machine
-/// re-enrolls that node (replacing its token) instead of littering the org with
-/// duplicate rows for one physical Pi. The id is namespaced by org so the same
-/// node name in two tenants is two nodes.
+/// Deterministic on purpose: re-running `share` / `agent up` on the same
+/// machine re-enrolls that node (replacing its token) instead of littering the
+/// org with duplicate rows for one physical Pi. The id is namespaced by org so
+/// the same node name in two tenants is two nodes.
 fn node_id_for(org: &OrgId, name: &str) -> AgentId {
     AgentId(format!("{}/{name}", org.0))
 }
@@ -1519,6 +1715,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(scoped.audit_count().await.unwrap(), 2);
+    }
+
+    /// `ensure_node` runs on every inventory report, so it must create a row
+    /// the policy parser accepts. `0001_init.sql`'s column default is the
+    /// retired placeholder `'manual'`, which `AdoptPolicy::from_label` rejects
+    /// — so a row that let the default apply would fail the lookup on the very
+    /// next report.
+    #[tokio::test]
+    async fn ensure_node_creates_a_row_with_a_parseable_policy() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        assert_eq!(
+            db.node_org_and_policy(&AgentId("agent-a".to_owned()))
+                .await
+                .unwrap(),
+            Some((o, AdoptPolicy::Declared)),
+            "an implicitly created node is conservative, and parseable"
+        );
+    }
+
+    /// The crux of the `ensure_node` / `register_node_full` split: an inventory
+    /// report must never reset a `share`-created node to `declared`, which is
+    /// what would happen if `ensure_node`'s `ON CONFLICT` touched the column.
+    #[tokio::test]
+    async fn ensure_node_does_not_overwrite_a_registered_policy() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        db.ensure_org(&o, "personal").await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+        let node = db
+            .register_node_full(&o, "laptop", "hash", &[], Some("alice"), AdoptPolicy::Auto, 1000)
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            db.scoped(o.clone()).ensure_node(&node, 2000).await.unwrap();
+        }
+
+        assert_eq!(
+            db.node_org_and_policy(&node).await.unwrap(),
+            Some((o, AdoptPolicy::Auto))
+        );
+        assert_eq!(db.node_owner(&node).await.unwrap().as_deref(), Some("alice"));
+    }
+
+    /// A machine enrolled from an image and later shared by its owner must
+    /// converge on the latest registration, rather than keeping a stale policy
+    /// nobody can see.
+    #[tokio::test]
+    async fn re_registering_converges_on_the_latest_owner_and_policy() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        db.ensure_org(&o, "personal").await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+
+        // Auth-key enrollment: unowned, `declared`.
+        let node = db
+            .register_node(&o, "laptop", "hash-1", &["lab".to_owned()], 1000)
+            .await
+            .unwrap();
+        assert!(db.node_owner(&node).await.unwrap().is_none());
+        assert_eq!(
+            db.node_org_and_policy(&node).await.unwrap().unwrap().1,
+            AdoptPolicy::Declared
+        );
+
+        // ...then `share`: same id (one physical machine, one row), now owned
+        // and auto-adopting.
+        let again = db
+            .register_node_full(&o, "laptop", "hash-2", &[], Some("alice"), AdoptPolicy::Auto, 2000)
+            .await
+            .unwrap();
+        assert_eq!(again, node, "one machine must not become two rows");
+        assert_eq!(db.node_owner(&node).await.unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            db.node_org_and_policy(&node).await.unwrap().unwrap().1,
+            AdoptPolicy::Auto
+        );
+    }
+
+    /// An unrecognised stored policy must fail loudly. Treating it as `auto`
+    /// would adopt probes nobody asked to share; treating it as `declared`
+    /// would silently disable a feature its owner turned on.
+    #[tokio::test]
+    async fn an_unrecognised_stored_policy_is_an_error_not_a_default() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        sqlx::query("UPDATE node SET adopt_policy = 'manual' WHERE id = ?1")
+            .bind("agent-a")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let _ = o;
+
+        let err = db
+            .node_org_and_policy(&AgentId("agent-a".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CoordinatorError::State(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// Auth keys are listable so that "revocable" is true in practice: an
+    /// operator who has lost track of which images carry which key can see
+    /// what is outstanding. The listing is hash-only, so it is safe to print.
+    #[tokio::test]
+    async fn auth_keys_are_listable_and_revocable_by_prefix() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        let other = org("other");
+        db.ensure_org(&o, "personal").await.unwrap();
+        db.ensure_org(&other, "team").await.unwrap();
+
+        db.insert_auth_key(&o, "aaaa1111", &["lab".to_owned()], true, Some(9_999), None, 1000)
+            .await
+            .unwrap();
+        db.insert_auth_key(&o, "bbbb2222", &[], false, None, None, 1001)
+            .await
+            .unwrap();
+        // Another org's key must not appear, or be revocable from here.
+        db.insert_auth_key(&other, "aaaa9999", &[], true, None, None, 1002)
+            .await
+            .unwrap();
+
+        let keys = db.list_auth_keys(&o).await.unwrap();
+        assert_eq!(keys.len(), 2, "only this org's keys");
+        // Newest first, so the key an operator just minted is at the top.
+        assert_eq!(keys[0].key_hash, "bbbb2222");
+        assert!(!keys[0].single_use);
+        assert!(keys[0].expires.is_none());
+        assert_eq!(keys[1].tags, vec!["lab".to_owned()]);
+        assert_eq!(keys[1].expires, Some(9_999));
+
+        let deleted = db.delete_auth_keys_by_prefix(&o, "aaaa").await.unwrap();
+        assert_eq!(deleted, vec!["aaaa1111".to_owned()]);
+        assert_eq!(db.list_auth_keys(&o).await.unwrap().len(), 1);
+        // Tenancy: the other org's similarly-prefixed key is untouched.
+        assert_eq!(db.list_auth_keys(&other).await.unwrap().len(), 1);
+
+        // A revoked key stops being redeemable, which is the point.
+        assert!(db.consume_auth_key("aaaa1111", 1_500).await.unwrap().is_none());
     }
 
     #[tokio::test]

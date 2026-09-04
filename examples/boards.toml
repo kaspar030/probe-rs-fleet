@@ -5,13 +5,35 @@
 # ~/.config/probe-rs-fleet/node/boards.toml; override it with `boards_path` in
 # node.toml (see examples/node.toml).
 #
-# `probe-rs-fleet agent init` scaffolds a commented version of this file; edit
-# it to declare each board attached to the Pi.
+# `probe-rs-fleet share` / `agent up` scaffold a commented version of this file.
+#
+# ---------------------------------------------------------------------------
+# ANNOTATION AND OVERRIDE, not admission control (architecture §8)
+# ---------------------------------------------------------------------------
+#
+# Revision 1 made every probe wait for a declaration here. That is right for a
+# lab and pure friction for a laptop, so it is now this node's `adopt` policy
+# (see examples/node.toml) that decides:
+#
+#   adopt = "auto"     — undeclared probes are adopted automatically, with a
+#                        derived id and inferred tags. This file is then where
+#                        you give one a STABLE id, a chip name, curated tags, or
+#                        power wiring — none of which the agent can infer.
+#   adopt = "declared" — only the boards below are leasable.
+#
+# An auto-adopted board has no `chip`: `probe-rs list` reports the probe, not
+# the target attached to it. So `ctl lease --select 'chip=…'` will not match one
+# until you set `chip` here. That is the trade, not a defect.
 
-# Repeat one [[board]] table per attached board.
+# Repeat one [[board]] table per board you want to declare or annotate.
 
 [[board]]
-# Stable board id, unique across the whole fleet (referenced by `ctl lease`).
+# Stable board id, referenced by `ctl lease`.
+#
+# Unique WITHIN THIS NODE, not across the fleet: a board is identified
+# fleet-wide by (org, node, id) — see architecture §6.1. Auto-adoption is
+# exactly where a global id space breaks, since two laptops can each plug in an
+# nRF52840-DK.
 id        = "nrf52840-dk-3"
 
 # Physical probe serial bound to this board. The agent locks each `probe-rs

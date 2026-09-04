@@ -117,6 +117,9 @@ fn agent_config(token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
         coordinator_token_pubkey: hex_encode(token_pubkey),
         boards_path: std::path::PathBuf::from("/boards.toml"),
         heartbeat_secs: 30,
+        // Long enough that these transport tests never tick discovery.
+        discovery_secs: 3_600,
+        adopt: fleet_proto::AdoptPolicy::Declared,
         erase_on_release: false,
     }
 }
@@ -147,6 +150,13 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // The membership `coordinator user-token` provisions when it mints a
     // session: without it, `authz::require_role` denies a perfectly valid token.
     db.ensure_user_member(&OrgId("default".to_owned()), "dev", Role::Admin)
+        .await
+        .unwrap();
+    // The node row resolves this agent's reports to an org: since task 3448
+    // there is no `default_org` fallback, so a report from a node with no row
+    // is dropped rather than filed into the configured tenant.
+    db.scoped(OrgId("default".to_owned()))
+        .ensure_node(&AgentId("agent-a".to_owned()), 1_000)
         .await
         .unwrap();
     let dev = Subject::new(OrgId("default".to_owned()), SubjectKind::User, "dev");

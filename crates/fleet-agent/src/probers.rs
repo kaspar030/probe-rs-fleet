@@ -557,20 +557,9 @@ pub(crate) mod mock {
 mod tests {
     use super::*;
     use crate::config::BoardsConfig;
-    use crate::discovery::ProbeLister;
+    // One definition, three users: see `discovery::StubLister`.
+    use crate::discovery::StubLister;
     use fleet_proto::DiscoveredProbe;
-
-    /// A stub [`ProbeLister`] returning a fixed probe set (no hardware / no
-    /// `probe-rs` binary needed), so the spawn-time vid/pid resolution path is
-    /// exercised in tests.
-    struct StubLister(Vec<DiscoveredProbe>);
-
-    #[async_trait]
-    impl ProbeLister for StubLister {
-        async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
-            Ok(self.0.clone())
-        }
-    }
 
     fn discovered(serial: &str, vid: u16, pid: u16) -> DiscoveredProbe {
         DiscoveredProbe {

@@ -1,7 +1,7 @@
 //! The HTTP client for `POST /auth/token` (feature `client`).
 //!
-//! `agent init --auth-key` and a session-token refresh need to make exactly one
-//! HTTP request, and `agent init` runs on the Pi — so this stack is inside the
+//! `share`, `agent up --auth-key` and a session-token refresh each need to make
+//! exactly one HTTP request, and `agent up` runs on the Pi — so this stack is inside the
 //! hard cross-compilation constraint that forced `ring` over `aws-lc-rs`.
 //!
 //! # Why hyper rather than reqwest
@@ -220,6 +220,42 @@ pub async fn refresh_session(
         pin,
         &TokenRequest::Refresh {
             session_token: session_token.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Register this machine as a node in the caller's own org, proving
+/// membership with a user session token (architecture §4.2 path 2).
+///
+/// This is the request `probe-rs-fleet share` makes: no auth key, no
+/// coordinator shell, no out-of-band step. The returned node token is a
+/// *distinct* credential from the session token that authorised it — see
+/// `fleet-bin`'s `fleet_config` for why the two never merge.
+///
+/// `adopt` is the node's probe-adoption policy (`"auto"` | `"declared"`);
+/// `None` lets the coordinator apply this grant's default (`auto`).
+///
+/// # Errors
+///
+/// See [`exchange`]. A caller who is not a member of the org their session
+/// authenticated into is refused with `403 forbidden`.
+pub async fn self_register(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+    node_name: &str,
+    tags: Vec<String>,
+    adopt: Option<&str>,
+) -> Result<TokenResponse, ClientError> {
+    exchange(
+        base_url,
+        pin,
+        &TokenRequest::SelfRegister {
+            session_token: session_token.to_owned(),
+            node_name: node_name.to_owned(),
+            tags,
+            adopt: adopt.map(ToOwned::to_owned),
         },
     )
     .await

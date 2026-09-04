@@ -95,6 +95,7 @@ use fleet_auth::api::{
 };
 use fleet_auth::github::{self, DevicePoll, GithubApp, GithubEndpoints};
 use fleet_auth::{AuthError, Authenticated, OpaqueToken, TokenKind};
+use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::ids::{AgentId, OrgId, Role, Subject, SubjectKind};
 
 use crate::core::Coordinator;
@@ -298,6 +299,12 @@ async fn auth_token(
             tags,
         } => redeem_auth_key(&coord, &auth_key, &node_name, tags).await,
         TokenRequest::Refresh { session_token } => refresh_session(&coord, &session_token).await,
+        TokenRequest::SelfRegister {
+            session_token,
+            node_name,
+            tags,
+            adopt,
+        } => self_register(&coord, &session_token, &node_name, tags, adopt.as_deref()).await,
     }
 }
 
@@ -364,6 +371,142 @@ async fn redeem_auth_key(
         })
         .await;
     info!(node = %node, org = %org, "node enrolled");
+
+    Json(TokenResponse {
+        token: token.to_secret_string(),
+        node_id: Some(node.0),
+        org: org.0,
+        expires: None,
+        coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
+        login: None,
+    })
+    .into_response()
+}
+
+/// Self-register the calling machine as a node in the caller's own org
+/// (architecture §4.2 path 2, §6.4). This is what `probe-rs-fleet share` calls.
+///
+/// **Self-approving: membership is sufficient.** There is no admin approval
+/// step — a decision, not an omission (§6.4); a device-approval gate can be
+/// added later without a data migration.
+///
+/// Membership *is* checked, though, and that check is not decorative:
+/// `authz::require_role` denies a non-member everywhere else, so a node
+/// created for one would be an orphan its "owner" could never use.
+///
+/// The audit row's subject is the **user**, unlike [`redeem_auth_key`] where it
+/// is the node. That asymmetry is the point: here a human's authority is what
+/// created the node, and that is the fact worth being able to look up later.
+async fn self_register(
+    coord: &Coordinator,
+    session_token: &str,
+    node_name: &str,
+    tags: Vec<String>,
+    adopt: Option<&str>,
+) -> Response {
+    let now = coord.now();
+    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+
+    if node_name.trim().is_empty() {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+
+    // An unrecognised policy is a 400, never a silent default: a typo'd
+    // `adopt = "delcared"` quietly meaning `auto` would share probes the
+    // operator did not mean to share. Absent means this grant's default, which
+    // is `auto` — `share` is a deliberate "offer this machine's probes".
+    let adopt = match adopt {
+        None => AdoptPolicy::Auto,
+        Some(label) => match AdoptPolicy::from_label(label) {
+            Some(policy) => policy,
+            None => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
+        },
+    };
+
+    let auth = match fleet_auth::authenticate(coord.db(), session_token, now).await {
+        Ok(auth) if auth.kind == TokenKind::Session => auth,
+        Ok(auth) => {
+            let e = AuthError::WrongKind { got: auth.kind };
+            audit_reject(coord, &OrgId(auth.org_id.clone()), &auth.id, &e).await;
+            return reject(StatusCode::FORBIDDEN, "forbidden");
+        }
+        Err(e) => {
+            warn!(reason = e.label(), "self-registration rejected");
+            return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+        }
+    };
+
+    let org = OrgId(auth.org_id.clone());
+    match coord.db().role_of(&org, &auth.id).await {
+        Ok(Some(_role)) => {}
+        Ok(None) => {
+            // Audited with its own action rather than an `AuthError` label: the
+            // credential was perfectly valid, so this is an *authorization*
+            // refusal. Conflating it with a credential rejection would hide the
+            // one case an operator actually needs to see — someone whose
+            // membership was revoked still holding a live session.
+            let _ = coord
+                .db()
+                .scoped(org.clone())
+                .append_audit(&AuditEntry {
+                    ts: now_i64,
+                    subject: Some(auth.id.as_str()),
+                    action: "node.self_register.denied",
+                    node: None,
+                    board: None,
+                    lease: None,
+                    detail: Some("not a member of the org the session belongs to"),
+                })
+                .await;
+            warn!(org = %org, subject = %auth.id, "self-registration by a non-member");
+            return reject(StatusCode::FORBIDDEN, "forbidden");
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to resolve membership");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    }
+
+    let token = OpaqueToken::mint(TokenKind::Node);
+    let mut all_tags = tags;
+    all_tags.sort_unstable();
+    all_tags.dedup();
+
+    let node = match coord
+        .db()
+        .register_node_full(
+            &org,
+            node_name,
+            token.hash().as_str(),
+            &all_tags,
+            Some(&auth.id),
+            adopt,
+            now_i64,
+        )
+        .await
+    {
+        Ok(node) => node,
+        Err(e) => {
+            warn!(error = %e, "failed to register node");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    let detail = format!("self-registered by {} (adopt={adopt})", auth.id);
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now_i64,
+            subject: Some(auth.id.as_str()),
+            action: "node.self_register",
+            node: Some(node.0.as_str()),
+            board: None,
+            lease: None,
+            detail: Some(&detail),
+        })
+        .await;
+    info!(node = %node, org = %org, owner = %auth.id, %adopt, "node self-registered");
 
     Json(TokenResponse {
         token: token.to_secret_string(),

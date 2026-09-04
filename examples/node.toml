@@ -4,7 +4,7 @@
 #   $XDG_CONFIG_HOME/probe-rs-fleet/node/node.toml
 #   (i.e. ~/.config/probe-rs-fleet/node/node.toml)
 #
-# `probe-rs-fleet agent init` scaffolds a commented version of this file.
+# `probe-rs-fleet share` / `agent up` scaffold a commented version of this file.
 #
 # ---------------------------------------------------------------------------
 # Why this is NOT per fleet
@@ -22,6 +22,36 @@
 # There are no credentials in this file, so it is written world-readable.
 #
 # Every key below is optional; an absent file is equivalent to an empty one.
+
+# What this node does with a probe `boards.toml` does not declare
+# (architecture §4.2, §8). Default: "declared".
+#
+#   "auto"     — adopt it: derive a stable node-local id from the probe, infer
+#                tags (the probe type, plus `auto`), and make it leasable.
+#                `share` sets this, because someone deliberately offering their
+#                machine wants a board they plug in to just work. The adopted
+#                board has NO `chip`, because `probe-rs list` reports the probe
+#                and not the target attached to it — so `ctl lease --select
+#                'chip=…'` will not match it until boards.toml annotates it.
+#   "declared" — report it, but keep it unleasable until it is declared in
+#                boards.toml. `agent up --auth-key` sets this: CI and lab nodes
+#                want stable ids and no surprises.
+#
+# ADVISORY. The coordinator's `node` row is what actually decides; this setting
+# only governs whether this agent bothers to synthesise board metadata for
+# undeclared probes at all. Editing it here does NOT change what the coordinator
+# will adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `agent up
+# --adopt <policy>`) for that.
+# adopt = "declared"
+
+# How often (seconds) the agent re-enumerates locally attached probes.
+# Default: 30.
+#
+# This is what makes "plug in a board and it becomes leasable" true; each pass
+# shells out to `probe-rs list`, so it is cheap but not free. The agent reports
+# a new inventory only when something actually changed, so a quiet node stays
+# quiet whatever this is set to.
+# discovery_secs = 30
 
 # Path to this node's board inventory (see examples/boards.toml).
 # Default: ~/.config/probe-rs-fleet/node/boards.toml

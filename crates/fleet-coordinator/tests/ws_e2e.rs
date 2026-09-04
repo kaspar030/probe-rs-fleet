@@ -99,6 +99,9 @@ fn agent_config(
         coordinator_token_pubkey: hex_encode(token_pubkey),
         boards_path: std::path::PathBuf::from("/boards.toml"),
         heartbeat_secs: 30,
+        // Long enough that these transport tests never tick discovery.
+        discovery_secs: 3_600,
+        adopt: fleet_proto::AdoptPolicy::Declared,
         erase_on_release: false,
     }
 }

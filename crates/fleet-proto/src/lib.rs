@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod adopt;
 pub mod admin;
 pub mod agent_api;
 pub mod board;
@@ -17,6 +18,7 @@ pub mod ids;
 pub mod lease;
 pub mod token;
 
+pub use adopt::AdoptPolicy;
 pub use admin::{BoardAvailability, BoardSummary, LeaseHolderSummary, LogLine};
 pub use agent_api::{
     AgentReport, BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe,
@@ -75,4 +77,10 @@ pub struct ChannelId(pub u64);
 ///   [`agent_api::AgentReport::TokenRotated`]; adding variants to a postcard
 ///   enum shifts later discriminants, so this is not wire-compatible either
 ///   way.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// * 5 → 6: per-node probe adoption ([`adopt::AdoptPolicy`]).
+///   [`agent_api::BoardStatus`] gained `adopted`, distinguishing a board the
+///   node synthesised from an undeclared probe under `adopt = "auto"` from one
+///   declared in `boards.toml`. postcard is positional, so the added field
+///   re-encodes every `AgentReport::Inventory`; `#[serde(default)]` would not
+///   have saved it.
+pub const PROTOCOL_VERSION: u32 = 6;

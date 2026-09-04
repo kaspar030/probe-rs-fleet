@@ -9,6 +9,9 @@
 //! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
 //!   coordinator client the tree has
 //! - [`login`] → the GitHub device flow, brokered by the coordinator
+//! - [`share`] → self-register this machine as a node with the login it has
+//! - [`agent_up`] → the §4.2 credential ladder, then [`agent`]
+//! - [`node_setup`] → the enrollment mechanics [`share`] and [`agent_up`] share
 //!
 //! Every client role selects its credentials by **fleet name**
 //! (`--fleet` / `PROBE_RS_FLEET`), resolving to one file per fleet. See
@@ -19,11 +22,13 @@
 
 pub mod admin;
 pub mod agent;
-pub mod agent_init;
+pub mod agent_up;
 pub mod coordinator;
 pub mod ctl;
 pub mod init;
 pub mod login;
+pub mod node_setup;
+pub mod share;
 pub mod sidecar;
 
 use anyhow::Result;

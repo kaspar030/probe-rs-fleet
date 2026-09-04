@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fleet_proto::{BoardName, PowerKind};
+use fleet_proto::{AdoptPolicy, BoardName, PowerKind};
 use serde::Deserialize;
 
 /// Errors arising from configuration parsing and validation.
@@ -225,6 +225,16 @@ pub fn default_heartbeat_secs() -> u64 {
     15
 }
 
+/// The probe-discovery interval `fleet-bin` applies when `node.toml` omits one.
+///
+/// 30s is a compromise: a `probe-rs list` shell-out per tick is cheap but not
+/// free, and half a minute between plugging a board in and it becoming leasable
+/// is well inside "it just works".
+#[must_use]
+pub fn default_discovery_secs() -> u64 {
+    30
+}
+
 /// Agent runtime configuration (separate from `boards.toml`).
 ///
 /// # Not a file format
@@ -241,7 +251,7 @@ pub fn default_heartbeat_secs() -> u64 {
 /// [`NodeTokenStore`] the binary supplies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
-    /// This node's id, as returned by the token exchange at `agent init`.
+    /// This node's id, as returned by the token exchange at `share` / `agent up`.
     ///
     /// **Advisory.** The coordinator identifies this node by the token it
     /// presents, not by this field; it is carried here so logs and
@@ -274,6 +284,20 @@ pub struct AgentConfig {
     pub boards_path: PathBuf,
     /// Heartbeat interval, seconds.
     pub heartbeat_secs: u64,
+    /// How often (seconds) the agent re-enumerates locally attached probes.
+    ///
+    /// Each tick shells out to `probe-rs list`, so it is not free — hence
+    /// configurable rather than hard-coded. See
+    /// [`default_discovery_secs`].
+    pub discovery_secs: u64,
+    /// This node's probe adoption policy, from `node/node.toml`.
+    ///
+    /// **Advisory.** The coordinator's `node` row is authoritative for
+    /// enforcement; this copy only governs whether the agent synthesises board
+    /// metadata for undeclared probes at all. Editing it locally does not
+    /// change what the coordinator will adopt — re-run `share` / `agent up
+    /// --adopt …` for that.
+    pub adopt: AdoptPolicy,
     /// Whether to erase the target's flash on lease release.
     pub erase_on_release: bool,
 }
@@ -416,6 +440,15 @@ impl AgentConfig {
     #[must_use]
     pub fn heartbeat_interval(&self) -> Duration {
         Duration::from_secs(self.heartbeat_secs)
+    }
+
+    /// The probe-discovery interval as a [`Duration`].
+    ///
+    /// Clamped to at least one second: a zero interval would spin
+    /// `tokio::time::interval` and shell out to `probe-rs list` in a hot loop.
+    #[must_use]
+    pub fn discovery_interval(&self) -> Duration {
+        Duration::from_secs(self.discovery_secs.max(1))
     }
 }
 
@@ -620,6 +653,8 @@ chip = "c1"
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_owned(),
             boards_path: PathBuf::from("/etc/fleet/boards.toml"),
             heartbeat_secs: default_heartbeat_secs(),
+            discovery_secs: default_discovery_secs(),
+            adopt: AdoptPolicy::Declared,
             erase_on_release: false,
         }
     }

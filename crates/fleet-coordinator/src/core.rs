@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Scheduler};
+use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::agent_api::AgentReport;
 use fleet_proto::board::{Board, BoardState};
 use fleet_proto::ids::{
@@ -139,21 +140,24 @@ impl Coordinator {
         i64::try_from(self.now()).unwrap_or(i64::MAX)
     }
 
-    /// The org a node's inventory and boards belong to.
+    /// The org a node's inventory and boards belong to, with its probe
+    /// adoption policy.
     ///
-    /// Resolved from the `node` table, falling back to the configured default
-    /// org. A node whose org cannot be resolved *because the lookup failed* has
-    /// its inventory rejected, never defaulted into someone else's tenant.
-    ///
-    /// TODO(adoption, task 3448): the `Ok(None)` fallback below is what makes
-    /// first-connect adoption work today, and with a single org it is harmless.
-    /// It is **not** the intended end state — once a second org exists an
-    /// unknown node silently lands in `default_org`. The adoption-policy task
-    /// replaces it with an explicit adopt/reject decision per node.
-    async fn org_of_node(&self, node: &AgentId) -> Option<OrgId> {
-        match self.db.org_of_node(node).await {
-            Ok(Some(org)) => Some(org),
-            Ok(None) => Some(self.config.default_org.clone()),
+    /// Resolved from the `node` table, and **only** from it: there is no
+    /// fallback to `config.default_org` any more. A node connecting on
+    /// `/agent` has already been authenticated against its `node` row, so a
+    /// `None` here means the row vanished between authentication and the
+    /// report (a revocation racing an inventory push). Defaulting that into
+    /// the configured org silently lands a node in someone else's tenant the
+    /// moment a second org exists, so the report is dropped instead — exactly
+    /// as the `Err` arm does.
+    async fn org_and_policy_of_node(&self, node: &AgentId) -> Option<(OrgId, AdoptPolicy)> {
+        match self.db.node_org_and_policy(node).await {
+            Ok(Some(found)) => Some(found),
+            Ok(None) => {
+                warn!(%node, "no node row for this connection; dropping report");
+                None
+            }
             Err(e) => {
                 warn!(%node, error = %e, "failed to resolve node org");
                 None
@@ -172,7 +176,7 @@ impl Coordinator {
         agent_id: &AgentId,
         report: AgentReport,
     ) -> Result<()> {
-        let Some(org) = self.org_of_node(agent_id).await else {
+        let Some((org, adopt)) = self.org_and_policy_of_node(agent_id).await else {
             warn!(%agent_id, "dropping report from a node with no resolvable org");
             return Ok(());
         };
@@ -202,7 +206,7 @@ impl Coordinator {
                 // `boards.toml`, but never for the org. The scheduler preserves
                 // any live lease state on re-report (see
                 // `Scheduler::upsert_board`).
-                let online = self.reconcile_inventory(&org, agent_id, &inv).await;
+                let online = self.reconcile_inventory(&org, agent_id, adopt, &inv).await;
                 self.audit(
                     &org,
                     "agent.inventory",
@@ -210,7 +214,10 @@ impl Coordinator {
                     Some(&agent_id.0),
                     None,
                     None,
-                    Some(&format!("{} boards ({online} online)", inv.boards.len())),
+                    Some(&format!(
+                        "{} boards ({online} online, adopt={adopt})",
+                        inv.boards.len()
+                    )),
                 )
                 .await?;
             }
@@ -278,19 +285,34 @@ impl Coordinator {
 
     /// Reconcile an agent inventory snapshot into the scheduler's board set.
     ///
-    /// Online declared boards are upserted (and persisted to the board table)
-    /// as `Board`s owned by `agent_id` **in `org`**; offline boards are removed
+    /// Online boards are upserted (and persisted to the board table) as
+    /// `Board`s owned by `agent_id` **in `org`**; offline boards are removed
     /// from the scheduler unless they currently hold a live lease. Returns the
     /// number of online boards.
     ///
     /// This is the only place a [`BoardRef`] is minted from node input: the
     /// node supplies a node-local [`BoardName`] and the coordinator attaches the
     /// org of the authenticated connection, so cross-org board injection is not
-    /// expressible.
+    /// expressible. That holds for an **adopted** board exactly as it does for
+    /// a declared one — auto-adoption changes which probes become boards, never
+    /// whose tenant they land in.
+    ///
+    /// `adopt` is the node's policy from its `node` row, which is the
+    /// authoritative copy (the agent's `node.toml` setting only governs what it
+    /// reports):
+    ///
+    /// * [`AdoptPolicy::Declared`] — a board the node flagged `adopted` is
+    ///   dropped. The node should not have synthesised it, but the enforcement
+    ///   point is here, so a node whose local config drifted (or which is
+    ///   simply lying) cannot widen its own policy.
+    /// * [`AdoptPolicy::Auto`] — adopted boards are scheduled like declared
+    ///   ones. The synthesis itself lives on the agent, which is the only side
+    ///   that can see a probe's identity.
     async fn reconcile_inventory(
         &self,
         org: &OrgId,
         agent_id: &AgentId,
+        adopt: AdoptPolicy,
         inv: &fleet_proto::agent_api::ProbeInventory,
     ) -> usize {
         use fleet_proto::agent_api::BoardPresence;
@@ -309,6 +331,17 @@ impl Coordinator {
         {
             let mut sched = self.scheduler.lock().await;
             for status in &inv.boards {
+                // Enforcement, not decoration: a `declared` node that reports
+                // an adopted board has drifted from (or is contradicting) the
+                // policy its owner set, and the row here is what decides.
+                if status.adopted && adopt != AdoptPolicy::Auto {
+                    warn!(
+                        node = %agent_id,
+                        board = %status.board,
+                        "ignoring an adopted board from a node whose policy is `declared`"
+                    );
+                    continue;
+                }
                 let board_ref =
                     BoardRef::new(org.clone(), agent_id.clone(), status.board.0.clone());
                 if status.presence == BoardPresence::Online {
@@ -1019,6 +1052,7 @@ mod tests {
     use crate::state::DEFAULT_ORG_ID;
     use ed25519_dalek::{Verifier, VerifyingKey};
     use fleet_core::policy::Policy;
+    use fleet_proto::agent_api::BoardPresence;
     use fleet_proto::board::PowerKind;
     use fleet_proto::ids::{AgentId, SubjectKind};
     use fleet_proto::lease::{Constraint, Priority};
@@ -1745,37 +1779,24 @@ mod tests {
     /// otherwise hide.
     #[tokio::test]
     async fn inventory_populates_scheduler_db_and_list() {
-        use fleet_proto::agent_api::{BoardPresence, BoardStatus, ProbeInventory};
+        use fleet_proto::agent_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         // Fresh coordinator with NO pre-seeded boards.
-        let coord = coordinator_with(
-            clock,
-            &[],
-            &[(DEFAULT_ORG_ID, "op", Role::Admin)],
-        )
-        .await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         let agent_id = AgentId("agent-a".to_owned());
+        // The node row is what resolves the report's org: there is no default-org
+        // fallback any more (see `org_and_policy_of_node`).
+        coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .ensure_node(&agent_id, 1000)
+            .await
+            .unwrap();
 
         let inv = ProbeInventory {
             boards: vec![
-                BoardStatus {
-                    board: BoardName("online-1".to_owned()),
-                    serial: "S-ON".to_owned(),
-                    presence: BoardPresence::Online,
-                    chip: "nRF52840_xxAA".to_owned(),
-                    tags: vec!["nrf52".to_owned()],
-                    exclusive: true,
-                    power: PowerKind::None,
-                },
-                BoardStatus {
-                    board: BoardName("offline-1".to_owned()),
-                    serial: "S-OFF".to_owned(),
-                    presence: BoardPresence::Offline,
-                    chip: "STM32F4".to_owned(),
-                    tags: vec![],
-                    exclusive: true,
-                    power: PowerKind::None,
-                },
+                status("online-1", "S-ON", BoardPresence::Online, "nRF52840_xxAA", false),
+                status("offline-1", "S-OFF", BoardPresence::Offline, "STM32F4", false),
             ],
             unknown: vec![],
         };
@@ -1835,5 +1856,211 @@ mod tests {
             }
             other => panic!("expected BoardList, got {other:?}"),
         }
+    }
+
+    /// A [`BoardStatus`] for the inventory tests.
+    fn status(
+        name: &str,
+        serial: &str,
+        presence: BoardPresence,
+        chip: &str,
+        adopted: bool,
+    ) -> fleet_proto::BoardStatus {
+        fleet_proto::BoardStatus {
+            board: BoardName(name.to_owned()),
+            serial: serial.to_owned(),
+            presence,
+            chip: chip.to_owned(),
+            tags: vec![],
+            exclusive: true,
+            power: PowerKind::None,
+            adopted,
+        }
+    }
+
+    /// The direct regression test for the deleted `default_org` fallback.
+    ///
+    /// A node with no row used to have its inventory silently filed under
+    /// `config.default_org` — harmless with one org, a cross-tenant board
+    /// injection the moment there are two. The report must now be dropped.
+    #[tokio::test]
+    async fn a_report_from_a_node_with_no_row_is_dropped_not_defaulted() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        // Deliberately NOT calling `ensure_node`: this node is unknown.
+        let ghost = AgentId("ghost".to_owned());
+
+        let inv = ProbeInventory {
+            boards: vec![status(
+                "b1",
+                "S1",
+                BoardPresence::Online,
+                "nRF52840_xxAA",
+                false,
+            )],
+            unknown: vec![],
+        };
+        coord
+            .handle_agent_report(&ghost, AgentReport::Inventory(inv))
+            .await
+            .unwrap();
+
+        assert!(
+            coord
+                .scheduler()
+                .lock()
+                .await
+                .board(&board_ref(DEFAULT_ORG_ID, "ghost", "b1"))
+                .is_none(),
+            "an unknown node's board must not land in the configured default org"
+        );
+        assert!(
+            coord.db().org_of_node(&ghost).await.unwrap().is_none(),
+            "the report must not have created a node row either"
+        );
+    }
+
+    /// A node registered `auto` has its adopted boards scheduled like any
+    /// other. This is the coordinator half of "plug in a probe and it is
+    /// leasable".
+    #[tokio::test]
+    async fn an_auto_node_adopts_boards_a_declared_node_would_not() {
+        use fleet_proto::agent_api::ProbeInventory;
+        for (policy, expect_scheduled) in [(AdoptPolicy::Auto, true), (AdoptPolicy::Declared, false)]
+        {
+            let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+            let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+            let agent_id = AgentId("laptop".to_owned());
+            coord
+                .db()
+                .register_node_full(
+                    &org(DEFAULT_ORG_ID),
+                    "laptop",
+                    "hash",
+                    &[],
+                    Some("op"),
+                    policy,
+                    1000,
+                )
+                .await
+                .unwrap();
+            let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+
+            let inv = ProbeInventory {
+                boards: vec![status(
+                    "j-link-abc",
+                    "ABC",
+                    BoardPresence::Online,
+                    "",
+                    true,
+                )],
+                unknown: vec![],
+            };
+            coord
+                .handle_agent_report(&node, AgentReport::Inventory(inv))
+                .await
+                .unwrap();
+
+            let scheduled = coord
+                .scheduler()
+                .lock()
+                .await
+                .board(&board_ref(DEFAULT_ORG_ID, &node.0, "j-link-abc"))
+                .is_some();
+            assert_eq!(
+                scheduled, expect_scheduled,
+                "policy {policy} should {}have scheduled the adopted board",
+                if expect_scheduled { "" } else { "not " }
+            );
+            let _ = agent_id;
+        }
+    }
+
+    /// A declared board is unaffected by the policy: `declared` is the
+    /// unchanged behaviour, not a lockdown.
+    #[tokio::test]
+    async fn a_declared_board_is_scheduled_under_either_policy() {
+        use fleet_proto::agent_api::ProbeInventory;
+        for policy in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
+            let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+            let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+            coord
+                .db()
+                .register_node_full(
+                    &org(DEFAULT_ORG_ID),
+                    "pi",
+                    "hash",
+                    &[],
+                    None,
+                    policy,
+                    1000,
+                )
+                .await
+                .unwrap();
+            let node = AgentId(format!("{DEFAULT_ORG_ID}/pi"));
+
+            let inv = ProbeInventory {
+                boards: vec![status("b1", "S1", BoardPresence::Online, "chip", false)],
+                unknown: vec![],
+            };
+            coord
+                .handle_agent_report(&node, AgentReport::Inventory(inv))
+                .await
+                .unwrap();
+
+            assert!(
+                coord
+                    .scheduler()
+                    .lock()
+                    .await
+                    .board(&board_ref(DEFAULT_ORG_ID, &node.0, "b1"))
+                    .is_some(),
+                "a declared board must be scheduled under policy {policy}"
+            );
+        }
+    }
+
+    /// `ensure_node` runs on every inventory report, so if it touched
+    /// `adopt_policy` on conflict it would silently reset a `share`-created
+    /// node to `declared` the first time it connected — turning auto-adoption
+    /// off for exactly the machines it exists for.
+    #[tokio::test]
+    async fn an_inventory_report_does_not_reset_the_adopt_policy() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        coord
+            .db()
+            .register_node_full(
+                &org(DEFAULT_ORG_ID),
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Auto,
+                1000,
+            )
+            .await
+            .unwrap();
+        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+
+        for _ in 0..3 {
+            coord
+                .handle_agent_report(
+                    &node,
+                    AgentReport::Inventory(ProbeInventory {
+                        boards: vec![],
+                        unknown: vec![],
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            coord.db().node_org_and_policy(&node).await.unwrap(),
+            Some((org(DEFAULT_ORG_ID), AdoptPolicy::Auto))
+        );
     }
 }

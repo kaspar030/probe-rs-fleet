@@ -39,7 +39,7 @@
 #   4. On your laptop: probe-rs-fleet login --fleet-url <url>
 #      → first login creates your user and a personal org of one.
 #   5. For a node: coordinator auth-key   (prints an auth key)
-#      on the node: agent init --fleet-url <url> --auth-key <key>
+#      on the node: agent up --fleet-url <url> --auth-key <key>
 #
 # Bootstrap without GitHub (air-gapped, or development):
 #   coordinator user-token <you>            (prints a session token) [INTERIM]
@@ -63,7 +63,7 @@
 listen_addr = "127.0.0.1:7000"
 
 # The externally reachable base URL agents and clients DIAL to reach this
-# coordinator — what you pass to `login --fleet-url` / `agent init --fleet-url`.
+# coordinator — what you pass to `login --fleet-url` / `agent up --fleet-url`.
 #
 # NOT an OAuth callback origin: the device flow has no redirect_uri, so nothing
 # here needs to be registered with GitHub.

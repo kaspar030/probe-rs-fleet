@@ -348,13 +348,14 @@ where
     let routes: Arc<Mutex<HashMap<ChannelId, mpsc::Sender<DataFrame>>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let mut heartbeat = tokio::time::interval(config.heartbeat_interval());
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first tick fires immediately; skip it so we don't double-report.
-    heartbeat.tick().await;
+    let mut heartbeat = periodic(config.heartbeat_interval()).await;
     let mut ping = tokio::time::interval(PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ping.tick().await;
+    // Live probe discovery. Without this the inventory is whatever
+    // `seed_inventory_from_boards` put there at startup, and "plug in a board
+    // and it becomes leasable" is impossible whatever the adoption policy says.
+    let mut discovery = periodic(config.discovery_interval()).await;
     let started = std::time::Instant::now();
     let mut last_seen = tokio::time::Instant::now();
 
@@ -394,6 +395,12 @@ where
                     break Err(AgentError::Connection("writer closed".to_owned()));
                 }
             }
+            // Probe-discovery tick: re-enumerate and report only on change.
+            _ = discovery.tick() => {
+                if report_discovery(agent, &out_tx).await.is_err() {
+                    break Err(AgentError::Connection("writer closed".to_owned()));
+                }
+            }
             // Keepalive tick.
             _ = ping.tick() => {
                 if last_seen.elapsed() > SILENCE_TIMEOUT {
@@ -418,6 +425,43 @@ where
 }
 
 /// Send one report upward, mapping a closed writer to a connection error.
+/// A periodic timer whose immediate first tick has been consumed.
+///
+/// `tokio::time::interval` fires at once, which for both users here would mean
+/// double-reporting what the code just sent. Missed ticks are **skipped**
+/// rather than replayed: a node that was blocked for a minute wants one
+/// heartbeat and one discovery pass, not a minute's backlog of them.
+async fn periodic(period: Duration) -> tokio::time::Interval {
+    let mut timer = tokio::time::interval(period);
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    timer.tick().await;
+    timer
+}
+
+/// Run one discovery pass and report the result **only if it changed**.
+///
+/// Reporting unconditionally would make a quiet fleet chatty for nothing: a
+/// lab node is idle most of the time and its probe set does not move.
+///
+/// An enumeration failure is absorbed inside
+/// [`Agent::discovery_pass`](crate::agent::Agent::discovery_pass) — it logs and
+/// keeps the previous inventory rather than surfacing here — so the only error
+/// this can return is a closed writer.
+async fn report_discovery<B: ProbeRsBackend>(
+    agent: &Arc<Agent<B>>,
+    out_tx: &mpsc::Sender<AgentToCoord>,
+) -> Result<()> {
+    let Some(inventory) = agent.discovery_pass().await else {
+        return Ok(());
+    };
+    tracing::debug!(
+        boards = inventory.boards.len(),
+        unknown = inventory.unknown.len(),
+        "probe inventory changed"
+    );
+    send_report(out_tx, AgentReport::Inventory(inventory)).await
+}
+
 async fn send_report(out_tx: &mpsc::Sender<AgentToCoord>, report: AgentReport) -> Result<()> {
     out_tx
         .send(AgentToCoord::Report(report))
@@ -679,6 +723,9 @@ mod tests {
             coordinator_token_pubkey: pubkey_hex,
             boards_path: std::path::PathBuf::from("/boards.toml"),
             heartbeat_secs: 1,
+            // Long enough that a test which is not about discovery never ticks.
+            discovery_secs: 3_600,
+            adopt: fleet_proto::AdoptPolicy::Declared,
             erase_on_release: false,
         }
     }
@@ -882,6 +929,165 @@ kind = "none"
         assert_eq!(data.bytes, b"pong");
 
         agent_task.abort();
+    }
+
+    /// The discovery tick is what makes "plug in a board and it becomes
+    /// leasable" possible at all: before it, a `ProbeLister` was never wired
+    /// into the live path and the inventory was frozen at whatever
+    /// `seed_inventory_from_boards` produced at startup.
+    ///
+    /// Both halves matter. A tick that finds new hardware must report it; a
+    /// tick that finds nothing new must stay **silent**, or a quiet fleet
+    /// becomes chatty for nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_discovery_tick_reports_a_change_once_and_then_goes_quiet() {
+        use crate::discovery::StubLister;
+
+        let backend = Arc::new(DuplexBackend {
+            peer: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        // `adopt = auto` and a probe absent from `boards.toml`, so the tick has
+        // something to find that the seed did not already know.
+        let mut config = agent_config();
+        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        config.discovery_secs = 1;
+        let probe = fleet_proto::DiscoveredProbe {
+            serial: "ZZZ".to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: Some("J-Link".to_owned()),
+            inaccessible: false,
+        };
+        let agent = Arc::new(
+            Agent::new(config.clone(), boards(), backend)
+                .unwrap()
+                .with_lister(Arc::new(StubLister(vec![probe]))),
+        );
+        agent.seed_inventory_from_boards().await;
+
+        let (agent_tx, agent_rx, _coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let store: Arc<dyn NodeTokenStore> = Arc::new(MemoryStore::default());
+        let task = {
+            let agent = Arc::clone(&agent);
+            let mut config = config;
+            tokio::spawn(async move {
+                let _ = serve_connection(
+                    &agent,
+                    &mut config,
+                    &store,
+                    Box::new(agent_tx),
+                    Box::new(agent_rx),
+                )
+                .await;
+            })
+        };
+
+        // Register, then the seeded inventory (declared boards only).
+        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+            AgentToCoord::Report(AgentReport::Inventory(inv)) => {
+                assert!(inv.boards.iter().all(|b| !b.adopted));
+            }
+            other => panic!("expected the seeded Inventory, got {other:?}"),
+        }
+
+        // The first discovery tick finds the undeclared probe and reports it.
+        let adopted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+                    AgentToCoord::Report(AgentReport::Inventory(inv)) => break inv,
+                    // Heartbeats are expected traffic; anything else is not.
+                    AgentToCoord::Report(AgentReport::Heartbeat { .. }) => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the discovery tick must report the new probe");
+        assert_eq!(adopted.boards.iter().filter(|b| b.adopted).count(), 1);
+
+        // Every later tick sees the same hardware, so no further Inventory may
+        // arrive. (Heartbeats are 1s here, so several ticks pass in this
+        // window.)
+        let quiet = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let AgentToCoord::Report(AgentReport::Inventory(_)) =
+                    fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap()
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            quiet.is_err(),
+            "an unchanged discovery pass must not re-report the inventory"
+        );
+
+        task.abort();
+    }
+
+    /// A `list_probes` failure must not drop the connection: a transient USB or
+    /// `probe-rs` hiccup taking the whole fleet's boards offline would be a
+    /// great deal worse than a stale inventory.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_lister_does_not_drop_the_connection() {
+        use crate::discovery::FailingLister;
+
+        let backend = Arc::new(DuplexBackend {
+            peer: Arc::new(tokio::sync::Mutex::new(None)),
+        });
+        let mut config = agent_config();
+        config.discovery_secs = 1;
+        let agent = Arc::new(
+            Agent::new(config.clone(), boards(), backend)
+                .unwrap()
+                .with_lister(Arc::new(FailingLister)),
+        );
+        agent.seed_inventory_from_boards().await;
+        let before = agent.current_inventory().await;
+
+        let (agent_tx, agent_rx, _coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let store: Arc<dyn NodeTokenStore> = Arc::new(MemoryStore::default());
+        let task = {
+            let agent = Arc::clone(&agent);
+            let mut config = config;
+            tokio::spawn(async move {
+                let _ = serve_connection(
+                    &agent,
+                    &mut config,
+                    &store,
+                    Box::new(agent_tx),
+                    Box::new(agent_rx),
+                )
+                .await;
+            })
+        };
+
+        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+        let _seed = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+
+        // Several discovery ticks fail in this window; the connection must
+        // still be producing heartbeats afterwards.
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        let alive = tokio::time::timeout(
+            Duration::from_secs(3),
+            fleet_wire::recv::<AgentToCoord>(&mut coord_rx),
+        )
+        .await
+        .expect("the connection must survive failed enumeration")
+        .unwrap();
+        assert!(matches!(
+            alive,
+            AgentToCoord::Report(AgentReport::Heartbeat { .. })
+        ));
+        assert_eq!(
+            agent.current_inventory().await,
+            before,
+            "a failed enumeration must not empty the inventory"
+        );
+
+        task.abort();
     }
 
     /// A pushed rotation is persisted to disk **before** it is acknowledged, so
@@ -1123,7 +1329,7 @@ kind = "none"
     #[test]
     fn credential_rejection_names_the_remedy() {
         let rendered = AgentError::CredentialRejected("401".to_owned()).to_string();
-        assert!(rendered.contains("agent init"), "got: {rendered}");
+        assert!(rendered.contains("agent up"), "got: {rendered}");
         assert!(rendered.contains("--auth-key"), "got: {rendered}");
     }
 }

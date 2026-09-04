@@ -49,6 +49,11 @@ pub enum BoardPresence {
 
 /// Per-board reconciliation status reported to the coordinator.
 ///
+/// A board is either *declared* (an entry in the node's `boards.toml`) or
+/// *adopted* (synthesised from a probe nobody declared, under
+/// [`AdoptPolicy::Auto`](crate::AdoptPolicy::Auto)); [`BoardStatus::adopted`]
+/// says which.
+///
 /// Carries the full leasable-board metadata declared in the agent's
 /// `boards.toml` (chip / tags / exclusivity / power capability) in addition to
 /// the live presence, so the coordinator can reconstruct a
@@ -76,6 +81,14 @@ pub struct BoardStatus {
     pub exclusive: bool,
     /// How the agent can cut/restore power to this board.
     pub power: BoardPower,
+    /// Whether this board was **adopted** from an undeclared probe under
+    /// [`AdoptPolicy::Auto`](crate::AdoptPolicy::Auto) rather than declared in
+    /// `boards.toml`.
+    ///
+    /// Carried so the coordinator can audit it and `ctl list` can show it: an
+    /// adopted board has a derived id and no `chip`, which is exactly what an
+    /// operator wondering why `--select 'chip=…'` does not match needs to see.
+    pub adopted: bool,
 }
 
 /// A full inventory snapshot: which declared boards are present, plus any
@@ -307,6 +320,7 @@ mod tests {
                 tags: vec!["nrf52".to_owned()],
                 exclusive: true,
                 power: PowerKind::None,
+                adopted: false,
             }],
             unknown: vec![
                 DiscoveredProbe {

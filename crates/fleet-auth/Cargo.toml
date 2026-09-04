@@ -19,7 +19,7 @@ thiserror.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 
-# `client` feature: the HTTP egress used by `agent init` / `ctl` to call
+# `client` feature: the HTTP egress used by `share` / `agent up` / `ctl` to call
 # `POST /auth/token`. Off by default so the crate stays pure for the
 # coordinator, which only ever verifies.
 hyper = { workspace = true, optional = true, features = ["client", "http1"] }

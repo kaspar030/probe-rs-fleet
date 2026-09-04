@@ -24,6 +24,7 @@ use fleet_proto::{
 };
 
 use crate::config::{AgentConfig, BoardSpec, BoardsConfig};
+use crate::discovery::{self, ProbeLister, ProbeRsListLister};
 use crate::error::{AgentError, Result};
 use crate::gdb::{GdbConnection, GdbStub, ProcessGdbStub};
 use crate::power::{self, PowerControl};
@@ -58,6 +59,24 @@ type PowerFactory = Box<dyn Fn(&PowerKind) -> Box<dyn PowerControl> + Send + Syn
 pub struct Agent<B: ProbeRsBackend> {
     config: AgentConfig,
     boards: BoardsConfig,
+    /// Boards synthesised from undeclared probes under `adopt = "auto"`.
+    ///
+    /// Rebuilt by the discovery loop ([`Agent::set_adopted`]); `boards.toml`
+    /// always wins on collision, which [`Agent::board_spec`] enforces
+    /// structurally by consulting `boards` first.
+    ///
+    /// A `Mutex` rather than an `ArcSwap`: no new dependency, contention is nil
+    /// (a discovery tick every ~30s against a session open), and it matches how
+    /// `inventory` / `sessions` / `gdb_sessions` are already held.
+    adopted: Mutex<HashMap<BoardName, BoardSpec>>,
+    /// Enumerates locally attached probes for the discovery loop.
+    ///
+    /// The agent holds its own handle rather than reaching into the backend's:
+    /// [`ProcessBackend`](crate::probers::ProcessBackend) uses one at
+    /// session-open time to resolve vid/pid, and the connection loop needs one
+    /// on a timer. Injectable so tests need neither hardware nor a `probe-rs`
+    /// binary.
+    lister: Arc<dyn ProbeLister>,
     verifier: Ed25519Verifier,
     backend: Arc<B>,
     /// Spawns board-local `probe-rs gdb` stubs for gdb-tunnel channels.
@@ -78,6 +97,27 @@ fn wall_clock_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+/// The [`BoardStatus`](fleet_proto::BoardStatus) a **declared** board is
+/// advertised as when seeding the inventory from `boards.toml` alone (no live
+/// discovery yet).
+///
+/// The adopted counterpart is
+/// [`adopted_board_status`](crate::discovery::adopted_board_status); both
+/// derive the status from a [`BoardSpec`], so the id a board is reported under
+/// and the id [`Agent::board_spec`] resolves cannot drift apart.
+fn declared_board_status(b: &BoardSpec) -> fleet_proto::BoardStatus {
+    fleet_proto::BoardStatus {
+        board: BoardName(b.id.clone()),
+        serial: b.serial.clone(),
+        presence: fleet_proto::BoardPresence::Online,
+        chip: b.chip.clone(),
+        tags: b.tags.clone(),
+        exclusive: b.exclusive,
+        power: b.power.to_power_kind(),
+        adopted: false,
+    }
 }
 
 /// Lowercase-hex encode a byte slice (used to render the serve user token).
@@ -108,6 +148,8 @@ impl<B: ProbeRsBackend> Agent<B> {
         Ok(Self {
             config,
             boards,
+            adopted: Mutex::new(HashMap::new()),
+            lister: Arc::new(ProbeRsListLister::default()),
             verifier,
             backend,
             gdb_stub: Arc::new(ProcessGdbStub::new()),
@@ -141,9 +183,64 @@ impl<B: ProbeRsBackend> Agent<B> {
         self.gdb_stub = stub;
     }
 
+    /// Override the probe enumerator (tests, or a node with a non-default
+    /// `probe-rs` binary).
+    #[must_use]
+    pub fn with_lister(mut self, lister: Arc<dyn ProbeLister>) -> Self {
+        self.lister = lister;
+        self
+    }
+
+    /// Run one probe-discovery pass and, if anything changed, install the
+    /// result.
+    ///
+    /// Returns the new inventory when it differs from the current one, and
+    /// `None` when nothing changed — so the connection loop reports **only on
+    /// change** rather than making a quiet fleet chatty for nothing.
+    ///
+    /// An enumeration failure is **not** an error here: it logs at warn and
+    /// returns `None`, leaving the previous inventory in place. A transient USB
+    /// or `probe-rs` hiccup taking every board in the fleet offline would be a
+    /// great deal worse than a stale snapshot.
+    ///
+    /// Under `adopt = "auto"` the inventory and the adopted-spec map are
+    /// installed together (see [`Agent::set_inventory`]).
+    pub async fn discovery_pass(&self) -> Option<ProbeInventory> {
+        let discovered = match self.lister.list_probes().await {
+            Ok(probes) => probes,
+            Err(e) => {
+                tracing::warn!(error = %e, "probe enumeration failed; keeping the previous inventory");
+                return None;
+            }
+        };
+        let mut inventory = discovery::reconcile(&self.boards, &discovered);
+        let adopted = discovery::adopt_unknown(&mut inventory, self.config.adopt);
+        if *self.inventory.lock().await == inventory {
+            return None;
+        }
+        // Both or neither: an inventory advertising a board whose spec is
+        // missing is a lease that fails at the last hop.
+        self.set_adopted(adopted).await;
+        self.set_inventory(inventory.clone()).await;
+        Some(inventory)
+    }
+
     /// Replace the current inventory snapshot (called after discovery).
+    ///
+    /// Under `adopt = "auto"` this must be paired with [`Agent::set_adopted`]
+    /// — **set both or neither**. An inventory that advertises a board whose
+    /// spec is missing produces a lease the coordinator grants and this agent
+    /// then refuses with `UnknownBoard`, at the last possible moment and with
+    /// an opaque error.
     pub async fn set_inventory(&self, inventory: ProbeInventory) {
         *self.inventory.lock().await = inventory;
+    }
+
+    /// Replace the set of boards adopted from undeclared probes.
+    ///
+    /// See [`Agent::set_inventory`] for why the two are always set together.
+    pub async fn set_adopted(&self, specs: HashMap<BoardName, BoardSpec>) {
+        *self.adopted.lock().await = specs;
     }
 
     /// A clone of the current inventory snapshot.
@@ -162,20 +259,11 @@ impl<B: ProbeRsBackend> Agent<B> {
     ///
     /// [`set_inventory`]: Agent::set_inventory
     pub async fn seed_inventory_from_boards(&self) {
-        use fleet_proto::{BoardPresence, BoardStatus};
         let boards = self
             .boards
             .boards
             .iter()
-            .map(|b| BoardStatus {
-                board: BoardName(b.id.clone()),
-                serial: b.serial.clone(),
-                presence: BoardPresence::Online,
-                chip: b.chip.clone(),
-                tags: b.tags.clone(),
-                exclusive: b.exclusive,
-                power: b.power.to_power_kind(),
-            })
+            .map(declared_board_status)
             .collect();
         *self.inventory.lock().await = ProbeInventory {
             boards,
@@ -192,15 +280,34 @@ impl<B: ProbeRsBackend> Agent<B> {
         self.outbox.lock().await.push(report);
     }
 
-    fn board_spec(&self, board: &BoardName) -> Result<&BoardSpec> {
-        self.boards
-            .board(board)
+    /// Resolve a board's spec: `boards.toml` first, then the adopted set.
+    ///
+    /// **Declared wins**, and it wins *here* rather than by convention at each
+    /// call site — that is what makes the precedence rule (a declaration
+    /// overrides an adoption for the same probe) a structural property rather
+    /// than something two call sites have to remember.
+    ///
+    /// Returns an owned spec because the adopted half lives behind a lock and
+    /// is rebuilt at runtime by the discovery loop.
+    async fn board_spec(&self, board: &BoardName) -> Result<BoardSpec> {
+        if let Some(spec) = self.boards.board(board) {
+            return Ok(spec.clone());
+        }
+        self.adopted
+            .lock()
+            .await
+            .get(board)
+            .cloned()
             .ok_or_else(|| AgentError::UnknownBoard(board.0.clone()))
     }
 
     /// Resolve the power controller for a board.
-    fn power_for(&self, board: &BoardName) -> Result<Box<dyn PowerControl>> {
-        let spec = self.board_spec(board)?;
+    ///
+    /// An adopted board has `PowerSpec::None` — correct for a probe nobody
+    /// wired power to — so cleanup and explicit power-cycles run a no-op
+    /// controller rather than failing.
+    async fn power_for(&self, board: &BoardName) -> Result<Box<dyn PowerControl>> {
+        let spec = self.board_spec(board).await?;
         Ok((self.power_factory)(&spec.power.to_power_kind()))
     }
 
@@ -253,8 +360,9 @@ impl<B: ProbeRsBackend> Agent<B> {
         kind: ChannelKind,
     ) -> Result<()> {
         let local = board.board_name();
-        // Board must be declared.
-        let spec = self.board_spec(&local)?.clone();
+        // The board must resolve: declared in `boards.toml`, or adopted from an
+        // undeclared probe under `adopt = "auto"`.
+        let spec = self.board_spec(&local).await?;
 
         // Verify the capability token locally before doing anything else. The
         // required capability depends on the channel kind: a gdb tunnel needs
@@ -394,7 +502,7 @@ impl<B: ProbeRsBackend> Agent<B> {
 
     /// Cleanup a board: power-cycle and optionally note erase.
     async fn cleanup_board(&self, board: &BoardName, erase: bool) -> Result<()> {
-        let power = self.power_for(board)?;
+        let power = self.power_for(board).await?;
         power.cycle().await?;
         self.emit(AgentReport::PowerEvent {
             board: board.clone(),
@@ -418,7 +526,7 @@ impl<B: ProbeRsBackend> Agent<B> {
 
     /// Explicit operator power-cycle.
     async fn on_power_cycle(&self, board: &BoardName) -> Result<()> {
-        let power = self.power_for(board)?;
+        let power = self.power_for(board).await?;
         power.cycle().await?;
         self.emit(AgentReport::PowerEvent {
             board: board.clone(),
@@ -447,7 +555,7 @@ impl<B: ProbeRsBackend> Agent<B> {
             self.on_kill_session(channel).await?;
         }
         // Best-effort power-cycle; report the fault regardless.
-        let _ = self.power_for(board).map(|_| ());
+        let _ = self.power_for(board).await.map(|_| ());
         self.emit(AgentReport::Fault {
             board: board.clone(),
             reason,
@@ -558,6 +666,8 @@ mod tests {
             coordinator_token_pubkey: hex_encode(&signing_key().verifying_key().to_bytes()),
             boards_path: std::path::PathBuf::from("/boards.toml"),
             heartbeat_secs: crate::config::default_heartbeat_secs(),
+            discovery_secs: crate::config::default_discovery_secs(),
+            adopt: fleet_proto::AdoptPolicy::Declared,
             erase_on_release: false,
         }
     }
@@ -946,5 +1056,170 @@ port = 2
             .unwrap();
         assert_eq!(agent.active_session_count().await, 0);
         assert_eq!(agent.gdb_session_count().await, 0);
+    }
+
+    // ---- adoption ----------------------------------------------------------
+
+    /// **The acceptance test for the whole feature.**
+    ///
+    /// With `adopt = "auto"` and a probe absent from `boards.toml`, a
+    /// capability token minted for the *synthesised* board must open a session.
+    /// Every other test in this task exercises one side of the seam: the agent
+    /// synthesising a `BoardStatus`, or the coordinator scheduling it. This is
+    /// the one that closes it.
+    ///
+    /// Before adopted specs were resolvable, this path ended in
+    /// `AgentError::UnknownBoard` — the coordinator would adopt the probe,
+    /// lease it, mint a token, and the agent would refuse at the last possible
+    /// moment with an opaque error.
+    #[tokio::test]
+    async fn an_auto_adopted_board_can_actually_open_a_session() {
+        use crate::discovery::StubLister;
+
+        let backend = Arc::new(MockBackend::new());
+        let mut config = agent_config();
+        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        // A probe nobody declared: `boards()` knows only S1.
+        let probe = fleet_proto::DiscoveredProbe {
+            serial: "ZZZ".to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: Some("J-Link".to_owned()),
+            inaccessible: false,
+        };
+        let mut agent = Agent::new(config, boards(), backend.clone()).unwrap();
+        agent.set_clock(|| 1_000);
+        agent.set_power_factory(Box::new(|_| Box::new(crate::power::NoPower)));
+        let agent = agent.with_lister(Arc::new(StubLister(vec![probe])));
+
+        let inventory = agent.discovery_pass().await.expect("the probe is new");
+        let adopted = inventory
+            .boards
+            .iter()
+            .find(|b| b.adopted)
+            .expect("the undeclared probe must be adopted under `auto`");
+        let board = adopted.board.0.clone();
+
+        // Exactly the board the coordinator would have scheduled, leased with
+        // exactly the token it would have minted.
+        let token = signed_token(7, &board, vec![AllowedOp::Attach], 2_000);
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: board_ref(&board),
+                token,
+                channel: ChannelId(1),
+                kind: ChannelKind::Data,
+            })
+            .await
+            .expect("an auto-adopted board must be leasable, not UnknownBoard");
+        assert_eq!(backend.open_count(), 1);
+        assert_eq!(agent.active_session_count().await, 1);
+    }
+
+    /// Under `declared`, the same probe stays unadoptable and the same lease
+    /// fails — which is the policy doing its job, not a bug.
+    #[tokio::test]
+    async fn under_declared_the_same_probe_yields_no_board() {
+        use crate::discovery::StubLister;
+
+        let backend = Arc::new(MockBackend::new());
+        let mut config = agent_config();
+        config.adopt = fleet_proto::AdoptPolicy::Declared;
+        let probe = fleet_proto::DiscoveredProbe {
+            serial: "ZZZ".to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: Some("J-Link".to_owned()),
+            inaccessible: false,
+        };
+        let mut agent = Agent::new(config, boards(), backend).unwrap();
+        agent.set_clock(|| 1_000);
+        let agent = agent.with_lister(Arc::new(StubLister(vec![probe])));
+
+        let inventory = agent.discovery_pass().await.expect("inventory changed");
+        assert!(inventory.boards.iter().all(|b| !b.adopted));
+        assert_eq!(inventory.unknown.len(), 1, "reported, just not leasable");
+
+        let token = signed_token(7, "j-link-zzz", vec![AllowedOp::Attach], 2_000);
+        let err = agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: board_ref("j-link-zzz"),
+                token,
+                channel: ChannelId(1),
+                kind: ChannelKind::Data,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::UnknownBoard(_)));
+    }
+
+    /// Declared wins, and it wins inside `board_spec` rather than by convention
+    /// at each call site. Here the adopted map is deliberately poisoned with an
+    /// entry for a declared board's name; the declaration must still be what
+    /// resolves.
+    #[tokio::test]
+    async fn a_declaration_beats_an_adopted_entry_of_the_same_name() {
+        let agent = make_agent(Arc::new(MockBackend::new()));
+        let mut poisoned = HashMap::new();
+        poisoned.insert(
+            BoardName("b1".to_owned()),
+            BoardSpec {
+                id: "b1".to_owned(),
+                serial: "WRONG".to_owned(),
+                vid: 0,
+                pid: 0,
+                chip: String::new(),
+                tags: vec!["auto".to_owned()],
+                exclusive: true,
+                power: crate::config::PowerSpec::None,
+            },
+        );
+        agent.set_adopted(poisoned).await;
+
+        let spec = agent.board_spec(&BoardName("b1".to_owned())).await.unwrap();
+        assert_eq!(spec.serial, "S1", "boards.toml must win");
+    }
+
+    /// An enumeration hiccup must not empty the inventory: a transient USB or
+    /// `probe-rs` failure taking every board in the fleet offline would be much
+    /// worse than a stale snapshot.
+    #[tokio::test]
+    async fn a_failing_lister_keeps_the_previous_inventory() {
+        use crate::discovery::FailingLister;
+
+        let mut agent = Agent::new(agent_config(), boards(), Arc::new(MockBackend::new())).unwrap();
+        agent.set_clock(|| 1_000);
+        let agent = agent.with_lister(Arc::new(FailingLister));
+        agent.seed_inventory_from_boards().await;
+        let before = agent.current_inventory().await;
+
+        assert!(
+            agent.discovery_pass().await.is_none(),
+            "a failed enumeration must report nothing"
+        );
+        assert_eq!(agent.current_inventory().await, before);
+    }
+
+    /// A second pass over unchanged hardware reports nothing, so a quiet fleet
+    /// stays quiet.
+    #[tokio::test]
+    async fn an_unchanged_pass_reports_nothing() {
+        use crate::discovery::StubLister;
+
+        let probes = vec![fleet_proto::DiscoveredProbe {
+            serial: "S1".to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: Some("J-Link".to_owned()),
+            inaccessible: false,
+        }];
+        let mut agent = Agent::new(agent_config(), boards(), Arc::new(MockBackend::new())).unwrap();
+        agent.set_clock(|| 1_000);
+        let agent = agent.with_lister(Arc::new(StubLister(probes)));
+
+        assert!(agent.discovery_pass().await.is_some(), "the first pass changed it");
+        assert!(agent.discovery_pass().await.is_none(), "nothing changed");
     }
 }

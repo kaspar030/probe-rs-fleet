@@ -1,9 +1,15 @@
 //! Interim admin verbs: `coordinator auth-key` and `coordinator user-token`.
 //!
 //! Both mint a credential directly from a shell on the coordinator host,
-//! bypassing the login flow. Now that `probe-rs-fleet login` exists they are the
-//! **unattended / air-gapped escape hatch**, not the front door, and they stay
-//! marked interim in their help text and in a runtime warning.
+//! bypassing the login flow. Now that `probe-rs-fleet login` and
+//! `probe-rs-fleet share` exist they are the **unattended / air-gapped escape
+//! hatch**, not the front door.
+//!
+//! `auth-key` is joined here by `auth-keys` (list) and `auth-key-revoke`.
+//! Those are not conveniences: auth keys are the weak link in the credential
+//! model — long-lived bearer secrets that end up in strangers' CI config and
+//! disk images — and "revocable" is only true in practice if an operator can
+//! first find out which keys exist.
 //!
 //! # `user-token` and `login` mint different identities
 //!
@@ -89,9 +95,9 @@ fn org_kind(explicit: bool) -> &'static str {
 /// fails.
 pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     warn!(
-        "`coordinator auth-key` is an INTERIM verb: it mints a node-enrollment \
-         credential from a shell on this host. It will become the unattended \
-         escape hatch now that `probe-rs-fleet login` exists."
+        "`coordinator auth-key` mints a node-enrollment credential from a shell \
+         on this host. It is the unattended / air-gapped escape hatch, not the \
+         normal path: a machine with a login uses `probe-rs-fleet share`."
     );
 
     let (db, default_org, _) = open_db(args.config_dir).await?;
@@ -136,10 +142,120 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     }
     println!();
     println!("Enroll a node with it:");
-    println!("  probe-rs-fleet agent init --fleet-url <url> --auth-key <key>");
+    println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
     println!();
     println!("This key is a bearer credential and is not stored anywhere (only its");
     println!("hash). Copy it now; anyone holding it can enroll a node into this org.");
+    Ok(())
+}
+
+/// Run `coordinator auth-keys`: list the org's outstanding auth keys.
+///
+/// The secret was never stored — only its SHA-256 — so a listing is safe to
+/// print and pipe, and the hash prefix is the handle `auth-key-revoke` takes.
+/// Without this an operator has no way to find out what keys exist, which is
+/// what makes "revocable" true in practice rather than only in principle.
+///
+/// # Errors
+///
+/// Returns an error if the config or database cannot be opened.
+pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
+    let (db, default_org, _) = open_db(args.config_dir).await?;
+    let org = args.org.map_or(default_org, OrgId);
+    let keys = db
+        .list_auth_keys(&org)
+        .await
+        .context("listing the org's auth keys")?;
+
+    if keys.is_empty() {
+        println!("No auth keys for org '{org}'.");
+        return Ok(());
+    }
+
+    let now = now();
+    println!("Auth keys for org '{org}' ({} total):", keys.len());
+    println!();
+    println!(
+        "  {:<16}  {:<10}  {:<12}  {:<12}  TAGS",
+        "HASH PREFIX", "SINGLE-USE", "EXPIRES", "STATE"
+    );
+    for key in &keys {
+        let prefix: String = key.key_hash.chars().take(16).collect();
+        let expires = match key.expires {
+            None => "never".to_owned(),
+            Some(e) => e.to_string(),
+        };
+        let state = if key.consumed_at.is_some() {
+            "consumed"
+        } else if key.expires.is_some_and(|e| e <= now) {
+            "expired"
+        } else {
+            "live"
+        };
+        println!(
+            "  {prefix:<16}  {:<10}  {expires:<12}  {state:<12}  {}",
+            key.single_use,
+            key.tags.join(",")
+        );
+    }
+    println!();
+    println!("Revoke one with:");
+    println!("  probe-rs-fleet coordinator auth-key-revoke <hash-prefix> --org {org}");
+    Ok(())
+}
+
+/// Run `coordinator auth-key-revoke`: delete an auth key by hash prefix.
+///
+/// An **ambiguous** prefix is refused rather than resolved to the first match:
+/// a rack provisioned from one image shares nothing, but a rack provisioned
+/// from several might, and revoking the wrong one silently de-provisions
+/// machines nobody is looking at.
+///
+/// # Errors
+///
+/// Returns an error if the config or database cannot be opened, the prefix
+/// matches nothing, or it matches more than one key.
+pub async fn auth_key_revoke(args: crate::cli::AuthKeyRevokeArgs) -> Result<()> {
+    let (db, default_org, _) = open_db(args.config_dir).await?;
+    let org = args.org.map_or(default_org, OrgId);
+    let prefix = args.prefix.trim().to_ascii_lowercase();
+    anyhow::ensure!(!prefix.is_empty(), "a hash prefix is required");
+
+    // Resolve before deleting, so an ambiguous prefix can be refused with the
+    // candidates named rather than after the fact.
+    let keys = db
+        .list_auth_keys(&org)
+        .await
+        .context("listing the org's auth keys")?;
+    let matches: Vec<_> = keys
+        .iter()
+        .filter(|k| k.key_hash.starts_with(&prefix))
+        .collect();
+    match matches.len() {
+        0 => anyhow::bail!("no auth key in org '{org}' has a hash starting with {prefix:?}"),
+        1 => {}
+        n => {
+            let candidates: Vec<String> = matches
+                .iter()
+                .map(|k| k.key_hash.chars().take(16).collect())
+                .collect();
+            anyhow::bail!(
+                "{prefix:?} matches {n} auth keys in org '{org}'; be more specific:\n  {}",
+                candidates.join("\n  ")
+            );
+        }
+    }
+
+    let deleted = db
+        .delete_auth_keys_by_prefix(&org, &prefix)
+        .await
+        .context("revoking the auth key")?;
+    for hash in &deleted {
+        println!("Revoked auth key {hash} (org '{org}').");
+    }
+    println!();
+    println!("Nodes already enrolled with it keep working: their node tokens are");
+    println!("separate credentials. Revoke a node by deleting its row.");
     Ok(())
 }
 

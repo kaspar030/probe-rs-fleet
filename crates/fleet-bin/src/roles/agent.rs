@@ -25,6 +25,7 @@ use fleet_agent::agent::Agent;
 use fleet_agent::config::{AgentConfig, BoardsConfig, NodeTokenStore};
 use fleet_agent::connection;
 use fleet_agent::probers::ProcessBackend;
+use fleet_proto::AdoptPolicy;
 
 use crate::cli::AgentArgs;
 use crate::fleet_config;
@@ -42,6 +43,23 @@ pub struct NodeSettings {
     /// Heartbeat interval, seconds.
     #[serde(default)]
     pub heartbeat_secs: Option<u64>,
+    /// How often (seconds) to re-enumerate attached probes.
+    ///
+    /// Each pass shells out to `probe-rs list`, so it is not free.
+    #[serde(default)]
+    pub discovery_secs: Option<u64>,
+    /// What this node does with a probe `boards.toml` does not declare.
+    ///
+    /// **Advisory.** The coordinator's `node` row is authoritative for
+    /// enforcement; this only governs whether the agent synthesises board
+    /// metadata for undeclared probes at all. Editing it here does not change
+    /// what the coordinator will adopt — re-run `share` / `agent up --adopt …`.
+    ///
+    /// Absent means `declared`, the conservative policy: a node whose settings
+    /// file predates this key must not silently start offering probes nobody
+    /// declared.
+    #[serde(default)]
+    pub adopt: Option<AdoptPolicy>,
     /// Whether to erase the target's flash on lease release.
     #[serde(default)]
     pub erase_on_release: bool,
@@ -144,6 +162,10 @@ fn assemble_agent_config(
         heartbeat_secs: settings
             .heartbeat_secs
             .unwrap_or_else(fleet_agent::config::default_heartbeat_secs),
+        discovery_secs: settings
+            .discovery_secs
+            .unwrap_or_else(fleet_agent::config::default_discovery_secs),
+        adopt: settings.adopt.unwrap_or_default(),
         erase_on_release: settings.erase_on_release,
     }
 }
@@ -163,17 +185,20 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     };
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
-            "loading fleet config {} — enroll this node with \
-             `probe-rs-fleet agent init --fleet {} --fleet-url <url> --auth-key <key>`",
+            "loading fleet config {} — register this node with \
+             `probe-rs-fleet agent up --fleet {}` (after `login`), or \
+             `probe-rs-fleet agent up --fleet {} --fleet-url <url> --auth-key <key>`",
             fleet_path.display(),
+            args.fleet,
             args.fleet
         )
     })?;
     let node = file.node.clone().with_context(|| {
         format!(
             "fleet `{}` has no [node] credential on this machine; run \
-             `probe-rs-fleet agent init --fleet {} --fleet-url <url> --auth-key <key>`",
-            args.fleet, args.fleet
+             `probe-rs-fleet share --fleet {}` (if you have logged in), or \
+             `probe-rs-fleet agent up --fleet {} --fleet-url <url> --auth-key <key>`",
+            args.fleet, args.fleet, args.fleet
         )
     })?;
 
@@ -200,6 +225,8 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         coordinator = %agent_config.fleet_url,
         fleet = %args.fleet,
         boards = boards.boards.len(),
+        adopt = %agent_config.adopt,
+        discovery_secs = agent_config.discovery_secs,
         "starting agent"
     );
 
@@ -212,12 +239,16 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     let agent =
         Arc::new(Agent::new(agent_config.clone(), boards, backend).context("constructing agent")?);
 
-    // Seed the agent's inventory from `boards.toml` so the boards are advertised
-    // to the coordinator on registration and become leasable. (A concrete probe
-    // enumerator can later refine presence via `Agent::set_inventory`.) The
-    // serve-config's canonical `vid:pid:serial` allow entry does NOT depend on
-    // this: `ProcessBackend` resolves each board's USB vid/pid from a live
-    // `probe-rs list` enumeration at session-open time (see
+    // Seed the agent's inventory from `boards.toml` so declared boards are
+    // advertised on registration even before the first discovery pass (a node
+    // whose probes are all attached behaves identically to before). The
+    // connection loop then refines it every `discovery_secs` from a live
+    // `probe-rs list`, which is what makes "plug in a board and it becomes
+    // leasable" possible under `adopt = "auto"`.
+    //
+    // The serve-config's canonical `vid:pid:serial` allow entry does NOT depend
+    // on either: `ProcessBackend` resolves each board's USB vid/pid from a
+    // fresh enumeration at session-open time (see
     // `ProcessBackend::serve_spec`).
     agent.seed_inventory_from_boards().await;
 

@@ -9,8 +9,9 @@
 #
 # You do not normally write this file by hand. It is managed by:
 #   probe-rs-fleet login       → writes [user]
-#   probe-rs-fleet agent init  → writes [node]
-# Both preserve the other's table.
+#   probe-rs-fleet share       → writes [node], using the login you already have
+#   probe-rs-fleet agent up    → writes [node] (session, or --auth-key)
+# All of them preserve the other's table.
 #
 # ---------------------------------------------------------------------------
 # THIS FILE HOLDS BEARER CREDENTIALS. It is written 0600.
@@ -85,7 +86,7 @@ expires = 1788600000
 
 
 # ---------------------------------------------------------------------------
-# [node] — written by `probe-rs-fleet agent init`, refreshed by the agent
+# [node] — written by `probe-rs-fleet share` / `agent up`, refreshed by the agent
 # ---------------------------------------------------------------------------
 #
 # Present only if this machine offers probes to the fleet. Node-local settings

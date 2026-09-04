@@ -298,6 +298,7 @@ probe-rs-fleet ctl list
 probe-rs-fleet ctl lease --select 'tag=nrf52'
 
 # 5. A headless Pi in the lab: prints a URL + code; approve it in your browser.
+#    (NOT YET IMPLEMENTED — task 3451. Use 5b until then.)
 probe-rs-fleet agent up --fleet-url https://fleet.example.com
 
 # 5b. …or, for an unattended image, a pre-minted auth key:
@@ -421,6 +422,25 @@ It obtains a node token by whichever of these applies, in order:
 4. **An auth key** (`--auth-key`) — org-scoped, expiring, optionally
    single-use, carrying default tags. This is the unattended/image path.
 
+> **Implementation status (task 3448).** Rungs 1, 2 and 4 ship; **rung 3 is
+> deferred to task 3451**. The coordinator has no browser-authenticated
+> surface — `login` is the GitHub *device* flow, which by design has no
+> `redirect_uri` and no cookie session (§6.4) — so an approval page cannot yet
+> know who is looking at it, and building one means an OAuth redirect flow plus
+> cookies, which contradicts §6.4 and reopens §10 Q6. Until 3451 lands, a
+> headless machine with no credential uses `--auth-key`, and `agent up` says so
+> rather than failing silently.
+>
+> One **deliberate deviation** from the order above: an explicit `--auth-key`
+> beats an existing `[user]` session. Passing it is a deliberate act — a
+> provisioning script run on a developer's own laptop should enroll the node it
+> was told to, not the one the laptop's owner implies. An existing `[node]`
+> credential still wins over everything, and is reused rather than replaced.
+>
+> `share` is `agent up`'s rung 2 as a standalone verb, and does **not** start
+> the agent: it writes the credential and the node-local settings, and its
+> summary points at `probe-rs-fleet agent`.
+
 The node token is long-lived but **rotating**: the coordinator can issue a
 replacement over the established connection, so a leaked token has bounded
 value and revocation is a `DELETE` in the `node` table rather than a CRL.
@@ -430,14 +450,42 @@ every probe wait for a `boards.toml` declaration, which is right for a lab and
 pure friction for a laptop:
 
 - `adopt = "auto"` (default for nodes created by `share`): discovered probes are
-  adopted into the owning org automatically, with tags inferred from probe and
-  chip. Plug in a board, it is usable.
+  adopted into the owning org automatically, with tags inferred from the probe.
+  Plug in a board, it is usable.
 - `adopt = "declared"` (default for auth-key / lab nodes): unknown probes are
   reported but not leasable until declared, so CI gets stable ids and no
   surprises.
 
 `boards.toml` therefore becomes **annotation and override** — stable ids, power
 wiring, curated tags — rather than admission control.
+
+**Where the policy lives, and which copy wins.** It is recorded in two places
+and they are not equals. The **coordinator's `node` row is authoritative**: it
+is the enforcement point, and an adopted board reported by a node whose row says
+`declared` is dropped. The node's own `node.toml` copy is *advisory* — it
+governs only whether the agent bothers to synthesise board metadata for
+undeclared probes at all. Editing it locally therefore does not change what the
+coordinator will adopt; re-running `share` / `agent up --adopt …` does. (Having
+the coordinator push the policy down the established connection, as it does for
+node tokens, is an obvious follow-up and deliberately not built here.)
+
+**What an adopted board looks like.** Its id is derived from the probe alone
+(`{product-slug}-{serial}`, or `probe-{vid}{pid}-{serial}` where the probe
+reports no product), so it survives a restart and a reordered `probe-rs list` —
+a lease selector names that id. Its tags are the probe type plus a literal
+`auto`. Its `chip` is **empty**, because `probe-rs list` reports the probe and
+not the target attached to it; the honest consequence is that `ctl lease
+--select 'chip=…'` will not match an adopted board until `boards.toml`
+annotates it. Two probes are never adopted: one that is `inaccessible` (the
+lease would fail at `probe-rs serve` spawn time) and one reporting no serial
+(which can be neither stably named nor fenced with `ProbeAccess::Allow`).
+
+**Live discovery.** None of this means anything without a node that
+re-enumerates: the agent runs a discovery pass every `discovery_secs` (default
+30) and reports a new inventory **only when it changed**, so a quiet fleet stays
+quiet. An enumeration failure keeps the previous inventory and does not drop the
+connection — a transient USB or `probe-rs` hiccup taking every board offline
+would be far worse than a stale snapshot.
 
 
 ### 4.3 `sidecar` (workstation / CI)
@@ -610,7 +658,7 @@ is no rate limiting in the coordinator yet):
 |---|---|---|
 | **User** (laptop) | `login` — GitHub device flow | browser, once |
 | **Node, user present** | `share` — reuses the session to self-register | zero extra steps |
-| **Node, headless** | `agent up` prints URL + code; approve in a browser | no token copy-paste |
+| **Node, headless** | `agent up` prints URL + code; approve in a browser (task 3451) | no token copy-paste |
 | **Node, unattended** | pre-minted **auth key** (org-scoped, expiring, tagged) | one paste, revocable |
 | **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token` | zero secrets |
 | **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
@@ -647,7 +695,10 @@ enrollments producing two unrelated identities (`alice` as a client CN,
   survives reboots; the session token is human-scoped and short-lived. Merging
   them would make a compromised Pi equivalent to a compromised you.
 - **One command:** `probe-rs-fleet share` — "this machine now offers its probes
-  to the fleet", using the login you already have.
+  to the fleet", using the login you already have. Self-approving: membership in
+  the org the session authenticated into is sufficient, and is *checked* (a
+  non-member is a 403 — `authz::require_role` denies one everywhere else, so a
+  node created for one would be an orphan its owner could never use).
 
 ### 6.5 Authorization (new)
 
@@ -776,7 +827,13 @@ org with inferred tags; `adopt = "declared"` (default for auth-key / lab nodes)
 reports them but keeps them unleasable until declared here. Under `auto`, this
 file is annotation and override — stable ids, power wiring, curated tags —
 rather than admission control. `id` is unique **within its node**, not globally
-(§6.1).
+(§6.1); auto-adoption is exactly the case where a global id space breaks, since
+two laptops can each plug in an nRF52840-DK.
+
+A declaration always beats an adoption for the same probe, and the agent
+enforces that in one place (its board lookup consults `boards.toml` first), so
+it is a structural property rather than a convention every call site has to
+remember.
 
 ## 9. Crate layout (proposed)
 

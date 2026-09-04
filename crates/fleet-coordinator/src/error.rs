@@ -65,6 +65,15 @@ pub enum CoordinatorError {
     /// A configuration value was invalid.
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// A persisted value is not one this build understands.
+    ///
+    /// Distinct from [`CoordinatorError::Db`]: the query succeeded, the *data*
+    /// is unrecognised. Kept loud rather than defaulted, because the one thing
+    /// stored here — a node's `adopt_policy` — decides whether an undeclared
+    /// probe is adopted, and guessing would adopt probes nobody shared.
+    #[error("invalid persisted state: {0}")]
+    State(String),
 }
 
 impl CoordinatorError {

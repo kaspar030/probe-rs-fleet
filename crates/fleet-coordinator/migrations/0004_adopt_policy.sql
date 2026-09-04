@@ -1,0 +1,22 @@
+-- Per-node probe adoption policy (architecture §4.2, §8): retire the schema
+-- placeholder `'manual'`.
+--
+-- `0001_init.sql` created `node.adopt_policy TEXT NOT NULL DEFAULT 'manual'` as
+-- a placeholder, before this task decided what the values would be. The policy
+-- is now `auto` | `declared` (`fleet_proto::AdoptPolicy`), and that parse is
+-- deliberately **strict** — an unrecognised value fails loudly rather than
+-- silently resolving to a policy the operator did not choose. So the leftover
+-- `'manual'` rows have to go.
+--
+-- `declared` is the right landing place for them: it is the conservative
+-- policy (an undeclared probe stays unleasable), and every node that existed
+-- before this migration was enrolled with an auth key, whose default is
+-- `declared` anyway.
+--
+-- Note what this file deliberately does NOT do: change the column default.
+-- SQLite has no `ALTER COLUMN`, so that would mean the 12-step table-rebuild
+-- dance for a column nothing should be defaulting. Instead every writer names
+-- the value explicitly — see `OrgDb::ensure_node`, which inserts `'declared'`
+-- and, crucially, does not touch `adopt_policy` on conflict (it runs on every
+-- inventory report and must never reset a policy `share` set).
+UPDATE node SET adopt_policy = 'declared' WHERE adopt_policy NOT IN ('auto', 'declared');

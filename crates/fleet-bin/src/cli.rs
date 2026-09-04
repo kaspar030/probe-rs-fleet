@@ -48,6 +48,9 @@ pub enum Command {
     /// Log in to a fleet with GitHub, caching a session token for `ctl` and the
     /// `probe-rs` sidecar shim.
     Login(LoginArgs),
+    /// Offer this machine's probes to the fleet, using the login you already
+    /// have. No token, no coordinator shell.
+    Share(ShareArgs),
     /// List the fleets this machine has a config for.
     Fleets,
 }
@@ -113,6 +116,10 @@ pub enum CoordinatorCommand {
     Init(InitArgs),
     /// Mint an org-scoped auth key for unattended node enrollment.
     AuthKey(AuthKeyArgs),
+    /// List this org's auth keys (by hash prefix — the secrets are not stored).
+    AuthKeys(AuthKeysArgs),
+    /// Revoke an auth key by hash prefix.
+    AuthKeyRevoke(AuthKeyRevokeArgs),
     /// Mint a user session token directly (INTERIM).
     UserToken(UserTokenArgs),
 }
@@ -141,12 +148,17 @@ pub struct InitArgs {
 
 /// Arguments for `coordinator auth-key`.
 ///
-/// **Interim.** Once the GitHub device flow lands (a later task), an operator
-/// will normally get a node enrolled through `fleet login` + `agent init`
-/// instead; this verb remains as the unattended / air-gapped escape hatch.
+/// The **unattended / air-gapped escape hatch**, not the front door: a laptop
+/// with a login runs `probe-rs-fleet share` and a headless node runs
+/// `agent up`, neither of which needs a key.
 ///
-/// The key is a pure bearer credential: anyone holding it can enroll a node into
-/// the named org until it expires or is used. It is printed once.
+/// Auth keys are the weak link in the model — long-lived credentials that end
+/// up in strangers' CI config and disk images — so they are org-scoped, TTL'd,
+/// revocable (`auth-key-revoke`) and listable (`auth-keys`). Do not make them
+/// the default anyone reaches for.
+///
+/// The key is a pure bearer credential: anyone holding it can enroll a node
+/// into the named org until it expires or is used. It is printed once.
 #[derive(Debug, Args)]
 pub struct AuthKeyArgs {
     /// Org the enrolled nodes join. Defaults to the coordinator's
@@ -217,6 +229,90 @@ impl From<RoleArg> for fleet_proto::ids::Role {
     }
 }
 
+/// Arguments for `coordinator auth-keys` (list).
+///
+/// The secret was never stored — only its SHA-256 — so a listing is safe to
+/// print and pipe. It is also the only way to find out what keys exist: an
+/// operator who has lost track of which images carry which key can see what is
+/// outstanding, and revoke.
+#[derive(Debug, Args)]
+pub struct AuthKeysArgs {
+    /// Org whose keys to list. Defaults to the coordinator's `default_org`.
+    #[arg(long)]
+    pub org: Option<String>,
+    /// Override the config directory (default: XDG config dir). Used to locate
+    /// `coordinator.toml`.
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `coordinator auth-key-revoke`.
+#[derive(Debug, Args)]
+pub struct AuthKeyRevokeArgs {
+    /// Hash prefix of the key to revoke, from `coordinator auth-keys`.
+    ///
+    /// An **ambiguous** prefix is refused rather than resolved: revoking the
+    /// wrong key of a rack's worth silently de-provisions machines nobody is
+    /// looking at.
+    pub prefix: String,
+    /// Org the key belongs to. Defaults to the coordinator's `default_org`.
+    #[arg(long)]
+    pub org: Option<String>,
+    /// Override the config directory (default: XDG config dir). Used to locate
+    /// `coordinator.toml`.
+    #[arg(long)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet share`.
+///
+/// "This machine now offers its probes to the fleet", using the login you
+/// already have (architecture §6.4). No token, no coordinator shell, no
+/// out-of-band step: the `[user]` session in the fleet file proves membership,
+/// and membership is sufficient — there is no admin approval step.
+#[derive(Debug, Args)]
+pub struct ShareArgs {
+    /// The fleet to share this machine with.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// This node's name within its org. Defaults to the machine's hostname.
+    ///
+    /// Advisory: it names the row, it does not grant anything.
+    #[arg(long)]
+    pub node_name: Option<String>,
+    /// Selection tag to report for this node (repeatable).
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Probe adoption policy for this node. Defaults to `auto` for `share`.
+    #[arg(long, value_enum)]
+    pub adopt: Option<AdoptArg>,
+    /// Overwrite an existing `[node]` credential instead of refusing.
+    #[arg(long)]
+    pub force: bool,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// A probe adoption policy, for the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum AdoptArg {
+    /// Adopt discovered probes automatically, tags inferred from the probe.
+    Auto,
+    /// Report undeclared probes but keep them unleasable until declared.
+    Declared,
+}
+
+impl From<AdoptArg> for fleet_proto::AdoptPolicy {
+    fn from(a: AdoptArg) -> Self {
+        match a {
+            AdoptArg::Auto => fleet_proto::AdoptPolicy::Auto,
+            AdoptArg::Declared => fleet_proto::AdoptPolicy::Declared,
+        }
+    }
+}
+
 /// Arguments for the `agent` role.
 #[derive(Debug, Args)]
 pub struct AgentArgs {
@@ -231,7 +327,7 @@ pub struct AgentArgs {
     /// packaging support.
     #[arg(long, hide = true, global = true)]
     pub config_dir: Option<std::path::PathBuf>,
-    /// Optional nested subcommand (e.g. `init`). When absent, the agent runs.
+    /// Optional nested subcommand (e.g. `up`). When absent, the agent runs.
     #[command(subcommand)]
     pub command: Option<AgentCommand>,
 }
@@ -239,21 +335,28 @@ pub struct AgentArgs {
 /// `agent` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
-    /// Redeem an auth key for a node token, write it into the fleet file's
-    /// `[node]` table, and scaffold `node/node.toml` + `node/boards.toml`.
-    Init(AgentInitArgs),
+    /// Register this machine as a node if it is not one yet, then run the
+    /// agent.
+    Up(AgentUpArgs),
 }
 
-/// Arguments for `agent init`.
+/// Arguments for `agent up`.
+///
+/// `agent up` resolves a node credential by the §4.2 ladder and then **runs**
+/// the agent. Plain `probe-rs-fleet agent` is the subset that requires an
+/// existing `[node]` credential.
 #[derive(Debug, Args)]
-pub struct AgentInitArgs {
+pub struct AgentUpArgs {
     /// Base URL of the coordinator (`https://fleet.example`). A bare
     /// `host:port` is accepted and assumes https.
+    ///
+    /// Required only when bootstrapping with `--auth-key`; otherwise the fleet
+    /// file already knows where the coordinator is.
     #[arg(long)]
-    pub fleet_url: String,
-    /// The auth key printed by `coordinator auth-key`.
+    pub fleet_url: Option<String>,
+    /// An auth key from `coordinator auth-key` (the unattended/image path).
     #[arg(long)]
-    pub auth_key: String,
+    pub auth_key: Option<String>,
     /// This node's name within its org. Defaults to the machine's hostname.
     ///
     /// Advisory: it names the row, it does not grant anything. The coordinator
@@ -263,13 +366,20 @@ pub struct AgentInitArgs {
     /// Selection tag to report for this node (repeatable).
     #[arg(long)]
     pub tag: Vec<String>,
+    /// Probe adoption policy for this node.
+    ///
+    /// Defaults to `declared` when bootstrapping with `--auth-key` (a lab node
+    /// wants stable ids and no surprises) and `auto` when bootstrapping from an
+    /// existing `[user]` session (the `share` path).
+    #[arg(long, value_enum)]
+    pub adopt: Option<AdoptArg>,
     /// Pin the coordinator's server certificate by its SHA-256 (64 hex chars).
     ///
     /// For a self-hosted coordinator with no publicly trusted certificate.
     /// Without it the coordinator is verified against the public web PKI roots.
     #[arg(long)]
     pub server_cert_sha256: Option<String>,
-    /// Overwrite an existing `[node]` credential instead of refusing.
+    /// Overwrite an existing `[node]` credential instead of reusing it.
     #[arg(long)]
     pub force: bool,
 }
@@ -446,6 +556,14 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         roles::admin::auth_key(args).await?;
                         Ok(ExitCode::SUCCESS)
                     }
+                    Some(CoordinatorCommand::AuthKeys(args)) => {
+                        roles::admin::auth_keys(args).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    Some(CoordinatorCommand::AuthKeyRevoke(args)) => {
+                        roles::admin::auth_key_revoke(args).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
                     Some(CoordinatorCommand::UserToken(args)) => {
                         roles::admin::user_token(args).await?;
                         Ok(ExitCode::SUCCESS)
@@ -456,8 +574,8 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     }
                 },
                 Command::Agent(args) => match args.command {
-                    Some(AgentCommand::Init(init)) => {
-                        roles::agent_init::run(init, &args.fleet, args.config_dir).await?;
+                    Some(AgentCommand::Up(up)) => {
+                        roles::agent_up::run(up, &args.fleet, args.config_dir).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                     None => {
@@ -474,6 +592,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 }
                 Command::Login(args) => {
                     roles::login::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Share(args) => {
+                    roles::share::run(args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::Fleets => {
@@ -697,13 +819,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_init() {
+    fn parses_agent_up() {
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
             "agent",
             "--fleet",
             "lab1",
-            "init",
+            "up",
             "--fleet-url",
             "https://fleet.example",
             "--auth-key",
@@ -713,15 +835,95 @@ mod tests {
             Command::Agent(a) => {
                 assert_eq!(a.fleet, "lab1");
                 match a.command {
-                    Some(AgentCommand::Init(init)) => {
-                        assert_eq!(init.fleet_url, "https://fleet.example");
-                        assert_eq!(init.auth_key, "prffk1_abc");
-                        assert!(init.node_name.is_none());
+                    Some(AgentCommand::Up(up)) => {
+                        assert_eq!(up.fleet_url.as_deref(), Some("https://fleet.example"));
+                        assert_eq!(up.auth_key.as_deref(), Some("prffk1_abc"));
+                        assert!(up.node_name.is_none());
+                        assert!(up.adopt.is_none());
                     }
-                    other => panic!("expected agent init, got {other:?}"),
+                    other => panic!("expected agent up, got {other:?}"),
                 }
             }
             other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    /// The whole point of `agent up`: on a machine that has already logged in,
+    /// it needs no flags at all. Both `--auth-key` and `--fleet-url` are
+    /// optional, which is what makes paths 1 and 2 of the §4.2 ladder reachable
+    /// without the operator knowing they exist.
+    #[test]
+    fn agent_up_needs_no_flags() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "up"]));
+        match cli.command {
+            Command::Agent(a) => match a.command {
+                Some(AgentCommand::Up(up)) => {
+                    assert!(up.auth_key.is_none());
+                    assert!(up.fleet_url.is_none());
+                }
+                other => panic!("expected agent up, got {other:?}"),
+            },
+            other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    /// `share` is the story-2 payoff: one word, no flags.
+    #[test]
+    fn parses_share_with_no_flags() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "share"]));
+        match cli.command {
+            Command::Share(s) => {
+                assert_eq!(s.fleet, "default");
+                assert!(s.node_name.is_none());
+                assert!(s.adopt.is_none());
+                assert!(!s.force);
+            }
+            other => panic!("expected share, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_share_with_an_explicit_adopt_policy() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "share",
+            "--adopt",
+            "declared",
+            "--tag",
+            "nrf52",
+        ]));
+        match cli.command {
+            Command::Share(s) => {
+                assert_eq!(s.adopt, Some(AdoptArg::Declared));
+                assert_eq!(s.tag, vec!["nrf52".to_owned()]);
+            }
+            other => panic!("expected share, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_auth_key_list_and_revoke() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "auth-keys"]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::AuthKeys(k)) => assert!(k.org.is_none()),
+                other => panic!("expected auth-keys, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "coordinator",
+            "auth-key-revoke",
+            "deadbeef",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::AuthKeyRevoke(r)) => assert_eq!(r.prefix, "deadbeef"),
+                other => panic!("expected auth-key-revoke, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
         }
     }
 

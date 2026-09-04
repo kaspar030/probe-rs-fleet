@@ -12,7 +12,7 @@
 //! session_token = "prfs1_…"
 //! org = "gh-4242"
 //!
-//! [node]                # written by `probe-rs-fleet agent init`
+//! [node]                # written by `probe-rs-fleet share` / `agent up`
 //! node_token = "prfn1_…"
 //! node_id = "gh-4242/rpi-lab-1"
 //! coordinator_token_pubkey = "<64 hex>"
@@ -86,7 +86,7 @@ pub struct UserSection {
     pub expires: Option<u64>,
 }
 
-/// The `[node]` table, written by `probe-rs-fleet agent init` and refreshed by
+/// The `[node]` table, written by `probe-rs-fleet share` / `agent up` and refreshed by
 /// the running agent when the coordinator rotates its token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSection {
@@ -119,7 +119,8 @@ const HEADER: &str = r"# probe-rs-fleet — per-fleet configuration
 # The two tokens are deliberately distinct: merging them would make a
 # compromised node equivalent to a compromised user account.
 #
-# Managed by `probe-rs-fleet login` ([user]) and `agent init` ([node]). Both
+# Managed by `probe-rs-fleet login` ([user]) and `share` / `agent up` ([node]).
+# Both
 # preserve the other's table, so a laptop can hold both.
 ";
 

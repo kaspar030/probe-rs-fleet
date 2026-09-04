@@ -3,13 +3,28 @@
 //! The agent enumerates locally attached probes and reconciles them against the
 //! declared boards: matched serials become leasable boards, declared-but-absent
 //! boards are reported offline, and probes that are present but undeclared are
-//! reported as `unknown` (not leasable) — see architecture §8.
+//! reported as `unknown`.
+//!
+//! What happens to those `unknown` probes is the node's **adoption policy**
+//! ([`AdoptPolicy`], architecture §4.2 / §8):
+//!
+//! * [`AdoptPolicy::Declared`] — nothing. They are reported (so the condition
+//!   is diagnosable) and stay unleasable until `boards.toml` declares them.
+//! * [`AdoptPolicy::Auto`] — [`adopt_unknown`] synthesises a board for each,
+//!   with a stable derived id and inferred tags, so plugging in a probe makes
+//!   it usable with no further steps.
+//!
+//! A `boards.toml` declaration always wins: [`adopt_unknown`] only ever sees
+//! probes [`reconcile`] put in `unknown`, which is by definition the set no
+//! declaration matched.
 
 use async_trait::async_trait;
 
-use fleet_proto::{BoardName, BoardPresence, BoardStatus, DiscoveredProbe, ProbeInventory};
+use fleet_proto::{
+    AdoptPolicy, BoardName, BoardPresence, BoardStatus, DiscoveredProbe, ProbeInventory,
+};
 
-use crate::config::BoardsConfig;
+use crate::config::{BoardSpec, BoardsConfig, PowerSpec};
 
 /// Enumerates probes physically attached to the agent host.
 ///
@@ -81,6 +96,7 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
             tags: board.tags.clone(),
             exclusive: board.exclusive,
             power: board.power.to_power_kind(),
+            adopted: false,
         });
     }
 
@@ -96,6 +112,168 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
         boards: board_statuses,
         unknown,
     }
+}
+
+/// The [`BoardSpec`] an undeclared probe becomes under [`AdoptPolicy::Auto`].
+///
+/// `None` when the probe cannot be adopted:
+///
+/// * it is `inaccessible` — `probe-rs` cannot open it, so advertising it would
+///   only produce leases that fail at `probe-rs serve` spawn time (the same
+///   reasoning [`reconcile`] applies to declared boards);
+/// * it reports **no serial** — without one the board can be neither stably
+///   named across restarts nor fenced with `ProbeAccess::Allow`, and a lease
+///   selector that stops working after a reboot is worse than no board.
+///
+/// # The derived id must be stable
+///
+/// A lease selector names this id, so it is derived purely from the probe's own
+/// identity — never from enumeration order, which `probe-rs list` does not
+/// promise to keep.
+///
+/// # What is deliberately absent
+///
+/// * `chip` is **empty**. `probe-rs list` reports the *probe*, not the target
+///   attached to it, so the agent genuinely cannot know. `chip` is documented
+///   as informational (the caller passes `--chip` in-band), so an empty string
+///   is honest. The visible consequence: `ctl lease --select 'chip=…'` will not
+///   match an auto-adopted board until `boards.toml` annotates it. That is the
+///   `boards.toml`-as-annotation story (§8), not a defect.
+/// * `power` is [`PowerSpec::None`] — nobody declared this board, so nothing is
+///   wired up to cut its power.
+/// * `vid`/`pid` stay `0`. [`ProcessBackend::serve_spec`] re-enumerates at
+///   spawn time and matches **by serial**, so a synthesised spec is enriched by
+///   exactly the same path as a declared one (and already refuses to emit an
+///   unmatchable `0000:0000:<serial>`). Nothing needs plumbing through the
+///   wire.
+///
+/// [`ProcessBackend::serve_spec`]: crate::probers::ProcessBackend::serve_spec
+#[must_use]
+pub fn adopted_board_spec(probe: &DiscoveredProbe) -> Option<BoardSpec> {
+    if probe.inaccessible || probe.serial.trim().is_empty() {
+        return None;
+    }
+    Some(BoardSpec {
+        id: adopted_board_id(probe),
+        serial: probe.serial.clone(),
+        vid: 0,
+        pid: 0,
+        chip: String::new(),
+        tags: inferred_tags(probe),
+        exclusive: true,
+        power: PowerSpec::None,
+    })
+}
+
+/// A stable, node-local, filesystem-safe board id for an undeclared probe.
+///
+/// `{product-slug}-{serial}` where the probe reports a product string,
+/// `probe-{vid:04x}{pid:04x}-{serial}` where it does not. Both are functions of
+/// the probe alone, so two discovery passes over the same hardware — in any
+/// order, across a restart — produce the same id.
+fn adopted_board_id(probe: &DiscoveredProbe) -> String {
+    let serial = slugify(&probe.serial);
+    match probe.product.as_deref().map(slugify) {
+        Some(product) if !product.is_empty() => format!("{product}-{serial}"),
+        _ => format!("probe-{:04x}{:04x}-{serial}", probe.vid, probe.pid),
+    }
+}
+
+/// Selection tags inferred for an adopted board.
+///
+/// The probe-type slug plus a literal `auto`, so `ctl list` shows at a glance
+/// which boards were adopted rather than declared. The spec asks for "tags
+/// inferred from probe/chip"; the chip is unknowable here (see
+/// [`adopted_board_spec`]), so the probe is all there is.
+fn inferred_tags(probe: &DiscoveredProbe) -> Vec<String> {
+    let mut tags = vec!["auto".to_owned()];
+    if let Some(product) = probe.product.as_deref().map(slugify) {
+        if !product.is_empty() && product != "auto" {
+            tags.push(product);
+        }
+    }
+    tags
+}
+
+/// Lowercase a string and collapse everything that is not `[a-z0-9]` into a
+/// single `-`, trimming leading/trailing separators.
+///
+/// Board ids end up in file paths (the agent's per-board runtime directory) and
+/// in selectors, so a probe reporting `"J-Link (v1.0)"` must not produce
+/// something that needs quoting.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_owned()
+}
+
+/// The [`BoardStatus`] an adopted board is reported as.
+///
+/// Derived *from* the [`BoardSpec`], never in parallel with it: if the id in
+/// the report and the id [`Agent::board_spec`] resolves could drift apart, the
+/// coordinator would happily lease a board the agent then fails to find, with
+/// no error anywhere until the last hop.
+///
+/// [`Agent::board_spec`]: crate::agent::Agent
+#[must_use]
+pub fn adopted_board_status(spec: &BoardSpec) -> BoardStatus {
+    BoardStatus {
+        board: spec.board_id(),
+        serial: spec.serial.clone(),
+        presence: BoardPresence::Online,
+        chip: spec.chip.clone(),
+        tags: spec.tags.clone(),
+        exclusive: spec.exclusive,
+        power: spec.power.to_power_kind(),
+        adopted: true,
+    }
+}
+
+/// Apply [`AdoptPolicy::Auto`] to a reconciled inventory: turn every adoptable
+/// `unknown` probe into an online board.
+///
+/// Returns the synthesised specs by board name, for
+/// [`Agent::set_adopted`](crate::agent::Agent::set_adopted) — the *same*
+/// derivation that produced the reported statuses, which is what keeps the two
+/// from drifting.
+///
+/// The adopted probes stay in `inventory.unknown` as well: they are still
+/// probes nobody declared, and an operator writing `boards.toml` wants to see
+/// them there.
+///
+/// Under [`AdoptPolicy::Declared`] this is a no-op, returning an empty map — so
+/// a caller can apply the policy unconditionally rather than branching.
+pub fn adopt_unknown(
+    inventory: &mut ProbeInventory,
+    policy: AdoptPolicy,
+) -> std::collections::HashMap<BoardName, BoardSpec> {
+    let mut adopted = std::collections::HashMap::new();
+    if policy != AdoptPolicy::Auto {
+        return adopted;
+    }
+    for probe in &inventory.unknown {
+        let Some(spec) = adopted_board_spec(probe) else {
+            if !probe.inaccessible {
+                tracing::warn!(
+                    vid = probe.vid,
+                    pid = probe.pid,
+                    "a probe reporting no serial cannot be adopted (it can be neither \
+                     stably named nor fenced to one probe); declare it in boards.toml \
+                     if you need it"
+                );
+            }
+            continue;
+        };
+        inventory.boards.push(adopted_board_status(&spec));
+        adopted.insert(spec.board_id(), spec);
+    }
+    adopted
 }
 
 /// Stamp each declared board with the USB `vid`/`pid` of its physically present
@@ -233,12 +411,45 @@ impl ProbeLister for ProbeRsListLister {
 }
 
 /// Whether `board` is leasable given an inventory snapshot (present + declared).
+///
+/// Keys off `inventory.boards`, so an **adopted** board is leasable here for
+/// free once [`adopt_unknown`] has put it there — there is nothing extra to do.
 #[must_use]
 pub fn is_leasable(inventory: &ProbeInventory, board: &BoardName) -> bool {
     inventory
         .boards
         .iter()
         .any(|b| &b.board == board && b.presence == BoardPresence::Online)
+}
+
+/// A stub [`ProbeLister`] returning a fixed probe set: no hardware and no
+/// `probe-rs` binary needed.
+///
+/// Lives here beside the trait it implements (rather than in one test module)
+/// because three test modules need it — `discovery`, `probers` (the spawn-time
+/// vid/pid resolution path) and `connection` (the discovery tick).
+#[cfg(test)]
+pub(crate) struct StubLister(pub Vec<DiscoveredProbe>);
+
+#[cfg(test)]
+#[async_trait]
+impl ProbeLister for StubLister {
+    async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A [`ProbeLister`] that always fails, for the "an enumeration hiccup must not
+/// drop the connection or the inventory" path.
+#[cfg(test)]
+pub(crate) struct FailingLister;
+
+#[cfg(test)]
+#[async_trait]
+impl ProbeLister for FailingLister {
+    async fn list_probes(&self) -> Result<Vec<DiscoveredProbe>, String> {
+        Err("usb is having a moment".to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -412,5 +623,148 @@ chip = "c2"
         assert!(parse_probe_list_line("").is_none());
         // Has " -- " but no hex vid:pid.
         assert!(parse_probe_list_line("weird -- not:hex:stuff").is_none());
+    }
+
+    // ---- adoption ----------------------------------------------------------
+
+    fn named_probe(serial: &str, product: Option<&str>) -> DiscoveredProbe {
+        DiscoveredProbe {
+            serial: serial.to_owned(),
+            vid: 0x1366,
+            pid: 0x1015,
+            product: product.map(ToOwned::to_owned),
+            inaccessible: false,
+        }
+    }
+
+    /// The derived id is what a lease selector names, so it must survive a
+    /// restart and a reordered `probe-rs list`. Deriving it from enumeration
+    /// order would look fine in one pass and break silently on the next.
+    #[test]
+    fn adopted_ids_are_stable_across_passes_and_ordering() {
+        let a = named_probe("XXX", Some("J-Link"));
+        let b = named_probe("YYY", Some("CMSIS-DAP"));
+
+        let mut first = reconcile(&boards(), &[a.clone(), b.clone()]);
+        let mut second = reconcile(&boards(), &[b, a]);
+        let ids_a = adopt_unknown(&mut first, AdoptPolicy::Auto);
+        let ids_b = adopt_unknown(&mut second, AdoptPolicy::Auto);
+
+        let mut names_a: Vec<_> = ids_a.keys().map(|n| n.0.clone()).collect();
+        let mut names_b: Vec<_> = ids_b.keys().map(|n| n.0.clone()).collect();
+        names_a.sort();
+        names_b.sort();
+        assert_eq!(names_a, names_b);
+        assert_eq!(
+            names_a,
+            vec!["cmsis-dap-yyy".to_owned(), "j-link-xxx".to_owned()]
+        );
+    }
+
+    /// A probe with no serial can be neither stably named nor fenced with
+    /// `ProbeAccess::Allow`, so adopting it would produce a board whose leases
+    /// silently attach to the wrong hardware.
+    #[test]
+    fn a_serial_less_probe_is_not_adopted() {
+        let mut probe = named_probe("", Some("J-Link"));
+        probe.serial = String::new();
+        assert!(adopted_board_spec(&probe).is_none());
+
+        let mut inv = reconcile(&boards(), &[probe]);
+        assert!(adopt_unknown(&mut inv, AdoptPolicy::Auto).is_empty());
+        assert!(inv.boards.iter().all(|b| !b.adopted));
+    }
+
+    /// An unopenable probe must never become a board under either policy: the
+    /// lease would fail at `probe-rs serve` spawn time, which is the same
+    /// reasoning `reconcile` applies to declared boards.
+    #[test]
+    fn an_inaccessible_probe_is_never_adopted() {
+        assert!(adopted_board_spec(&inaccessible_probe("ZZZ")).is_none());
+        for policy in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
+            let mut inv = reconcile(&boards(), &[inaccessible_probe("ZZZ")]);
+            assert!(adopt_unknown(&mut inv, policy).is_empty());
+            assert!(inv.boards.iter().all(|b| !b.adopted));
+        }
+    }
+
+    /// `declared` is unchanged behaviour: reported, not leasable.
+    #[test]
+    fn declared_policy_adopts_nothing() {
+        let mut inv = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        assert!(adopt_unknown(&mut inv, AdoptPolicy::Declared).is_empty());
+        assert_eq!(inv.unknown.len(), 1);
+        assert!(!is_leasable(&inv, &BoardName("j-link-zzz".into())));
+    }
+
+    /// The adopted board is leasable, tagged `auto`, and carries no chip — the
+    /// documented consequence being that `--select 'chip=…'` will not match it
+    /// until `boards.toml` annotates it.
+    #[test]
+    fn an_adopted_board_is_leasable_tagged_auto_and_has_no_chip() {
+        let mut inv = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let specs = adopt_unknown(&mut inv, AdoptPolicy::Auto);
+        assert_eq!(specs.len(), 1);
+
+        let name = BoardName("j-link-zzz".into());
+        assert!(is_leasable(&inv, &name));
+        let status = inv.boards.iter().find(|b| b.board == name).unwrap();
+        assert!(status.adopted);
+        assert!(status.tags.contains(&"auto".to_owned()));
+        assert!(status.tags.contains(&"j-link".to_owned()));
+        assert!(status.chip.is_empty(), "the agent cannot know the target chip");
+        assert_eq!(status.serial, "ZZZ");
+    }
+
+    /// A probe with no product string still gets a stable id, from its USB ids.
+    #[test]
+    fn a_product_less_probe_falls_back_to_its_usb_ids() {
+        let spec = adopted_board_spec(&named_probe("ZZZ", None)).unwrap();
+        assert_eq!(spec.id, "probe-13661015-zzz");
+        assert_eq!(spec.tags, vec!["auto".to_owned()]);
+    }
+
+    /// Precedence: a declared board and its probe must produce exactly one
+    /// board, the declared one. `adopt_unknown` only ever sees probes
+    /// `reconcile` put in `unknown`, so this is structural — but it is the
+    /// property §2.4 is about, so it is asserted rather than assumed.
+    #[test]
+    fn a_declared_probe_is_never_also_adopted() {
+        let mut inv = reconcile(&boards(), &[probe("AAA")]);
+        let specs = adopt_unknown(&mut inv, AdoptPolicy::Auto);
+        assert!(specs.is_empty());
+        assert_eq!(inv.boards.iter().filter(|b| b.serial == "AAA").count(), 1);
+        let b1 = inv.boards.iter().find(|b| b.board.0 == "b1").unwrap();
+        assert!(!b1.adopted);
+        assert_eq!(b1.chip, "c1", "the declaration's metadata must survive");
+    }
+
+    /// The status and the spec come from one derivation, so the id the
+    /// coordinator schedules is exactly the id the agent can resolve. Drift
+    /// here presents as a board that leases and then fails to open, with no
+    /// error anywhere in between.
+    #[test]
+    fn the_reported_id_and_the_resolvable_id_are_the_same() {
+        let mut inv = reconcile(&boards(), &[named_probe("ZZZ", Some("J-Link"))]);
+        let specs = adopt_unknown(&mut inv, AdoptPolicy::Auto);
+        for status in inv.boards.iter().filter(|b| b.adopted) {
+            assert!(
+                specs.contains_key(&status.board),
+                "reported {} with no resolvable spec",
+                status.board
+            );
+        }
+    }
+
+    /// Board ids reach file paths and selectors, so a chatty product string
+    /// must not produce something that needs quoting.
+    #[test]
+    fn ids_are_slugified() {
+        let spec = adopted_board_spec(&named_probe("00:11", Some("J-Link (v1.0)"))).unwrap();
+        assert_eq!(spec.id, "j-link-v1-0-00-11");
+        assert!(spec
+            .id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
     }
 }

@@ -39,6 +39,10 @@ fn fleet_example_parses_with_both_tables() {
 
 /// `examples/node.toml` is entirely commented out, so it must parse as the
 /// all-defaults case the agent treats an absent file as.
+///
+/// `adopt` in particular must stay commented: an example that switched a
+/// reader's node to `auto` merely by being copied would share probes nobody
+/// asked to share.
 #[test]
 fn node_example_parses_as_all_defaults() {
     let path = examples_dir().join("node.toml");
@@ -46,7 +50,37 @@ fn node_example_parses_as_all_defaults() {
     let settings: fleet_bin::roles::agent::NodeSettings = toml::from_str(&text).unwrap();
     assert!(settings.boards_path.is_none());
     assert!(settings.heartbeat_secs.is_none());
+    assert!(settings.discovery_secs.is_none());
+    assert!(settings.adopt.is_none());
     assert!(!settings.erase_on_release);
+}
+
+/// The `adopt` key must be *documented* in the example even though it is
+/// commented out, and both of its values must be ones the code accepts — a
+/// reader uncommenting the line has to get a file that loads.
+#[test]
+fn the_node_example_documents_both_adopt_policies_and_they_parse() {
+    let path = examples_dir().join("node.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("adopt"), "the example must document `adopt`");
+    assert!(text.contains("discovery_secs"));
+
+    for policy in ["auto", "declared"] {
+        assert!(
+            text.contains(&format!("\"{policy}\"")),
+            "the example must name the `{policy}` policy"
+        );
+        let uncommented = text
+            .replace("# adopt = ", "adopt = ")
+            .replace("adopt = \"declared\"", &format!("adopt = \"{policy}\""));
+        let settings: fleet_bin::roles::agent::NodeSettings =
+            toml::from_str(&uncommented).unwrap();
+        assert_eq!(
+            settings.adopt.map(fleet_proto::AdoptPolicy::as_str),
+            Some(policy),
+            "uncommenting `adopt` must yield a file that loads"
+        );
+    }
 }
 
 /// `examples/coordinator.toml` must load through the real loader, including the
@@ -114,6 +148,25 @@ fn boards_example_parses_and_validates() {
     let boards = fleet_agent::config::BoardsConfig::from_str(&text).unwrap();
     boards.validate().unwrap();
     assert!(!boards.boards.is_empty());
+}
+
+/// The `boards.toml` example's prose is load-bearing: revision 2 demoted the
+/// file from admission control to annotation, and made board ids node-local
+/// rather than fleet-global. A reader who copies the old wording gets a mental
+/// model that breaks the moment two machines plug in the same dev kit.
+#[test]
+fn the_boards_example_does_not_still_claim_global_ids_or_admission_control() {
+    let path = examples_dir().join("boards.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !text.contains("unique across the whole fleet"),
+        "board ids are unique within their node, not across the fleet (§6.1)"
+    );
+    assert!(text.contains("WITHIN THIS NODE"));
+    assert!(
+        text.contains("adopt"),
+        "the file must explain the adoption policy that replaced it as a gate"
+    );
 }
 
 /// The deleted files must stay deleted: leaving them would send a reader

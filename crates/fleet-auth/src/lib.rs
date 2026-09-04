@@ -74,6 +74,30 @@ pub mod api {
             /// The current session token (`prfs1_…`).
             session_token: String,
         },
+        /// Register the calling machine as a node in the caller's own org,
+        /// proving membership with a user session token (architecture §4.2
+        /// path 2, §6.4). This is what `probe-rs-fleet share` sends.
+        ///
+        /// Self-approving: **membership is sufficient**. There is deliberately
+        /// no admin approval step at v1 (a device-approval gate can be added
+        /// later without a data migration).
+        SelfRegister {
+            /// The caller's session token (`prfs1_…`).
+            session_token: String,
+            /// The node's self-chosen name. Advisory; it names the row.
+            node_name: String,
+            /// Optional selection tags to record on the node.
+            #[serde(default)]
+            tags: Vec<String>,
+            /// Probe adoption policy for this node (`auto` | `declared`).
+            ///
+            /// Absent means the endpoint's default for this grant, which is
+            /// `auto` — a machine its owner is deliberately sharing wants its
+            /// probes usable without a second edit. An unrecognised value is a
+            /// `400`, never a silent default.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            adopt: Option<String>,
+        },
     }
 
     /// A successful token exchange.
@@ -81,7 +105,8 @@ pub mod api {
     pub struct TokenResponse {
         /// The minted token.
         pub token: String,
-        /// The node id the token authenticates as, for an `AuthKey` grant.
+        /// The node id the token authenticates as, for an `AuthKey` or
+        /// `SelfRegister` grant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node_id: Option<String>,
         /// The org the token belongs to.
