@@ -1,0 +1,247 @@
+//! The HTTP client for `POST /auth/token` (feature `client`).
+//!
+//! `agent init --auth-key` and a session-token refresh need to make exactly one
+//! HTTP request, and `agent init` runs on the Pi — so this stack is inside the
+//! hard cross-compilation constraint that forced `ring` over `aws-lc-rs`.
+//!
+//! # Why hyper rather than reqwest
+//!
+//! Both cross-build to a static armv7-musl binary with zero `aws-lc-rs` (see
+//! `docs/cross-compiling.md`). `reqwest` pulls ~37 crates nothing else in the
+//! workspace needs, including `url` → `idna` → the `icu_*` unicode stack. The
+//! `hyper` route reuses `hyper` / `hyper-util` / `rustls` / `http`, which the
+//! coordinator and `tokio-tungstenite` already require.
+//!
+//! The deciding property, though, is trust: [`hyper_rustls`]'s
+//! `with_tls_config` takes an explicitly-built [`rustls::ClientConfig`], so the
+//! token exchange and the WebSocket dialer share
+//! [`fleet_tls::client_trust_config`]. **Keep that single trust path.** If it
+//! forks, `--server-cert-sha256` silently stops covering `/auth/token` while
+//! appearing to work.
+
+use std::time::Duration;
+
+use http_body_util::{BodyExt as _, Full};
+use hyper::body::Bytes;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
+
+use crate::api::{ErrorResponse, TokenRequest, TokenResponse};
+
+/// How long a token exchange may take before it is abandoned.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Errors from a token exchange.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientError {
+    /// The base URL could not be parsed / had no host.
+    #[error("invalid coordinator URL: {0}")]
+    Url(String),
+    /// The request could not be sent or the response could not be read.
+    #[error("token exchange transport error: {0}")]
+    Transport(String),
+    /// The coordinator rejected the exchange.
+    ///
+    /// Deliberately coarse, because the response body is deliberately coarse.
+    /// The remediation text belongs to the caller, which knows what it was
+    /// trying to do.
+    #[error("token exchange rejected by the coordinator ({status}): {code}")]
+    Rejected {
+        /// The HTTP status.
+        status: u16,
+        /// The machine-readable error code from the body, or `unknown`.
+        code: String,
+    },
+    /// The response was not the JSON we expect.
+    #[error("malformed token exchange response: {0}")]
+    Malformed(String),
+}
+
+/// Build the `/auth/token` URI from a coordinator base URL.
+fn token_uri(base_url: &str) -> Result<http::Uri, ClientError> {
+    let normalised = normalise_base(base_url)?;
+    format!("{normalised}/auth/token")
+        .parse::<http::Uri>()
+        .map_err(|e| ClientError::Url(e.to_string()))
+}
+
+/// Normalise a user-supplied coordinator address into an `http(s)://host[:port]`
+/// origin with no trailing slash.
+///
+/// Accepts a bare `host:port` (defaulting to `https`), matching what the WS
+/// dialer accepts, so an operator can paste the same string into both.
+///
+/// # Errors
+///
+/// Returns [`ClientError::Url`] if the string is not a usable origin.
+pub fn normalise_base(base_url: &str) -> Result<String, ClientError> {
+    let s = base_url.trim();
+    if s.is_empty() {
+        return Err(ClientError::Url("empty URL".to_owned()));
+    }
+    // No trailing-slash trim here: the origin is rebuilt from the parsed
+    // scheme/authority/path below, so `https://x/` and `https://x` converge
+    // without a textual hack that would turn `https://` into `https:`.
+    let with_scheme = if s.contains("://") {
+        s.to_owned()
+    } else {
+        format!("https://{s}")
+    };
+    let uri: http::Uri = with_scheme
+        .parse()
+        .map_err(|e: http::uri::InvalidUri| ClientError::Url(e.to_string()))?;
+    let scheme = uri.scheme_str().unwrap_or("https");
+    if scheme != "http" && scheme != "https" {
+        return Err(ClientError::Url(format!("unsupported scheme `{scheme}`")));
+    }
+    let authority = uri
+        .authority()
+        .filter(|a| !a.host().is_empty())
+        .ok_or_else(|| ClientError::Url("URL has no host".to_owned()))?;
+    let path = uri.path().trim_end_matches('/');
+    Ok(format!("{scheme}://{authority}{path}"))
+}
+
+/// POST a [`TokenRequest`] to `<base_url>/auth/token`.
+///
+/// `pin` is the optional server-cert SHA-256 for self-hosted deployments; it is
+/// threaded into the *same* [`fleet_tls::client_trust_config`] the WebSocket
+/// dialer uses.
+///
+/// # Errors
+///
+/// Returns [`ClientError`] on a transport failure, a non-2xx response, or a body
+/// that is not a [`TokenResponse`].
+pub async fn exchange(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    request: &TokenRequest,
+) -> Result<TokenResponse, ClientError> {
+    let uri = token_uri(base_url)?;
+    let body = serde_json::to_vec(request)
+        .map_err(|e| ClientError::Malformed(format!("encoding request: {e}")))?;
+
+    let tls = fleet_tls::client_trust_config(pin);
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .build();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+
+    let req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(uri)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::ACCEPT, "application/json")
+        .body(Full::new(Bytes::from(body)))
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+    let resp = tokio::time::timeout(REQUEST_TIMEOUT, client.request(req))
+        .await
+        .map_err(|_| ClientError::Transport("token exchange timed out".to_owned()))?
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+
+    let status = resp.status();
+    let bytes = resp
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| ClientError::Transport(e.to_string()))?
+        .to_bytes();
+
+    if !status.is_success() {
+        let code = serde_json::from_slice::<ErrorResponse>(&bytes)
+            .map_or_else(|_| "unknown".to_owned(), |e| e.error);
+        return Err(ClientError::Rejected {
+            status: status.as_u16(),
+            code,
+        });
+    }
+
+    serde_json::from_slice(&bytes).map_err(|e| ClientError::Malformed(e.to_string()))
+}
+
+/// Redeem an auth key for a node token.
+///
+/// # Errors
+///
+/// See [`exchange`].
+pub async fn exchange_auth_key(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    auth_key: &str,
+    node_name: &str,
+    tags: Vec<String>,
+) -> Result<TokenResponse, ClientError> {
+    exchange(
+        base_url,
+        pin,
+        &TokenRequest::AuthKey {
+            auth_key: auth_key.to_owned(),
+            node_name: node_name.to_owned(),
+            tags,
+        },
+    )
+    .await
+}
+
+/// Exchange a still-valid session token for a fresh one.
+///
+/// # Errors
+///
+/// See [`exchange`].
+pub async fn refresh_session(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+) -> Result<TokenResponse, ClientError> {
+    exchange(
+        base_url,
+        pin,
+        &TokenRequest::Refresh {
+            session_token: session_token.to_owned(),
+        },
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_host_port_defaults_to_https() {
+        assert_eq!(
+            normalise_base("fleet.example:7000").unwrap(),
+            "https://fleet.example:7000"
+        );
+    }
+
+    #[test]
+    fn explicit_scheme_and_trailing_slash_are_preserved_and_trimmed() {
+        assert_eq!(
+            normalise_base("http://127.0.0.1:7000/").unwrap(),
+            "http://127.0.0.1:7000"
+        );
+        assert_eq!(
+            normalise_base("https://fleet.example").unwrap(),
+            "https://fleet.example"
+        );
+    }
+
+    #[test]
+    fn token_uri_appends_the_route() {
+        assert_eq!(
+            token_uri("https://fleet.example:7000").unwrap().to_string(),
+            "https://fleet.example:7000/auth/token"
+        );
+    }
+
+    #[test]
+    fn unusable_urls_are_rejected() {
+        assert!(normalise_base("").is_err());
+        assert!(normalise_base("ftp://fleet.example").is_err());
+        assert!(normalise_base("https://").is_err());
+    }
+}

@@ -1,35 +1,30 @@
-//! Mutual-TLS configuration and certificate-pinning helpers for probe-rs-fleet.
+//! Client-side TLS trust configuration for probe-rs-fleet.
 //!
-//! This crate builds [`rustls`] configurations and exposes small helpers; it
-//! deliberately performs **no I/O**. It does not open sockets, run an accept
-//! loop, or speak any application protocol. Callers wrap the resulting configs
-//! in [`tokio_rustls::TlsAcceptor`] / [`tokio_rustls::TlsConnector`] around a
-//! tokio `TcpStream`, and the control-plane RPC (postcard-rpc) rides on top of
-//! the resulting `TlsStream` (which is `AsyncRead + AsyncWrite`).
+//! Architecture revision 2 (§3.5, §6.2) deletes the private CA: there are no
+//! client certificates, no CSRs, no fingerprint pinning of *agents*. Connection
+//! authentication is a bearer token on the WebSocket upgrade
+//! (`fleet-auth`); TLS is back to doing the one job it is good at, namely
+//! authenticating the **server**.
 //!
-//! # Topology
+//! What survives here:
 //!
-//! * The **coordinator** is the only listener. It uses [`server_config`] to
-//!   require client authentication (mTLS): every peer must present a client
-//!   certificate signed by a trusted CA.
-//! * **Agents** (persistent connection) and **sidecars** (per-session
-//!   connection) dial out to the coordinator. They use [`client_config`] to
-//!   present their own client certificate + key and to verify the
-//!   coordinator's server certificate against a trusted CA.
+//! * [`client_trust_config`] — the single trust path every outbound connection
+//!   in the tree uses. `WebPKI` roots by default; optionally a pinned server-leaf
+//!   SHA-256 for a self-hosted coordinator with no public DNS name. Both the WS
+//!   dialer (`fleet_wire::client`) and the `POST /auth/token` HTTP client
+//!   (`fleet_auth::http_client`) build from this one function, so
+//!   `--server-cert-sha256` covers both. If that ever forks, pinning silently
+//!   stops covering the token exchange.
+//! * [`PinnedServerCertVerifier`] — the pin itself, no longer a *bootstrap*
+//!   mechanism (there is no bootstrap handshake any more) but a deployment
+//!   option for self-hosting.
+//! * [`server_config`] — a plain server config with **no client auth**, for the
+//!   optional case where the coordinator terminates TLS itself. In the hosted
+//!   deployment a reverse proxy terminates TLS and the coordinator speaks plain
+//!   HTTP on loopback.
 //!
-//! # Identity
-//!
-//! Once a handshake completes, the coordinator derives a peer identity from the
-//! verified end-entity certificate:
-//!
-//! * [`subject_id_from_cert`] extracts the subject **id string** from the
-//!   certificate's Subject Common Name (CN), falling back to the first DNS
-//!   Subject Alternative Name. It deliberately stops at a `String`: this crate
-//!   knows nothing about orgs, so the coordinator is the only place that turns
-//!   an id into an authenticated `Subject`. See the function docs.
-//! * [`cert_fingerprint`] returns the lowercase-hex SHA-256 of the
-//!   certificate DER. The coordinator pins agent identities by this
-//!   fingerprint (configuration maps fingerprint → [`AgentId`]).
+//! The crate still performs **no I/O** beyond reading PEM files from disk: it
+//! opens no sockets and speaks no application protocol.
 //!
 //! No `unsafe` code is used.
 
@@ -38,10 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-
-use fleet_proto::AgentId;
 
 /// Errors produced while loading PEM material or building a TLS config.
 #[derive(Debug, thiserror::Error)]
@@ -82,26 +74,26 @@ pub enum TlsError {
     #[error("invalid trust anchor: {0}")]
     InvalidTrustAnchor(rustls::Error),
 
-    /// Building the client-certificate verifier failed.
-    #[error("failed to build client cert verifier: {0}")]
-    Verifier(rustls::server::VerifierBuilderError),
-
     /// rustls rejected the supplied configuration (e.g. bad cert/key pair).
     #[error("rustls configuration error: {0}")]
     Rustls(#[from] rustls::Error),
 }
 
-/// Error raised while deriving a subject id / [`AgentId`] from a peer cert.
-#[derive(Debug, thiserror::Error)]
-pub enum IdentityError {
-    /// The certificate DER could not be parsed.
-    #[error("failed to parse certificate: {0}")]
-    Parse(String),
-
-    /// The certificate carried no Common Name or usable SAN to derive an
-    /// identity from.
-    #[error("certificate has no usable subject identity (no CN or DNS SAN)")]
-    NoSubject,
+/// Install the `ring` crypto provider as rustls's process default, exactly once.
+///
+/// rustls panics if `install_default` is called twice, and returns an error if a
+/// provider is already installed — both of which are trivially reachable once
+/// the agent, the coordinator and the token-exchange client all build configs in
+/// one process (`fleet-bin` links all three). Every entry point that builds a
+/// rustls config calls this first; it is idempotent and cheap.
+pub fn install_crypto_provider() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        // An error means another provider is already installed, which is fine:
+        // the point is that exactly one ends up installed, not that ours wins.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
 }
 
 /// Read a PEM certificate chain from `path`.
@@ -156,17 +148,6 @@ pub fn load_private_key(path: impl AsRef<Path>) -> Result<PrivateKeyDer<'static>
     key.ok_or(TlsError::NoPrivateKey { path: display })
 }
 
-/// Build a [`RootCertStore`] from a PEM file of trust-anchor (CA) certificates.
-///
-/// # Errors
-///
-/// Returns a [`TlsError`] if the file cannot be read/parsed, contains no
-/// certificates, or a certificate is not a valid trust anchor.
-pub fn load_root_store(path: impl AsRef<Path>) -> Result<RootCertStore, TlsError> {
-    let certs = load_cert_chain(path)?;
-    root_store_from_certs(certs)
-}
-
 /// Build a [`RootCertStore`] from already-parsed CA certificates.
 ///
 /// # Errors
@@ -183,75 +164,109 @@ pub fn root_store_from_certs(
     Ok(store)
 }
 
-/// Build a mutual-TLS [`ServerConfig`] for the coordinator (the only listener).
+/// Build the [`ClientConfig`] every outbound fleet connection uses.
 ///
-/// Presents `server_cert_chain` + `server_key` and verifies any client
-/// certificate against `client_ca`. Client authentication is **optional**: a
-/// peer that presents a valid client certificate is authenticated (runtime
-/// mTLS), while a peer that presents *no* certificate is allowed to complete
-/// the handshake so it can reach the bootstrap/enrollment path. The
-/// application layer (the coordinator) branches on client-cert presence: a
-/// connection with no client cert may ONLY perform bootstrap enrollment; the
-/// runtime agent/sidecar dispatch is reachable only with a verified client
-/// cert. A client cert that is present but *not* verifiable against
-/// `client_ca` is still rejected during the handshake.
+/// * `pin = None` — verify the coordinator against the **`WebPKI` roots** compiled
+///   into the binary (the `webpki-roots` crate, not the platform store: a
+///   platform store would reintroduce a native dependency on musl and differ
+///   between the Pi and the developer's laptop).
+/// * `pin = Some(sha256)` — accept exactly the server leaf whose DER SHA-256
+///   matches. This is the self-hosted escape hatch for a coordinator with no
+///   public DNS name and therefore no publicly trusted certificate.
 ///
-/// # Errors
-///
-/// Returns a [`TlsError`] if the verifier cannot be built or the
-/// certificate/key pair is rejected by rustls.
-pub fn server_config(
-    server_cert_chain: Vec<CertificateDer<'static>>,
-    server_key: PrivateKeyDer<'static>,
-    client_ca: RootCertStore,
-) -> Result<ServerConfig, TlsError> {
-    let verifier = WebPkiClientVerifier::builder(Arc::new(client_ca))
-        .allow_unauthenticated()
-        .build()
-        .map_err(TlsError::Verifier)?;
-
-    let config = ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(server_cert_chain, server_key)?;
-
-    Ok(config)
+/// Presents **no client certificate** in either case; there are none any more.
+#[must_use]
+pub fn client_trust_config(pin: Option<[u8; 32]>) -> ClientConfig {
+    install_crypto_provider();
+    if let Some(pin) = pin {
+        return ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(pin)))
+            .with_no_client_auth();
+    }
+    let roots = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth()
 }
 
-/// Build a mutual-TLS [`ClientConfig`] for agents and sidecars (dial-out).
+/// Build a [`ServerConfig`] for a coordinator that terminates TLS itself.
 ///
-/// Presents `client_cert_chain` + `client_key` to the coordinator and verifies
-/// the coordinator's server certificate against `server_ca`.
+/// **No client authentication**: the peer proves who it is with a bearer token
+/// on the WebSocket upgrade, not with a certificate. This exists for
+/// self-hosted/dev deployments; the hosted deployment puts a reverse proxy in
+/// front and the coordinator speaks plain HTTP on loopback.
 ///
 /// # Errors
 ///
 /// Returns a [`TlsError`] if the certificate/key pair is rejected by rustls.
-pub fn client_config(
-    client_cert_chain: Vec<CertificateDer<'static>>,
-    client_key: PrivateKeyDer<'static>,
-    server_ca: RootCertStore,
-) -> Result<ClientConfig, TlsError> {
-    let config = ClientConfig::builder()
-        .with_root_certificates(server_ca)
-        .with_client_auth_cert(client_cert_chain, client_key)?;
-
+pub fn server_config(
+    server_cert_chain: Vec<CertificateDer<'static>>,
+    server_key: PrivateKeyDer<'static>,
+) -> Result<ServerConfig, TlsError> {
+    install_crypto_provider();
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(server_cert_chain, server_key)?;
     Ok(config)
 }
 
 /// Compute the raw SHA-256 digest of a certificate's DER bytes.
-fn cert_sha256(cert: &CertificateDer<'_>) -> [u8; 32] {
+#[must_use]
+pub fn cert_sha256(cert: &CertificateDer<'_>) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(cert.as_ref()).into()
+}
+
+/// Compute the lowercase-hex SHA-256 fingerprint of a certificate's DER bytes.
+///
+/// This is the value an operator passes as `--server-cert-sha256` when
+/// self-hosting without a publicly trusted certificate. It is reproducible with
+/// `openssl x509 -in coordinator.pem -noout -fingerprint -sha256` (after
+/// stripping the colons and lowercasing).
+#[must_use]
+pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
+    let digest = cert_sha256(cert);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        // Infallible: writing to a String never fails.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Parse a lowercase-hex SHA-256 fingerprint into raw bytes.
+///
+/// # Errors
+///
+/// Returns `None` if `hex` is not 64 hex characters.
+#[must_use]
+pub fn parse_fingerprint(hex: &str) -> Option<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// A [`rustls::client::danger::ServerCertVerifier`] that accepts a server leaf
 /// **iff** its DER SHA-256 equals a pinned hash.
 ///
-/// This is used ONLY for the one-time bootstrap/enrollment handshake, where the
-/// client does not yet trust the coordinator's CA but carries the server-cert
-/// hash inside its enrollment token (our improvement over a blind
-/// trust-on-first-use verifier). It accepts self-signed / leaf-only chains and
-/// ignores the server name and intermediates; the pin is the sole check. It is
-/// never used for runtime traffic, which stays full mTLS.
+/// The one surviving remnant of the deleted pinning code. It is no longer a
+/// bootstrap mechanism — there is no bootstrap handshake — but the way a
+/// self-hosted deployment without public DNS establishes trust: the operator
+/// reads the fingerprint off the coordinator host and passes it to
+/// `agent init --server-cert-sha256` / `ctl init`.
+///
+/// It accepts self-signed / leaf-only chains and ignores the server name and
+/// intermediates; the pin is the sole check.
 #[derive(Debug)]
 pub struct PinnedServerCertVerifier {
     pin: [u8; 32],
@@ -283,7 +298,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerCertVerifier {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::General(
-                "bootstrap server certificate does not match the pinned hash".to_owned(),
+                "server certificate does not match the pinned hash".to_owned(),
             ))
         }
     }
@@ -321,121 +336,4 @@ impl rustls::client::danger::ServerCertVerifier for PinnedServerCertVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-
-/// Build a bootstrap [`ClientConfig`] that pins the coordinator's server
-/// certificate by its DER SHA-256 (`pin`) and presents no client certificate.
-///
-/// Used ONLY for the one-time enrollment handshake (`agent init` / `ctl init`):
-/// the server cert is verified against the pin carried in the enrollment token,
-/// then the client sends an `fleet_proto::enroll::EnrollRequest`. Runtime
-/// traffic uses [`client_config`] (full mTLS) instead.
-#[must_use]
-pub fn bootstrap_client_config(pin: [u8; 32]) -> ClientConfig {
-    ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServerCertVerifier::new(pin)))
-        .with_no_client_auth()
-}
-
-
-/// Compute the lowercase-hex SHA-256 fingerprint of a certificate's DER bytes.
-///
-/// This is the value the coordinator pins agent identities against: its config
-/// maps a fingerprint to an [`AgentId`]. Operators can reproduce it with, e.g.
-/// `openssl x509 -in agent.pem -noout -fingerprint -sha256` (after stripping
-/// the colons and lowercasing).
-#[must_use]
-pub fn cert_fingerprint(cert: &CertificateDer<'_>) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(cert.as_ref());
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        // Infallible: writing to a String never fails.
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
-}
-
-/// Derive the **subject id string** from a verified peer end-entity
-/// certificate.
-///
-/// Deliberately returns a plain `String`, not a `Subject`: this crate knows
-/// nothing about orgs or membership, and minting an authenticated identity here
-/// would create a second construction site outside the coordinator's single
-/// resolution seam. The coordinator combines this id with an org to build the
-/// `Subject` that authorization consumes.
-///
-/// # Identity choice
-///
-/// We use the certificate's Subject **Common Name (CN)**, falling back to the
-/// first **DNS Subject Alternative Name** if no CN is present. CN is chosen
-/// because fleet certificates are issued internally (a private CA) with the
-/// operator-assigned identity placed in the CN — this keeps the mapping
-/// human-meaningful and matches how the certs are minted. The SAN fallback
-/// accommodates modern certs that omit the CN.
-///
-/// The certificate is assumed to have already been *verified* by rustls during
-/// the handshake; this function only parses the subject, it does not validate
-/// trust.
-///
-/// # Errors
-///
-/// Returns [`IdentityError::Parse`] if the DER cannot be parsed and
-/// [`IdentityError::NoSubject`] if neither a CN nor a DNS SAN is present.
-pub fn subject_id_from_cert(cert: &CertificateDer<'_>) -> Result<String, IdentityError> {
-    subject_identity(cert)
-}
-
-/// Derive an [`AgentId`] from a verified agent end-entity certificate.
-///
-/// Uses the same subject-string extraction as [`subject_id_from_cert`] (CN,
-/// then DNS SAN). Note the coordinator additionally *pins* agents by
-/// [`cert_fingerprint`]; this helper provides the human-readable identity that
-/// accompanies the pin.
-///
-/// # Errors
-///
-/// Returns [`IdentityError::Parse`] if the DER cannot be parsed and
-/// [`IdentityError::NoSubject`] if neither a CN nor a DNS SAN is present.
-pub fn agent_id_from_cert(cert: &CertificateDer<'_>) -> Result<AgentId, IdentityError> {
-    let name = subject_identity(cert)?;
-    Ok(AgentId(name))
-}
-
-/// Extract the subject identity string (CN, then first DNS SAN) from a cert.
-fn subject_identity(cert: &CertificateDer<'_>) -> Result<String, IdentityError> {
-    use x509_parser::extensions::GeneralName;
-    use x509_parser::prelude::FromDer;
-
-    let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())
-        .map_err(|e| IdentityError::Parse(e.to_string()))?;
-
-    // Prefer the Subject Common Name.
-    if let Some(cn) = parsed
-        .subject()
-        .iter_common_name()
-        .next()
-        .and_then(|attr| attr.as_str().ok())
-    {
-        let cn = cn.trim();
-        if !cn.is_empty() {
-            return Ok(cn.to_owned());
-        }
-    }
-
-    // Fall back to the first DNS Subject Alternative Name.
-    if let Ok(Some(san)) = parsed.subject_alternative_name() {
-        for name in &san.value.general_names {
-            if let GeneralName::DNSName(dns) = name {
-                let dns = dns.trim();
-                if !dns.is_empty() {
-                    return Ok((*dns).to_owned());
-                }
-            }
-        }
-    }
-
-    Err(IdentityError::NoSubject)
 }

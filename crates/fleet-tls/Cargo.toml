@@ -5,23 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "TLS configuration and helpers for probe-rs-fleet."
+description = "Client-side TLS trust configuration for probe-rs-fleet."
 
 [dependencies]
-fleet-proto.workspace = true
-
-tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
+webpki-roots.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 sha2 = { workspace = true }
-x509-parser = "0.16"
 
 [dev-dependencies]
 rcgen = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [lints]
 workspace = true

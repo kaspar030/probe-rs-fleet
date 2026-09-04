@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 pub mod admin;
 pub mod agent_api;
 pub mod board;
-pub mod enroll;
 pub mod ids;
 pub mod lease;
 pub mod token;
@@ -24,7 +23,6 @@ pub use agent_api::{
     LogLevel, PowerAction, ProbeInventory,
 };
 pub use board::{Board, BoardState, PowerKind};
-pub use enroll::{EnrollRequest, EnrollResponse, EnrollTokenError, EnrollmentToken};
 pub use ids::{
     AgentId, BoardName, BoardRef, Group, LeaseId, NodeId, OrgId, Role, Subject, SubjectKey,
     SubjectKind, UserId,
@@ -69,4 +67,12 @@ pub struct ChannelId(pub u64);
 ///   fleet-unique [`ids::BoardRef`] (`(org, node, name)`) and a node-local
 ///   [`ids::BoardName`]. postcard is positional, so every envelope carrying
 ///   either re-encodes.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// * 4 → 5: revision-2 transport and credentials. The control plane moved from
+///   a bespoke `u32`-length-prefixed TCP stream to **binary `WebSocket`
+///   messages over HTTPS** (architecture §3.5): the length prefix is gone, the
+///   envelopes are unchanged. Node-token rotation added
+///   [`agent_api::CoordinatorCommand::RotateNodeToken`] and its ack
+///   [`agent_api::AgentReport::TokenRotated`]; adding variants to a postcard
+///   enum shifts later discriminants, so this is not wire-compatible either
+///   way.
+pub const PROTOCOL_VERSION: u32 = 5;

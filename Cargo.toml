@@ -4,6 +4,7 @@ members = [
     "crates/fleet-proto",
     "crates/fleet-core",
     "crates/fleet-tls",
+    "crates/fleet-auth",
     "crates/fleet-wire",
     "crates/fleet-agent",
     "crates/fleet-coordinator",
@@ -30,6 +31,7 @@ repository = "https://github.com/ariel-os/probe-rs-fleet"
 fleet-proto = { path = "crates/fleet-proto" }
 fleet-core = { path = "crates/fleet-core" }
 fleet-tls = { path = "crates/fleet-tls" }
+fleet-auth = { path = "crates/fleet-auth" }
 fleet-wire = { path = "crates/fleet-wire" }
 fleet-agent = { path = "crates/fleet-agent" }
 fleet-coordinator = { path = "crates/fleet-coordinator" }
@@ -40,7 +42,30 @@ postcard-rpc = { version = "0.12", features = ["use-std"] }
 postcard = { version = "1", features = ["use-std"] }
 postcard-schema = "0.2"
 serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 base64 = "0.22"
+
+# http / websocket transport (architecture §3.5).
+#
+# Everything below is pinned to `default-features = false` and the rustls `ring`
+# provider for the same reason the TLS block below says: the agent must
+# cross-compile to armv7-musl, and `aws-lc-rs` does not. `docs/cross-compiling.md`
+# records the verification.
+#
+# Layering: `axum`/`hyper`'s *server* half is a coordinator-only dependency.
+# `fleet-agent` / `fleet-sidecar` pull only `tokio-tungstenite` (through
+# `fleet-wire`'s `tungstenite` feature) — see
+# `crates/fleet-agent/tests/no_http_server_dep.rs`.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+hyper = { version = "1", default-features = false }
+hyper-util = { version = "0.1", default-features = false }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "webpki-tokio"] }
+http-body-util = { version = "0.1", default-features = false }
+http = { version = "1", default-features = false, features = ["std"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tower = { version = "0.5", default-features = false }
+webpki-roots = { version = "1", default-features = false }
 
 # async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "sync", "time", "signal"] }

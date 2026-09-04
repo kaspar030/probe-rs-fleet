@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Length-delimited postcard framing + control-plane envelopes for probe-rs-fleet."
+description = "WebSocket framing + control-plane envelopes for probe-rs-fleet."
 
 [dependencies]
 fleet-proto.workspace = true
@@ -13,10 +13,31 @@ fleet-proto.workspace = true
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+# The dial-out client half. Off by default so a crate that only needs the
+# envelopes (or only the axum adapter, which lives in fleet-coordinator) does
+# not link a WebSocket client.
+tokio-tungstenite = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+fleet-tls = { workspace = true, optional = true }
+
+[features]
+default = []
+tungstenite = [
+    "dep:tokio-tungstenite",
+    "dep:futures-util",
+    "dep:http",
+    "dep:fleet-tls",
+    "tokio/net",
+]
+# Expose the in-memory WireTx/WireRx pair to other crates' tests.
+test-util = []
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [lints]
 workspace = true

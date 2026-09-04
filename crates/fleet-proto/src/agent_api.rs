@@ -2,13 +2,10 @@
 //!
 //! These are the *payload* types for the dial-out control plane (architecture
 //! §5): the agent reports upward ([`AgentReport`]) and the coordinator commands
-//! downward ([`CoordinatorCommand`]) over the agent's single persistent mTLS
-//! connection. The decided transport is **postcard-rpc for both planes** (§3):
-//! agent→coordinator messages map to `ToServer` topics/endpoints and
-//! coordinator→agent commands to `ToClient` topics. The concrete topic/endpoint
-//! binding is wired by whichever of the coordinator (task 1711) / agent (task
-//! 1712) crates owns the postcard-rpc service; this module defines only the
-//! shared serde payloads so the two ends cannot drift.
+//! downward ([`CoordinatorCommand`]) over the agent's single persistent
+//! `WebSocket` connection (revision 2, §3.5 — it was a bespoke mTLS stream
+//! before). This module defines only the shared serde payloads so the two ends
+//! cannot drift; the framing lives in `fleet-wire`.
 //!
 //! The opaque data plane (probe-rs frames) is *not* modeled here — it rides
 //! [`crate::DataFrame`] on a leased [`crate::ChannelId`].
@@ -144,7 +141,16 @@ pub enum ChannelKind {
 pub enum AgentReport {
     /// First message after the dial-out connection is established.
     Register {
-        /// This agent's id (matches the pinned cert fingerprint).
+        /// The agent id this node believes it has.
+        ///
+        /// **Advisory, and validated — never trusted.** Under bearer auth the
+        /// node's identity comes from the token the coordinator resolved on the
+        /// `WebSocket` upgrade, so this field is attacker-controlled text. The
+        /// coordinator compares it with the token-derived id and closes the
+        /// connection on a mismatch (a node claiming another node's id is not a
+        /// benign typo); routing and authorization use the token-derived id
+        /// regardless. `agent.toml` writes this field from the `node_id` the
+        /// token exchange returned.
         agent: AgentId,
         /// Wire protocol version this agent speaks.
         protocol_version: u32,
@@ -185,6 +191,20 @@ pub enum AgentReport {
         channel: ChannelId,
         /// The probe-rs server process exit code, if it exited on its own.
         exit_code: Option<i32>,
+    },
+    /// Acknowledges a [`CoordinatorCommand::RotateNodeToken`] push: the node has
+    /// **durably persisted** the replacement token.
+    ///
+    /// This ack is what makes rotation safe on hardware we cannot walk up to.
+    /// The coordinator keeps the old token authoritative until it arrives, so a
+    /// push lost to a connection dying mid-write costs one retry rather than a
+    /// physical re-provisioning trip. See
+    /// [`CoordinatorCommand::RotateNodeToken`].
+    TokenRotated {
+        /// Echoes the pushed `rotation_id`, correlating the ack with the
+        /// specific push. Deliberately not a fingerprint of the token: no
+        /// function of the secret goes on the wire.
+        rotation_id: u64,
     },
 }
 
@@ -235,6 +255,26 @@ pub enum CoordinatorCommand {
     },
     /// Ask the agent to re-report its current state and inventory.
     QueryState,
+    /// Push a replacement node token down the established connection.
+    ///
+    /// Node tokens are long-lived, which is precisely what makes a leak
+    /// valuable; rotating them bounds the value of one stolen from a node's
+    /// disk. Revocation remains "delete the `node` row".
+    ///
+    /// **Ack-then-retire.** The coordinator holds the replacement in memory and
+    /// keeps the *old* token authoritative until the node replies with
+    /// [`AgentReport::TokenRotated`] carrying the same `rotation_id`. The push
+    /// is lost exactly when the connection dies mid-write — the expected case
+    /// behind a proxy that reaps idle connections — and eagerly retiring the old
+    /// token would then de-enroll a headless node. The agent persists the new
+    /// token *before* acking, and keeps the previous one until a connection with
+    /// the new one succeeds, which closes the mirror-image window.
+    RotateNodeToken {
+        /// The replacement token, in its `prfn1_…` string form.
+        token: String,
+        /// Correlates the ack with this push.
+        rotation_id: u64,
+    },
 }
 
 /// The power kind a board declares, re-exported for control-plane consumers.
@@ -320,5 +360,24 @@ mod tests {
             panic!("expected OpenSession");
         };
         assert_eq!(kind, ChannelKind::Gdb);
+    }
+
+    /// Rotation is a push + an ack, and the ack carries only the correlation
+    /// id — never a function of the secret.
+    #[test]
+    fn rotation_push_and_ack_roundtrip_through_postcard() {
+        let cmd = CoordinatorCommand::RotateNodeToken {
+            token: "prfn1_AAAA".to_owned(),
+            rotation_id: 42,
+        };
+        let bytes = postcard::to_allocvec(&cmd).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<CoordinatorCommand>(&bytes).unwrap(),
+            cmd
+        );
+
+        let ack = AgentReport::TokenRotated { rotation_id: 42 };
+        let bytes = postcard::to_allocvec(&ack).unwrap();
+        assert_eq!(postcard::from_bytes::<AgentReport>(&bytes).unwrap(), ack);
     }
 }

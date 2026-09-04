@@ -10,7 +10,6 @@ description = "Shared wire types and RPC service definitions for probe-rs-fleet 
 [dependencies]
 serde.workspace = true
 postcard.workspace = true
-base64.workspace = true
 thiserror.workspace = true
 
 [lints]
