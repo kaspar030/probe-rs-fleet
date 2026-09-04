@@ -275,96 +275,13 @@ probe-rs-fleet ctl delegate --select 'tag=nrf52' --ops flash,attach --ttl 2h
 #    → prints a lease-bound capability token; nothing else is granted.
 ```
 
-To enroll an agent, ctl user, or sidecar, use the **bootstrap-token** flow. The
-token is a one-time *bootstrap* credential; **runtime authentication stays mTLS,
-unchanged** — the token only buys the client a CA-signed client certificate.
-
-1. **`probe-rs-fleet coordinator enroll <principal-id> --kind agent|client
-   [--ttl <secs>]`** (run on the coordinator host). This mints a random
-   single-use secret, stores only its SHA-256 hash in the coordinator database
-   (`enroll_tokens`, single-use + TTL'd), and prints **one opaque,
-   copy-pasteable token string** plus a ready-to-paste `agent init` / `ctl
-   init` command. The token encodes three things:
-   1. the coordinator address (`host:port`) clients should **dial**,
-   2. the SHA-256 of the coordinator's server certificate (for bootstrap
-      server-cert pinning — see below), and
-   3. the random single-use secret (the credential).
-   The token is a transport blob, not signed; the secret IS the credential,
-   validated server-side by hash lookup.
-   - **Advertised address.** The embedded `host:port` is the address agents /
-     clients dial, which is often *not* the `listen_addr` (typically the
-     wildcard `0.0.0.0:7000` / `[::]:7000`, which is not routable from another
-     host). `enroll` resolves the embedded address as: `--coordinator-addr
-     <host:port>` override > `advertise_addr` in `coordinator.toml` >
-     `listen_addr` fallback. If the resolved address is a wildcard /
-     unspecified IP it is **rejected with a hard error** rather than silently
-     embedding an undialable `0.0.0.0` — set `advertise_addr` or pass
-     `--coordinator-addr` with the coordinator's LAN / public address. (A
-     hostname is always accepted; only `0.0.0.0` / `::` are treated as
-     wildcards.)
-   - `--kind agent`: the issued cert's fingerprint is **auto-pinned** in the
-     coordinator database (`agent_pins`) on enrollment, so the manual
-     `[pinned_agents]` edit is unnecessary.
-   - `--kind client` (ctl / sidecar users): no pinning needed (non-agent
-     principals are treated as sidecars).
-2. **Redeem the token** on the target host with `agent init` / `ctl init
-   --token <t> --profile <p>` (below). The client opens a bootstrap TLS
-   connection to the coordinator (verifying the server leaf against the token's
-   hash via a custom pinning verifier — **not** blind trust-on-first-use),
-   generates a keypair + CSR **locally** (the private key never leaves the
-   host), sends an `EnrollRequest { secret, csr_pem }`, and receives back
-   `{ client_cert_pem, ca_cert_pem, coordinator_token_pubkey }`.
-
-The coordinator's TLS listener allows **optional** client auth: a connection
-that presents **no** client cert may ONLY perform the enroll exchange (it can
-never reach the runtime agent/sidecar dispatch); a connection with a verified
-client cert routes to the existing runtime mTLS path. This mirrors hydra's
-branch on client-cert presence on a single listener — no separate bootstrap
-port.
-
-The issued-cert fingerprint is the **lowercase hex SHA-256 of the certificate
-DER, with no `sha256:` prefix and no colons** (exactly what
-`fleet_tls::cert_fingerprint` produces). A fully-commented reference config
-lives at `examples/coordinator.toml`.
-
-#### End-to-end deployment flow
-
-A clean setup from scratch:
-
-```sh
-# 1. On the coordinator host: scaffold CA + signing seed + server cert + config.
-#    Use --hostname / --ip so the server cert SANs cover the address clients
-#    will dial; set `advertise_addr` in coordinator.toml (or pass
-#    --coordinator-addr to `enroll`) to that same dialable address.
-probe-rs-fleet coordinator init --hostname coordinator.example --ip 192.168.1.10
-
-# 2. Start the coordinator.
-probe-rs-fleet coordinator
-
-# 3a. Mint a one-time bootstrap token for an agent (auto-pinned on enrollment).
-#     The embedded address must be DIALABLE: because listen_addr defaults to the
-#     wildcard 0.0.0.0:7000, pass --coordinator-addr (or set advertise_addr in
-#     coordinator.toml) — otherwise `enroll` errors instead of embedding 0.0.0.0.
-probe-rs-fleet coordinator enroll rpi-lab-1 --kind agent --coordinator-addr 192.168.1.10:7000
-#   → prints: prffe1_…  (addr + server-cert hash + single-use secret)
-
-# 3b. Mint a one-time bootstrap token for a ctl / sidecar user.
-probe-rs-fleet coordinator enroll alice --kind client --coordinator-addr 192.168.1.10:7000
-#   → prints: prffe1_…
-
-# 4. Redeem each token on its target host (runtime stays mTLS):
-
-#   On the agent (Raspberry Pi): pinned bootstrap TLS → local CSR → CA-signed cert.
-probe-rs-fleet agent init --profile lab1 --token prffe1_…
-# edit ~/.config/probe-rs-fleet/agent/lab1/boards.toml, then:
-probe-rs-fleet agent --profile lab1     # connects via mTLS with the issued cert
-
-#   On the workstation / CI host:
-probe-rs-fleet ctl init --profile ci --token prffe1_…
-probe-rs-fleet ctl --profile ci list    # authenticates via client.toml (mTLS)
-# the `probe-rs` sidecar shim uses the same per-profile client.toml automatically
-# (select the profile with PROBE_RS_FLEET_PROFILE).
-```
+> **Superseded.** The revision-1 bootstrap-token flow (`coordinator enroll`
+> minting a single-use secret → `agent init` / `ctl init` redeeming it over a
+> pinned bootstrap TLS connection for a CA-signed client certificate), the
+> optional-client-auth listener branch, and the revision-1 deployment flow that
+> went with them are **withdrawn** — see §6.2 and §6.4 for what replaces them,
+> and the deployment flow above for the current commands. `enroll` survives
+> only as the auth-key minter.
 
 
 ### 4.2 `agent` (Raspberry Pi)
