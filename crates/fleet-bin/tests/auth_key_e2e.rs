@@ -123,6 +123,11 @@ fn create_args(config_dir: &std::path::Path, tags: &[&str]) -> AuthKeyCreateArgs
         ttl: "24h".to_owned(),
         multi_use: false,
         single_use: false,
+        // Node enrollment is what this file exercises, and it is the default a
+        // caller who says nothing gets — the CI purpose is a deliberate opt-in
+        // (architecture §6.7).
+        purpose: "node".to_owned(),
+        ops: None,
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     }

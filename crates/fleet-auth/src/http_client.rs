@@ -394,6 +394,43 @@ pub async fn create_auth_key(
     ttl_secs: u64,
     multi_use: bool,
 ) -> Result<AuthKeyCreated, ClientError> {
+    create_auth_key_with_purpose(
+        base_url,
+        pin,
+        session_token,
+        tags,
+        ttl_secs,
+        multi_use,
+        None,
+        Vec::new(),
+    )
+    .await
+}
+
+/// Mint an auth key with an explicit purpose (architecture §6.7).
+///
+/// `purpose = Some("ci")` mints a **CI** key: one that redeems into a workload
+/// token and a synthesised grant, rather than into a node token. It is a
+/// different credential with a different blast radius, so it is a different
+/// call rather than an extra boolean — and [`create_auth_key`] stays the
+/// node-enrollment spelling.
+///
+/// # Errors
+///
+/// See [`exchange`]. An unrecognised purpose, or a `ci` key with no tags, is a
+/// `400 invalid_request`: an empty tag set is an empty selector, which would
+/// match every board in the org.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_auth_key_with_purpose(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+    tags: Vec<String>,
+    ttl_secs: u64,
+    multi_use: bool,
+    purpose: Option<&str>,
+    ops: Vec<String>,
+) -> Result<AuthKeyCreated, ClientError> {
     post_json(
         &route_uri(base_url, "/auth/keys")?,
         pin,
@@ -402,6 +439,8 @@ pub async fn create_auth_key(
             tags,
             ttl_secs,
             multi_use,
+            purpose: purpose.map(ToOwned::to_owned),
+            ops,
         },
     )
     .await

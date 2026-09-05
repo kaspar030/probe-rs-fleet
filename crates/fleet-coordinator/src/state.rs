@@ -74,6 +74,7 @@ type AuthKeyRow = (
     Option<i64>,
     i64,
     Option<String>,
+    String,
 );
 
 /// One `grant` row as `SQLite` hands it back.
@@ -231,6 +232,13 @@ pub struct AuthKeyListing {
     /// revoke their own key, and an org admin revoke any key including the
     /// shell-minted ones this column leaves `NULL`.
     pub created_by: Option<String>,
+    /// What the key is for (`node` | `ci`).
+    ///
+    /// Listed because revoking a `ci` key also revokes the grant it
+    /// synthesised, and therefore tears down live leases (architecture §6.7).
+    /// An operator who cannot see which kind a key is will revoke one and be
+    /// surprised by what else disappears.
+    pub purpose: String,
 }
 
 /// One `pending_node` row as `SQLite` hands it back.
@@ -975,7 +983,7 @@ impl Db {
     /// Returns a database error if the query fails.
     pub async fn list_auth_keys(&self, org: &OrgId) -> Result<Vec<AuthKeyListing>> {
         let rows: Vec<AuthKeyRow> = sqlx::query_as(
-            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at, created_by
+            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at, created_by, purpose
              FROM auth_key WHERE org_id = ?1 ORDER BY created_at DESC",
         )
         .bind(org.0.as_str())
@@ -984,7 +992,16 @@ impl Db {
         Ok(rows
             .into_iter()
             .map(
-                |(key_hash, tags, single_use, expires, consumed_at, created_at, created_by)| {
+                |(
+                    key_hash,
+                    tags,
+                    single_use,
+                    expires,
+                    consumed_at,
+                    created_at,
+                    created_by,
+                    purpose,
+                )| {
                     AuthKeyListing {
                         key_hash,
                         tags: split_tags(&tags),
@@ -993,6 +1010,7 @@ impl Db {
                         consumed_at,
                         created_at,
                         created_by,
+                        purpose,
                     }
                 },
             )

@@ -56,6 +56,8 @@ pub enum Command {
     AuthKey(AuthKeyCliArgs),
     /// Share a subset of this org's boards with another person.
     Grant(GrantArgs),
+    /// CI-runner verbs. Today: exchange a workload identity for a fleet token.
+    Ci(CiArgs),
     /// Node-side operator verbs. Today: approve a machine that is asking to
     /// join your org.
     Node(NodeArgs),
@@ -366,6 +368,23 @@ pub struct AuthKeyCreateArgs {
     /// error.
     #[arg(long, conflicts_with = "multi_use")]
     pub single_use: bool,
+    /// What the key is for: `node` (enroll a machine that *offers* probes — the
+    /// default) or `ci` (a runner that *leases* them, architecture §6.7).
+    ///
+    /// A `ci` key is the fallback for a runner with no workload identity, and
+    /// it is honestly the weak path: a long-lived bearer secret in somebody
+    /// else's CI config. It requires at least one `--tag`, because the tags
+    /// become the selector of the grant its redemption synthesises and an empty
+    /// selector matches every board in the org.
+    #[arg(long, default_value = "node", value_parser = ["node", "ci"])]
+    pub purpose: String,
+    /// For `--purpose ci`: the operations the key's grant confers,
+    /// comma-separated. Defaults to `flash,attach,reset,erase`.
+    ///
+    /// `power-cycle` is deliberately not in that default: an unattended runner
+    /// cutting power to a lab board should be an explicit choice.
+    #[arg(long)]
+    pub ops: Option<String>,
     /// The fleet whose `[user]` session authorises the mint.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
     pub fleet: String,
@@ -422,6 +441,83 @@ pub struct NodeArgs {
 pub enum NodeCommand {
     /// Approve (or deny) a machine that printed a short code and is waiting.
     Approve(NodeApproveArgs),
+}
+
+/// Arguments for `probe-rs-fleet ci`.
+///
+/// A namespace for the same reason [`NodeArgs`] is one: `ci status` / `ci
+/// whoami` are obvious follow-ups, and `ci-login` as a single hyphenated verb
+/// would have to be renamed to make room.
+#[derive(Debug, Args)]
+pub struct CiArgs {
+    /// The CI verb.
+    #[command(subcommand)]
+    pub command: CiCommand,
+}
+
+/// `ci` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum CiCommand {
+    /// Exchange this job's workload identity for a short-lived fleet token.
+    Login(CiLoginArgs),
+}
+
+/// Arguments for `probe-rs-fleet ci login` (architecture §6.7).
+///
+/// Two paths, and the difference between them is the whole point:
+///
+/// * **GitHub Actions** (the default): no secret is stored anywhere. The job
+///   asks GitHub's own token service for a signed OIDC JWT — which
+///   `permissions: id-token: write` and nothing else enables — and the
+///   coordinator verifies it against the issuer's JWKS. What the runner holds
+///   before this command runs is *nothing*.
+/// * **`--auth-key`**: the fallback for a runner with no workload identity (a
+///   self-hosted Jenkins box). Honestly the weak path: a long-lived bearer
+///   secret living in somebody else's CI configuration.
+#[derive(Debug, Args)]
+pub struct CiLoginArgs {
+    /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
+    #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR")]
+    pub fleet_url: Option<String>,
+    /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
+    /// self-hosted deployment with no publicly trusted certificate.
+    #[arg(long, env = "PROBE_RS_FLEET_SERVER_CERT_SHA256")]
+    pub server_cert_sha256: Option<String>,
+    /// The `aud` claim to request from GitHub.
+    ///
+    /// Must match the coordinator's configured audience, which is normally its
+    /// `public_url`. There is deliberately no default on the *coordinator*
+    /// side: GitHub's own default audience is `https://github.com/<owner>`,
+    /// which is not specific to any service, so a token minted for something
+    /// else under the same owner would be replayable. Defaults here to
+    /// `--fleet-url`, which is that public URL in every ordinary deployment.
+    #[arg(long)]
+    pub audience: Option<String>,
+    /// Redeem a workload auth key instead of a GitHub workload identity.
+    ///
+    /// For a runner GitHub does not mint tokens for. Read it from the CI
+    /// system's secret store, not from a literal on the command line — argv is
+    /// visible to every process on the box.
+    #[arg(long, env = "PROBE_RS_FLEET_AUTH_KEY")]
+    pub auth_key: Option<String>,
+    /// Print `export …` lines on stdout even when `$GITHUB_ENV` is set.
+    ///
+    /// Off by default, and that default is a safety property: on GitHub Actions
+    /// the token goes into `$GITHUB_ENV` and is never printed, because stdout
+    /// is the job log.
+    #[arg(long)]
+    pub export: bool,
+    /// The fleet name, for the `PROBE_RS_FLEET` variable it exports.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the fleets directory (default: XDG config dir). Test and
+    /// packaging support.
+    ///
+    /// Note this verb **writes no fleet file**: a CI runner's token lives in
+    /// the environment for one job. The flag exists only so a test can prove
+    /// that.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// Arguments for `probe-rs-fleet node approve`.
@@ -717,6 +813,15 @@ pub struct GrantArgs {
     /// key (`<org>/user:<id>`). Resolved to an immutable user id at creation —
     /// a login can be renamed and reused, an id cannot.
     pub subject: Option<String>,
+    /// Share with a **CI repository** instead of a person: `owner/name`
+    /// (architecture §6.7).
+    ///
+    /// Grants exactly that repo, never its owner. A fork, or a newly created
+    /// repo under the same owner, is a different subject and gets nothing —
+    /// which is the entire point of the per-repo rule, and why there is no
+    /// `--repo-owner`.
+    #[arg(long, conflicts_with = "subject")]
+    pub repo: Option<String>,
     /// Which boards to share: `tag=<t> && <t>`, `chip=<c>`, or `board=<name>`
     /// for a single board (a degenerate selector, not a special case).
     #[arg(long)]
@@ -916,6 +1021,9 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         roles::node_approve::run(&approve).await?;
                         Ok(ExitCode::SUCCESS)
                     }
+                },
+                Command::Ci(args) => match args.command {
+                    CiCommand::Login(login) => roles::ci::run(login).await,
                 },
                 Command::Fleets => {
                     roles::list_fleets()?;

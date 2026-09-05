@@ -1094,6 +1094,41 @@ impl Coordinator {
         Ok(CoordToSidecar::GrantRevoked { ids })
     }
 
+    /// Revoke a **specific** grant by exact id, cascading as `grant revoke`
+    /// does, without any of its authorization checks.
+    ///
+    /// The auth-key revocation path's hook (architecture §6.7): revoking a CI
+    /// key must also tear down the grant its redemption synthesised, or the
+    /// runner keeps its board until the lease TTL runs out and the operator is
+    /// left believing the key is dead. Authorization already happened at
+    /// `POST /auth/keys` — same rule, creator-or-admin — which is why this
+    /// takes no `Subject`.
+    ///
+    /// Returns the ids actually deleted, so the caller can say whether
+    /// anything cascaded. A key that was never redeemed has no grant, and that
+    /// is an empty vector rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database or scheduler error from the release path.
+    pub async fn revoke_grant_by_id(&self, org: &OrgId, id: &str) -> Result<Vec<String>> {
+        let scoped = self.db.scoped(org.clone());
+        let all = scoped.list_grants().await?;
+        let Some(target) = all.iter().find(|g| g.id == id) else {
+            return Ok(Vec::new());
+        };
+        let grantee = target.parsed_subject();
+        // By exact id, via the prefix delete: the id *is* the whole prefix, so
+        // this matches one row and reuses the one delete statement rather than
+        // adding a second way to remove a grant.
+        let deleted = scoped.delete_grants_by_prefix(id).await?;
+        let ids: Vec<String> = deleted.iter().map(|g| g.id.clone()).collect();
+        if let Some(grantee) = grantee {
+            self.cascade_revocation(&grantee, org).await?;
+        }
+        Ok(ids)
+    }
+
     /// After a grant is deleted, take back whatever it was still holding open.
     ///
     /// Recomputes `grantee`'s access from scratch and releases every lease it

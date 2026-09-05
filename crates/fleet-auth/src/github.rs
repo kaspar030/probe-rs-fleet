@@ -612,6 +612,65 @@ pub async fn fetch_user(app: &GithubApp, access_token: &str) -> Result<GithubUse
     parse_user_response(&body)
 }
 
+/// Fetch a **GitHub Actions workload identity token** from the runner's own
+/// token service (architecture §6.7).
+///
+/// This is the other half of the sentence this module opens with. User login is
+/// plain `OAuth2` with nothing to verify; a *workload* identity is real OIDC —
+/// a signed JWT with a JWKS behind it — and this is where a CI job obtains one.
+///
+/// `url` and `request_token` come from `ACTIONS_ID_TOKEN_REQUEST_URL` /
+/// `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, which the runner injects **only** for a
+/// job carrying `permissions: id-token: write`. Both are per-job credentials
+/// the runner already holds; nothing is stored and nothing outlives the job.
+///
+/// It lives here rather than in `fleet-bin` for the reason
+/// [`crate::http_client`]'s docs give about forking trust paths: this request
+/// and the `/auth/token` exchange that follows it must go through the same
+/// `hyper` + `hyper-rustls` stack, or one of them silently stops honouring the
+/// workspace's TLS decisions.
+///
+/// # Errors
+///
+/// Returns [`GithubError`] on a transport failure, a non-2xx status (the usual
+/// cause being a job without `id-token: write`), a body with no `value` field,
+/// or an `audience` carrying query metacharacters — refused rather than
+/// escaped, because a fleet URL containing `&` is a configuration mistake and
+/// not something to paper over.
+pub async fn fetch_workload_id_token(
+    url: &str,
+    request_token: &str,
+    audience: &str,
+) -> Result<String, GithubError> {
+    if audience.trim().is_empty() || audience.contains('&') || audience.contains('#') {
+        return Err(GithubError::Url(
+            "audience must be non-empty and free of `&` and `#`".to_owned(),
+        ));
+    }
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let full = format!("{url}{separator}audience={}", percent_encode(audience));
+    let (status, body) = get_json(&full, request_token).await?;
+    if !(200..300).contains(&status) {
+        return Err(GithubError::Http {
+            status,
+            body: body_text(&body),
+        });
+    }
+
+    #[derive(Deserialize)]
+    struct IdTokenResponse {
+        value: String,
+    }
+    let parsed: IdTokenResponse = serde_json::from_slice(&body)
+        .map_err(|e| GithubError::Malformed(format!("OIDC token response: {e}")))?;
+    if parsed.value.trim().is_empty() {
+        return Err(GithubError::Malformed(
+            "OIDC token response carried an empty `value`".to_owned(),
+        ));
+    }
+    Ok(parsed.value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

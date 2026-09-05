@@ -3,9 +3,19 @@
 //!
 //! ```text
 //! probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
+//! probe-rs-fleet grant --repo ariel-os/ariel-os --select 'tag=nrf52' --ops flash
 //! probe-rs-fleet grant list
 //! probe-rs-fleet grant revoke a1b2c3d4
 //! ```
+//!
+//! # `--repo` grants a repository, never its owner
+//!
+//! `--repo owner/name` is the CI half (architecture §6.7): the grantee is a
+//! GitHub Actions **workload** that proved, with a signed OIDC token, that it
+//! is a job in that repo. The rule this verb has to make visible is that
+//! `repository_owner` confers nothing — a fork, or a newly created repo under
+//! the same owner, is a different subject with no grant. So the output prints
+//! the resolved subject key and says so in as many words.
 //!
 //! Four properties come from the coordinator rather than from here, and are
 //! worth knowing while reading this file:
@@ -70,11 +80,22 @@ pub async fn run(args: GrantArgs) -> Result<ExitCode> {
     }
 }
 
-/// `grant <subject> --select … --ops … [--until|--ttl]`.
+/// `grant <subject>|--repo <owner/name> --select … --ops … [--until|--ttl]`.
 async fn create(args: GrantArgs) -> Result<ExitCode> {
-    let subject = args
-        .subject
-        .context("who to share with? e.g. `probe-rs-fleet grant bob --select 'tag=nrf52'`")?;
+    // `--repo` is sent as the `repo:` spelling `Coordinator::resolve_grantee`
+    // accepts, rather than as a distinct wire field: validation and
+    // normalisation stay **server-side**, which is the property that matters
+    // (a client cannot talk the coordinator into a subject key it would not
+    // build itself), and the spelling is one a human can type directly.
+    let is_repo = args.repo.is_some();
+    let subject = match (&args.repo, &args.subject) {
+        (Some(repo), _) => format!("repo:{}", repo.trim()),
+        (None, Some(subject)) => subject.clone(),
+        (None, None) => anyhow::bail!(
+            "who to share with? A person: `probe-rs-fleet grant bob --select 'tag=nrf52'`. \
+             A CI repository: `probe-rs-fleet grant --repo owner/name --select 'tag=nrf52'`."
+        ),
+    };
     let selector = args
         .select
         .context("--select is required: which boards to share (e.g. 'tag=nrf52', 'board=dk-3')")?;
@@ -129,6 +150,18 @@ async fn create(args: GrantArgs) -> Result<ExitCode> {
             println!("  ops     {}", render_ops(&grant.ops));
             println!("  expires {expires} (epoch)");
             println!("  revoke  probe-rs-fleet grant revoke {}", &grant.id[..8]);
+            if is_repo {
+                // The subject key printed above is the exact identity a CI job
+                // authenticates as, and the reminder is not decoration: "I
+                // granted the org" is the single most likely misreading of this
+                // verb, and the CLI is the right place to correct it before
+                // somebody debugs a `403 no_grant` from the other end.
+                println!(
+                    "  note    this grants exactly that repository. Its OWNER is not \
+                     granted: a fork, or a new repo under the same owner, gets nothing \
+                     and needs its own grant."
+                );
+            }
             print_enforcement_note(&grant.ops);
             Ok(ExitCode::SUCCESS)
         }

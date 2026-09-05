@@ -1285,7 +1285,22 @@ async fn auth_keys(
             tags,
             ttl_secs,
             multi_use,
-        } => create_auth_key(&coord, &org, &auth.id, tags, ttl_secs, multi_use, now_i64).await,
+            purpose,
+            ops,
+        } => {
+            create_auth_key(
+                &coord,
+                &org,
+                &auth.id,
+                tags,
+                ttl_secs,
+                multi_use,
+                purpose.as_deref(),
+                ops,
+                now_i64,
+            )
+            .await
+        }
         AuthKeyRequest::List {} => list_auth_keys(&coord, &org).await,
         AuthKeyRequest::Revoke { prefix } => {
             revoke_auth_key(&coord, &org, &auth.id, &subject, &prefix, now_i64).await
@@ -1305,6 +1320,8 @@ async fn create_auth_key(
     tags: Vec<String>,
     ttl_secs: u64,
     multi_use: bool,
+    purpose: Option<&str>,
+    ops: Vec<String>,
     now: i64,
 ) -> Response {
     // A forever-key over the API is refused rather than silently capped: the
@@ -1313,16 +1330,53 @@ async fn create_auth_key(
     if ttl_secs == 0 || ttl_secs > MAX_API_AUTH_KEY_TTL_SECS {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     }
-    let expires = now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+    // An unrecognised purpose is a 400, never a silent default. The two
+    // purposes are *different credentials* — one offers hardware, one leases it
+    // — so a typo'd `--purpose ic` quietly meaning `node` would mint the wrong
+    // thing and only fail at redemption, far from the mistake.
+    let purpose = match purpose {
+        None => crate::state::AUTH_KEY_PURPOSE_NODE,
+        Some(p) if p == crate::state::AUTH_KEY_PURPOSE_NODE => {
+            crate::state::AUTH_KEY_PURPOSE_NODE
+        }
+        Some(p) if p == crate::state::AUTH_KEY_PURPOSE_CI => crate::state::AUTH_KEY_PURPOSE_CI,
+        Some(_) => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
 
     let mut tags = tags;
     tags.sort_unstable();
     tags.dedup();
 
+    // A CI key's tags become the *selector* of the grant its redemption
+    // synthesises, and an empty selector matches every board in the org. The
+    // selector parser refuses an empty expression at every other entry point
+    // (§6.5); refusing it here keeps that rule from having an exception nobody
+    // would find until a runner had the whole fleet.
+    if purpose == crate::state::AUTH_KEY_PURPOSE_CI && tags.is_empty() {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    // Ops are validated here so a typo is a 400 rather than an op silently
+    // dropped at redemption.
+    let normalized_ops: Vec<String> = if ops.is_empty() {
+        Vec::new()
+    } else {
+        let parsed: Vec<fleet_proto::token::AllowedOp> = match ops
+            .iter()
+            .map(|o| fleet_proto::token::AllowedOp::from_label(o))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(parsed) => fleet_proto::token::normalize_ops(parsed),
+            None => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
+        };
+        parsed.iter().map(|o| o.as_str().to_owned()).collect()
+    };
+
+    let expires = now.saturating_add(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+
     let token = OpaqueToken::mint(TokenKind::AuthKey);
     if let Err(e) = coord
         .db()
-        .insert_auth_key(
+        .insert_auth_key_with_purpose(
             org,
             token.hash().as_str(),
             &tags,
@@ -1330,6 +1384,8 @@ async fn create_auth_key(
             Some(expires),
             Some(user_id),
             now,
+            purpose,
+            &normalized_ops,
         )
         .await
     {
@@ -1341,7 +1397,7 @@ async fn create_auth_key(
     // `redeem_auth_key`: a human's authority created this credential, and that
     // is the fact worth being able to look up later.
     let detail = format!(
-        "minted by {user_id} (single_use={}, tags=[{}])",
+        "minted by {user_id} (purpose={purpose}, single_use={}, tags=[{}])",
         !multi_use,
         tags.join(",")
     );
@@ -1358,7 +1414,7 @@ async fn create_auth_key(
             detail: Some(&detail),
         })
         .await;
-    info!(org = %org, subject = %user_id, key = %token.hash().short(), "auth key minted");
+    info!(org = %org, subject = %user_id, key = %token.hash().short(), %purpose, "auth key minted");
 
     Json(AuthKeyCreated {
         key: token.to_secret_string(),
@@ -1366,6 +1422,7 @@ async fn create_auth_key(
         org: org.0.clone(),
         tags,
         single_use: !multi_use,
+        purpose: purpose.to_owned(),
         expires: Some(expires),
     })
     .into_response()
@@ -1388,6 +1445,7 @@ async fn list_auth_keys(coord: &Coordinator, org: &OrgId) -> Response {
                 key_hash: k.key_hash,
                 tags: k.tags,
                 single_use: k.single_use,
+                purpose: k.purpose,
                 expires: k.expires,
                 consumed_at: k.consumed_at,
                 created_at: k.created_at,
@@ -1467,7 +1525,38 @@ async fn revoke_auth_key(
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
-    let detail = format!("revoked by {user_id}: {}", revoked.join(","));
+
+    // Revoking a CI key must also revoke the grant its redemption synthesised
+    // (architecture §6.7), for the reason §6.5 gives about grant revocation:
+    // deleting the credential alone would leave the runner relaying bytes on a
+    // board it may no longer use until the lease TTL ran out, while the
+    // operator believed the key was dead. `revoke_grant_by_id` goes through the
+    // whole release path — channels down, lease closed and audited, waiters
+    // promoted — so revocation here is as real as it is there.
+    let mut cascaded: Vec<String> = Vec::new();
+    for hash in &revoked {
+        let grant_id = format!("ci-{}", hash.get(..29).unwrap_or(hash));
+        match coord.revoke_grant_by_id(org, &grant_id).await {
+            Ok(ids) => cascaded.extend(ids),
+            // A failure here must not swallow the revocation that already
+            // happened: the key is gone either way, and an operator needs to
+            // know a lease may still be live.
+            Err(e) => warn!(error = %e, %grant_id, "failed to cascade a CI key's grant"),
+        }
+    }
+    if !cascaded.is_empty() {
+        info!(grants = %cascaded.join(","), "revoked the grants a CI auth key had synthesised");
+    }
+
+    let detail = if cascaded.is_empty() {
+        format!("revoked by {user_id}: {}", revoked.join(","))
+    } else {
+        format!(
+            "revoked by {user_id}: {} (cascaded grants {})",
+            revoked.join(","),
+            cascaded.join(",")
+        )
+    };
     let _ = coord
         .db()
         .scoped(org.clone())

@@ -74,16 +74,37 @@ pub async fn run(args: AuthKeyCliArgs) -> Result<()> {
 /// rather than bouncing the user off a `400`.
 pub async fn create(args: &AuthKeyCreateArgs) -> Result<AuthKeyCreated> {
     let ttl = parse_ttl(&args.ttl)?;
+    // A CI key's tags become the *selector* of the grant its redemption
+    // synthesises, so an empty set would share every board in the org. Refused
+    // here as well as at the coordinator, because the local message can say
+    // *why* where a `400` cannot.
+    anyhow::ensure!(
+        args.purpose != "ci" || !args.tag.is_empty(),
+        "a `--purpose ci` key needs at least one `--tag`: the tags become the \
+         selector of the grant it creates, and an empty selector matches every \
+         board in the org"
+    );
+    let ops = match &args.ops {
+        // Validated locally so a typo names the unknown op rather than
+        // bouncing off a coarse `400`.
+        Some(spec) => crate::roles::grant::parse_ops_arg(spec)?
+            .iter()
+            .map(|o| o.as_str().to_owned())
+            .collect(),
+        None => Vec::new(),
+    };
     let (file, session) = session_for(&args.fleet, args.config_dir.as_deref()).await?;
     // `--single-use` is the default, so it is accepted and ignored; clap already
     // refuses it together with `--multi-use`.
-    fleet_auth::http_client::create_auth_key(
+    fleet_auth::http_client::create_auth_key_with_purpose(
         &file.url,
         file.pin(),
         &session,
         args.tag.clone(),
         ttl,
         args.multi_use,
+        Some(&args.purpose),
+        ops,
     )
     .await
     .map_err(|e| describe(&e, "minting an auth key"))
@@ -232,11 +253,22 @@ fn print_created(created: &AuthKeyCreated) {
     }
     println!("  hash       : {}", short(&created.key_hash));
     println!();
-    println!("Enroll a node with it:");
-    println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
+    if created.purpose == "ci" {
+        println!("Use it on a CI runner with no workload identity of its own:");
+        println!("  probe-rs-fleet ci login --fleet-url <url> --auth-key <key>");
+        println!();
+        println!("Redeeming it creates a GRANT in this org selecting the tagged boards,");
+        println!("so revoking the key also tears down whatever it is holding — not just");
+        println!("the credential. This is the weak CI path: prefer GitHub Actions");
+        println!("workload identity (`grant --repo owner/name`), which stores no secret");
+        println!("anywhere at all. See docs/ci-github-actions.md.");
+    } else {
+        println!("Enroll a node with it:");
+        println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
+    }
     println!();
     println!("This key is a bearer credential and is not stored anywhere (only its");
-    println!("hash). Copy it now; anyone holding it can enroll a node into this org.");
+    println!("hash). Copy it now; anyone holding it can use it.");
 }
 
 /// Print a listing, in the same column layout as `coordinator auth-keys`.
@@ -258,8 +290,8 @@ fn print_list(list: &AuthKeyList) {
     );
     println!();
     println!(
-        "  {:<16}  {:<10}  {:<12}  {:<12}  {:<16}  TAGS",
-        "HASH PREFIX", "SINGLE-USE", "EXPIRES", "STATE", "CREATED BY"
+        "  {:<16}  {:<8}  {:<10}  {:<12}  {:<12}  {:<16}  TAGS",
+        "HASH PREFIX", "PURPOSE", "SINGLE-USE", "EXPIRES", "STATE", "CREATED BY"
     );
     for key in &list.keys {
         let expires = key
@@ -274,8 +306,9 @@ fn print_list(list: &AuthKeyList) {
         };
         let created_by = key.created_by.as_deref().unwrap_or("(shell)");
         println!(
-            "  {:<16}  {:<10}  {expires:<12}  {state:<12}  {created_by:<16}  {}",
+            "  {:<16}  {:<8}  {:<10}  {expires:<12}  {state:<12}  {created_by:<16}  {}",
             short(&key.key_hash),
+            key.purpose,
             key.single_use,
             key.tags.join(",")
         );
@@ -283,6 +316,13 @@ fn print_list(list: &AuthKeyList) {
     println!();
     println!("Revoke one with:");
     println!("  probe-rs-fleet auth-key revoke <hash-prefix>");
+    if list.keys.iter().any(|k| k.purpose == "ci") {
+        // Said out loud because it is the surprising part: a `ci` key carries a
+        // grant, so revoking it releases live leases too.
+        println!();
+        println!("Note a `ci` key also carries a GRANT on this org's boards. Revoking it");
+        println!("revokes that grant as well, releasing any lease the runner is holding.");
+    }
 }
 
 /// Print what a revocation deleted.

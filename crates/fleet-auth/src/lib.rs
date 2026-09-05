@@ -65,6 +65,15 @@ pub use verify::{authenticate, AuthError, Authenticated};
 pub mod api {
     use serde::{Deserialize, Serialize};
 
+    /// `auth_key.purpose` for an older peer that does not send the field.
+    ///
+    /// Node enrollment is the historical meaning, so an absent field must keep
+    /// meaning exactly that — a `ci` default would silently reinterpret every
+    /// existing key as a board-access credential.
+    fn default_auth_key_purpose() -> String {
+        "node".to_owned()
+    }
+
     /// A token-exchange request.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     #[serde(tag = "grant_type", rename_all = "snake_case")]
@@ -237,6 +246,19 @@ pub mod api {
             /// Allow the key to enroll more than one node.
             #[serde(default)]
             multi_use: bool,
+            /// What the key is for: `node` (the default — enroll a machine
+            /// that *offers* probes) or `ci` (architecture §6.7 — a runner that
+            /// *leases* them).
+            ///
+            /// Absent means `node`, so an older client's request keeps its
+            /// exact previous meaning. An unrecognised value is a `400`, never
+            /// a silent default: the two purposes are different credentials.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            purpose: Option<String>,
+            /// For a `ci` key: the operations its synthesised grant confers.
+            /// Empty means the coordinator's default set.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            ops: Vec<String>,
         },
         /// List the caller's org's auth keys (hashes only).
         List {},
@@ -260,6 +282,10 @@ pub mod api {
         pub tags: Vec<String>,
         /// Whether redeeming the key consumes it.
         pub single_use: bool,
+        /// What the key is for (`node` | `ci`), echoed so the CLI can print it
+        /// and an operator can see which credential they just minted.
+        #[serde(default = "default_auth_key_purpose")]
+        pub purpose: String,
         /// Expiry (epoch seconds). Always set on this path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expires: Option<i64>,
@@ -274,6 +300,13 @@ pub mod api {
         pub tags: Vec<String>,
         /// Whether redeeming the key consumes it.
         pub single_use: bool,
+        /// What the key is for (`node` | `ci`).
+        ///
+        /// Listed because revoking a `ci` key also tears down the grant it
+        /// synthesised, and therefore live leases — an operator must be able to
+        /// see which kind they are about to revoke.
+        #[serde(default = "default_auth_key_purpose")]
+        pub purpose: String,
         /// Expiry (epoch seconds), or `None` for a key that never expires.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expires: Option<i64>,
