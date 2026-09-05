@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use fleet_auth::{OpaqueToken, TokenKind};
@@ -21,6 +22,9 @@ use fleet_proto::ids::{AgentId, BoardRef, OrgId, Role};
 
 /// The signing seed every test coordinator uses.
 pub const SEED: [u8; 32] = [7u8; 32];
+
+/// Counter behind [`TestCoordinator::seed_workload_grant`]'s ids.
+static NEXT_GRANT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A coordinator serving its real router on a real loopback port.
 pub struct TestCoordinator {
@@ -160,6 +164,111 @@ impl TestCoordinator {
                 expires,
                 None,
                 now,
+            )
+            .await
+            .unwrap();
+        token.to_secret_string()
+    }
+
+    /// Seed a CI (`--purpose ci`) auth key; returns the key's string form.
+    ///
+    /// Separate from [`TestCoordinator::seed_auth_key`] because it is a
+    /// different credential: a `node` key enrolls a machine that *offers*
+    /// probes, a `ci` key redeems into a workload token that *leases* them
+    /// (architecture §6.7). Nothing should be able to conflate the two by
+    /// accident, in the tests least of all.
+    pub async fn seed_ci_auth_key(
+        &self,
+        org: &str,
+        tags: &[String],
+        expires: Option<i64>,
+    ) -> String {
+        let org = OrgId(org.to_owned());
+        self.db().ensure_org(&org, "personal").await.unwrap();
+        let token = OpaqueToken::mint(TokenKind::AuthKey);
+        let now = i64::try_from(self.coord.now()).unwrap();
+        self.db()
+            .insert_auth_key_with_purpose(
+                &org,
+                token.hash().as_str(),
+                tags,
+                false,
+                expires,
+                None,
+                now,
+                "ci",
+                &[],
+            )
+            .await
+            .unwrap();
+        token.to_secret_string()
+    }
+
+    /// Grant `repo` (as `owner/name`) access to `org`'s boards matching
+    /// `selector`, returning the grant id.
+    ///
+    /// The **per-repo** grant of architecture §6.7, built through the same
+    /// `workload_subject_key` the exchange path uses, so a test cannot pass by
+    /// agreeing with itself about a spelling the production code would not
+    /// produce.
+    pub async fn seed_workload_grant(
+        &self,
+        org: &str,
+        repo: &str,
+        selector: &str,
+        ops: &[fleet_proto::token::AllowedOp],
+        expires: Option<i64>,
+    ) -> String {
+        let org = OrgId(org.to_owned());
+        self.db().ensure_org(&org, "personal").await.unwrap();
+        let normalised = fleet_proto::ids::normalise_repo(repo)
+            .unwrap_or_else(|| panic!("{repo} is not a valid owner/name"));
+        let key = fleet_proto::ids::workload_subject_key(&normalised);
+        let selector =
+            fleet_proto::lease::parse_constraint(selector, fleet_proto::lease::BareTerm::Tag)
+                .unwrap()
+                .to_string();
+        // Unique per call: the id is the revocation handle and two grants in one
+        // test must not collide.
+        let id = format!("{:032x}", NEXT_GRANT_ID.fetch_add(1, Ordering::Relaxed));
+        let now = i64::try_from(self.coord.now()).unwrap();
+        self.db()
+            .scoped(org)
+            .insert_grant(
+                &id,
+                &key,
+                &selector,
+                ops,
+                expires.or(Some(now + 86_400)),
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Seed a workload token row directly; returns the token's string form.
+    ///
+    /// For tests about what a workload token may *do* once it exists, which
+    /// should not have to stand up a stub issuer to find out.
+    pub async fn seed_workload_token(&self, repo: &str, expires: i64) -> String {
+        let token = OpaqueToken::mint(TokenKind::Workload);
+        let normalised = fleet_proto::ids::normalise_repo(repo).unwrap();
+        let key = fleet_proto::ids::workload_subject_key(&normalised);
+        let now = i64::try_from(self.coord.now()).unwrap();
+        self.db()
+            .insert_workload_token(
+                token.hash().as_str(),
+                &key,
+                "github_oidc",
+                &fleet_coordinator::state::WorkloadClaimColumns {
+                    repository: Some(normalised),
+                    repository_owner: Some("seeded".to_owned()),
+                    ..fleet_coordinator::state::WorkloadClaimColumns::default()
+                },
+                now,
+                expires,
             )
             .await
             .unwrap();
