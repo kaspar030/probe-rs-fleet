@@ -11,9 +11,11 @@
 //! [`fleet_proto::LeaseGrant`], minting the signed capability token that is
 //! deliberately out of scope here.
 
+pub mod access;
 pub mod policy;
 pub mod scheduler;
 
+pub use access::{Access, GrantScope};
 pub use policy::Policy;
 pub use scheduler::{
     ExpireResult, ExpiredLease, GrantedLease, LeaseAuthError, LeaseDecision, Scheduler,
