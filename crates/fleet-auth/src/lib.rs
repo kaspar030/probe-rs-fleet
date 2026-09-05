@@ -37,13 +37,23 @@ pub mod token;
 pub mod user_code;
 pub mod verify;
 
+/// GitHub Actions workload identity (feature `oidc`).
+///
+/// Off by default, and `fleet-coordinator` is the only crate that enables it:
+/// `jsonwebtoken/rust_crypto` drags in `rsa`, `p256`, `p384`, `ed25519-dalek`
+/// and friends, and this crate's other consumer path ends up in the Raspberry
+/// Pi binary (see `docs/cross-compiling.md`). Only the coordinator verifies a
+/// JWT.
+#[cfg(feature = "oidc")]
+pub mod oidc;
+
 #[cfg(feature = "client")]
 pub mod github;
 #[cfg(feature = "client")]
 pub mod http_client;
 
 pub use rotation::{should_rotate, RotationPolicy};
-pub use store::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore};
+pub use store::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore, WorkloadRecord};
 pub use token::{OpaqueToken, TokenError, TokenHash, TokenKind};
 pub use verify::{authenticate, AuthError, Authenticated};
 
@@ -99,6 +109,29 @@ pub mod api {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             adopt: Option<String>,
         },
+        /// Exchange a **GitHub Actions OIDC token** for a per-job workload
+        /// token (architecture §6.7).
+        ///
+        /// This is the zero-secrets CI path: the runner holds no credential at
+        /// all, it asks GitHub's own token service for a signed JWT (which
+        /// needs `permissions: id-token: write` and nothing else) and hands
+        /// that here. The coordinator verifies the signature against the
+        /// issuer's JWKS and looks for an explicit **per-repo** grant.
+        GithubOidc {
+            /// The OIDC JWT, as `ACTIONS_ID_TOKEN_REQUEST_URL` returned it.
+            oidc_token: String,
+        },
+        /// Redeem a **workload auth key** for a workload token: the fallback
+        /// for a runner with no workload identity of its own (a self-hosted
+        /// Jenkins box).
+        ///
+        /// Honestly the weak path — a long-lived bearer secret living in
+        /// somebody else's CI configuration. It is bounded by being org-scoped,
+        /// selector-scoped, op-scoped, expiring and revocable, and that is all.
+        WorkloadKey {
+            /// The workload auth key (`prffk1_…`, minted with `--purpose ci`).
+            auth_key: String,
+        },
     }
 
     /// A successful token exchange.
@@ -111,7 +144,18 @@ pub mod api {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub node_id: Option<String>,
         /// The org the token belongs to.
+        ///
+        /// For a **workload** token this is not a scope: a workload belongs to
+        /// no org (see [`TokenResponse::orgs`]). It carries the first, sorted,
+        /// granting org purely so the CLI has something to print.
         pub org: String,
+        /// Every org that granted this workload access, for provenance.
+        ///
+        /// Empty for every other grant type. A workload is **not a member** of
+        /// any of these: it reaches their boards through explicit per-repo
+        /// grants and nothing else.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub orgs: Vec<String>,
         /// Expiry (epoch seconds), if the token has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expires: Option<u64>,

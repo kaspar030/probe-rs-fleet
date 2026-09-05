@@ -26,8 +26,8 @@ pub use agent_api::{
 };
 pub use board::{Board, BoardState, PowerKind};
 pub use ids::{
-    AgentId, BoardName, BoardRef, Group, LeaseId, NodeId, OrgId, Role, Subject, SubjectKey,
-    SubjectKind, UserId,
+    normalise_repo, workload_subject_key, AgentId, BoardName, BoardRef, Group, LeaseId, NodeId,
+    OrgId, Role, Subject, SubjectKey, SubjectKind, UserId, WORKLOAD_NS_GHA,
 };
 pub use lease::{
     parse_constraint, BareTerm, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest,

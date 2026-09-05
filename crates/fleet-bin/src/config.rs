@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use fleet_coordinator::config::{CoordinatorConfig, GithubConfig, SigningKeySource, TlsConfig};
+use fleet_coordinator::config::{
+    CoordinatorConfig, GithubActionsConfig, GithubConfig, SigningKeySource, TlsConfig,
+};
 use fleet_core::policy::Policy;
 
 /// Optional coordinator-terminated TLS, as a `[tls]` table.
@@ -72,6 +74,58 @@ fn default_access_token_url() -> String {
 
 fn default_api_base() -> String {
     "https://api.github.com".to_owned()
+}
+
+/// The `[github_actions]` table: the OIDC issuer backing `probe-rs-fleet ci
+/// login` (architecture §6.7).
+///
+/// Independent of `[github]`: a fleet may have CI without user login, or the
+/// reverse. `audience` has **no default** — see [`GithubActionsToml::audience`].
+#[derive(Debug, Clone, Deserialize)]
+struct GithubActionsToml {
+    /// The `aud` claim a workload token must carry.
+    ///
+    /// Required, deliberately. GitHub's default audience is
+    /// `https://github.com/<owner>`, which is not fleet-specific, so a token
+    /// minted for another service under the same owner would be replayable
+    /// here. Set it to this coordinator's `public_url`.
+    audience: String,
+    /// The expected `iss` claim. Overridable for GitHub Enterprise.
+    #[serde(default = "default_gha_issuer")]
+    issuer: String,
+    /// Where the issuer publishes its signing keys. Overridable so a test can
+    /// point it at a loopback stub.
+    #[serde(default = "default_gha_jwks_url")]
+    jwks_url: String,
+    /// JWKS cache staleness horizon, seconds.
+    #[serde(default = "default_jwks_refresh_secs")]
+    jwks_refresh_secs: u64,
+    /// Floor between refetches forced by an unknown `kid`, seconds.
+    #[serde(default = "default_jwks_min_refetch_secs")]
+    jwks_min_refetch_secs: u64,
+    /// Minted workload-token lifetime, seconds.
+    #[serde(default = "default_workload_token_ttl_secs")]
+    workload_token_ttl_secs: u64,
+}
+
+fn default_gha_issuer() -> String {
+    fleet_coordinator::config::DEFAULT_GHA_ISSUER.to_owned()
+}
+
+fn default_gha_jwks_url() -> String {
+    fleet_coordinator::config::DEFAULT_GHA_JWKS_URL.to_owned()
+}
+
+fn default_jwks_refresh_secs() -> u64 {
+    3600
+}
+
+fn default_jwks_min_refetch_secs() -> u64 {
+    60
+}
+
+fn default_workload_token_ttl_secs() -> u64 {
+    3600
 }
 
 /// The on-disk shape of `coordinator.toml`.
@@ -127,6 +181,9 @@ struct CoordinatorConfigToml {
     /// The GitHub OAuth app backing `probe-rs-fleet login`.
     #[serde(default)]
     github: Option<GithubToml>,
+    /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`.
+    #[serde(default)]
+    github_actions: Option<GithubActionsToml>,
 }
 
 fn default_sweep_interval_secs() -> u64 {
@@ -215,6 +272,14 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
             device_code_url: g.device_code_url,
             access_token_url: g.access_token_url,
             api_base: g.api_base,
+        }),
+        github_actions: raw.github_actions.map(|g| GithubActionsConfig {
+            issuer: g.issuer,
+            jwks_url: g.jwks_url,
+            audience: g.audience,
+            jwks_refresh_secs: g.jwks_refresh_secs,
+            jwks_min_refetch_secs: g.jwks_min_refetch_secs,
+            workload_token_ttl_secs: g.workload_token_ttl_secs,
         }),
     })
 }

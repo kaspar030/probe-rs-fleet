@@ -144,6 +144,17 @@ pub async fn sweep_once(coord: &Coordinator) {
         Ok(n) => debug!(count = n, "spent pending node registrations swept"),
         Err(e) => warn!(error = %e, "failed to sweep pending node registrations"),
     }
+
+    // CI workload tokens (architecture §6.7). The same hygiene argument, with
+    // the volume turned up: one row per CI job makes this the highest-churn
+    // credential table in the schema, so without the sweep the table grows
+    // monotonically with the fleet's CI usage. Expiry is still *enforced* at
+    // verification time — a swept-or-not distinction is invisible to a caller.
+    match coord.db().delete_expired_workload_tokens(now_i64).await {
+        Ok(0) => {}
+        Ok(n) => debug!(count = n, "expired workload tokens swept"),
+        Err(e) => warn!(error = %e, "failed to sweep expired workload tokens"),
+    }
 }
 
 #[cfg(test)]

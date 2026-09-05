@@ -358,6 +358,88 @@ impl std::fmt::Display for Subject {
     }
 }
 
+/// The reserved namespace a GitHub Actions workload subject lives in
+/// (architecture §6.7).
+///
+/// A workload token proves "a job in repo `owner/name`", and that fact is
+/// **org-independent**: the same repo may be granted hardware by several orgs,
+/// and belongs to none of them. So the subject key is
+/// `gha/workload:<owner>/<repo>` — `gha` occupies the namespace slot a
+/// [`SubjectKey`] would otherwise fill with an org id, and there is no `org`
+/// row named `gha` that anything is scoped to.
+///
+/// Two properties make this safe rather than a collision waiting to happen:
+///
+/// * the namespace is **reserved at every org-creation path**
+///   (`Db::ensure_org` refuses it, and `CoordinatorConfig::validate` refuses
+///   `default_org = "gha"`), so no tenant can ever occupy it;
+/// * a grant is matched on the **whole rendered key**, so even a hypothetical
+///   `gha/user:x` could not be reached by a workload token, which always
+///   renders `gha/workload:…`.
+///
+/// `repository_owner` is deliberately *not* part of the trust decision: a fork
+/// or a newly created repo under a granted owner produces a different id here
+/// and therefore matches no grant.
+pub const WORKLOAD_NS_GHA: &str = "gha";
+
+/// Validate and normalise a GitHub `owner/name` repository string.
+///
+/// Returns the **lowercased** repo, or `None` if it is not exactly one
+/// `owner/name` pair over a conservative charset (`[A-Za-z0-9._-]`).
+///
+/// # Why lowercase, and why in one function
+///
+/// GitHub repository names are case-*preserving* but case-*insensitive*, so
+/// `Ariel-OS/ariel-os` and `ariel-os/ariel-os` are the same repo. A grant
+/// stores this id and a workload token's claim is matched against it by exact
+/// string equality, so a case difference between the two spellings would
+/// become a silent denial that looks like a coordinator bug. Both sides call
+/// **this** function — `grant --repo` on the way in and the OIDC claim on the
+/// way in — so they cannot disagree.
+///
+/// The charset is enforced because the result becomes a subject id that is
+/// rendered into `<ns>/<kind>:<id>`: a `/` or `:` in the wrong place would let
+/// a repo name impersonate another subject shape. One slash is allowed (the
+/// separator itself), and [`SubjectKey::parse`] splits at the *first* `/` and
+/// the *first* `:`, so the result round-trips.
+#[must_use]
+pub fn normalise_repo(repo: &str) -> Option<String> {
+    let repo = repo.trim();
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    // 39 is GitHub's owner limit and 100 its repo-name limit; the cap is here
+    // to bound what a claim can write into a subject id, not to mirror GitHub
+    // exactly.
+    if owner.len() > 64 || name.len() > 128 {
+        return None;
+    }
+    let ok = |s: &str| {
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    };
+    if !ok(owner) || !ok(name) {
+        return None;
+    }
+    Some(format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+}
+
+/// The [`SubjectKey`] a GitHub Actions job in `repo` authenticates as.
+///
+/// `repo` must already have passed [`normalise_repo`]. The single constructor,
+/// so the grant-creation path (`grant --repo`) and the token-exchange path
+/// cannot produce two different spellings of the same identity.
+#[must_use]
+pub fn workload_subject_key(repo: &str) -> SubjectKey {
+    SubjectKey {
+        org: OrgId(WORKLOAD_NS_GHA.to_owned()),
+        kind: SubjectKind::Workload,
+        id: repo.to_owned(),
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -417,6 +499,49 @@ mod tests {
         ] {
             assert_eq!(SubjectKey::parse(bad), None, "{bad} should not parse");
         }
+    }
+
+    /// The workload subject shape, and the property that makes it work with no
+    /// schema change: an id containing a slash round-trips through
+    /// `SubjectKey::parse`, because the parse splits at the *first* separators.
+    #[test]
+    fn a_workload_subject_key_round_trips_through_parse() {
+        let key = workload_subject_key(&normalise_repo("ariel-os/ariel-os").unwrap());
+        assert_eq!(key.to_string(), "gha/workload:ariel-os/ariel-os");
+        assert_eq!(SubjectKey::parse(&key.to_string()), Some(key.clone()));
+        assert_eq!(key.org, OrgId(WORKLOAD_NS_GHA.to_owned()));
+        assert_eq!(key.kind, SubjectKind::Workload);
+    }
+
+    /// Case-insensitivity is normalised on **both** sides (grant creation and
+    /// claim ingestion) by this one function, so a repo whose GitHub spelling
+    /// is mixed-case cannot become a silent denial.
+    #[test]
+    fn repo_normalisation_lowercases_and_validates() {
+        assert_eq!(
+            normalise_repo("Ariel-OS/Ariel-OS").as_deref(),
+            Some("ariel-os/ariel-os")
+        );
+        assert_eq!(normalise_repo("  a/b ").as_deref(), Some("a/b"));
+        assert_eq!(normalise_repo("a_b.c/d-e.f").as_deref(), Some("a_b.c/d-e.f"));
+
+        for bad in [
+            "",
+            "owner",
+            "owner/",
+            "/name",
+            // A second slash, or a colon, would let a repo name impersonate
+            // another subject shape once it is rendered into a subject key.
+            "owner/name/extra",
+            "own:er/name",
+            "owner/na:me",
+            "owner/na me",
+            "owner/na\nme",
+        ] {
+            assert_eq!(normalise_repo(bad), None, "{bad:?} should not normalise");
+        }
+        assert_eq!(normalise_repo(&format!("{}/b", "x".repeat(65))), None);
+        assert_eq!(normalise_repo(&format!("a/{}", "x".repeat(129))), None);
     }
 
     #[test]

@@ -9,9 +9,11 @@
 //! never stored.
 
 use async_trait::async_trait;
+use tracing::warn;
 
-use fleet_auth::store::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore};
+use fleet_auth::store::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore, WorkloadRecord};
 use fleet_auth::TokenHash;
+use fleet_proto::ids::SubjectKey;
 
 use crate::state::Db;
 
@@ -53,6 +55,31 @@ impl TokenStore for Db {
             tags,
             single_use,
             expires: expires.and_then(|e| u64::try_from(e).ok()),
+        }))
+    }
+
+    async fn lookup_workload(&self, hash: &TokenHash) -> Result<Option<WorkloadRecord>, String> {
+        let Some((subject, expires)) = self
+            .workload_by_token_hash(hash.as_str())
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        // The stored `subject` is a rendered `SubjectKey`, split back into its
+        // namespace and id halves. A row that will not parse resolves to `None`
+        // — **fails closed**, the same rule `authz::board_access` applies to an
+        // unparseable grant row. Widening it into some default subject is the
+        // one outcome that must never happen, since that subject would then be
+        // matched against grants.
+        let Some(key) = SubjectKey::parse(&subject) else {
+            warn!(%subject, "dropping an unparseable workload_token row (fails closed)");
+            return Ok(None);
+        };
+        Ok(Some(WorkloadRecord {
+            org_id: key.org.0,
+            id: key.id,
+            expires: u64::try_from(expires).unwrap_or(0),
         }))
     }
 }
@@ -131,5 +158,90 @@ mod tests {
             .unwrap();
         assert!(db.consume_auth_key(key.hash().as_str(), 1_500).await.unwrap().is_some());
         assert!(db.lookup_auth_key(&key.hash()).await.unwrap().is_none());
+    }
+
+    /// The workload bridge splits the stored `SubjectKey` back into its two
+    /// halves, and an id containing a slash (`owner/repo`) survives the round
+    /// trip — which is the property that lets a repo be a subject id with no
+    /// schema change.
+    #[tokio::test]
+    async fn workload_lookup_splits_the_stored_subject_key() {
+        use crate::state::WorkloadClaimColumns;
+        let db = Db::connect_in_memory().await.unwrap();
+        let token = OpaqueToken::mint(TokenKind::Workload);
+        let key = fleet_proto::ids::workload_subject_key("ariel-os/ariel-os");
+        db.insert_workload_token(
+            token.hash().as_str(),
+            &key,
+            "github_oidc",
+            &WorkloadClaimColumns {
+                repository: Some("ariel-os/ariel-os".to_owned()),
+                repository_owner: Some("ariel-os".to_owned()),
+                ..WorkloadClaimColumns::default()
+            },
+            1_000,
+            4_600,
+        )
+        .await
+        .unwrap();
+
+        let record = db.lookup_workload(&token.hash()).await.unwrap().unwrap();
+        assert_eq!(record.org_id, "gha");
+        assert_eq!(record.id, "ariel-os/ariel-os");
+        assert_eq!(record.expires, 4_600);
+
+        // The sweep reclaims it, and it then resolves to nothing.
+        assert_eq!(
+            db.delete_expired_workload_tokens(4_600).await.unwrap(),
+            1,
+            "expiry is inclusive in the sweep"
+        );
+        assert!(db.lookup_workload(&token.hash()).await.unwrap().is_none());
+    }
+
+    /// A `workload_token` row whose subject no longer parses resolves to
+    /// `None`, never to some default subject: a subject invented here would be
+    /// matched against grants.
+    #[tokio::test]
+    async fn an_unparseable_workload_subject_fails_closed() {
+        use crate::state::WorkloadClaimColumns;
+        let db = Db::connect_in_memory().await.unwrap();
+        let token = OpaqueToken::mint(TokenKind::Workload);
+        // Written straight through sqlx: the typed API cannot express a broken
+        // key, which is the point — this simulates a corrupt or
+        // future-versioned row.
+        db.insert_workload_token(
+            token.hash().as_str(),
+            &fleet_proto::ids::workload_subject_key("a/b"),
+            "github_oidc",
+            &WorkloadClaimColumns::default(),
+            1_000,
+            4_600,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workload_token SET subject = 'nonsense'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.lookup_workload(&token.hash()).await.unwrap().is_none());
+    }
+
+    /// The reserved namespace cannot be claimed as a tenant — at *every*
+    /// org-creation path, not just through the config validator.
+    #[tokio::test]
+    async fn the_workload_namespace_is_not_creatable_as_an_org() {
+        let db = Db::connect_in_memory().await.unwrap();
+        assert!(db
+            .ensure_org(&OrgId("gha".to_owned()), "team")
+            .await
+            .is_err());
+        // …but the migration's own row exists, so the audit-log foreign key
+        // holds on the paths that fall back to a workload's namespace.
+        let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM org WHERE id = 'gha'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

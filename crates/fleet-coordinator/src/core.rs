@@ -57,6 +57,13 @@ pub struct Coordinator {
     agents: AgentRegistry,
     channels: ChannelTable,
     clock: SharedClock,
+    /// The GitHub Actions JWKS cache, built lazily from `config` on first use.
+    ///
+    /// Lazy, and behind a `OnceLock`, so [`Coordinator::new`]'s signature does
+    /// not change: every test harness in the tree constructs one, and a fleet
+    /// with no `[github_actions]` table must not pay for a cache it will never
+    /// consult.
+    jwks: std::sync::OnceLock<Arc<fleet_auth::oidc::JwksCache>>,
 }
 
 impl Coordinator {
@@ -77,7 +84,25 @@ impl Coordinator {
             agents: AgentRegistry::new(),
             channels: ChannelTable::new(),
             clock,
+            jwks: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The GitHub Actions JWKS cache, or `None` when CI is unconfigured.
+    ///
+    /// Built on first use from `[github_actions]`. One cache per coordinator,
+    /// so the rotation refetch and its rate limit are fleet-wide rather than
+    /// per request — which is what makes the amplification bound real.
+    #[must_use]
+    pub fn jwks_cache(&self) -> Option<&Arc<fleet_auth::oidc::JwksCache>> {
+        let gha = self.config.github_actions.as_ref()?;
+        Some(self.jwks.get_or_init(|| {
+            Arc::new(fleet_auth::oidc::JwksCache::new(
+                gha.jwks_url.clone(),
+                std::time::Duration::from_secs(gha.jwks_refresh_secs),
+                std::time::Duration::from_secs(gha.jwks_min_refetch_secs),
+            ))
+        }))
     }
 
     /// The static configuration.
@@ -894,14 +919,29 @@ impl Coordinator {
 
     /// Resolve a grantee spelling to a [`SubjectKey`].
     ///
-    /// Three accepted forms, narrowing in precision:
+    /// Four accepted forms, narrowing in precision:
     ///
+    /// * `repo:<owner>/<name>` — a **CI repository** (architecture §6.7). It is
+    ///   first so it can never be shadowed by the `SubjectKey::parse` branch,
+    ///   and it is a distinct spelling rather than a bare `owner/name` because
+    ///   granting hardware to a repo should not be something a typo produces;
     /// * a rendered `SubjectKey` (`gh-2/user:gh-2`) — unambiguous, and the way
-    ///   to name a node or workload subject;
+    ///   to name a node subject;
     /// * a bare `gh-<id>` — a user's immutable id, personal org implied;
     /// * a GitHub login — looked up in the `user` table and immediately
     ///   resolved to the immutable id.
+    ///
+    /// The repo form is validated and lowercased by the **same** function the
+    /// OIDC claim path uses (`fleet_proto::ids::normalise_repo`), so the two
+    /// sides of the per-repo trust rule cannot disagree about spelling. Note
+    /// that a grant names exactly one repo: `repository_owner` is never a
+    /// grantee, so a fork or a new repo under the same owner matches nothing.
     async fn resolve_grantee(&self, spec: &str) -> Result<Option<SubjectKey>> {
+        if let Some(repo) = spec.strip_prefix("repo:") {
+            return Ok(fleet_proto::ids::normalise_repo(repo)
+                .as_deref()
+                .map(fleet_proto::ids::workload_subject_key));
+        }
         if let Some(key) = SubjectKey::parse(spec) {
             return Ok(Some(key));
         }
@@ -1123,6 +1163,20 @@ impl Coordinator {
     /// [`Coordinator::request_lease`] with the token attenuated further, to the
     /// intersection of what the caller may do and what they asked to hand over
     /// — you can never delegate more than you hold.
+    ///
+    /// # A CI workload may not delegate
+    ///
+    /// Every other `/client` verb is gated by `board_access` or `require_role`,
+    /// and a workload passes exactly the ones it should: it may lease, extend,
+    /// release, open channels and list; `Logs` and the grant verbs need a role
+    /// it can never hold. `Delegate` is the one verb gated by `board_access`
+    /// *alone*, so a workload would otherwise be able to mint a capability
+    /// token for a lab board and hand it to something else. That is refused
+    /// here rather than allowed by omission: nothing in the CI story needs it,
+    /// v1 has no way for an operator to see that a CI job re-delegated their
+    /// hardware, and allowing it later is a strictly smaller change than
+    /// withdrawing it. The route allowlist is only a fence if the verbs behind
+    /// the route have been walked — architecture §6.7 records the walk.
     async fn delegate(
         &self,
         subject: &Subject,
@@ -1130,6 +1184,12 @@ impl Coordinator {
         duration_secs: u64,
         ops: Vec<fleet_proto::token::AllowedOp>,
     ) -> Result<CoordToSidecar> {
+        if subject.kind == fleet_proto::ids::SubjectKind::Workload {
+            debug!(%subject, "refusing delegation by a CI workload");
+            return Ok(CoordToSidecar::Error {
+                message: "a CI workload may not delegate its lease".to_owned(),
+            });
+        }
         let ops = fleet_proto::token::normalize_ops(ops);
         if ops.is_empty() {
             return Ok(CoordToSidecar::Error {
@@ -1239,12 +1299,33 @@ impl Coordinator {
     async fn request_lease(
         &self,
         subject: &Subject,
-        req: LeaseRequest,
+        mut req: LeaseRequest,
     ) -> Result<CoordToSidecar> {
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
         if access.is_empty() {
             return Ok(Self::denied());
+        }
+        // A CI workload is clamped to `Priority::Ci`, whatever it asked for.
+        //
+        // §6.6's fairness ordering is "interactive dev > nightly CI > soak", and
+        // priority is a plain wire field: without this, a CI job could outbid a
+        // human at a desk simply by setting it. This is not an edge case — the
+        // sidecar sends `Priority::Interactive` unconditionally
+        // (`fleet-sidecar/src/lib.rs`), so the clamp fires on *every* CI lease.
+        //
+        // `Policy::max_duration_ci` then applies to it, and extension inherits
+        // the clamp for free: `Scheduler::extend_lease` re-derives the duration
+        // from the **recorded** priority, so there is deliberately no second
+        // guard in `extend_lease` — please do not add one.
+        if subject.kind == fleet_proto::ids::SubjectKind::Workload
+            && req.priority != fleet_proto::lease::Priority::Ci
+        {
+            debug!(
+                %subject, requested = ?req.priority,
+                "clamping a workload's lease request to CI priority"
+            );
+            req.priority = fleet_proto::lease::Priority::Ci;
         }
         let decision = {
             let mut sched = self.scheduler.lock().await;

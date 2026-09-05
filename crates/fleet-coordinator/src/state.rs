@@ -40,6 +40,28 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// The org every subject is assigned to until GitHub login exists.
 pub const DEFAULT_ORG_ID: &str = "default";
 
+/// `auth_key.purpose` for a key that enrolls a node — the historical meaning,
+/// and the default every pre-0007 row carries.
+pub const AUTH_KEY_PURPOSE_NODE: &str = "node";
+/// `auth_key.purpose` for a key that redeems into a **CI workload** credential
+/// (architecture §6.7).
+///
+/// The distinction is what stops migration 0007 from silently turning every
+/// existing enrollment key into a board-access credential.
+pub const AUTH_KEY_PURPOSE_CI: &str = "ci";
+
+/// The CI-relevant half of an `auth_key` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiAuthKeyMeta {
+    /// `node` or `ci`.
+    pub purpose: String,
+    /// Op labels the synthesised grant confers; empty means the redemption
+    /// path's default.
+    pub ops: Vec<String>,
+    /// The key's expiry, which the synthesised grant inherits.
+    pub expires: Option<i64>,
+}
+
 /// One `auth_key` row as `SQLite` hands it back.
 ///
 /// Named rather than written inline so the seven-tuple does not become an
@@ -91,6 +113,32 @@ pub struct GrantRow {
     pub created_by: Option<String>,
     /// When the grant was created (epoch seconds).
     pub created_at: i64,
+}
+
+/// The claim columns recorded alongside a workload token.
+///
+/// A struct rather than six positional arguments because every field is an
+/// `Option<String>` and transposing two of them would be invisible at the call
+/// site — and because it is the right place to state, once, that **none of
+/// these takes part in an authorization decision**. `repository` is the
+/// exception only in that it is *also* the subject id, decided before this
+/// struct is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkloadClaimColumns {
+    /// `owner/name`, lowercased. OIDC path only.
+    pub repository: Option<String>,
+    /// The repository's owner. **Recorded, never authorizing** — a fork or a
+    /// new repo under a granted owner must not inherit access (§6.7).
+    pub repository_owner: Option<String>,
+    /// The git ref the job ran on. Recorded; per-ref conditions are a
+    /// follow-up, not v1.
+    pub git_ref: Option<String>,
+    /// The workflow's name.
+    pub workflow: Option<String>,
+    /// The fully-qualified workflow reference.
+    pub job_workflow_ref: Option<String>,
+    /// The Actions run id — the handle an operator uses to find the job.
+    pub run_id: Option<String>,
 }
 
 impl GrantRow {
@@ -399,10 +447,28 @@ impl Db {
 
     /// Idempotently insert an org row.
     ///
+    /// Refuses the reserved CI-workload namespace
+    /// ([`fleet_proto::ids::WORKLOAD_NS_GHA`]). That namespace has a real `org`
+    /// row — migration 0007 creates it, of kind `system`, so the audit-log
+    /// foreign key holds on the rare paths that fall back to an acting
+    /// subject's org — but nothing may *reuse* it as a tenant. Reserving it
+    /// here rather than only in `CoordinatorConfig::validate` is the point:
+    /// admin verbs reach this function with an operator-supplied name, and a
+    /// reserved name that only one creation path respects is a trap for the
+    /// next change.
+    ///
     /// # Errors
     ///
-    /// Returns a database error if the write fails.
+    /// Returns a database error if the write fails, or
+    /// [`crate::error::CoordinatorError::Config`] if `org` is the reserved
+    /// namespace.
     pub async fn ensure_org(&self, org: &OrgId, kind: &str) -> Result<()> {
+        if org.0 == fleet_proto::ids::WORKLOAD_NS_GHA {
+            return Err(crate::error::CoordinatorError::Config(format!(
+                "`{}` is a reserved namespace for CI workload subjects and cannot be an org",
+                fleet_proto::ids::WORKLOAD_NS_GHA
+            )));
+        }
         sqlx::query(
             "INSERT INTO org (id, slug, kind, created_at)
              VALUES (?1, ?1, ?2, unixepoch())
@@ -687,6 +753,118 @@ impl Db {
         Ok(result.rows_affected())
     }
 
+    /// Record a freshly minted CI workload token (architecture §6.7).
+    ///
+    /// # Why this is on [`Db`] and not [`OrgDb`]
+    ///
+    /// For the same reason [`Db::grants_for_subject`] is, read from the other
+    /// side: **a workload belongs to no org.** Its subject is a repo in a
+    /// reserved namespace, several orgs may independently grant it access, and
+    /// it is a member of none of them — so there is no org to scope by that
+    /// would not be an arbitrary pick among the granting orgs. The scoping key
+    /// is the token hash, which *is* the credential and which no caller can
+    /// enumerate.
+    ///
+    /// The claim columns (`repository_owner`, `git_ref`, `workflow`,
+    /// `job_workflow_ref`, `run_id`) are recorded for audit and metering and
+    /// are **never** read by an authorization decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the insert fails.
+    pub async fn insert_workload_token(
+        &self,
+        token_hash: &str,
+        subject: &SubjectKey,
+        kind: &str,
+        claims: &WorkloadClaimColumns,
+        issued_at: i64,
+        expires: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO workload_token
+               (token_hash, subject, kind, repository, repository_owner,
+                git_ref, workflow, job_workflow_ref, run_id, issued_at, expires)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .bind(token_hash)
+        .bind(subject.to_string())
+        .bind(kind)
+        .bind(claims.repository.as_deref())
+        .bind(claims.repository_owner.as_deref())
+        .bind(claims.git_ref.as_deref())
+        .bind(claims.workflow.as_deref())
+        .bind(claims.job_workflow_ref.as_deref())
+        .bind(claims.run_id.as_deref())
+        .bind(issued_at)
+        .bind(expires)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up a workload token by hash: `(rendered subject, expires)`.
+    ///
+    /// Expiry is **not** filtered here, deliberately: `fleet-auth` compares it
+    /// against the coordinator's clock so an expired credential is
+    /// `AuthError::Expired` rather than the indistinguishable
+    /// `AuthError::Unknown` — the difference between an operator diagnosing a
+    /// long job and hunting a phantom revocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn workload_by_token_hash(&self, token_hash: &str) -> Result<Option<(String, i64)>> {
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT subject, expires FROM workload_token WHERE token_hash = ?1")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Delete every workload token that expired at or before `now`; returns the
+    /// count.
+    ///
+    /// The highest-churn credential in the schema (one row per CI job), which
+    /// is why the sweep runs it beside the session sweep and why the table
+    /// carries an index on `expires`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_expired_workload_tokens(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM workload_token WHERE expires <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// The CI-relevant metadata of an auth key, by hash.
+    ///
+    /// Read **before** the atomic consume, so redeeming a `node` key at the CI
+    /// grant type does not burn a single-use enrollment key on its way to a
+    /// `403`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn ci_auth_key_meta(&self, key_hash: &str) -> Result<Option<CiAuthKeyMeta>> {
+        let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
+            "SELECT purpose, ops, expires FROM auth_key
+             WHERE key_hash = ?1 AND consumed_at IS NULL",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(purpose, ops, expires)| CiAuthKeyMeta {
+            purpose,
+            ops: split_tags(&ops),
+            expires,
+        }))
+    }
+
     /// Insert a node-enrollment auth key (stored by hash).
     ///
     /// # Errors
@@ -706,9 +884,48 @@ impl Db {
         created_by: Option<&str>,
         created_at: i64,
     ) -> Result<()> {
+        self.insert_auth_key_with_purpose(
+            org,
+            key_hash,
+            tags,
+            single_use,
+            expires,
+            created_by,
+            created_at,
+            AUTH_KEY_PURPOSE_NODE,
+            &[],
+        )
+        .await
+    }
+
+    /// Insert an auth key with an explicit purpose (architecture §6.7).
+    ///
+    /// [`Db::insert_auth_key`] is the node-enrollment spelling and stays the
+    /// default, so a caller has to *ask* for a CI key. That asymmetry is
+    /// deliberate: a key that can lease hardware is a different credential from
+    /// one that can offer it, and the difference must be visible at the call
+    /// site rather than in a boolean at the end of an argument list.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_auth_key_with_purpose(
+        &self,
+        org: &OrgId,
+        key_hash: &str,
+        tags: &[String],
+        single_use: bool,
+        expires: Option<i64>,
+        created_by: Option<&str>,
+        created_at: i64,
+        purpose: &str,
+        ops: &[String],
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO auth_key (key_hash, org_id, tags, single_use, expires, created_by, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO auth_key
+               (key_hash, org_id, tags, single_use, expires, created_by, created_at, purpose, ops)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(key_hash)
         .bind(org.0.as_str())
@@ -717,6 +934,8 @@ impl Db {
         .bind(expires)
         .bind(created_by)
         .bind(created_at)
+        .bind(purpose)
+        .bind(ops.join("\n"))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1776,6 +1995,55 @@ impl OrgDb<'_> {
         Ok(())
     }
 
+    /// Insert a grant, replacing any row with the same id.
+    ///
+    /// The auth-key CI path's write (architecture §6.7): a multi-use key is
+    /// redeemed by however many runners, and each redemption must converge on
+    /// **one** grant row rather than accumulating a row per runner. The id is
+    /// derived deterministically from the key hash, so "same key" is "same
+    /// row".
+    ///
+    /// Deliberately separate from [`OrgDb::insert_grant`] rather than making
+    /// that one upsert: a human-created grant colliding on id would be a bug
+    /// worth failing on, and silently overwriting one is exactly the behaviour
+    /// a security verb must not have.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_grant(
+        &self,
+        id: &str,
+        subject: &SubjectKey,
+        selector: &str,
+        ops: &[AllowedOp],
+        expires: Option<i64>,
+        created_by: Option<&str>,
+        created_at: i64,
+    ) -> Result<()> {
+        let ops: Vec<&str> = ops.iter().map(|o| o.as_str()).collect();
+        sqlx::query(
+            "INSERT INTO \"grant\" (id, org_id, subject, selector, ops, expires, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+               selector = excluded.selector,
+               ops      = excluded.ops,
+               expires  = excluded.expires",
+        )
+        .bind(id)
+        .bind(self.org.0.as_str())
+        .bind(subject.to_string())
+        .bind(selector)
+        .bind(ops.join("\n"))
+        .bind(expires)
+        .bind(created_by)
+        .bind(created_at)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
     /// Every grant this org has issued, newest first.
     ///
     /// # Errors
@@ -1994,7 +2262,16 @@ mod tests {
             .fetch_one(db.pool())
             .await
             .unwrap();
-        assert_eq!(row.0, 1);
+        // Two: the default org, plus the reserved `gha` namespace migration
+        // 0007 creates (kind `system`, member of nothing) so that the
+        // audit-log foreign key holds on every path that can be reached with a
+        // workload subject. See that migration's header.
+        assert_eq!(row.0, 2);
+        let (kind,): (String,) = sqlx::query_as("SELECT kind FROM org WHERE id = 'gha'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(kind, "system");
     }
 
     #[tokio::test]

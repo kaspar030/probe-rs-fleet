@@ -52,6 +52,27 @@ pub struct AuthKeyRecord {
     pub expires: Option<u64>,
 }
 
+/// A CI workload token row (architecture §6.7).
+///
+/// Deliberately **not** org-scoped: a workload belongs to no tenant. The
+/// `subject` it renders as is `gha/workload:<owner>/<repo>` for the OIDC path
+/// (a reserved namespace, not an org) or `<key org>/workload:key:<hash8>` for
+/// the auth-key fallback, and it reaches boards only through grants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkloadRecord {
+    /// The namespace half of the subject key, used as
+    /// [`crate::Authenticated::org_id`].
+    ///
+    /// For the OIDC path this is the reserved `gha` namespace, which has no
+    /// `org` row — every caller that writes an org-scoped row for a workload
+    /// must therefore key it on the *granting* org, not on this.
+    pub org_id: String,
+    /// The id half of the subject key (`<owner>/<repo>`, or `key:<hash8>`).
+    pub id: String,
+    /// Expiry, epoch seconds. Always set: a workload token is per job.
+    pub expires: u64,
+}
+
 /// Read/write access to the credential tables.
 ///
 /// Errors are returned as `String` rather than a concrete error type so this
@@ -79,6 +100,13 @@ pub trait TokenStore: Send + Sync {
     ///
     /// Returns a storage error description.
     async fn lookup_auth_key(&self, hash: &TokenHash) -> Result<Option<AuthKeyRecord>, String>;
+
+    /// Look up a CI workload token by its hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error description.
+    async fn lookup_workload(&self, hash: &TokenHash) -> Result<Option<WorkloadRecord>, String>;
 }
 
 #[cfg(test)]
@@ -88,7 +116,7 @@ pub(crate) mod fake {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore};
+    use super::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore, WorkloadRecord};
     use crate::token::TokenHash;
     use async_trait::async_trait;
 
@@ -97,6 +125,7 @@ pub(crate) mod fake {
         pub(crate) nodes: Mutex<HashMap<String, NodeRecord>>,
         pub(crate) sessions: Mutex<HashMap<String, SessionRecord>>,
         pub(crate) auth_keys: Mutex<HashMap<String, AuthKeyRecord>>,
+        pub(crate) workloads: Mutex<HashMap<String, WorkloadRecord>>,
     }
 
     impl FakeStore {
@@ -123,6 +152,14 @@ pub(crate) mod fake {
                 .insert(hash.as_str().to_owned(), record);
             self
         }
+
+        pub(crate) fn with_workload(self, hash: &TokenHash, record: WorkloadRecord) -> Self {
+            self.workloads
+                .lock()
+                .unwrap()
+                .insert(hash.as_str().to_owned(), record);
+            self
+        }
     }
 
     #[async_trait]
@@ -137,6 +174,13 @@ pub(crate) mod fake {
 
         async fn lookup_auth_key(&self, hash: &TokenHash) -> Result<Option<AuthKeyRecord>, String> {
             Ok(self.auth_keys.lock().unwrap().get(hash.as_str()).cloned())
+        }
+
+        async fn lookup_workload(
+            &self,
+            hash: &TokenHash,
+        ) -> Result<Option<WorkloadRecord>, String> {
+            Ok(self.workloads.lock().unwrap().get(hash.as_str()).cloned())
         }
     }
 }

@@ -103,6 +103,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = "0.6"
 
+# JWT verification for GitHub Actions workload identity (architecture §6.7).
+#
+# `rust_crypto`, not `aws_lc_rs`, for the reason the http/tls blocks above give:
+# the workspace is deliberately pure-Rust so the agent cross-compiles to
+# armv7-musl. `default-features = false` also drops `use_pem` (and with it
+# `pem` + `simple_asn1`): nothing here loads a PEM key — the coordinator builds
+# its decoding keys from a JWKS, and the tests sign with a committed DER
+# fixture through `EncodingKey::from_rsa_der`.
+#
+# Only `fleet-auth`'s OFF-BY-DEFAULT `oidc` feature pulls this in, so the Pi
+# binary's graph is unchanged (see crates/fleet-auth/Cargo.toml).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
+
 # async traits (object-safe dyn impls)
 async-trait = "0.1"
 

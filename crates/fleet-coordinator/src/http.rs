@@ -268,6 +268,11 @@ async fn authenticate_request(
         // token from being replayed into another tenant.
         TokenKind::Node => Subject::new(org, SubjectKind::Node, auth.id.clone()),
         TokenKind::Session => Subject::new(org, SubjectKind::User, auth.id.clone()),
+        // A workload's "org" is the reserved `gha` namespace (architecture
+        // §6.7), not a tenant: it is a member of nothing and reaches boards
+        // only through per-repo grants, which `board_access` evaluates against
+        // this exact subject key.
+        TokenKind::Workload => Subject::new(org, SubjectKind::Workload, auth.id.clone()),
         // `authenticate` never returns these kinds; both are redeemed at a
         // route, never presented as a connection credential.
         TokenKind::AuthKey | TokenKind::NodeDevice => {
@@ -301,6 +306,12 @@ fn reject_authentication(e: &AuthError) -> Response {
 }
 
 /// Audit a rejection that *does* have a resolvable org.
+///
+/// "Resolvable" means an `org` row exists to hang the row off. That is true for
+/// every credential kind including a workload, because migration 0007 creates a
+/// real `org` row of kind `system` for the reserved `gha` namespace — which is
+/// the whole reason it does, rather than leaving the namespace row-less and
+/// scattering "never write here" conditions through the code.
 async fn audit_reject(coord: &Coordinator, org: &OrgId, subject_id: &str, e: &AuthError) {
     let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
     let detail = e.to_string();
@@ -357,16 +368,29 @@ async fn agent_ws(
 }
 
 /// `GET /client` — a ctl or sidecar connection.
+///
+/// Accepts a user session **or** a CI workload token (architecture §6.7). The
+/// allowlist is the fence that keeps a workload off `/agent` and `/auth/keys`:
+/// a CI job must not be able to enroll a node or mint credentials, and
+/// `require_role` alone would not say so (a workload has no role anywhere, but
+/// relying on that is relying on an absence). The verbs reachable *behind* this
+/// route were walked too — see `Coordinator::delegate`, which refuses a
+/// workload explicitly.
 async fn client_ws(
     State(coord): State<Arc<Coordinator>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let (_auth, subject) =
-        match authenticate_request(&coord, &headers, &[TokenKind::Session]).await {
-            Ok(v) => v,
-            Err(response) => return response,
-        };
+    let (_auth, subject) = match authenticate_request(
+        &coord,
+        &headers,
+        &[TokenKind::Session, TokenKind::Workload],
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
     debug!(%subject, "client connected");
 
     ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
@@ -492,6 +516,8 @@ async fn auth_token(
             tags,
             adopt,
         } => self_register(&coord, &session_token, &node_name, tags, adopt.as_deref()).await,
+        TokenRequest::GithubOidc { oidc_token } => exchange_github_oidc(&coord, &oidc_token).await,
+        TokenRequest::WorkloadKey { auth_key } => exchange_workload_key(&coord, &auth_key).await,
     }
 }
 
@@ -563,12 +589,412 @@ async fn redeem_auth_key(
         token: token.to_secret_string(),
         node_id: Some(node.0),
         org: org.0,
+        // A node belongs to exactly one org, so there is nothing to list here.
+        orgs: Vec::new(),
         expires: None,
         coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
         login: None,
     })
     .into_response()
 }
+
+/// `grant_type: github_oidc` — exchange a GitHub Actions OIDC JWT for a
+/// per-job workload token (architecture §6.7).
+///
+/// # The trust rule, in one place
+///
+/// A verified token proves "a job in repo `owner/name` at ref X". Mapping that
+/// to fleet hardware takes an **explicit per-repo grant** and nothing else:
+/// `repository_owner` is recorded on the row and in the audit detail, and is
+/// never consulted. A fork, or a newly created repo under a granted owner,
+/// therefore produces a subject key no grant names and is refused with
+/// `403 no_grant`. That refusal is the security-relevant behaviour of this
+/// whole path; `workload_oidc.rs` pins it with a sibling grant proving the
+/// owner *is* otherwise reachable.
+///
+/// # Failure shapes
+///
+/// * no `[github_actions]` table → `503 workload_oidc_unconfigured`, mirroring
+///   `device_flow_unconfigured` — a named code beats silence;
+/// * any verification failure → a flat `401 invalid_grant`, with the reason in
+///   the log only (no oracle). An unknown `kid` first triggers **one** JWKS
+///   refresh, because that is what a key rotation looks like; the refresh is
+///   itself rate-limited so an attacker feeding invented `kid`s cannot turn
+///   this route into a fetch amplifier;
+/// * a verified token with no grant → `403 no_grant`. Deliberately
+///   distinguishable from `401`: the credential *is* valid, and conflating the
+///   two would send an operator hunting a signing problem when the answer is
+///   "run `grant --repo`". It leaks only that the repo is not granted, which is
+///   something the repo's own maintainers already know.
+async fn exchange_github_oidc(coord: &Coordinator, jwt: &str) -> Response {
+    use fleet_auth::oidc::{self, OidcError, OidcPolicy};
+
+    let now = coord.now();
+    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+
+    let (Some(gha), Some(cache)) = (coord.config().github_actions.as_ref(), coord.jwks_cache())
+    else {
+        debug!("workload OIDC exchange attempted with no [github_actions] table");
+        return reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "workload_oidc_unconfigured",
+        );
+    };
+    let policy = OidcPolicy {
+        issuer: gha.issuer.clone(),
+        audience: gha.audience.clone(),
+        leeway_secs: 60,
+    };
+
+    let keys = match cache.get().await {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!(reason = e.label(), detail = %e, "JWKS unavailable");
+            return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+        }
+    };
+    let claims = match oidc::verify(jwt, &keys, &policy, now) {
+        Ok(claims) => Ok(claims),
+        // The rotation case, and the only error worth a second attempt: the
+        // issuer published a new key after our last fetch.
+        Err(OidcError::UnknownKid(kid)) => match cache.refresh_for_unknown_kid().await {
+            Ok(fresh) => {
+                debug!(%kid, "refreshed the JWKS for an unknown key id");
+                oidc::verify(jwt, &fresh, &policy, now)
+            }
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    };
+    let claims = match claims {
+        Ok(claims) => claims,
+        Err(e) => {
+            // The reason is logged, never returned: the body is the same flat
+            // `invalid_grant` for expiry, audience, issuer, signature and
+            // everything else.
+            warn!(reason = e.label(), detail = %e, "workload OIDC token rejected");
+            return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+        }
+    };
+
+    let key = fleet_proto::ids::workload_subject_key(&claims.repository);
+    let grants = match coord.db().grants_for_subject(&key, now_i64).await {
+        Ok(grants) => grants,
+        Err(e) => {
+            warn!(error = %e, "grant lookup failed during workload exchange");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+    if grants.is_empty() {
+        // Named in the log with the repo, because the operator's next action is
+        // exactly `grant --repo <that repo>`. The owner is logged beside it so
+        // the "but I granted the org!" case is diagnosable in one line.
+        warn!(
+            repository = %claims.repository,
+            repository_owner = %claims.repository_owner,
+            "no grant for this repository; the owner is deliberately not sufficient"
+        );
+        return reject(StatusCode::FORBIDDEN, "no_grant");
+    }
+
+    let token = OpaqueToken::mint(TokenKind::Workload);
+    let expires = now_i64.saturating_add(
+        i64::try_from(gha.workload_token_ttl_secs).unwrap_or(i64::from(i32::MAX)),
+    );
+    let columns = crate::state::WorkloadClaimColumns {
+        repository: Some(claims.repository.clone()),
+        repository_owner: Some(claims.repository_owner.clone()),
+        git_ref: claims.git_ref.clone(),
+        workflow: claims.workflow.clone(),
+        job_workflow_ref: claims.job_workflow_ref.clone(),
+        run_id: claims.run_id.clone(),
+    };
+    if let Err(e) = coord
+        .db()
+        .insert_workload_token(
+            token.hash().as_str(),
+            &key,
+            "github_oidc",
+            &columns,
+            now_i64,
+            expires,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to record a workload token");
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    }
+
+    // One audit row per granting org: each of them is lending hardware to this
+    // job, and each of their operators must be able to answer "who used what,
+    // for how long" from their own audit log alone (§6.6's metering note). The
+    // `leases` rows carry the duration half.
+    let mut orgs: Vec<String> = grants.iter().map(|g| g.org.0.clone()).collect();
+    orgs.sort_unstable();
+    orgs.dedup();
+    let grant_ids: Vec<&str> = grants.iter().map(|g| g.id.as_str()).collect();
+    let detail = format!(
+        "repo={} owner={} ref={} workflow={} run={} grants=[{}]",
+        claims.repository,
+        claims.repository_owner,
+        claims.git_ref.as_deref().unwrap_or("-"),
+        claims.workflow.as_deref().unwrap_or("-"),
+        claims.run_id.as_deref().unwrap_or("-"),
+        grant_ids.join(","),
+    );
+    let subject_rendered = key.to_string();
+    for org in &orgs {
+        let _ = coord
+            .db()
+            .scoped(OrgId(org.clone()))
+            .append_audit(&AuditEntry {
+                ts: now_i64,
+                subject: Some(subject_rendered.as_str()),
+                action: "workload.token.mint",
+                node: None,
+                board: None,
+                lease: None,
+                detail: Some(&detail),
+            })
+            .await;
+    }
+    info!(
+        repository = %claims.repository,
+        orgs = %orgs.join(","),
+        "minted a workload token"
+    );
+
+    Json(TokenResponse {
+        token: token.to_secret_string(),
+        node_id: None,
+        // Not a scope — a workload belongs to no org. The first granting org,
+        // so the CLI has something to print; `orgs` is the honest answer.
+        org: orgs.first().cloned().unwrap_or_default(),
+        orgs,
+        expires: Some(u64::try_from(expires).unwrap_or(0)),
+        coordinator_token_pubkey: None,
+        login: None,
+    })
+    .into_response()
+}
+
+/// `grant_type: workload_key` — redeem a **workload auth key** for a workload
+/// token, for a runner with no workload identity of its own (architecture
+/// §6.7).
+///
+/// # This is the weak path, stated plainly
+///
+/// Everything the OIDC path avoids, this one accepts: a long-lived bearer
+/// secret sitting in somebody else's CI configuration, usable by anyone who
+/// reads that configuration or a leaked log. It exists because heterogeneous
+/// runners are a stated requirement and a self-hosted Jenkins box has no
+/// workload identity to offer. What bounds it: the key is org-scoped, tagged
+/// (so the synthesised grant selects a subset of boards, never all of them),
+/// op-scoped, expiring, listable and revocable — and revoking it tears down the
+/// grant, and therefore live leases, rather than waiting out a TTL.
+///
+/// # Why redemption synthesises a grant rather than widening `board_access`
+///
+/// An auth key has always minted a **node** token: a machine that offers
+/// probes. Teaching `board_access` to honour an auth key directly would
+/// silently turn every existing enrollment key in every deployment into a
+/// board-access credential. Instead the key carries an explicit
+/// `purpose = 'ci'`, and redeeming one upserts an **ordinary grant** to an
+/// org-scoped workload subject — the same row `grant --repo` writes, evaluated
+/// by the same code, revocable by the same verb.
+async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response {
+    let now = coord.now();
+    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
+
+    // Shape/expiry pre-check, so a malformed key is rejected without a write.
+    let hash = match fleet_auth::verify::verify_auth_key(coord.db(), auth_key, now).await {
+        Ok((hash, _record)) => hash,
+        Err(e) => {
+            warn!(reason = e.label(), "workload key rejected");
+            return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+        }
+    };
+
+    // A `node` key must not become a board-access credential: that is the whole
+    // reason `purpose` exists. Checked before the consume, so a mis-typed
+    // redemption does not burn a single-use enrollment key.
+    let meta = match coord.db().ci_auth_key_meta(hash.as_str()).await {
+        Ok(Some(meta)) => meta,
+        Ok(None) => return reject(StatusCode::UNAUTHORIZED, "invalid_grant"),
+        Err(e) => {
+            warn!(error = %e, "failed to read an auth key's CI metadata");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+    if meta.purpose != crate::state::AUTH_KEY_PURPOSE_CI {
+        warn!(
+            key = %hash.short(), purpose = %meta.purpose,
+            "auth key is not a CI key; refusing to mint a workload token"
+        );
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    // The single atomic consume, exactly as `redeem_auth_key` does it: a
+    // single-use key is spent here and a multi-use one is left redeemable.
+    let Ok(Some((org, tags))) = coord.db().consume_auth_key(hash.as_str(), now_i64).await else {
+        warn!(key = %hash.short(), "workload key could not be consumed");
+        return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+    };
+    if tags.is_empty() {
+        // Belt to `auth-key create --purpose ci`'s brace: an empty tag set is
+        // an *empty selector*, which matches every board in the org. The
+        // selector parser refuses one at every other entry point and so does
+        // this, rather than synthesising a grant to the whole fleet.
+        warn!(key = %hash.short(), "a CI auth key with no tags cannot be redeemed");
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    }
+
+    // Subject: org-scoped, so it can never collide with a `gha/workload:` repo
+    // subject, and derived from the key hash so every runner redeeming the same
+    // key is the same subject (one grant row, one concurrency budget).
+    let key_subject = fleet_proto::ids::SubjectKey {
+        org: org.clone(),
+        kind: SubjectKind::Workload,
+        id: format!("key:{}", hash.short()),
+    };
+
+    let selector = tags
+        .iter()
+        .map(|t| format!("tag={t}"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let selector =
+        match fleet_proto::lease::parse_constraint(&selector, fleet_proto::lease::BareTerm::Tag) {
+            Ok(c) => c.to_string(),
+            Err(e) => {
+                warn!(error = %e, "a CI auth key's tags do not form a valid selector");
+                return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+            }
+        };
+    let ops = if meta.ops.is_empty() {
+        DEFAULT_CI_KEY_OPS.to_vec()
+    } else {
+        fleet_proto::token::normalize_ops(
+            meta.ops
+                .iter()
+                .filter_map(|o| fleet_proto::token::AllowedOp::from_label(o))
+                .collect(),
+        )
+    };
+
+    // A deterministic grant id derived from the key hash, so a multi-use key
+    // upserts one row however many runners redeem it. Prefixed `ci-` and
+    // therefore in a namespace no human-created grant id can occupy (those are
+    // 32 random hex characters), which is what keeps `grant revoke <prefix>`
+    // unambiguous between the two.
+    let grant_id = format!("ci-{}", hash.as_str().get(..29).unwrap_or(hash.as_str()));
+    // The grant inherits the key's expiry; a shell-minted perpetual key gets a
+    // bounded one rather than an unbounded share of the org's hardware.
+    let grant_expires = meta
+        .expires
+        .unwrap_or_else(|| now_i64.saturating_add(DEFAULT_CI_GRANT_TTL_SECS));
+
+    if let Err(e) = coord
+        .db()
+        .scoped(org.clone())
+        .upsert_grant(
+            &grant_id,
+            &key_subject,
+            &selector,
+            &ops,
+            Some(grant_expires),
+            None,
+            now_i64,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to synthesise a CI key's grant");
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    }
+
+    let token = OpaqueToken::mint(TokenKind::Workload);
+    let ttl = coord
+        .config()
+        .github_actions
+        .as_ref()
+        .map_or(DEFAULT_WORKLOAD_KEY_TTL_SECS, |g| g.workload_token_ttl_secs);
+    // Never outlive the key's own expiry: a key revoked by letting it lapse
+    // must not leave a token running past it.
+    let expires = now_i64
+        .saturating_add(i64::try_from(ttl).unwrap_or(i64::from(i32::MAX)))
+        .min(grant_expires);
+    if let Err(e) = coord
+        .db()
+        .insert_workload_token(
+            token.hash().as_str(),
+            &key_subject,
+            "auth_key",
+            &crate::state::WorkloadClaimColumns::default(),
+            now_i64,
+            expires,
+        )
+        .await
+    {
+        warn!(error = %e, "failed to record a workload token");
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    }
+
+    let subject_rendered = key_subject.to_string();
+    let detail = format!(
+        "auth key {} selector={selector} grant={grant_id}",
+        hash.short()
+    );
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now_i64,
+            subject: Some(subject_rendered.as_str()),
+            action: "workload.token.mint",
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some(&detail),
+        })
+        .await;
+    info!(org = %org, key = %hash.short(), "minted a workload token from an auth key");
+
+    Json(TokenResponse {
+        token: token.to_secret_string(),
+        node_id: None,
+        org: org.0.clone(),
+        orgs: vec![org.0],
+        expires: Some(u64::try_from(expires).unwrap_or(0)),
+        coordinator_token_pubkey: None,
+        login: None,
+    })
+    .into_response()
+}
+
+/// Ops a CI auth key confers when `--ops` was not given.
+///
+/// `attach` is implied by the data-plane ops anyway (`normalize_ops`), and is
+/// listed for readability. `power-cycle` is deliberately absent: an unattended
+/// runner cutting power to a lab board should be an explicit choice.
+const DEFAULT_CI_KEY_OPS: [fleet_proto::token::AllowedOp; 4] = [
+    fleet_proto::token::AllowedOp::Attach,
+    fleet_proto::token::AllowedOp::Flash,
+    fleet_proto::token::AllowedOp::Reset,
+    fleet_proto::token::AllowedOp::Erase,
+];
+
+/// Bound on the grant synthesised for a key that never expires.
+///
+/// A shell-minted `--ttl 0` key is an operator's informed choice about the
+/// *key*; it is not a choice to share the org's hardware forever, which is the
+/// artefact §6.5 refuses to let a grant be.
+const DEFAULT_CI_GRANT_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// Workload-token TTL when there is no `[github_actions]` table.
+///
+/// The auth-key path works without one — it involves no issuer — so it needs
+/// its own default rather than refusing to run.
+const DEFAULT_WORKLOAD_KEY_TTL_SECS: u64 = 3600;
 
 /// Self-register the calling machine as a node in the caller's own org
 /// (architecture §4.2 path 2, §6.4). This is what `probe-rs-fleet share` calls.
@@ -737,6 +1163,7 @@ async fn mint_node_token(
         token: token.to_secret_string(),
         node_id: Some(node.0),
         org: org.0.clone(),
+        orgs: Vec::new(),
         expires: None,
         coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
         login: None,
@@ -782,6 +1209,8 @@ async fn refresh_session(coord: &Coordinator, session_token: &str) -> Response {
         token: fresh.to_secret_string(),
         node_id: None,
         org: org.0,
+        // A session belongs to exactly one org, so there is nothing to list.
+        orgs: Vec::new(),
         expires: u64::try_from(expires).ok(),
         coordinator_token_pubkey: None,
         login: None,
@@ -1301,6 +1730,7 @@ async fn auth_device_poll(
         token,
         node_id: None,
         org: org.0,
+        orgs: Vec::new(),
         expires: u64::try_from(expires).ok(),
         coordinator_token_pubkey: None,
         login: Some(user.login),

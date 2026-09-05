@@ -219,6 +219,55 @@ pub async fn exchange_auth_key(
     .await
 }
 
+/// Exchange a GitHub Actions OIDC JWT for a per-job workload token
+/// (architecture §6.7).
+///
+/// The runner holds **no secret**: `permissions: id-token: write` lets it ask
+/// GitHub for the JWT, and this exchanges it. What comes back is scoped to one
+/// job by its TTL and reaches only boards an explicit per-repo grant names.
+///
+/// # Errors
+///
+/// See [`exchange`]. A coordinator with no `[github_actions]` table answers
+/// `503 workload_oidc_unconfigured`; a repo nobody has granted answers
+/// `403 no_grant`; every verification failure is a flat `401 invalid_grant`.
+pub async fn exchange_github_oidc(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    oidc_token: &str,
+) -> Result<TokenResponse, ClientError> {
+    exchange(
+        base_url,
+        pin,
+        &TokenRequest::GithubOidc {
+            oidc_token: oidc_token.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Redeem a workload auth key for a workload token — the fallback for a runner
+/// with no workload identity (architecture §6.7).
+///
+/// # Errors
+///
+/// See [`exchange`]. A key that is not `--purpose ci` is refused with
+/// `403 forbidden`, an expired or consumed one with `401 invalid_grant`.
+pub async fn exchange_workload_key(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    auth_key: &str,
+) -> Result<TokenResponse, ClientError> {
+    exchange(
+        base_url,
+        pin,
+        &TokenRequest::WorkloadKey {
+            auth_key: auth_key.to_owned(),
+        },
+    )
+    .await
+}
+
 /// Exchange a still-valid session token for a fresh one.
 ///
 /// # Errors

@@ -75,10 +75,13 @@ pub struct Authenticated {
     pub kind: TokenKind,
     /// The org the credential belongs to.
     ///
-    /// For a node this is the node row's org — never a configured default.
+    /// For a node this is the node row's org — never a configured default. For
+    /// a [`TokenKind::Workload`] it is the *namespace* half of the subject key
+    /// (`gha`, or the granting org for the auth-key fallback), which on the
+    /// OIDC path is **not** an org that exists in the database.
     pub org_id: String,
     /// The principal's id: a node id for [`TokenKind::Node`], a user id for
-    /// [`TokenKind::Session`].
+    /// [`TokenKind::Session`], `<owner>/<repo>` for [`TokenKind::Workload`].
     pub id: String,
     /// Expiry, epoch seconds, if the credential has one.
     pub expires: Option<u64>,
@@ -145,6 +148,26 @@ pub async fn authenticate(
                 org_id: session.org_id,
                 id: session.user_id,
                 expires: Some(session.expires),
+                hash,
+                token_issued_at: None,
+            })
+        }
+        TokenKind::Workload => {
+            let workload = store
+                .lookup_workload(&hash)
+                .await
+                .map_err(AuthError::Store)?
+                .ok_or(AuthError::Unknown(TokenKind::Workload))?;
+            if workload.expires <= now {
+                return Err(AuthError::Expired(TokenKind::Workload));
+            }
+            Ok(Authenticated {
+                kind: TokenKind::Workload,
+                // The reserved `gha` namespace, not an org: a workload belongs
+                // to no tenant and reaches boards only through grants.
+                org_id: workload.org_id,
+                id: workload.id,
+                expires: Some(workload.expires),
                 hash,
                 token_issued_at: None,
             })
@@ -262,6 +285,42 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, AuthError::Unknown(TokenKind::Node));
         assert_eq!(err.label(), "auth.reject.node_unknown");
+    }
+
+    /// A workload token *is* a connection credential (unlike an auth key), and
+    /// its namespace is the reserved `gha`, not an org row.
+    #[tokio::test]
+    async fn workload_token_resolves_and_expires() {
+        use crate::store::WorkloadRecord;
+        let token = OpaqueToken::mint(TokenKind::Workload);
+        let store = FakeStore::default().with_workload(
+            &token.hash(),
+            WorkloadRecord {
+                org_id: "gha".to_owned(),
+                id: "ariel-os/ariel-os".to_owned(),
+                expires: 1_000,
+            },
+        );
+        let s = token.to_secret_string();
+        let auth = authenticate(&store, &s, 999).await.unwrap();
+        assert_eq!(auth.kind, TokenKind::Workload);
+        assert_eq!(auth.org_id, "gha");
+        assert_eq!(auth.id, "ariel-os/ariel-os");
+        assert_eq!(auth.expires, Some(1_000));
+        // Expiry is exclusive, as for a session: `now == expires` is expired.
+        assert_eq!(
+            authenticate(&store, &s, 1_000).await.unwrap_err(),
+            AuthError::Expired(TokenKind::Workload)
+        );
+        // An unknown workload token (the exchange row swept, or forged) is a
+        // plain unknown-token rejection.
+        let other = OpaqueToken::mint(TokenKind::Workload);
+        assert_eq!(
+            authenticate(&store, &other.to_secret_string(), 0)
+                .await
+                .unwrap_err(),
+            AuthError::Unknown(TokenKind::Workload)
+        );
     }
 
     #[tokio::test]

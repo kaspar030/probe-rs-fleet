@@ -7,6 +7,7 @@
 //! prfs1_<43 chars>      session token  (user; short TTL, refreshable)
 //! prffk1_<43 chars>     auth key       (node enrollment; org-scoped, revocable)
 //! prfnd1_<43 chars>     node device    (pending interactive approval; redeemed at a route)
+//! prfw1_<43 chars>      workload token (CI; one job, exchanged at /auth/token)
 //! ```
 //!
 //! The prefix is load-bearing, not decoration: it tells the coordinator which
@@ -31,6 +32,8 @@ const PREFIX_SESSION: &str = "prfs1_";
 const PREFIX_AUTH_KEY: &str = "prffk1_";
 /// Prefix for a pending-node device secret (interactive approval).
 const PREFIX_NODE_DEVICE: &str = "prfnd1_";
+/// Prefix for a CI workload token (architecture §6.7).
+const PREFIX_WORKLOAD: &str = "prfw1_";
 
 /// Number of random bytes in a token secret.
 const SECRET_LEN: usize = 32;
@@ -52,6 +55,14 @@ pub enum TokenKind {
     /// [`crate::verify::authenticate`] rejects it as
     /// [`crate::AuthError::WrongKind`].
     NodeDevice,
+    /// A CI job's per-job credential, exchanged at `POST /auth/token` from a
+    /// GitHub Actions OIDC JWT (or from a workload auth key for a runner with
+    /// no workload identity) — architecture §6.7.
+    ///
+    /// Unlike [`TokenKind::AuthKey`] this **is** a connection credential: it is
+    /// what the sidecar presents on `/client`. It belongs to no org — a
+    /// workload reaches boards only through per-repo grants.
+    Workload,
 }
 
 impl TokenKind {
@@ -63,6 +74,7 @@ impl TokenKind {
             TokenKind::Session => PREFIX_SESSION,
             TokenKind::AuthKey => PREFIX_AUTH_KEY,
             TokenKind::NodeDevice => PREFIX_NODE_DEVICE,
+            TokenKind::Workload => PREFIX_WORKLOAD,
         }
     }
 
@@ -74,6 +86,7 @@ impl TokenKind {
             TokenKind::Session => "session",
             TokenKind::AuthKey => "auth_key",
             TokenKind::NodeDevice => "node_device",
+            TokenKind::Workload => "workload",
         }
     }
 }
@@ -183,6 +196,7 @@ impl OpaqueToken {
             TokenKind::NodeDevice,
             TokenKind::Node,
             TokenKind::Session,
+            TokenKind::Workload,
         ];
         let (kind, body) = kinds
             .into_iter()
@@ -246,6 +260,7 @@ mod tests {
             TokenKind::Session,
             TokenKind::AuthKey,
             TokenKind::NodeDevice,
+            TokenKind::Workload,
         ] {
             let token = OpaqueToken::mint(kind);
             let s = token.to_secret_string();
@@ -294,6 +309,14 @@ mod tests {
         assert_eq!(
             OpaqueToken::parse(&device).unwrap().kind(),
             TokenKind::NodeDevice
+        );
+        // `prfw1_` shares only `prf` with the rest; a workload token must never
+        // be mistaken for a node token, which is what would silently give a CI
+        // job the `/agent` plane.
+        let workload = OpaqueToken::mint(TokenKind::Workload).to_secret_string();
+        assert_eq!(
+            OpaqueToken::parse(&workload).unwrap().kind(),
+            TokenKind::Workload
         );
     }
 

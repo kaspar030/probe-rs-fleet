@@ -31,6 +31,14 @@ rustls = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 fleet-tls = { workspace = true, optional = true }
 
+# `oidc` feature: GitHub Actions workload-identity JWT verification
+# (architecture §6.7). Off by default and enabled only by `fleet-coordinator`,
+# which is the only crate that verifies one. `jsonwebtoken/rust_crypto` drags
+# in `rsa`, `p256`, `p384`, `ed25519-dalek` and `num-bigint-dig`, and this
+# crate's other consumer path ends in the Raspberry Pi binary — so the flag
+# keeps `docs/cross-compiling.md`'s verified-crates table meaningful.
+jsonwebtoken = { workspace = true, optional = true }
+
 [features]
 default = []
 client = [
@@ -43,6 +51,9 @@ client = [
     "dep:tokio",
     "dep:fleet-tls",
 ]
+# The pure verifier. `JwksCache` additionally needs `client` for its HTTPS
+# egress, and is `#[cfg]`-gated on it inside the module.
+oidc = ["dep:jsonwebtoken"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

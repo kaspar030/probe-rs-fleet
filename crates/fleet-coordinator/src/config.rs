@@ -71,6 +71,74 @@ pub struct GithubConfig {
     pub api_base: String,
 }
 
+/// The GitHub Actions OIDC issuer the coordinator accepts workload tokens
+/// from (architecture §6.7).
+///
+/// **This one really is OIDC**, unlike [`GithubConfig`] above: signed JWTs, a
+/// JWKS endpoint, and claims to verify. The two are independent — a fleet may
+/// have CI without user login, or the reverse.
+#[derive(Debug, Clone)]
+pub struct GithubActionsConfig {
+    /// The expected `iss` claim.
+    pub issuer: String,
+    /// Where the issuer publishes its signing keys.
+    ///
+    /// Overridable (rather than derived from `issuer`) so the integration
+    /// tests can point it at a loopback stub — the only way to exercise
+    /// signature verification without github.com.
+    pub jwks_url: String,
+    /// The `aud` claim a workload token must carry.
+    ///
+    /// **Required, and deliberately without a default.** GitHub's default
+    /// audience is `https://github.com/<owner>`, which is not specific to any
+    /// service: a token minted for some *other* system that also took the
+    /// default would then be replayable against this fleet. Set it to the
+    /// coordinator's `public_url` and have the workflow request that audience
+    /// explicitly.
+    pub audience: String,
+    /// How long (seconds) a cached JWKS is served before a refetch.
+    pub jwks_refresh_secs: u64,
+    /// Floor (seconds) between refetches forced by an unknown `kid`.
+    ///
+    /// An unknown `kid` is how a key rotation looks, so it must trigger a
+    /// refetch; but the `kid` is attacker-chosen, so an unbounded one turns
+    /// `POST /auth/token` into a fetch amplifier aimed at the issuer.
+    pub jwks_min_refetch_secs: u64,
+    /// How long (seconds) a minted workload token is valid.
+    ///
+    /// Per job, by intent. A job that outlives it must re-run `ci login`:
+    /// there is no refresh path for a workload token (`Refresh` is
+    /// session-only), and that bound is documented in
+    /// `docs/ci-github-actions.md` rather than left to be discovered as a
+    /// flake.
+    pub workload_token_ttl_secs: u64,
+}
+
+impl Default for GithubActionsConfig {
+    fn default() -> Self {
+        Self {
+            issuer: DEFAULT_GHA_ISSUER.to_owned(),
+            jwks_url: DEFAULT_GHA_JWKS_URL.to_owned(),
+            // No sensible default exists; `validate()` refuses an empty one.
+            audience: String::new(),
+            jwks_refresh_secs: 3600,
+            jwks_min_refetch_secs: 60,
+            workload_token_ttl_secs: 3600,
+        }
+    }
+}
+
+/// GitHub's Actions OIDC issuer.
+pub const DEFAULT_GHA_ISSUER: &str = "https://token.actions.githubusercontent.com";
+/// GitHub's Actions OIDC JWKS endpoint.
+pub const DEFAULT_GHA_JWKS_URL: &str =
+    "https://token.actions.githubusercontent.com/.well-known/jwks";
+/// Ceiling on [`GithubActionsConfig::workload_token_ttl_secs`].
+///
+/// A workload token is a pure bearer credential handed to a CI runner; twelve
+/// hours is already generous for "one job".
+const MAX_WORKLOAD_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
+
 /// Full coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
@@ -141,6 +209,13 @@ pub struct CoordinatorConfig {
     /// `/auth/device/*` routes then answer a named `503`
     /// (`device_flow_unconfigured`) so the CLI can say *why*.
     pub github: Option<GithubConfig>,
+    /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`
+    /// (architecture §6.7).
+    ///
+    /// `None` is a supported deployment: a fleet with no CI. The exchange then
+    /// answers a named `503` (`workload_oidc_unconfigured`), mirroring
+    /// `device_flow_unconfigured`, so the CLI can say *why*.
+    pub github_actions: Option<GithubActionsConfig>,
 }
 
 impl CoordinatorConfig {
@@ -199,6 +274,20 @@ impl CoordinatorConfig {
                 "default_org must be non-empty".to_owned(),
             ));
         }
+        // `gha` is the reserved namespace a CI workload's subject key lives in
+        // (architecture §6.7, `fleet_proto::ids::WORKLOAD_NS_GHA`). Letting an
+        // operator point `default_org` at it would put real tenant objects in
+        // a namespace whose whole meaning is "not a tenant". This is the
+        // second belt; the first is `Db::ensure_org`, which refuses the id at
+        // *every* org-creation path — a reserved name only one of the two
+        // respects is a trap for the next change.
+        if self.default_org.0 == fleet_proto::ids::WORKLOAD_NS_GHA {
+            return Err(CoordinatorError::Config(format!(
+                "default_org must not be `{}`: that namespace is reserved for CI \
+                 workload subjects (architecture §6.7)",
+                fleet_proto::ids::WORKLOAD_NS_GHA
+            )));
+        }
         if let Some(gh) = &self.github {
             // A `[github]` table with no client id would make `login` fail at
             // GitHub with an opaque error, far from the mistake.
@@ -216,6 +305,41 @@ impl CoordinatorConfig {
                 if value.trim().is_empty() {
                     return Err(CoordinatorError::Config(format!("{label} must be non-empty")));
                 }
+            }
+        }
+        if let Some(gha) = &self.github_actions {
+            for (label, value) in [
+                ("github_actions.issuer", &gha.issuer),
+                ("github_actions.jwks_url", &gha.jwks_url),
+                // The one with real teeth: an empty audience would mean
+                // accepting GitHub's fleet-unspecific default, and with it any
+                // token minted for another service under the same owner.
+                ("github_actions.audience", &gha.audience),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(CoordinatorError::Config(format!(
+                        "{label} must be non-empty when a [github_actions] table is present"
+                    )));
+                }
+            }
+            for (label, value) in [
+                ("github_actions.jwks_refresh_secs", gha.jwks_refresh_secs),
+                (
+                    "github_actions.workload_token_ttl_secs",
+                    gha.workload_token_ttl_secs,
+                ),
+            ] {
+                if value == 0 {
+                    return Err(CoordinatorError::Config(format!(
+                        "{label} must be non-zero"
+                    )));
+                }
+            }
+            if gha.workload_token_ttl_secs > MAX_WORKLOAD_TOKEN_TTL_SECS {
+                return Err(CoordinatorError::Config(format!(
+                    "github_actions.workload_token_ttl_secs must not exceed \
+                     {MAX_WORKLOAD_TOKEN_TTL_SECS} (a workload token is per job)"
+                )));
             }
         }
         Ok(())
@@ -261,6 +385,7 @@ impl Default for CoordinatorConfig {
             max_pending_nodes: 256,
             default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
             github: None,
+            github_actions: None,
         }
     }
 }
@@ -403,5 +528,62 @@ mod tests {
     fn github_is_optional() {
         assert!(CoordinatorConfig::default().github.is_none());
         assert!(CoordinatorConfig::default().validate().is_ok());
+    }
+
+    /// A `[github_actions]` table must name an audience. Accepting GitHub's
+    /// default (`https://github.com/<owner>`) would make a token minted for a
+    /// *different* service under the same owner replayable here — which is
+    /// exactly the mistake a default would invite.
+    #[test]
+    fn github_actions_requires_an_audience_and_bounded_ttls() {
+        let good = GithubActionsConfig {
+            audience: "https://fleet.example".to_owned(),
+            ..GithubActionsConfig::default()
+        };
+        let c = CoordinatorConfig {
+            github_actions: Some(good.clone()),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_ok());
+
+        for mutate in [
+            (|g: &mut GithubActionsConfig| g.audience = "  ".to_owned())
+                as fn(&mut GithubActionsConfig),
+            |g| g.issuer = String::new(),
+            |g| g.jwks_url = String::new(),
+            |g| g.jwks_refresh_secs = 0,
+            |g| g.workload_token_ttl_secs = 0,
+            // Over the 12h cap.
+            |g| g.workload_token_ttl_secs = 13 * 3600,
+        ] {
+            let mut gha = good.clone();
+            mutate(&mut gha);
+            let c = CoordinatorConfig {
+                github_actions: Some(gha),
+                ..CoordinatorConfig::default()
+            };
+            assert!(c.validate().is_err());
+        }
+    }
+
+    /// A fleet with no CI is a supported deployment; the exchange route then
+    /// answers a named 503.
+    #[test]
+    fn github_actions_is_optional() {
+        assert!(CoordinatorConfig::default().github_actions.is_none());
+        assert!(CoordinatorConfig::default().validate().is_ok());
+    }
+
+    /// `gha` is the reserved namespace CI workload subjects live in, so it must
+    /// not also be a tenant id. This is the config half of the fence;
+    /// `Db::ensure_org` is the other half, and both are needed — a reserved
+    /// name that only one creation path respects is worse than none.
+    #[test]
+    fn default_org_may_not_be_the_reserved_workload_namespace() {
+        let c = CoordinatorConfig {
+            default_org: OrgId(fleet_proto::ids::WORKLOAD_NS_GHA.to_owned()),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_err());
     }
 }
