@@ -19,8 +19,10 @@
 #
 #   GET  /healthz      liveness, for the proxy
 #   GET  /agent        WebSocket upgrade — a node's persistent control plane
-#   GET  /client       WebSocket upgrade — ctl and the probe-rs sidecar
-#   POST /auth/token   JSON credential exchange (node enrollment, session refresh)
+#   GET  /client       WebSocket upgrade — ctl, the probe-rs sidecar, and a CI
+#                      workload token (architecture §6.7)
+#   POST /auth/token   JSON credential exchange (node enrollment, session
+#                      refresh, CI workload identity)
 #
 # Every principal presents `Authorization: Bearer …` on the upgrade. There are
 # no client certificates, no private CA, and no mTLS.
@@ -230,3 +232,73 @@ default_ttl_secs = 900
 # # device_code_url  = "https://github.com/login/device/code"
 # # access_token_url = "https://github.com/login/oauth/access_token"
 # # api_base         = "https://api.github.com"
+
+# ---------------------------------------------------------------------------
+# GitHub Actions workload identity (optional): what backs `ci login`
+# ---------------------------------------------------------------------------
+#
+# Independent of [github] above, and unrelated to it: a fleet may have CI
+# without user login, or the reverse. They are also two DIFFERENT identity
+# systems. User login is plain OAuth2 — no ID token, no JWKS, nothing to
+# verify. This one is real OIDC: a job with `permissions: id-token: write`
+# mints a signed JWT, and this coordinator verifies its signature against
+# GitHub's published keys. No secret ever enters the runner, which is the
+# entire point of the CI path.
+#
+# Omitting this whole block is a SUPPORTED deployment. `POST /auth/token` then
+# answers 503 with the code `workload_oidc_unconfigured` — the same shape as
+# `device_flow_unconfigured` — and `ci login` turns that into a sentence naming
+# the missing block.
+#
+# A verified token proves "a job in repo owner/name". Reaching hardware
+# additionally needs an explicit PER-REPO grant:
+#
+#   probe-rs-fleet grant --repo owner/name --select 'tag=nrf52' --ops flash
+#
+# The owner is deliberately NOT sufficient — a fork, or a new repo under a
+# granted owner, is a different subject and matches no grant (403 no_grant).
+# See docs/ci-github-actions.md.
+
+# [github_actions]
+# # The `aud` claim a workload token must carry. REQUIRED: there is no default
+# # and the coordinator refuses this block without one.
+# #
+# # This is the one key here with real teeth. GitHub's own default audience is
+# # `https://github.com/<owner>`, which is not specific to any service — so a
+# # token minted for some OTHER system under the same owner, which also took
+# # the default, would be replayable against this fleet. Set it to this
+# # coordinator's `public_url` (above) and have the workflow ask for that
+# # audience explicitly: `ci login --audience <it>`.
+# audience = "https://fleet.example"
+#
+# # The expected `iss` claim. Override only for GitHub Enterprise.
+# # issuer = "https://token.actions.githubusercontent.com"
+#
+# # Where the issuer publishes its signing keys. Overridable (rather than
+# # derived from `issuer`) so an integration test can point it at a loopback
+# # stub — the only way to exercise signature verification without github.com.
+# # jwks_url = "https://token.actions.githubusercontent.com/.well-known/jwks"
+#
+# # How long (seconds) a cached JWKS is served before a refetch. Default: 3600.
+# # A stale-but-present set survives a failed refresh: GitHub's signing keys
+# # outlive this interval by a wide margin, so serving the cached set through
+# # an issuer outage is the safer failure.
+# # jwks_refresh_secs = 3600
+#
+# # Floor (seconds) between refetches forced by an unknown key id. Default: 60.
+# #
+# # An unknown `kid` is what a key ROTATION looks like, so it must trigger a
+# # refetch — waiting out `jwks_refresh_secs` would break every CI job in
+# # between. But the `kid` comes from the token, i.e. from the caller, so an
+# # unbounded refetch turns POST /auth/token into a fetch amplifier aimed at
+# # the issuer. Over the limit the cached set is served and the token refused.
+# # jwks_min_refetch_secs = 60
+#
+# # How long (seconds) a minted workload token is valid. Default: 3600, and
+# # the validator caps it at 12h.
+# #
+# # Per job, by intent. There is NO refresh path for a workload token (refresh
+# # is session-only), so a job that runs past this must re-run `ci login`.
+# # Raising it trades that inconvenience for a longer-lived bearer credential
+# # sitting in a CI runner's environment.
+# # workload_token_ttl_secs = 3600

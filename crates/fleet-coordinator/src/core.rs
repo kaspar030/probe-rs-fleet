@@ -2654,6 +2654,47 @@ mod tests {
         }
     }
 
+    /// `--repo owner/name` resolves to the reserved-namespace workload subject
+    /// key, lowercased, and the branch is **first** so nothing can shadow it.
+    ///
+    /// This is the grant-creation half of the per-repo trust rule; the claim
+    /// half is `oidc::verify`. Both go through `normalise_repo`, which is why
+    /// they cannot disagree about spelling.
+    #[tokio::test]
+    async fn resolve_grantee_maps_repo_to_the_workload_namespace() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+
+        let key = coord
+            .resolve_grantee("repo:Ariel-OS/Ariel-OS")
+            .await
+            .unwrap()
+            .expect("a repo spec must resolve");
+        assert_eq!(key.to_string(), "gha/workload:ariel-os/ariel-os");
+        assert_eq!(key.kind, SubjectKind::Workload);
+
+        // Garbage after `repo:` resolves to nothing rather than to some
+        // fallback subject: a grant to a subject nobody can authenticate as is
+        // worse than a clear refusal.
+        for bad in ["repo:", "repo:owner", "repo:a/b/c", "repo:own er/name"] {
+            assert!(
+                coord.resolve_grantee(bad).await.unwrap().is_none(),
+                "{bad} must not resolve"
+            );
+        }
+
+        // The other spellings still work, and a rendered workload key is not
+        // mistaken for one of them.
+        let key = coord
+            .resolve_grantee("gha/workload:ariel-os/ariel-os")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.kind, SubjectKind::Workload);
+        let key = coord.resolve_grantee("gh-7").await.unwrap().unwrap();
+        assert_eq!(key.kind, SubjectKind::User);
+    }
+
     /// An ambiguous board name (two of the caller's *own* nodes carry it) is
     /// reported as ambiguous, not as "no such board" — naming the caller's own
     /// nodes leaks nothing, and the bare not-found reply would badly mislead.

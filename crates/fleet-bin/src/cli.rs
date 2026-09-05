@@ -1702,4 +1702,128 @@ mod tests {
             other => panic!("expected ctl, got {other:?}"),
         }
     }
+
+    /// `grant --repo` parses, and it **conflicts** with the positional subject.
+    ///
+    /// The conflict is the point: `grant bob --repo owner/name` has no coherent
+    /// meaning, and silently picking one would be a security verb guessing.
+    #[test]
+    fn grant_repo_parses_and_conflicts_with_a_positional_subject() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "grant",
+            "--repo",
+            "ariel-os/ariel-os",
+            "--select",
+            "tag=nrf52",
+            "--ops",
+            "flash",
+        ]));
+        match cli.command {
+            Command::Grant(a) => {
+                assert_eq!(a.repo.as_deref(), Some("ariel-os/ariel-os"));
+                assert!(a.subject.is_none());
+                assert_eq!(a.select.as_deref(), Some("tag=nrf52"));
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+
+        // The person form still works untouched.
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "grant", "bob", "--select", "tag=nrf52",
+        ]));
+        match cli.command {
+            Command::Grant(a) => {
+                assert_eq!(a.subject.as_deref(), Some("bob"));
+                assert!(a.repo.is_none());
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(os(&[
+                "probe-rs-fleet", "grant", "bob", "--repo", "a/b", "--select", "tag=x",
+            ]))
+            .is_err(),
+            "a person and a repo at once must be refused, not silently resolved"
+        );
+    }
+
+    #[test]
+    fn ci_login_parses_both_paths() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "ci",
+            "login",
+            "--fleet-url",
+            "https://fleet.example",
+            "--audience",
+            "https://fleet.example",
+        ]));
+        match cli.command {
+            Command::Ci(a) => match a.command {
+                CiCommand::Login(l) => {
+                    assert_eq!(l.fleet_url.as_deref(), Some("https://fleet.example"));
+                    assert_eq!(l.audience.as_deref(), Some("https://fleet.example"));
+                    assert!(l.auth_key.is_none());
+                    // The token must not reach stdout on a runner by default:
+                    // stdout is the job log.
+                    assert!(!l.export);
+                }
+            },
+            other => panic!("expected ci, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "ci", "login", "--fleet-url", "https://f", "--auth-key", "prffk1_x",
+        ]));
+        match cli.command {
+            Command::Ci(a) => match a.command {
+                CiCommand::Login(l) => assert_eq!(l.auth_key.as_deref(), Some("prffk1_x")),
+            },
+            other => panic!("expected ci, got {other:?}"),
+        }
+    }
+
+    /// `auth-key create --purpose` accepts only the two real purposes, and
+    /// defaults to node enrollment — so a caller has to *ask* for the
+    /// board-access credential.
+    #[test]
+    fn auth_key_purpose_defaults_to_node_and_rejects_junk() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => {
+                    assert_eq!(c.purpose, "node");
+                    assert!(c.ops.is_none());
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "auth-key", "create", "--purpose", "ci", "--tag", "nrf52",
+            "--ops", "flash,attach",
+        ]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => {
+                    assert_eq!(c.purpose, "ci");
+                    assert_eq!(c.ops.as_deref(), Some("flash,attach"));
+                    assert_eq!(c.tag, vec!["nrf52".to_owned()]);
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+
+        assert!(
+            Cli::try_parse_from(os(&[
+                "probe-rs-fleet", "auth-key", "create", "--purpose", "wat",
+            ]))
+            .is_err(),
+            "an unrecognised purpose must be a parse error, never a silent default"
+        );
+    }
 }
