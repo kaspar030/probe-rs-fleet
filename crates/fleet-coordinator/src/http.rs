@@ -626,6 +626,10 @@ async fn redeem_auth_key(
 ///   two would send an operator hunting a signing problem when the answer is
 ///   "run `grant --repo`". It leaks only that the repo is not granted, which is
 ///   something the repo's own maintainers already know.
+// Long, and deliberately linear: verify, look up the grant, mint, audit, reply.
+// Every step's failure has its own named response, and factoring the tail into
+// helpers would separate each rejection from the reason it exists.
+#[allow(clippy::too_many_lines)]
 async fn exchange_github_oidc(coord: &Coordinator, jwt: &str) -> Response {
     use fleet_auth::oidc::{self, OidcError, OidcPolicy};
 
@@ -802,6 +806,8 @@ async fn exchange_github_oidc(coord: &Coordinator, jwt: &str) -> Response {
 /// `purpose = 'ci'`, and redeeming one upserts an **ordinary grant** to an
 /// org-scoped workload subject — the same row `grant --repo` writes, evaluated
 /// by the same code, revocable by the same verb.
+// Linear for the same reason [`exchange_github_oidc`] is.
+#[allow(clippy::too_many_lines)]
 async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response {
     let now = coord.now();
     let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
@@ -1313,6 +1319,10 @@ async fn auth_keys(
 /// The secret exists exactly once, in this response: only its SHA-256 is
 /// stored. `created_by` is finally populated on this path, which is what lets
 /// the creator revoke their own key later.
+// One argument per column, as `insert_auth_key` has: the columns are the key's
+// whole definition and bundling them would only move the same list down a
+// level.
+#[allow(clippy::too_many_arguments)]
 async fn create_auth_key(
     coord: &Coordinator,
     org: &OrgId,

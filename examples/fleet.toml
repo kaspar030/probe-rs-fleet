@@ -34,6 +34,13 @@
 #   headless Pi→ [node] only
 #   CI runner  → neither (its token comes from the environment)
 #
+# That last row is a rule, not an omission. `probe-rs-fleet ci login` writes
+# NOTHING here: it exchanges the job's workload identity for a token that lives
+# in PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN for one job, and expires
+# with it (architecture §6.7). Persisting a credential to disk on a shared
+# runner is the one durable artefact the whole CI path exists to avoid, and the
+# sidecar reads exactly those two variables, so nothing needs the file.
+#
 # The two tokens stay DISTINCT CREDENTIALS. Merging them — "one identity per
 # machine" — would make a compromised Pi, a device sitting on a shelf that
 # anyone walking past can reach, equivalent to a compromised user account.

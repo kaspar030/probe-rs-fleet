@@ -75,11 +75,12 @@ pub fn same_org(subject: &Subject, org: &OrgId) -> Result<(), AuthzError> {
 
 /// Require that `subject` is a member of `org` with at least `min` role.
 ///
-/// **Membership is defined for [`SubjectKind::User`] only** in this task: the
-/// `member` table is keyed by `user_id` and references `user(id)`, so a
-/// `Node` or `Workload` subject has no row and is denied *by construction*.
-/// That is the intended outcome — workloads will get access through grants
-/// (a separate task), not by being silently treated as members.
+/// **Membership is defined for [`SubjectKind::User`] only**: the `member`
+/// table is keyed by `user_id` and references `user(id)`, so a `Node` or
+/// `Workload` subject has no row and is denied *by construction*. That is the
+/// intended outcome, not a gap: a CI workload reaches boards through
+/// **per-repo grants** ([`board_access`]'s grant leg, architecture §6.7), never
+/// by being silently treated as a member of anything.
 ///
 /// # Errors
 ///
@@ -331,8 +332,9 @@ mod tests {
         );
     }
 
-    /// Membership is a user-only concept in this task; node and workload
-    /// subjects must be denied by construction, not by accident.
+    /// Membership is a user-only concept, by construction rather than by
+    /// accident: node and workload subjects must be denied here even when the
+    /// same *id* holds a membership row as a user.
     #[tokio::test]
     async fn non_user_subjects_are_denied_membership() {
         let db = db_with(&[("a", "ci", Role::Admin)]).await;

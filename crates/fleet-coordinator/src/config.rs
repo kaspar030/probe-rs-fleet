@@ -225,6 +225,10 @@ impl CoordinatorConfig {
     ///
     /// Returns [`CoordinatorError::Config`] if a required path or value is
     /// empty/zero, or a `[tls]` table is missing one of its two paths.
+    // One `if` per rule, and each rule's comment is the reason it exists;
+    // splitting them across helpers would separate each check from its
+    // justification, which is the part worth reading.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<()> {
         if self.sqlite_path.as_os_str().is_empty() {
             return Err(CoordinatorError::Config("sqlite_path is empty".to_owned()));

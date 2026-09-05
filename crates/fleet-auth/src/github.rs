@@ -642,6 +642,11 @@ pub async fn fetch_workload_id_token(
     request_token: &str,
     audience: &str,
 ) -> Result<String, GithubError> {
+    #[derive(Deserialize)]
+    struct IdTokenResponse {
+        value: String,
+    }
+
     if audience.trim().is_empty() || audience.contains('&') || audience.contains('#') {
         return Err(GithubError::Url(
             "audience must be non-empty and free of `&` and `#`".to_owned(),
@@ -657,10 +662,6 @@ pub async fn fetch_workload_id_token(
         });
     }
 
-    #[derive(Deserialize)]
-    struct IdTokenResponse {
-        value: String,
-    }
     let parsed: IdTokenResponse = serde_json::from_slice(&body)
         .map_err(|e| GithubError::Malformed(format!("OIDC token response: {e}")))?;
     if parsed.value.trim().is_empty() {

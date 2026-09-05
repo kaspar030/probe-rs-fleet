@@ -91,9 +91,12 @@ pub struct FleetConfig {
     pub coordinator: String,
     /// The bearer token presented on the `WebSocket` upgrade.
     ///
-    /// One credential, whatever the principal is: a user session token, or (in
-    /// a later task) a workload token exchanged per CI job. The coordinator
-    /// resolves it to a `Subject`; the client has no say in who it is.
+    /// One credential, whatever the principal is: a user session token, or a
+    /// **workload token** exchanged per CI job (architecture §6.7, obtained by
+    /// `probe-rs-fleet ci login`). The coordinator resolves it to a `Subject`;
+    /// the client has no say in who it is — which is exactly why the CI path
+    /// needed no change here at all. A workload token arrives in
+    /// `PROBE_RS_FLEET_TOKEN` like any other.
     pub token: String,
     /// Which board to lease.
     pub select: Constraint,

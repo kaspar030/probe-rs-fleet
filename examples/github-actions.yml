@@ -48,34 +48,48 @@ jobs:
       # Install the two binaries this needs: the fleet CLI and the GENUINE
       # probe-rs.
       #
-      # Both, and in this order on PATH. The sidecar is a `probe-rs` shim
-      # (argv0 dispatch, so `probe-rs run …` below is unmodified), and it
-      # *executes the real probe-rs client* against the leased board rather
-      # than reimplementing it — which is precisely why the exit code still
-      # means what it means (architecture §7). It finds the real one by walking
-      # PATH and skipping itself, so the real binary must also be on PATH,
-      # after the shim.
+      # Both, and the ORDER ON PATH IS LOAD-BEARING. The sidecar is a
+      # `probe-rs` shim (argv0 dispatch, which is what lets `probe-rs run …`
+      # below stay unmodified), and it *executes the real probe-rs client*
+      # against the leased board rather than reimplementing it — which is
+      # precisely why the exit code still means what it means (architecture
+      # §7). It finds the real one by walking PATH and skipping any entry that
+      # canonicalises to itself, so:
+      #
+      #   * the shim's directory must come FIRST, or `probe-rs` is the real
+      #     client, runs locally, and finds no probe;
+      #   * the real binary must be on PATH TOO, later, or the shim has
+      #     nothing to exec and says so.
+      #
+      # Hence exactly one $GITHUB_PATH entry (which is prepended) for the shim,
+      # and the real probe-rs installed into a directory that is already on
+      # PATH behind it.
       # ---------------------------------------------------------------------
       - name: Install probe-rs-fleet and probe-rs
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.fleet/bin" "$HOME/.probe-rs/bin"
+          mkdir -p "$HOME/.fleet/bin"
 
           # Replace these two with however you distribute the binaries.
           curl -sSL https://example.invalid/probe-rs-fleet -o "$HOME/.fleet/bin/probe-rs-fleet"
-          curl -sSL https://example.invalid/probe-rs        -o "$HOME/.probe-rs/bin/probe-rs"
-          chmod +x "$HOME/.fleet/bin/probe-rs-fleet" "$HOME/.probe-rs/bin/probe-rs"
+          sudo curl -sSL https://example.invalid/probe-rs  -o /usr/local/bin/probe-rs
+          chmod +x "$HOME/.fleet/bin/probe-rs-fleet"
+          sudo chmod +x /usr/local/bin/probe-rs
 
           # The shim: a `probe-rs` that is really probe-rs-fleet. laze, cargo
           # runners and hand-written scripts all invoke `probe-rs` unmodified.
           ln -sf "$HOME/.fleet/bin/probe-rs-fleet" "$HOME/.fleet/bin/probe-rs"
 
-          # Shim first, real probe-rs second. The shim skips PATH entries that
-          # canonicalise to itself, so it finds the real one at the second
-          # entry; reverse these and the real client runs locally and finds no
-          # probe.
-          echo "$HOME/.fleet/bin"   >> "$GITHUB_PATH"
-          echo "$HOME/.probe-rs/bin" >> "$GITHUB_PATH"
+          # Prepended, so the shim wins; /usr/local/bin is already behind it,
+          # which is where the shim finds the real client.
+          echo "$HOME/.fleet/bin" >> "$GITHUB_PATH"
+
+      - name: Check the shim resolves before the real client
+        run: |
+          set -euo pipefail
+          # Cheap, and it fails here with an obvious message rather than three
+          # steps later as a confusing "no probe found".
+          test "$(command -v probe-rs)" = "$HOME/.fleet/bin/probe-rs"
 
       # ---------------------------------------------------------------------
       # Exchange this job's workload identity for a fleet token.

@@ -236,7 +236,8 @@ pub fn verify(
     validation.validate_exp = false;
     validation.validate_nbf = false;
 
-    let data = jsonwebtoken::decode::<RawClaims>(jwt, &key, &validation).map_err(map_jwt_error)?;
+    let data =
+        jsonwebtoken::decode::<RawClaims>(jwt, &key, &validation).map_err(|e| map_jwt_error(&e))?;
     let claims = data.claims;
     let exp = claims.exp.ok_or(OidcError::MissingClaim("exp"))?;
     let sub = claims
@@ -281,7 +282,7 @@ pub fn verify(
 }
 
 /// Map a `jsonwebtoken` error onto our own taxonomy.
-fn map_jwt_error(e: jsonwebtoken::errors::Error) -> OidcError {
+fn map_jwt_error(e: &jsonwebtoken::errors::Error) -> OidcError {
     use jsonwebtoken::errors::ErrorKind;
     match e.kind() {
         ErrorKind::InvalidSignature => OidcError::BadSignature,
@@ -393,11 +394,13 @@ mod cache {
         /// set; a stale-but-present set survives a failed refresh.
         pub async fn get(&self) -> Result<Arc<JwkSet>, OidcError> {
             let mut state = self.inner.lock().await;
-            let stale = state
+            let is_stale = state
                 .fetched_at
                 .is_none_or(|at| at.elapsed() >= self.refresh_after);
-            if state.keys.is_some() && !stale {
-                return Ok(Arc::clone(state.keys.as_ref().expect("checked")));
+            if !is_stale {
+                if let Some(keys) = state.keys.as_ref() {
+                    return Ok(Arc::clone(keys));
+                }
             }
             match self.fetch(&mut state).await {
                 Ok(keys) => Ok(keys),

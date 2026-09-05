@@ -84,21 +84,20 @@ pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
         .as_deref()
         .and_then(fleet_tls::parse_fingerprint);
 
-    let response = match &args.auth_key {
-        Some(key) => fleet_auth::http_client::exchange_workload_key(&url, pin, key.trim())
+    let response = if let Some(key) = &args.auth_key {
+        fleet_auth::http_client::exchange_workload_key(&url, pin, key.trim())
             .await
-            .map_err(|e| describe(&e, "redeeming a workload auth key")),
-        None => {
-            // The audience must match the coordinator's configured one. It
-            // defaults to the coordinator's URL because that is what an
-            // ordinary deployment sets `audience` to; the coordinator itself
-            // has no default, for the replay reason `CiLoginArgs` records.
-            let audience = args.audience.clone().unwrap_or_else(|| url.clone());
-            let jwt = request_github_oidc_token(&audience).await?;
-            fleet_auth::http_client::exchange_github_oidc(&url, pin, &jwt)
-                .await
-                .map_err(|e| describe(&e, "exchanging this job's GitHub workload identity"))
-        }
+            .map_err(|e| describe(&e, "redeeming a workload auth key"))
+    } else {
+        // The audience must match the coordinator's configured one. It
+        // defaults to the coordinator's URL because that is what an ordinary
+        // deployment sets `audience` to; the coordinator itself has no
+        // default, for the replay reason `CiLoginArgs` records.
+        let audience = args.audience.clone().unwrap_or_else(|| url.clone());
+        let jwt = request_github_oidc_token(&audience).await?;
+        fleet_auth::http_client::exchange_github_oidc(&url, pin, &jwt)
+            .await
+            .map_err(|e| describe(&e, "exchanging this job's GitHub workload identity"))
     }?;
 
     emit(&args, &url, &response)?;
@@ -305,22 +304,22 @@ mod tests {
         });
     }
 
-    /// A malformed audience is refused locally rather than becoming a query
-    /// string GitHub interprets differently than we meant.
+    /// A malformed audience is refused before any request leaves the process.
+    ///
+    /// The validation itself lives in `fleet_auth::github`; what this pins is
+    /// that `ci login` reaches it rather than building a query string GitHub
+    /// would read differently than we meant.
     #[tokio::test]
-    async fn a_malformed_audience_is_refused_before_any_request() {
-        temp_env_set(ENV_REQUEST_URL, "https://example/token", || {});
+    async fn a_malformed_audience_never_reaches_the_network() {
         for bad in ["", "https://fleet.example&x=1", "https://fleet.example#f"] {
-            let err = {
-                let _url = ENV_REQUEST_URL;
-                // No runner identity is set in the test process, so the
-                // no-identity error fires first for the empty case; the point
-                // asserted here is only that neither reaches the network.
-                request_github_oidc_token(bad).await.unwrap_err()
-            };
-            let text = err.to_string();
+            let err = temp_env_unset_async(ENV_REQUEST_URL, request_github_oidc_token(bad))
+                .await
+                .unwrap_err();
+            let text = format!("{err:#}");
+            // With no runner identity set in the test process, the
+            // no-identity error fires first; either way nothing was sent.
             assert!(
-                text.contains("--audience") || text.contains(ENV_REQUEST_URL),
+                text.contains("audience") || text.contains(ENV_REQUEST_URL),
                 "unexpected error for {bad:?}: {text}"
             );
         }

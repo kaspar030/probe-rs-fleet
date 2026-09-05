@@ -19,6 +19,12 @@
 //! integration test cannot reach it and declares its own. The two do not
 //! mutually exclude, which is why nothing in the *unit* tests touches these
 //! particular variables.
+//!
+//! The guard is deliberately held across `await` points: what it protects is
+//! the *process environment* for the whole duration of a test body, and an
+//! async-aware mutex would not change that requirement. Each test is a
+//! separate `#[tokio::test]` runtime, so there is no task to starve.
+#![allow(clippy::await_holding_lock)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +48,15 @@ use fleet_proto::token::AllowedOp;
 
 /// Serialises the tests in this file, which all mutate the same env vars.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take [`ENV_LOCK`], ignoring poisoning.
+///
+/// A panicking test poisons the lock; the *next* test would then fail for a
+/// reason that has nothing to do with it, which turns one failure into a
+/// cascade and hides the real one.
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 const SEED: [u8; 32] = [31u8; 32];
 const ISSUER: &str = "https://token.actions.githubusercontent.com";
@@ -359,7 +374,7 @@ impl Drop for RunnerEnv {
 /// sidecar reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
     let github = StubGithub::start().await;
     let fleet = start_fleet(Some(github.config())).await;
     grant_repo(&fleet).await;
@@ -432,7 +447,7 @@ async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
 /// no network at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_runner_without_id_token_permission_gets_actionable_advice() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
     let github = StubGithub::start().await;
     let fleet = start_fleet(Some(github.config())).await;
     let dir = tempfile::tempdir().unwrap();
@@ -460,7 +475,7 @@ async fn a_runner_without_id_token_permission_gets_actionable_advice() {
 /// rule and the admin command that fixes it — not a generic 403.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_ungranted_repo_is_told_about_the_per_repo_rule() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
     let github = StubGithub::start().await;
     // No grant seeded at all.
     let fleet = start_fleet(Some(github.config())).await;
@@ -490,7 +505,7 @@ async fn an_ungranted_repo_is_told_about_the_per_repo_rule() {
 /// only a pre-minted CI key, still authenticates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = lock_env();
     // No `[github_actions]` table: the auth-key path involves no issuer, and
     // must work on a coordinator that has never heard of GitHub Actions.
     let fleet = start_fleet(None).await;

@@ -116,6 +116,7 @@ Verified crates (all `default-features = false`, `ring` only):
 | `hyper-rustls` 0.27 (`ring,tls12,webpki-tokio`) | HTTPS for that client |
 | `tokio-rustls` / `rustls` 0.23 (`ring`) | TLS |
 | `webpki-roots` | trust anchors, compiled in rather than read from the platform |
+| `jsonwebtoken` 10 (`rust_crypto`) | the GitHub Actions OIDC verifier (§6.7), behind `fleet-auth`'s `oidc` feature — see below |
 
 Reproduce it (this is the exact invocation, not a paraphrase):
 
@@ -169,3 +170,32 @@ It is a layering rule. A library that discovers probes and dials outward should
 not need a server framework to compile, and the moment `fleet-agent` can reach
 for `axum::extract::ws::WebSocket` the `WireTx`/`WireRx` seam stops being load
 bearing and the next transport change has to be made twice.
+
+### The OIDC verifier's crypto tail (and what the feature gate actually buys)
+
+Architecture §6.7 added GitHub Actions workload-identity verification, which
+means **`jsonwebtoken`** and its signature-algorithm tail: `rsa`,
+`num-bigint-dig`, `p256`, `p384`, `ed25519-dalek`. It sits behind `fleet-auth`'s
+off-by-default `oidc` feature, enabled by exactly one crate — `fleet-coordinator`,
+the only one that verifies a token.
+
+Be accurate about what that gate buys, because the obvious reading is wrong:
+
+- **It does not keep the tail off the Pi.** `fleet-bin` links the coordinator,
+  so `jsonwebtoken` is in the shipped binary's graph on every target, exactly as
+  `axum` is. `cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf -i
+  jsonwebtoken` prints it.
+- **What it does buy** is that `fleet-agent` and `fleet-sidecar` link none of it
+  — the same layering rule as the section above, for the same reason. A library
+  that discovers probes has no business compiling an RSA implementation, and a
+  crate that only ever *presents* a bearer token should not gain the ability to
+  verify a JWT by accident.
+- **The cross-compile is unaffected**, which is the claim that matters here. The
+  whole tail is pure Rust: it pulls no `cc`/`bindgen` build script, needs no
+  sysroot CFLAGS, and does not touch rustls's provider selection. The
+  `aws-lc-rs` regression check above stays empty, and
+  `--features rust_crypto` (not `aws_lc_rs`) on the workspace's `jsonwebtoken`
+  pin is what keeps it that way. Flipping that feature would put a vendored C
+  crypto library back in the graph and break the musl build in the way this
+  document opens by describing.
+

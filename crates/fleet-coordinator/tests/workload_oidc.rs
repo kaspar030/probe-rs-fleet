@@ -259,6 +259,16 @@ async fn exchange(fleet: &TestCoordinator, jwt: &str) -> (u16, String) {
     fleet.http("POST", "/auth/token", Some(body)).await
 }
 
+/// POST a `workload_key` redemption; returns `(status, body)`.
+async fn redeem(fleet: &TestCoordinator, key: &str) -> (u16, String) {
+    let body = serde_json::to_string(&json!({
+        "grant_type": "workload_key",
+        "auth_key": key,
+    }))
+    .unwrap();
+    fleet.http("POST", "/auth/token", Some(body)).await
+}
+
 /// Start a coordinator wired to `issuer`.
 async fn coordinator_for(issuer: &StubIssuer) -> TestCoordinator {
     let config = issuer.config();
@@ -889,15 +899,6 @@ async fn a_self_hosted_runner_can_authenticate_with_a_ci_auth_key() {
     let key = fleet
         .seed_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires))
         .await;
-
-    async fn redeem(fleet: &TestCoordinator, key: &str) -> (u16, String) {
-        let body = serde_json::to_string(&json!({
-            "grant_type": "workload_key",
-            "auth_key": key,
-        }))
-        .unwrap();
-        fleet.http("POST", "/auth/token", Some(body)).await
-    }
 
     // A `node` key is not a board-access credential — the whole reason
     // `purpose` exists, since migration 0007 must not reinterpret existing keys.
