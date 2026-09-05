@@ -28,6 +28,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+use fleet_core::access::Access;
 use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Scheduler};
 use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::agent_api::AgentReport;
@@ -37,7 +38,7 @@ use fleet_proto::ids::{
 };
 use fleet_proto::lease::LeaseRequest;
 
-use crate::auth::{default_allowed_ops, Ed25519Signer};
+use crate::auth::Ed25519Signer;
 use crate::authz::{self, AuthzError};
 use crate::clock::SharedClock;
 use crate::config::CoordinatorConfig;
@@ -503,54 +504,93 @@ impl Coordinator {
         }
     }
 
-    /// Resolve a node-local board name to a [`BoardRef`] **within the caller's
-    /// org**.
+    /// Resolve a node-local board name to a [`BoardRef`] the caller may reach.
     ///
     /// The request wire stays node-local (so `PROBE_RS_FLEET_BOARD=nrf52840-dk-3`
     /// keeps working); the coordinator is the only thing that turns a name into
-    /// a fleet key, and it can only do so inside one org.
+    /// a fleet key.
     ///
-    /// Returns [`BoardLookup::NotFound`] for both an absent board and one in
-    /// another org — deliberately indistinguishable. An ambiguous name (the
-    /// same name on two of the caller's *own* nodes) is reported as such: every
-    /// candidate is already inside the caller's org, so naming them leaks
-    /// nothing, and a bare "no such board" would badly mislead.
-    async fn resolve_board(&self, subject: &Subject, name: &BoardName) -> BoardLookup {
-        let sched = self.scheduler.lock().await;
-        let mut matching = sched
-            .boards()
-            .filter(|b| b.id.org == subject.org && b.id.name == name.0)
-            .map(|b| b.id.clone());
-        let Some(first) = matching.next() else {
-            return BoardLookup::NotFound;
+    /// # Own org wins, then granted orgs
+    ///
+    /// Once grants exist, two different boards can answer to `nrf52840-dk-3`:
+    /// your own, and one somebody shared with you. Resolution is therefore
+    /// **tiered** — candidates in the caller's own org first, and only if
+    /// there are none, boards reachable by grant. A board acquired by grant can
+    /// never shadow your own hardware for `ctl release` / `ctl power-cycle`,
+    /// which is the failure a flat "report the ambiguity" rule would produce
+    /// for a bare name with no way to disambiguate.
+    ///
+    /// The escape hatch is a **qualified name**: `<node>/<name>` or
+    /// `<org>/<node>/<name>`, which reaches a granted board even when a
+    /// same-named local one exists. It is purely resolver-side — [`BoardName`]
+    /// stays an opaque wire string.
+    ///
+    /// Returns [`BoardLookup::NotFound`] for both an absent board and an
+    /// unreachable one — deliberately indistinguishable. `Ambiguous` is
+    /// reported only for a tie *within* the winning tier, where every candidate
+    /// is already reachable by the caller so naming the nodes leaks nothing.
+    async fn resolve_board(
+        &self,
+        access: &Access,
+        name: &BoardName,
+        now: u64,
+    ) -> BoardLookup {
+        // Split a qualified name. `a/b` is node/name, `a/b/c` is org/node/name.
+        let parts: Vec<&str> = name.0.split('/').collect();
+        let (want_org, want_node, want_name) = match parts.as_slice() {
+            [name] => (None, None, *name),
+            [node, name] => (None, Some(*node), *name),
+            [org, node, name] => (Some(*org), Some(*node), *name),
+            _ => return BoardLookup::NotFound,
         };
-        let mut nodes: Vec<AgentId> = vec![first.node.clone()];
-        nodes.extend(matching.map(|b| b.node));
-        if nodes.len() > 1 {
-            nodes.sort();
-            return BoardLookup::Ambiguous(nodes);
+
+        let sched = self.scheduler.lock().await;
+        let candidates: Vec<&fleet_proto::board::Board> = sched
+            .boards()
+            .filter(|b| b.id.name == want_name)
+            .filter(|b| want_node.is_none_or(|n| b.id.node.0 == n))
+            .filter(|b| want_org.is_none_or(|o| b.id.org.0 == o))
+            .filter(|b| access.may_use(b, now))
+            .collect();
+
+        // Tier 1: the caller's own org. Tier 2: everything else they may reach.
+        let own: Vec<&fleet_proto::board::Board> =
+            candidates.iter().copied().filter(|b| access.owns(b)).collect();
+        let tier = if own.is_empty() { &candidates } else { &own };
+
+        match tier.len() {
+            0 => BoardLookup::NotFound,
+            1 => BoardLookup::Found(tier[0].id.clone()),
+            _ => {
+                let mut nodes: Vec<AgentId> = tier.iter().map(|b| b.id.node.clone()).collect();
+                nodes.sort();
+                BoardLookup::Ambiguous(nodes)
+            }
         }
-        BoardLookup::Found(first)
     }
 
-    /// Build the operator board-inventory reply (`ctl list`), scoped to the
-    /// caller's org.
+    /// Build the operator board-inventory reply (`ctl list`).
     ///
-    /// Membership is enough: "membership alone is enough to add a node and to
-    /// use the org's boards" (§6.5).
+    /// Shows the caller's own org's boards (membership is enough — "membership
+    /// alone is enough to add a node and to use the org's boards", §6.5) plus
+    /// every board a live grant covers. This is the **grantee-facing view**:
+    /// there is deliberately no self-service "what am I granted?" verb, so
+    /// `ctl list` is how a grantee discovers what it may use.
+    ///
+    /// Note a grantee therefore sees the *holder* of a granted board. That is
+    /// necessary — "busy" is useless without "busy with whom" — and bounded:
+    /// only boards already shared with them.
     async fn list_boards(&self, subject: &Subject) -> CoordToSidecar {
         use fleet_proto::admin::{BoardAvailability, BoardSummary};
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
-            .await
-            .is_err()
-        {
+        let now = self.now();
+        let access = authz::board_access(&self.db, subject, now).await;
+        if access.is_empty() {
             return Self::denied();
         }
         let sched = self.scheduler.lock().await;
         let boards = sched
             .boards()
-            .filter(|b| b.id.org == org)
+            .filter(|b| access.may_use(b, now))
             .map(|b| {
                 let (availability, holder, lease, expires) = match &b.state {
                     BoardState::Idle => (BoardAvailability::Available, None, None, None),
@@ -580,21 +620,19 @@ impl Coordinator {
         CoordToSidecar::BoardList(boards)
     }
 
-    /// Build the operator lease-holder reply (`ctl who`), scoped to the
-    /// caller's org.
+    /// Build the operator lease-holder reply (`ctl who`), over the boards the
+    /// caller may reach — their own org's, plus any a live grant covers.
     async fn who(&self, subject: &Subject) -> CoordToSidecar {
         use fleet_proto::admin::LeaseHolderSummary;
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
-            .await
-            .is_err()
-        {
+        let now = self.now();
+        let access = authz::board_access(&self.db, subject, now).await;
+        if access.is_empty() {
             return Self::denied();
         }
         let sched = self.scheduler.lock().await;
         let holders = sched
             .boards()
-            .filter(|b| b.id.org == org)
+            .filter(|b| access.may_use(b, now))
             .filter_map(|b| match &b.state {
                 BoardState::Leased { lease, by, expires } => Some(LeaseHolderSummary {
                     lease: *lease,
@@ -633,21 +671,24 @@ impl Coordinator {
 
     /// Operator power-cycle: command the owning agent to power-cycle the board.
     ///
-    /// Scoped to the caller's org: a board in another org resolves to "no such
-    /// board", exactly as an absent one does.
+    /// Scoped by [`Access`]: an unreachable board resolves to "no such board",
+    /// exactly as an absent one does. A *grantee* additionally needs the
+    /// [`AllowedOp::PowerCycle`] op — this is the one op enforced here rather
+    /// than by the agent, because the agent's power-cycle command carries no
+    /// capability token to check.
     async fn operator_power_cycle(
         &self,
         subject: &Subject,
         board: &BoardName,
     ) -> Result<CoordToSidecar> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
-            .await
-            .is_err()
-        {
+        use fleet_proto::token::AllowedOp;
+
+        let now = self.now();
+        let access = authz::board_access(&self.db, subject, now).await;
+        if access.is_empty() {
             return Ok(Self::denied());
         }
-        let board_ref = match self.resolve_board(subject, board).await {
+        let board_ref = match self.resolve_board(&access, board, now).await {
             BoardLookup::Found(b) => b,
             BoardLookup::NotFound => {
                 return Ok(CoordToSidecar::Error {
@@ -664,10 +705,18 @@ impl Coordinator {
                 });
             }
         };
-        // Belt and braces: the resolved board must live in the caller's org.
-        if authz::same_org(subject, &board_ref.org).is_err() {
+        // Re-check with the op: resolution proved the caller may *see* the
+        // board, not that they may cut its power.
+        let allowed = {
+            let sched = self.scheduler.lock().await;
+            sched
+                .board(&board_ref)
+                .is_some_and(|b| access.allows(b, AllowedOp::PowerCycle, now))
+        };
+        if !allowed {
             return Ok(Self::denied());
         }
+        let org = board_ref.org.clone();
         let agent_id = board_ref.node.clone();
         let Some(agent) = self.agents.get(&agent_id).await else {
             return Ok(CoordToSidecar::Error {
@@ -676,7 +725,7 @@ impl Coordinator {
         };
         if agent
             .send_command(fleet_proto::CoordinatorCommand::PowerCycle {
-                board: board.clone(),
+                board: board_ref.board_name(),
             })
             .await
             .is_err()
@@ -696,34 +745,58 @@ impl Coordinator {
         )
         .await?;
         Ok(CoordToSidecar::PowerCycled {
-            board: board.clone(),
+            board: board_ref.board_name(),
         })
     }
 
-    /// Process a lease request: check membership, ask the scheduler, mint +
-    /// persist a grant.
+    /// Process a lease request: resolve the caller's access, ask the scheduler,
+    /// mint an **attenuated** token, and persist.
+    ///
+    /// Two things are subtly different from the pre-sharing version:
+    ///
+    /// * the gate is [`authz::board_access`], not `require_role(Member)` — a
+    ///   subject with no membership but a live grant is a first-class caller
+    ///   (CI workloads have no `member` row at all);
+    /// * the minted capability token carries `access.effective_ops(board)`
+    ///   rather than the full set, so a grantee's token says only what its
+    ///   grant said.
+    ///
+    /// Bookkeeping follows the **board's** org, not the subject's: with
+    /// cross-org leases the two differ, and a lease on org A's hardware belongs
+    /// in org A's lease table and audit log.
     async fn request_lease(
         &self,
         subject: &Subject,
         req: LeaseRequest,
     ) -> Result<CoordToSidecar> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
-            .await
-            .is_err()
-        {
+        let now = self.now();
+        let access = authz::board_access(&self.db, subject, now).await;
+        if access.is_empty() {
             return Ok(Self::denied());
         }
-        let now = self.now();
         let decision = {
             let mut sched = self.scheduler.lock().await;
-            sched.request_lease(subject.clone(), req, now)
+            sched.request_lease(subject.clone(), &access, req, now)
         };
         match decision {
             LeaseDecision::Granted(granted) => {
-                let grant = self
-                    .signer
-                    .grant_to_wire(&granted, default_allowed_ops())?;
+                // Recompute the ops for the board actually granted. The
+                // request's selector may have matched several; only this one's
+                // grant decides what the token may do.
+                let (ops, via) = {
+                    let sched = self.scheduler.lock().await;
+                    match sched.board(&granted.board) {
+                        Some(board) => (
+                            access.effective_ops(board, now),
+                            access
+                                .matching_grant(board, now)
+                                .map(|g| format!("via grant {}", g.id)),
+                        ),
+                        None => (Vec::new(), None),
+                    }
+                };
+                let grant = self.signer.grant_to_wire(&granted, ops)?;
+                let org = granted.board.org.clone();
                 self.db
                     .scoped(org.clone())
                     .record_lease(
@@ -741,7 +814,7 @@ impl Coordinator {
                     Some(&granted.board.node.0),
                     Some(&granted.board.name),
                     Some(granted.lease),
-                    None,
+                    via.as_deref(),
                 )
                 .await?;
                 Ok(CoordToSidecar::Lease(grant))
@@ -750,24 +823,34 @@ impl Coordinator {
         }
     }
 
-    /// Extend a lease the subject holds (or, as an org admin, someone else's).
+    /// Extend a lease the subject holds (or, as an admin of the holder's or the
+    /// board's org, someone else's).
+    ///
+    /// Bookkeeping goes to the **board's** org: with cross-org leases the
+    /// holder's org is the wrong tenant to write into.
     async fn extend_lease(&self, subject: &Subject, lease: LeaseId) -> Result<CoordToSidecar> {
         let now = self.now();
         let outcome = {
             let mut sched = self.scheduler.lock().await;
             match authz::require_lease_control(&self.db, &sched, subject, lease).await {
-                Ok(holder) => sched.extend_lease(lease, &holder, now).map(|e| (holder, e)),
+                Ok(holder) => {
+                    let board_org = sched.lease_target(lease).map(|(b, _)| b.org.clone());
+                    sched
+                        .extend_lease(lease, &holder, now)
+                        .map(|e| (holder, board_org, e))
+                }
                 Err(_) => Err(LeaseAuthError::Unknown),
             }
         };
         match outcome {
-            Ok((holder, expires)) => {
+            Ok((holder, board_org, expires)) => {
+                let org = board_org.unwrap_or_else(|| subject.org.clone());
                 self.db
-                    .scoped(subject.org.clone())
+                    .scoped(org.clone())
                     .update_lease_expiry(lease, i64::try_from(expires).unwrap_or(i64::MAX))
                     .await?;
                 self.audit(
-                    &subject.org,
+                    &org,
                     "lease.extend",
                     Some(&subject.key().to_string()),
                     None,
@@ -786,8 +869,6 @@ impl Coordinator {
 
     /// Release a lease, tearing down its channels and persisting the close.
     async fn release_lease(&self, subject: &Subject, lease: LeaseId) -> Result<CoordToSidecar> {
-        let now = self.now();
-
         // Authorize *before* any teardown: a refused release must have no
         // observable effect at all.
         let holder = {
@@ -802,30 +883,66 @@ impl Coordinator {
             }
         };
 
-        // Close any relay channels for this lease first.
+        match self
+            .tear_down_lease(lease, &holder, "released", "lease.release", subject)
+            .await?
+        {
+            true => Ok(CoordToSidecar::Released { lease }),
+            false => Ok(CoordToSidecar::Error {
+                message: AuthzError::lease_message(),
+            }),
+        }
+    }
+
+    /// The whole tail of releasing a lease: close its relay channels, release
+    /// it in the scheduler, persist the close, audit it, and persist whatever
+    /// waiter was promoted onto the freed board.
+    ///
+    /// Factored out so the **revocation cascade** goes through exactly this
+    /// path rather than a reimplementation of it: forgetting `close_lease` or
+    /// the promotion bookkeeping would leave the database claiming a lease is
+    /// still open, or lose a promoted waiter's grant entirely. Two callers, one
+    /// tail, no drift.
+    ///
+    /// Every write lands in the **board's** org, which under cross-org leases
+    /// is not the holder's. Returns `false` if the scheduler refused (the lease
+    /// vanished under us); the caller must already have authorized.
+    async fn tear_down_lease(
+        &self,
+        lease: LeaseId,
+        holder: &SubjectKey,
+        close_reason: &str,
+        audit_action: &str,
+        acting: &Subject,
+    ) -> Result<bool> {
+        let now = self.now();
+
+        // Close any relay channels for this lease first, so the data plane
+        // stops immediately rather than when the sidecar next notices.
         self.teardown_lease_channels(lease).await;
 
-        let promoted = {
+        let (promoted, board_org) = {
             let mut sched = self.scheduler.lock().await;
-            match sched.release_lease(lease, &holder, now) {
-                Ok(promoted) => promoted,
-                Err(_) => {
-                    return Ok(CoordToSidecar::Error {
-                        message: AuthzError::lease_message(),
-                    })
-                }
+            let board_org = sched.lease_target(lease).map(|(b, _)| b.org.clone());
+            match sched.release_lease(lease, holder, now) {
+                Ok(promoted) => (promoted, board_org),
+                Err(_) => return Ok(false),
             }
         };
-        let scoped = self.db.scoped(subject.org.clone());
-        scoped.close_lease(lease, self.now_i64(), "released").await?;
+        let org = board_org.unwrap_or_else(|| acting.org.clone());
+
+        self.db
+            .scoped(org.clone())
+            .close_lease(lease, self.now_i64(), close_reason)
+            .await?;
         self.audit(
-            &subject.org,
-            "lease.release",
-            Some(&subject.key().to_string()),
+            &org,
+            audit_action,
+            Some(&acting.key().to_string()),
             None,
             None,
             Some(lease),
-            Self::override_detail(subject, &holder).as_deref(),
+            Self::override_detail(acting, holder).as_deref(),
         )
         .await?;
 
@@ -856,7 +973,7 @@ impl Coordinator {
             .await?;
         }
 
-        Ok(CoordToSidecar::Released { lease })
+        Ok(true)
     }
 
     /// Audit detail noting an admin override, if the acting subject is not the
@@ -907,8 +1024,32 @@ impl Coordinator {
             (holder, board, agent_id, expires)
         };
 
-        // Belt and braces: the board itself must be in the caller's org.
-        if authz::same_org(subject, &board.org).is_err() {
+        // Belt and braces: the board itself must be reachable by whoever holds
+        // the lease. Recomputed here, not cached at lease time, so a narrowed
+        // or revoked grant bites on the very next channel open rather than at
+        // the end of the lease's TTL.
+        let holder_subject = {
+            let sched = self.scheduler.lock().await;
+            sched.lease_holder(lease).cloned()
+        };
+        let Some(holder_subject) = holder_subject else {
+            return Ok(Some(CoordToSidecar::Error {
+                message: AuthzError::lease_message(),
+            }));
+        };
+        let now = self.now();
+        let holder_access = authz::board_access(&self.db, &holder_subject, now).await;
+        let ops = {
+            let sched = self.scheduler.lock().await;
+            match sched.board(&board) {
+                Some(b) => holder_access.effective_ops(b, now),
+                None => Vec::new(),
+            }
+        };
+        if ops.is_empty() {
+            // The holder's access to this board is gone (grant revoked, expired,
+            // or narrowed to nothing). Refuse rather than mint an empty token:
+            // reconnection must not survive revocation.
             return Ok(Some(CoordToSidecar::Error {
                 message: AuthzError::lease_message(),
             }));
@@ -920,12 +1061,13 @@ impl Coordinator {
             }));
         };
 
-        // Mint a fresh capability token scoped to this lease/board. Reached
-        // only after the ownership check above.
+        // Mint a fresh capability token scoped to this lease/board, attenuated
+        // to the holder's *current* effective ops. Reached only after the
+        // ownership check above.
         let token = fleet_proto::token::CapabilityToken {
             lease,
             board: board.clone(),
-            allowed_ops: default_allowed_ops(),
+            allowed_ops: ops,
             expires,
         };
         let wire = self.signer.sign_to_wire(&token)?;

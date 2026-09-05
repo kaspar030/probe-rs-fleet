@@ -26,9 +26,11 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
+use fleet_core::access::GrantScope;
 use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::board::{Board, BoardState};
 use fleet_proto::ids::{AgentId, BoardRef, LeaseId, OrgId, Role, SubjectKey};
+use fleet_proto::token::AllowedOp;
 
 use crate::error::Result;
 
@@ -51,6 +53,103 @@ type AuthKeyRow = (
     i64,
     Option<String>,
 );
+
+/// One `grant` row as `SQLite` hands it back.
+type GrantDbRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+    i64,
+);
+
+/// One stored grant, as read back from the database.
+///
+/// Deliberately **unvalidated**: `subject`, `selector` and `ops` are the raw
+/// stored strings, because a row whose selector no longer parses must be
+/// visible to `grant list` (and revocable) rather than poisoning the whole
+/// query. Turning a row into something that grants access is
+/// [`GrantRow::to_scope`], which fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRow {
+    /// Opaque grant id (32 hex chars).
+    pub id: String,
+    /// The org whose hardware is shared.
+    pub org: OrgId,
+    /// The rendered [`SubjectKey`] the grant was issued to.
+    pub subject: String,
+    /// The canonical rendered selector.
+    pub selector: String,
+    /// Newline-joined op labels.
+    pub ops: String,
+    /// Expiry (epoch seconds), or `None`.
+    pub expires: Option<i64>,
+    /// The user who created the grant, if recorded.
+    pub created_by: Option<String>,
+    /// When the grant was created (epoch seconds).
+    pub created_at: i64,
+}
+
+impl GrantRow {
+    fn from_row(row: GrantDbRow) -> Self {
+        let (id, org, subject, selector, ops, expires, created_by, created_at) = row;
+        Self {
+            id,
+            org: OrgId(org),
+            subject,
+            selector,
+            ops,
+            expires,
+            created_by,
+            created_at,
+        }
+    }
+
+    /// The op labels, dropping any this build does not recognise.
+    #[must_use]
+    pub fn parsed_ops(&self) -> Vec<AllowedOp> {
+        self.ops
+            .split('\n')
+            .filter(|s| !s.is_empty())
+            .filter_map(AllowedOp::from_label)
+            .collect()
+    }
+
+    /// The subject this grant was issued to, if the stored key parses.
+    #[must_use]
+    pub fn parsed_subject(&self) -> Option<SubjectKey> {
+        SubjectKey::parse(&self.subject)
+    }
+
+    /// Turn the row into an evaluable [`GrantScope`], or `None` if any stored
+    /// field no longer parses.
+    ///
+    /// **Fails closed on purpose.** A selector that will not parse could only
+    /// be turned into "matches nothing" or "matches everything", and the second
+    /// is catastrophic; a grant with no recognisable op confers nothing anyway.
+    /// The caller is expected to `warn!` so a corrupt row is noticed rather
+    /// than quietly ignored.
+    #[must_use]
+    pub fn to_scope(&self) -> Option<GrantScope> {
+        let selector =
+            fleet_proto::lease::parse_constraint(&self.selector, fleet_proto::lease::BareTerm::Tag)
+                .ok()?;
+        let ops = self.parsed_ops();
+        if ops.is_empty() {
+            return None;
+        }
+        Some(GrantScope {
+            id: self.id.clone(),
+            org: self.org.clone(),
+            selector,
+            ops,
+            expires: self.expires.map(|e| u64::try_from(e).unwrap_or(0)),
+        })
+    }
+}
 
 /// A handle to the coordinator's `SQLite` database. Cheap to clone (wraps a pool).
 #[derive(Debug, Clone)]
@@ -1268,6 +1367,67 @@ impl Db {
             .await?;
         Ok(row.map(|r| r.0))
     }
+
+    /// Look up a user by their GitHub login, returning `(user id, personal org)`.
+    ///
+    /// The **only** place the mutable `login` column is used as a lookup key,
+    /// and it is safe here for a specific reason: the result is immediately
+    /// resolved to the immutable `user.id` and it is *that* which is stored in
+    /// the grant. `grant bob` therefore means "the account that is `bob`
+    /// right now", decided once, at creation — not "whoever holds the login
+    /// `bob` at evaluation time", which §6.4's rename/reuse takeover would make
+    /// a hole.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn user_by_login(&self, login: &str) -> Result<Option<(String, OrgId)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT id, personal_org_id FROM user WHERE login = ?1")
+                .bind(login)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id, org)| (id, OrgId(org))))
+    }
+
+    /// Every live grant issued **to** `subject`, across all orgs.
+    ///
+    /// # Why this is not on [`OrgDb`]
+    ///
+    /// This is the single query in the tree that deliberately reads outside the
+    /// org-scoping type, and it needs to read as a decision rather than an
+    /// oversight, so: **a grant's entire purpose is to cross an org boundary.**
+    /// Scoping it to the caller's org would return exactly the rows that do not
+    /// matter. The scoping key here is the *subject* instead, and that is not
+    /// weaker: a `SubjectKey` is derived from the authenticated `Subject` and
+    /// there is no wire field a caller can use to name a different one — the
+    /// same structural property that makes `OrgDb` safe, applied to a different
+    /// column.
+    ///
+    /// Expired rows are filtered here so a stale grant cannot widen access even
+    /// if a caller forgets the `now` check downstream; `Access` checks expiry
+    /// again anyway.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn grants_for_subject(
+        &self,
+        subject: &SubjectKey,
+        now: i64,
+    ) -> Result<Vec<GrantRow>> {
+        let rows: Vec<GrantDbRow> = sqlx::query_as(
+            "SELECT id, org_id, subject, selector, ops, expires, created_by, created_at
+             FROM \"grant\"
+             WHERE subject = ?1 AND (expires IS NULL OR expires > ?2)
+             ORDER BY created_at DESC",
+        )
+        .bind(subject.to_string())
+        .bind(now)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(GrantRow::from_row).collect())
+    }
 }
 
 /// A [`Db`] handle scoped to exactly one org.
@@ -1565,6 +1725,99 @@ impl OrgDb<'_> {
             })
             .collect())
     }
+
+    // -----------------------------------------------------------------------
+    // Grants (architecture §6.5)
+    //
+    // Creation, listing and revocation are org-scoped as usual: it is *this*
+    // org's hardware being shared, so this org's admins own the lifecycle.
+    // Only [`Db::grants_for_subject`] — the read on the receiving side — leaves
+    // the scope, for the reason documented there.
+    // -----------------------------------------------------------------------
+
+    /// Insert a grant of this org's hardware to `subject`.
+    ///
+    /// `selector` must be the **canonical rendering** of a
+    /// [`fleet_proto::lease::Constraint`] (its `Display`), because evaluation
+    /// re-parses it: storing whatever the user typed would let a grant's
+    /// meaning depend on which CLI wrote it. `ops` is stored newline-joined,
+    /// matching the `auth_key.tags` convention in this schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the insert fails (including the foreign key
+    /// on a nonexistent org).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_grant(
+        &self,
+        id: &str,
+        subject: &SubjectKey,
+        selector: &str,
+        ops: &[AllowedOp],
+        expires: Option<i64>,
+        created_by: Option<&str>,
+        created_at: i64,
+    ) -> Result<()> {
+        let ops: Vec<&str> = ops.iter().map(|o| o.as_str()).collect();
+        sqlx::query(
+            "INSERT INTO \"grant\" (id, org_id, subject, selector, ops, expires, created_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(id)
+        .bind(self.org.0.as_str())
+        .bind(subject.to_string())
+        .bind(selector)
+        .bind(ops.join("\n"))
+        .bind(expires)
+        .bind(created_by)
+        .bind(created_at)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Every grant this org has issued, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn list_grants(&self) -> Result<Vec<GrantRow>> {
+        let rows: Vec<GrantDbRow> = sqlx::query_as(
+            "SELECT id, org_id, subject, selector, ops, expires, created_by, created_at
+             FROM \"grant\" WHERE org_id = ?1 ORDER BY created_at DESC",
+        )
+        .bind(self.org.0.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(GrantRow::from_row).collect())
+    }
+
+    /// Delete this org's grants whose id starts with `prefix`, returning the
+    /// rows deleted.
+    ///
+    /// Mirrors [`Db::delete_auth_keys_by_prefix`] so `grant revoke <id-prefix>`
+    /// behaves like `auth-key revoke`, and returns the **whole rows** rather
+    /// than the ids: the caller needs the subject and selector to drive the
+    /// revocation cascade (tear down what the grantee is still holding).
+    ///
+    /// As there, the caller must refuse a too-short or ambiguous prefix
+    /// *before* calling: an empty prefix is `LIKE '%'`, i.e. every grant in the
+    /// org.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the delete fails.
+    pub async fn delete_grants_by_prefix(&self, prefix: &str) -> Result<Vec<GrantRow>> {
+        let rows: Vec<GrantDbRow> = sqlx::query_as(
+            "DELETE FROM \"grant\" WHERE org_id = ?1 AND id LIKE ?2 || '%'
+             RETURNING id, org_id, subject, selector, ops, expires, created_by, created_at",
+        )
+        .bind(self.org.0.as_str())
+        .bind(prefix)
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows.into_iter().map(GrantRow::from_row).collect())
+    }
 }
 
 /// One audit-log entry to append. The org comes from the [`OrgDb`] it is
@@ -1651,6 +1904,25 @@ async fn unique_personal_slug(
 /// the same node name in two tenants is two nodes.
 fn node_id_for(org: &OrgId, name: &str) -> AgentId {
     AgentId(format!("{}/{name}", org.0))
+}
+
+/// A fresh, opaque grant id: 16 random bytes as 32 lowercase hex characters.
+///
+/// Not a credential — a grant id is a handle, printed by `grant list` and used
+/// by `grant revoke <prefix>` — but random rather than sequential so an id
+/// leaks nothing about how many grants the fleet has, and so prefixes stay
+/// well distributed.
+#[must_use]
+pub fn new_grant_id() -> String {
+    use rand_core::RngCore as _;
+    use std::fmt::Write as _;
+    let mut bytes = [0u8; 16];
+    rand_core::OsRng.fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 
@@ -2628,5 +2900,200 @@ mod tests {
         // Reopen and confirm persistence.
         let db = Db::connect(path_str).await.unwrap();
         assert_eq!(db.scoped(o).board_count().await.unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Grants (architecture §6.5)
+    // -----------------------------------------------------------------------
+
+    fn subject_key(org_name: &str, id: &str) -> SubjectKey {
+        SubjectKey {
+            org: org(org_name),
+            kind: fleet_proto::ids::SubjectKind::User,
+            id: id.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn grants_insert_list_and_revoke_by_prefix() {
+        use fleet_proto::token::AllowedOp;
+
+        let db = Db::connect_in_memory().await.unwrap();
+        let a = org("org-a");
+        let other = org("org-b");
+        db.ensure_org(&a, "team").await.unwrap();
+        db.ensure_org(&other, "team").await.unwrap();
+
+        let bob = subject_key("gh-2", "gh-2");
+        db.scoped(a.clone())
+            .insert_grant(
+                "aaaa1111",
+                &bob,
+                "tag=nrf52",
+                &[AllowedOp::Flash, AllowedOp::Attach],
+                Some(9_999),
+                Some("gh-1"),
+                1_000,
+            )
+            .await
+            .unwrap();
+        db.scoped(a.clone())
+            .insert_grant("bbbb2222", &bob, "chip=nRF52840_xxAA", &[AllowedOp::Gdb], None, None, 1_001)
+            .await
+            .unwrap();
+        // Another org's grant must neither list nor revoke from here.
+        db.scoped(other.clone())
+            .insert_grant("aaaa9999", &bob, "tag=nrf52", &[AllowedOp::Attach], None, None, 1_002)
+            .await
+            .unwrap();
+
+        let grants = db.scoped(a.clone()).list_grants().await.unwrap();
+        assert_eq!(grants.len(), 2, "only this org's grants");
+        assert_eq!(grants[0].id, "bbbb2222", "newest first");
+        assert_eq!(grants[1].selector, "tag=nrf52");
+        assert_eq!(
+            grants[1].parsed_ops(),
+            vec![AllowedOp::Flash, AllowedOp::Attach]
+        );
+        assert_eq!(grants[1].parsed_subject(), Some(bob.clone()));
+        assert_eq!(grants[1].created_by.as_deref(), Some("gh-1"));
+
+        let deleted = db
+            .scoped(a.clone())
+            .delete_grants_by_prefix("aaaa")
+            .await
+            .unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, "aaaa1111");
+        assert_eq!(db.scoped(a).list_grants().await.unwrap().len(), 1);
+        // Tenancy: the other org's similarly-prefixed grant is untouched.
+        assert_eq!(db.scoped(other).list_grants().await.unwrap().len(), 1);
+    }
+
+    /// `grants_for_subject` is the one query that deliberately leaves `OrgDb`.
+    /// It must be scoped by the *subject* instead — tightly.
+    #[tokio::test]
+    async fn grants_for_subject_crosses_orgs_but_not_subjects() {
+        use fleet_proto::token::AllowedOp;
+
+        let db = Db::connect_in_memory().await.unwrap();
+        for name in ["org-a", "org-c", "org-b"] {
+            db.ensure_org(&org(name), "team").await.unwrap();
+        }
+        let bob = subject_key("gh-2", "gh-2");
+        let mallory = subject_key("gh-3", "gh-3");
+
+        db.scoped(org("org-a"))
+            .insert_grant("g1", &bob, "tag=nrf52", &[AllowedOp::Attach], None, None, 1)
+            .await
+            .unwrap();
+        db.scoped(org("org-c"))
+            .insert_grant("g2", &bob, "tag=stm32", &[AllowedOp::Gdb], None, None, 2)
+            .await
+            .unwrap();
+        db.scoped(org("org-a"))
+            .insert_grant("g3", &mallory, "tag=nrf52", &[AllowedOp::Attach], None, None, 3)
+            .await
+            .unwrap();
+
+        let mut ids: Vec<String> = db
+            .grants_for_subject(&bob, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["g1".to_owned(), "g2".to_owned()], "both orgs, one subject");
+
+        assert_eq!(db.grants_for_subject(&mallory, 100).await.unwrap().len(), 1);
+        assert!(db
+            .grants_for_subject(&subject_key("gh-9", "gh-9"), 100)
+            .await
+            .unwrap()
+            .is_empty());
+        // Same id in a different org is a different subject.
+        assert!(db
+            .grants_for_subject(&subject_key("org-z", "gh-2"), 100)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Expiry is filtered in SQL as well as in `Access`, so a stale row cannot
+    /// widen access even if a caller forgets the clock.
+    #[tokio::test]
+    async fn grants_for_subject_filters_expired_rows() {
+        use fleet_proto::token::AllowedOp;
+
+        let db = Db::connect_in_memory().await.unwrap();
+        db.ensure_org(&org("org-a"), "team").await.unwrap();
+        let bob = subject_key("gh-2", "gh-2");
+        db.scoped(org("org-a"))
+            .insert_grant("g1", &bob, "tag=nrf52", &[AllowedOp::Attach], Some(500), None, 1)
+            .await
+            .unwrap();
+        db.scoped(org("org-a"))
+            .insert_grant("g2", &bob, "tag=lab", &[AllowedOp::Attach], None, None, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(db.grants_for_subject(&bob, 400).await.unwrap().len(), 2);
+        let live = db.grants_for_subject(&bob, 600).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, "g2");
+    }
+
+    /// A row that no longer parses must fail closed. Notably an *unparseable
+    /// selector* must never become "matches everything", and a row with no
+    /// recognisable op confers nothing.
+    #[tokio::test]
+    async fn an_unusable_grant_row_yields_no_scope() {
+        use fleet_proto::token::AllowedOp;
+
+        let db = Db::connect_in_memory().await.unwrap();
+        db.ensure_org(&org("org-a"), "team").await.unwrap();
+        let bob = subject_key("gh-2", "gh-2");
+        let scoped = db.scoped(org("org-a"));
+
+        scoped
+            .insert_grant("good", &bob, "tag=nrf52", &[AllowedOp::Attach], None, None, 1)
+            .await
+            .unwrap();
+        // Written the way a bad migration or a hand-edit would leave it.
+        for (id, selector, ops) in [
+            ("empty-sel", "", "attach"),
+            ("bad-sel", "colour=red", "attach"),
+            ("no-ops", "tag=nrf52", ""),
+            ("junk-ops", "tag=nrf52", "root"),
+        ] {
+            sqlx::query(
+                "INSERT INTO \"grant\" (id, org_id, subject, selector, ops, expires, created_by, created_at)
+                 VALUES (?1, 'org-a', ?2, ?3, ?4, NULL, NULL, 0)",
+            )
+            .bind(id)
+            .bind(bob.to_string())
+            .bind(selector)
+            .bind(ops)
+            .execute(db.pool_for_test())
+            .await
+            .unwrap();
+        }
+
+        let rows = db.grants_for_subject(&bob, 100).await.unwrap();
+        assert_eq!(rows.len(), 5, "every row is still listable and revocable");
+        let usable: Vec<_> = rows.iter().filter_map(GrantRow::to_scope).collect();
+        assert_eq!(usable.len(), 1, "only the well-formed row confers access");
+        assert_eq!(usable[0].id, "good");
+    }
+
+    /// Grant ids are opaque and unique enough that a prefix addresses one row.
+    #[test]
+    fn grant_ids_are_random_hex() {
+        let a = new_grant_id();
+        let b = new_grant_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_ne!(a, b);
     }
 }

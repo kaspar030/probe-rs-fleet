@@ -36,6 +36,7 @@ sqlx.workspace = true
 sha2.workspace = true
 
 ed25519-dalek.workspace = true
+rand_core = { workspace = true, features = ["getrandom"] }
 
 async-trait.workspace = true
 thiserror.workspace = true
