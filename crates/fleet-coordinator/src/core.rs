@@ -3021,4 +3021,212 @@ mod tests {
             Some((org(DEFAULT_ORG_ID), AdoptPolicy::Auto))
         );
     }
+
+    // ---------------------------------------------------------------------
+    // Board resolution under sharing (architecture §6.5)
+    // ---------------------------------------------------------------------
+
+    /// Build an access that owns `own_org` and holds one grant over
+    /// `granted_org`'s `tag=nrf52` boards.
+    fn shared_access(own_org: &str, granted_org: &str) -> Access {
+        Access {
+            own_org: Some(org(own_org)),
+            grants: vec![fleet_core::access::GrantScope {
+                id: "g1".to_owned(),
+                org: org(granted_org),
+                selector: Constraint::Tags(vec!["nrf52".to_owned()]),
+                ops: vec![fleet_proto::token::AllowedOp::Attach],
+                expires: None,
+            }],
+        }
+    }
+
+    /// Own-org wins on a name collision. Without the tiering, a board somebody
+    /// shared with you could shadow your own hardware for `ctl release` — with
+    /// no way to say which one you meant.
+    #[tokio::test]
+    async fn a_shared_board_never_shadows_your_own() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board("org-b", "dk", "node-b"), board("org-a", "dk", "node-a")],
+            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Member)],
+        )
+        .await;
+
+        let access = shared_access("org-b", "org-a");
+        let found = coord
+            .resolve_board(&access, &BoardName("dk".to_owned()), 1000)
+            .await;
+        assert_eq!(
+            found,
+            BoardLookup::Found(board_ref("org-b", "node-b", "dk")),
+            "the caller's own board wins the bare name"
+        );
+    }
+
+    /// ...and the qualified forms are the escape hatch that reaches the other
+    /// one.
+    #[tokio::test]
+    async fn a_qualified_name_reaches_a_shared_board() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board("org-b", "dk", "node-b"), board("org-a", "dk", "node-a")],
+            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Member)],
+        )
+        .await;
+        let access = shared_access("org-b", "org-a");
+
+        for spelling in ["node-a/dk", "org-a/node-a/dk"] {
+            assert_eq!(
+                coord
+                    .resolve_board(&access, &BoardName(spelling.to_owned()), 1000)
+                    .await,
+                BoardLookup::Found(board_ref("org-a", "node-a", "dk")),
+                "{spelling} should reach the shared board"
+            );
+        }
+        // A qualified name for a board the caller may not reach is still just
+        // "not found" — no enumeration oracle.
+        assert_eq!(
+            coord
+                .resolve_board(&access, &BoardName("org-c/node-c/dk".to_owned()), 1000)
+                .await,
+            BoardLookup::NotFound
+        );
+    }
+
+    /// Ambiguity is still reported, but only within the winning tier: two of
+    /// your *own* nodes carrying one name is a real ambiguity you can fix.
+    #[tokio::test]
+    async fn ambiguity_within_the_winning_tier_is_still_reported() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[
+                board("org-b", "dk", "node-1"),
+                board("org-b", "dk", "node-2"),
+                board("org-a", "dk", "node-a"),
+            ],
+            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Member)],
+        )
+        .await;
+        let access = shared_access("org-b", "org-a");
+        match coord
+            .resolve_board(&access, &BoardName("dk".to_owned()), 1000)
+            .await
+        {
+            BoardLookup::Ambiguous(nodes) => {
+                assert_eq!(
+                    nodes,
+                    vec![AgentId("node-1".to_owned()), AgentId("node-2".to_owned())],
+                    "only the caller's own nodes are named"
+                );
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    /// A board nothing in the access admits is invisible, exactly as an absent
+    /// one is.
+    #[tokio::test]
+    async fn an_unreachable_board_resolves_to_not_found() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board("org-a", "dk", "node-a")],
+            &[("org-b", "bob", Role::Member)],
+        )
+        .await;
+        assert_eq!(
+            coord
+                .resolve_board(&Access::own_org(org("org-b")), &BoardName("dk".to_owned()), 1000)
+                .await,
+            BoardLookup::NotFound
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Revocation cascade
+    // ---------------------------------------------------------------------
+
+    /// Revoking a grant drops the grantee's *queued* requests too. A `Waiter`
+    /// carries an `Access` snapshot, which by construction cannot notice a
+    /// revocation, so without this the grantee would be promoted onto the board
+    /// it just lost access to.
+    #[tokio::test]
+    async fn revocation_drops_the_grantees_queued_requests() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board("org-a", "dk", "node-a")],
+            &[("org-a", "alice", Role::Admin), ("org-b", "bob", Role::Member)],
+        )
+        .await;
+        let alice = user("org-a", "alice");
+        let bob = user("org-b", "bob");
+
+        // Alice holds the board; bob queues behind her by grant.
+        let _ = grant_lease(&coord, &alice, "dk").await;
+        let id = crate::state::new_grant_id();
+        coord
+            .db()
+            .scoped(org("org-a"))
+            .insert_grant(
+                &id,
+                &bob.key(),
+                "tag=nrf52",
+                &[fleet_proto::token::AllowedOp::Attach],
+                None,
+                Some("alice"),
+                1000,
+            )
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &bob,
+                SidecarToCoord::Lease(LeaseRequest {
+                    select: Constraint::Tags(vec!["nrf52".to_owned()]),
+                    duration_secs: 600,
+                    priority: Priority::Interactive,
+                }),
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::Queued { .. }
+        ));
+
+        // Alice revokes, then releases the board.
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::GrantRevoke { id: id[..8].to_owned() },
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::GrantRevoked { .. }
+        ));
+
+        let promoted = {
+            let mut sched = coord.scheduler().lock().await;
+            let held = sched.leases_held_by(&alice.key());
+            sched
+                .release_lease(held[0].0, &alice.key(), 2000)
+                .expect("holder may release")
+        };
+        assert!(
+            promoted.is_none(),
+            "a revoked grantee must not be promoted onto the board it lost"
+        );
+    }
 }
