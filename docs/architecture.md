@@ -132,6 +132,7 @@ Routes:
 |---|---|---|
 | `GET /agent` (WS upgrade) | nodes | persistent dial-out control + data |
 | `GET /client` (WS upgrade) | ctl + sidecar | leases, relay channels, admin surface |
+| `GET /delegate` (WS upgrade) | a sandboxed agent | **relay only**, authorised by a capability token; no principal (§6.5) |
 | `POST /auth/device/*` | `login` | GitHub device-flow start/poll (§6.4) |
 | `POST /auth/token` | CI, nodes | token exchange (workload OIDC, auth keys) |
 | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys (§6.4) |
@@ -144,6 +145,17 @@ Routes:
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
 reaped on a timeout we do not control, so the node connection must run
 ping/pong keepalive, and the existing reconnect backoff stops being a nicety.
+Both sidecar-direction routes share one handshake + keepalive implementation
+(`server::sidecar_pump`); `/delegate` differs only in its per-message handler,
+so it cannot forget to ping.
+
+`GET /delegate` is the one authenticated route that constructs **no**
+`Subject`. It hex-decodes the bearer as a signed capability token, verifies the
+signature with the coordinator's own key, checks expiry, and checks the lease
+is still live — which is what makes "revoke by releasing the lease" immediate
+rather than "once the token expires". After the upgrade a flat message
+allowlist applies: `OpenChannel` (only for the token's own lease), `Data` and
+`CloseChannel`, and nothing else. Every rejection is the same `401`. See §6.5.
 
 **Cross-compilation constraint:** the WS implementation must build for
 `armv7-musl` / `aarch64` (Raspberry Pi nodes). `tokio-tungstenite` on rustls
@@ -866,6 +878,112 @@ The model, deliberately minimal:
   `ctl delegate` leases a board as you and hands out only the **capability
   token** for that lease — narrow, expiring, revocable by releasing the lease.
   The crypto for this already exists (§6.3); only the command is new.
+
+#### What shipped (grants, ACL evaluation, `ctl delegate`)
+
+**One selector grammar, extended by one term.** `board=<name>`, `chip=<c>`,
+`tag=<t>`, and `a && b` conjunctions of tags, parsed by a single function in
+`fleet-proto`. The sidecar's `PROBE_RS_FLEET_SELECT` and `ctl lease <sel>` are
+thin delegates that differ only in what a *bare* word means — a tag for the
+former, a board for the latter, which is a real difference between the two
+surfaces rather than an accident. `board=<name>` is the individual-board grant:
+a degenerate selector, not a special case. A grant stores the **canonical
+rendering** (`Constraint`'s `Display`) and evaluation re-parses it, so a grant's
+meaning never depends on which CLI wrote it; a row that will not re-parse is
+dropped **closed**, never widened into a match-anything. An empty expression is
+refused at every entry point, because an empty tag set matches every board.
+
+**Evaluation is a pure value object** (`fleet_core::access::Access`): ownership
+(a member of the board's org) or a live grant, deny by default, with `now`
+always a parameter — so the whole (subject, object, op) matrix is a
+table-driven unit test. The tenancy fence **moved rather than weakened**: board
+matching is now org-blind, and the org comparison lives in exactly one place,
+`grant.org == board.id.org`. A grant issued in org A saying `tag=nrf52`
+therefore cannot reach org C's identically tagged board.
+
+**Grants attenuate the capability token.** The token minted for a lease carries
+the grantee's effective ops, recomputed at every mint (lease and each channel
+open) and never cached, so a narrowed or revoked grant bites on the next
+channel open rather than at the end of the lease's TTL.
+
+**What `--ops` actually enforces**, stated plainly because writing "the agent
+enforces `--ops`" would be false for half the labels:
+
+| op | enforced where |
+|---|---|
+| `attach` | agent, at data-channel open |
+| `gdb` | agent, at gdb-channel open |
+| `power-cycle` | coordinator, in the power-cycle handler |
+| `flash`, `erase`, `reset` | **not enforced** — in-band probe-rs RPC inside the data channel, which the fleet relays without parsing |
+
+Recording the unenforced three is intent and audit. Enforcing them would mean
+the agent parsing probe-rs postcard-rpc frames; deliberately out of scope, filed
+as a follow-up. One consequence is handled rather than left as a trap: a
+data-plane op **implies `attach`**, because a token with `flash` but not
+`attach` cannot open a data channel at all and so cannot flash. The CLI says
+when the implication fires, and refuses an empty op set — a security verb must
+not silently mint a dud.
+
+**Creating a grant requires `admin`; listing needs only membership.** A
+deliberate divergence from `POST /auth/keys`, where membership is enough to
+mint. The two verbs have different blast radii: an auth key cannot exceed the
+caller's own org, while a grant points *outward*, handing the org's hardware to
+someone who is not in it at all. In a personal org you are the admin, so the
+single-user story is unchanged. Grants must expire (the API refuses an unbounded
+one), mirroring the auth-key TTL discipline: an unbounded share of somebody
+else's hardware is exactly the artefact that outlives its reason.
+
+**Revocation is creator-or-admin, and it is real.** The rule matches auth-key
+revocation verbatim, including the `grant.revoke.denied` audit. Deleting the row
+is not enough — it would leave the grantee relaying bytes until the lease's TTL
+ran out — so revocation recomputes the grantee's access and, for every lease it
+holds on a board it may no longer use, goes through the *whole* release path:
+channels torn down, lease closed and audited, any promoted waiter persisted. It
+also drops the grantee's queued requests, which a scheduler `Waiter`'s access
+snapshot cannot invalidate itself. The honest limit: an already-minted
+capability token stays cryptographically valid until it expires; tearing down
+the relay is what makes it useless, since there is no path to the board without
+the coordinator. Delegation has exactly the same bound, which is why lease TTLs
+are short.
+
+**A grantee has no "what am I granted?" verb.** `grant list` names this org's
+*outbound* grants; the grantee-facing view is `ctl list`, which shows granted
+boards alongside their own. Recorded as a decision — self-service is cheap to
+add later and nobody has asked for it.
+
+**Name resolution is tiered: own org wins, then granted orgs.** Once boards can
+be shared, two boards can answer to `nrf52840-dk-3`. A board acquired by grant
+must never shadow your own hardware for `ctl release` / `ctl power-cycle`, so
+candidates in the caller's own org win outright and ambiguity is reported only
+for a tie *within* the winning tier. The escape hatch is a qualified name —
+`<node>/<name>` or `<org>/<node>/<name>` — which is purely resolver-side, so
+`BoardName` stays an opaque wire string.
+
+**Lease bookkeeping follows the board's org**, not the holder's: a lease on org
+A's hardware belongs in org A's lease table and audit log, whoever is holding
+it.
+
+**Delegation ingress is `GET /delegate`** (§3.5): the sandbox presents the
+capability token as its bearer, the coordinator verifies its own signature,
+and a flat message allowlist applies — open a channel on *this* lease, relay
+bytes, close. No `Lease`, no `Extend`, no `Release` (the delegator owns the
+lease lifecycle; the sandbox's only lease-affecting power is letting it expire),
+no fleet enumeration, no grant verbs, and **no `Subject` constructed anywhere on
+the path**. The handed-out token is the intersection of what was asked for and
+what the delegator may actually do — you can never delegate more than you hold
+— and it is re-intersected with the delegator's *current* access at every
+channel open, so revoking the delegator's grant also narrows the sandbox. A
+contended `ctl delegate` prints no token and exits non-zero: a handoff script
+must not mistake a queue slip for a board.
+
+**One data-plane token, carried explicitly.** `CoordToSidecar::ChannelOpened`
+now carries the exact capability-token bytes the coordinator sent the node, and
+that is what the sidecar exports as `PROBE_RS_REMOTE_TOKEN`. Previously the
+sidecar exported the *lease grant's* token and the two matched only by
+coincidence — same fields, deterministic ed25519 — a coincidence that an
+`extend` already broke (it rewrites the expiry the channel mint reads) and that
+attenuation breaks by construction. The wire field removes the whole class of
+"two mints must be byte-identical" bugs. Protocol 6 → 7.
 
 ### 6.6 Lease lifecycle (unchanged)
 
