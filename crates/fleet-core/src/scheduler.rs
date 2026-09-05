@@ -36,7 +36,7 @@
 //! ## Who may reach which board
 //!
 //! Candidacy takes an [`Access`] (from [`crate::access`]) rather than a bare
-//! [`OrgId`]: architecture §6.5 lets a *grant* admit a board in another org, so
+//! `OrgId`: architecture §6.5 lets a *grant* admit a board in another org, so
 //! "the caller's org" is no longer the whole answer. The tenancy fence did not
 //! weaken, it moved: [`Access`] is built solely from the authenticated subject,
 //! and a grant only ever covers boards belonging to the granting org. Every
@@ -398,7 +398,7 @@ impl Scheduler {
     /// Replace the [`Access`] snapshot on every queued request from `key`,
     /// returning how many waiters were refreshed.
     ///
-    /// This is what closes revoke-while-queued. A [`Waiter`] carries a snapshot
+    /// This is what closes revoke-while-queued. A queued waiter carries a snapshot
     /// taken when the request was made, which by construction cannot notice a
     /// later revocation, so the revoking caller pushes the new access in.
     ///
@@ -417,9 +417,8 @@ impl Scheduler {
     ///   queue with it.
     ///
     /// Refreshing handles both exactly rather than approximately: the waiter
-    /// stays, and [`Scheduler::promote_one`] re-checks the new snapshot at
-    /// promotion time, so it is promoted onto precisely the boards the subject
-    /// may still use.
+    /// stays, and promotion re-checks the new snapshot, so it is promoted onto
+    /// precisely the boards the subject may still use.
     pub fn refresh_waiter_access(&mut self, key: &SubjectKey, access: &Access) -> usize {
         let mut refreshed = 0;
         for waiter in &mut self.queue {
@@ -570,8 +569,8 @@ impl Scheduler {
     /// it could not have leased at the front door — the back door onto the same
     /// hardware that [`Scheduler::request_lease`] closes. Re-evaluating at `now`
     /// additionally means an *expired* grant is never promoted onto; a
-    /// *revoked* one is handled by [`Scheduler::remove_waiters`], because a
-    /// snapshot cannot see a revocation.
+    /// *revoked* one is handled by [`Scheduler::refresh_waiter_access`], because
+    /// a snapshot cannot see a revocation.
     fn promote_one(&mut self, board_id: &BoardRef, now: u64) -> Option<GrantedLease> {
         let board = self.boards.get(board_id)?;
         if board.state != BoardState::Idle {
