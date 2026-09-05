@@ -1,0 +1,146 @@
+# probe-rs-fleet — GitHub Actions: flash and test lab hardware with NO secrets
+#
+# Copy this into .github/workflows/hil.yml and change three things: the
+# coordinator URL, the board selector, and the chip. Nothing else needs editing,
+# and in particular there is no secret to create.
+#
+# Read docs/ci-github-actions.md for the fleet admin's half (one `grant --repo`
+# and one config block) and docs/architecture.md §6.7 for why the trust rule is
+# per-repo rather than per-owner.
+#
+# ---------------------------------------------------------------------------
+# Why there is no `secrets.` reference anywhere below
+# ---------------------------------------------------------------------------
+#
+# `permissions: id-token: write` makes the runner inject two variables into this
+# job and no other: ACTIONS_ID_TOKEN_REQUEST_URL and
+# ACTIONS_ID_TOKEN_REQUEST_TOKEN. `ci login` spends them once, on GitHub's own
+# token service, to get a signed OIDC JWT asserting which repository this job is
+# running in. The coordinator verifies that signature against GitHub's published
+# JWKS and hands back a fleet token that expires with the job.
+#
+# So: nothing was stored in the repository, nothing was pasted into a secret,
+# and nothing survives the job. Deleting the `permissions:` block is the one
+# edit that breaks this workflow — `ci login` then reports exactly that, by
+# name, rather than a generic failure.
+
+name: hardware-in-the-loop
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Job-level, not workflow-level, so only the job that needs a workload identity
+# gets one. `contents: read` must be restated: naming `permissions` at all
+# replaces the default set rather than adding to it.
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  hil:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # Install the two binaries this needs: the fleet CLI and the GENUINE
+      # probe-rs.
+      #
+      # Both, and in this order on PATH. The sidecar is a `probe-rs` shim
+      # (argv0 dispatch, so `probe-rs run …` below is unmodified), and it
+      # *executes the real probe-rs client* against the leased board rather
+      # than reimplementing it — which is precisely why the exit code still
+      # means what it means (architecture §7). It finds the real one by walking
+      # PATH and skipping itself, so the real binary must also be on PATH,
+      # after the shim.
+      # ---------------------------------------------------------------------
+      - name: Install probe-rs-fleet and probe-rs
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.fleet/bin" "$HOME/.probe-rs/bin"
+
+          # Replace these two with however you distribute the binaries.
+          curl -sSL https://example.invalid/probe-rs-fleet -o "$HOME/.fleet/bin/probe-rs-fleet"
+          curl -sSL https://example.invalid/probe-rs        -o "$HOME/.probe-rs/bin/probe-rs"
+          chmod +x "$HOME/.fleet/bin/probe-rs-fleet" "$HOME/.probe-rs/bin/probe-rs"
+
+          # The shim: a `probe-rs` that is really probe-rs-fleet. laze, cargo
+          # runners and hand-written scripts all invoke `probe-rs` unmodified.
+          ln -sf "$HOME/.fleet/bin/probe-rs-fleet" "$HOME/.fleet/bin/probe-rs"
+
+          # Shim first, real probe-rs second. The shim skips PATH entries that
+          # canonicalise to itself, so it finds the real one at the second
+          # entry; reverse these and the real client runs locally and finds no
+          # probe.
+          echo "$HOME/.fleet/bin"   >> "$GITHUB_PATH"
+          echo "$HOME/.probe-rs/bin" >> "$GITHUB_PATH"
+
+      # ---------------------------------------------------------------------
+      # Exchange this job's workload identity for a fleet token.
+      #
+      # --audience must match the coordinator's configured `audience`, which is
+      # normally its public_url. It has no default on the coordinator side on
+      # purpose: GitHub's own default audience is https://github.com/<owner>,
+      # which is not specific to any service, so a token minted for some other
+      # system under the same owner would otherwise be replayable here.
+      #
+      # This appends PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN to
+      # $GITHUB_ENV for the later steps, and never prints the token — stdout is
+      # the job log. It writes nothing to disk: a CI runner's credential lives
+      # in the environment for one job.
+      # ---------------------------------------------------------------------
+      - name: Log in to the fleet
+        run: |
+          probe-rs-fleet ci login \
+            --fleet-url https://fleet.example \
+            --audience  https://fleet.example
+
+      # ---------------------------------------------------------------------
+      # Build whatever you are flashing. Nothing fleet-specific here.
+      # ---------------------------------------------------------------------
+      - name: Build
+        run: cargo build --release --target thumbv7em-none-eabihf --tests
+
+      # ---------------------------------------------------------------------
+      # Run it on real hardware.
+      #
+      # This is a VANILLA probe-rs invocation. The shim leases a matching board
+      # from the fleet, opens a relay channel, points the genuine probe-rs
+      # client at a local endpoint, and gets out of the way; --chip is selected
+      # in-band by that client exactly as it would be locally.
+      #
+      # The exit code is the embedded-test result and is propagated verbatim
+      # (architecture §7), so this step fails when the tests fail and for no
+      # other reason. Do not wrap it in `|| true`.
+      #
+      # PROBE_RS_FLEET_SELECT is a constraint expression: bare words are tags,
+      # and `&&` conjoins them (`nrf52 && bluetooth`). Use
+      # PROBE_RS_FLEET_BOARD instead to name one specific board; setting both
+      # is refused rather than guessed at.
+      # ---------------------------------------------------------------------
+      - name: Flash and run the embedded tests
+        env:
+          PROBE_RS_FLEET_SELECT: nrf52
+        run: |
+          probe-rs run --chip nRF52840_xxAA \
+            target/thumbv7em-none-eabihf/release/deps/integration-*
+
+      # ---------------------------------------------------------------------
+      # A matrix, if you want one. Two things to know before widening it:
+      #
+      #  * `max_concurrent_per_subject` (default 2) is keyed by SUBJECT, and
+      #    every job in this repository authenticates as the same subject
+      #    (gha/workload:<owner>/<repo>). So the cap is effectively per repo. A
+      #    ten-leg matrix against two boards QUEUES rather than failing — the
+      #    cost of a wide matrix is wall-clock time, so set the job timeout
+      #    accordingly.
+      #  * the workload token's TTL is one hour by default and there is no
+      #    refresh path. A leg that waits in the queue and then runs long can
+      #    outlive its token; re-run `ci login` immediately before the long
+      #    step if that is a risk.
+      #
+      # A CI lease is always clamped to CI priority whatever it asks for, so a
+      # queued matrix can never outbid a developer at a desk.
+      # ---------------------------------------------------------------------

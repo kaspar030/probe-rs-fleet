@@ -670,7 +670,7 @@ upgrade (§3.5):
 |---|---|---|---|
 | User | session token, minted after GitHub login | short, refreshable | delete session |
 | Node | node token, minted at registration | long, auto-rotating | delete node row |
-| Workload (CI) | exchanged from a GH Actions OIDC JWT | one job | expiry / grant removal |
+| Workload (CI) | exchanged from a GH Actions OIDC JWT, or from a `ci` auth key (§6.7) | one job: `workload_token_ttl_secs`, default 1h, capped at 12h, **no refresh path** | expiry, or revoking the per-repo grant (which tears down live leases) |
 
 The cost, stated honestly: bearer tokens are pure bearer credentials, so a leak
 is immediately usable. Short user sessions, rotating node tokens, and per-job CI
@@ -731,7 +731,8 @@ is no rate limiting in the coordinator yet):
 | **Node, user present** | `share` — reuses the session to self-register | zero extra steps |
 | **Node, headless** | `agent up` prints a URL + code; a member runs `node approve <code>` | no token copy-paste |
 | **Node, unattended** | pre-minted **auth key** (org-scoped, expiring, tagged) | one paste, revocable |
-| **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token` | zero secrets |
+| **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token`, plus a per-repo grant (§6.7) | zero secrets |
+| **CI worker, no workload identity** | a `--purpose ci` **auth key** redeemed at `/auth/token` (§6.7, the weak path) | one paste, revocable |
 | **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
 
 **Interactive node approval** (`agent up` rung 3, §4.2) reuses this ceremony's
@@ -1013,6 +1014,215 @@ attenuation breaks by construction. The wire field removes the whole class of
   by `Subject` rather than by a bare string.
 - Lease records are the natural basis for future metering (lease-seconds per
   org); no billing is built now, but the data is recoverable by construction.
+
+### 6.7 CI: workload identity (revision 2)
+
+§6.4's bootstrap table has a "CI worker" row and a three-sentence trust rule.
+This section is what that row turned into.
+
+A CI job authenticates with a **workload token**, exchanged per job at
+`POST /auth/token` from a credential the job already has and the fleet never
+stored. The GitHub Actions path is the real one: a job with
+`permissions: id-token: write` mints a signed OIDC JWT from
+`https://token.actions.githubusercontent.com`, the coordinator verifies it
+against the issuer's JWKS, and **no secret ever enters the runner**. The
+auth-key path below is the fallback, and it is honestly worse.
+
+#### The subject is a repo, in a namespace that is not an org
+
+A workload's subject key is `gha/workload:<owner>/<repo>`.
+
+`gha` occupies the slot a `SubjectKey` would otherwise fill with an org id, and
+it is a reserved **namespace**, not a tenant. That is not a shortcut: the fact a
+workload token proves — "a job in repo `owner/name`" — is genuinely
+org-independent. Several orgs may each grant the same repo access to their
+hardware, and the repo is a member of none of them. Stamping one org onto the
+identity would either pick an arbitrary winner among the granting orgs or invent
+a membership that does not exist. So the token row records the credential and
+the claims, and every authorization decision goes through `grant` — the one
+lookup in the tree that is deliberately subject-scoped rather than org-scoped.
+
+The namespace nevertheless gets a **real `org` row**, of kind `system`, created
+by migration 0007. Leaving it row-less is the tempting version and it does not
+survive contact with the code: `core.rs::tear_down_lease` and `extend_lease`
+both fall back to the *acting subject's* org when the board's org cannot be
+resolved (a lease being released as its board goes away), and
+`audit_log.org_id` is `NOT NULL REFERENCES org(id)`. A row-less namespace turns
+that rare release/extend race into a foreign-key error surfacing as a
+coordinator error instead of "no such lease". The row converts a scattered
+invariant ("never write an org-scoped row keyed on a workload's namespace") into
+a structural one, and costs nothing: nobody is ever a member of it. The name is
+reserved at **both** creation paths — `Db::ensure_org` refuses it and
+`CoordinatorConfig::validate` refuses `default_org = "gha"` — because a reserved
+name only one of two paths respects is a trap for the next change.
+
+A subject id containing a slash works with no schema change because
+`SubjectKey::parse` splits at the *first* `/` and the *first* `:`, so
+`gha/workload:ariel-os/ariel-os` round-trips exactly.
+
+#### `repository_owner` is verified, recorded, and never consulted
+
+This is the security-relevant decision of the whole path.
+
+`repository_owner` is required as a claim and refused if absent, written to the
+token row and into the audit detail — and it takes no part in any authorization
+decision. Access needs an explicit **per-repo** grant
+(`grant --repo owner/name`). A fork, or a newly created repo under a granted
+owner, produces a different subject key, matches no grant, and is refused with
+`403 no_grant`. There is deliberately no `--repo-owner` flag to type.
+
+Repo strings are lowercased on both sides — grant creation and claim ingestion —
+by one shared function (`fleet_proto::ids::normalise_repo`). GitHub repo names
+are case-preserving but case-insensitive, and a case difference between the two
+spellings would become a silent denial that looks like a coordinator bug.
+
+#### What is verified
+
+All of it explicitly, none of it inherited from a library default:
+
+- **Algorithm**: an allowlist of exactly `[RS256]`. This is what makes the
+  `alg: none` / HS256-key-confusion family (a token signed with the *public* key
+  as an HMAC secret) unrepresentable rather than merely unlikely.
+- **`kid`**: mandatory. Without one there is no way to say which key was meant,
+  and "try every key in the set" turns a rotation window into a second chance.
+- **Issuer and audience**: exact match against configured values.
+- **Expiry and not-before**: against the coordinator's injected clock *only*.
+  The JWT library's own `validate_exp` / `validate_nbf` are turned **off** (with
+  `exp` kept in `required_spec_claims`, so a token without one is still refused),
+  because a second invisible clock inside the library would disagree with the
+  coordinator's `Clock` seam and produce a test that passes for the wrong reason.
+
+An **unknown `kid` triggers exactly one JWKS refresh** — that is what a key
+rotation looks like, and waiting out the refresh interval would break every CI
+job in between. That refresh is rate-limited by `jwks_min_refetch_secs`
+(default 60s), because the `kid` is attacker-chosen: without the floor, a stream
+of invented `kid`s turns `POST /auth/token` into a fetch amplifier aimed at the
+issuer. A failed fetch never flushes a good cached set — GitHub's signing keys
+outlive the refresh interval by a wide margin, so serving the cached set through
+an issuer outage is the safer failure.
+
+#### Audience has no default, deliberately
+
+`audience` is required, and `validate()` refuses a `[github_actions]` table
+without one. GitHub's *default* `aud` is `https://github.com/<owner>`, which is
+not specific to any service: a token minted for some other system under the same
+owner, which also took the default, would then be replayable against this fleet.
+Set it to the coordinator's `public_url` and have the workflow request that
+audience explicitly (`ci login --audience`).
+
+#### Failure shapes
+
+| condition | answer |
+|---|---|
+| no `[github_actions]` table | `503 workload_oidc_unconfigured`, mirroring `device_flow_unconfigured` |
+| any verification failure | a flat `401 invalid_grant` |
+| verified token, no grant | `403 no_grant` |
+
+Every verification failure — expiry, audience, issuer, signature, missing claim,
+unknown `kid` — answers the same flat `401`, with the reason in the coordinator's
+log and never in the body. No oracle.
+
+`403 no_grant` is deliberately *not* folded into that: the credential **is**
+valid, and conflating the two sends an operator hunting a signing problem when
+the answer is `grant --repo`. It leaks only that a repo is not granted, which
+that repo's own maintainers already know. The coordinator's log names the repo
+and the owner beside it, so the "but I granted the org!" case is diagnosable in
+one line.
+
+#### Token TTL, and the bound with no refresh path
+
+`workload_token_ttl_secs` defaults to 3600 and is capped at 12h;
+`Policy::max_duration_ci` is also 3600. There is **no refresh path for a
+workload token** — `Refresh` is session-only — so a job that runs longer than the
+token's TTL must re-run `ci login`. That is an acceptable v1 bound, but it is
+stated here and in `docs/ci-github-actions.md` rather than left to be discovered
+as a flake.
+
+#### A workload's lease is clamped to CI priority
+
+Whatever priority the request carries, a `SubjectKind::Workload` lease request
+is clamped to `Priority::Ci`. §6.6's fairness ordering is "interactive dev >
+nightly CI > soak" and priority is a plain wire field, so without the clamp a CI
+job outbids a human at a desk by setting it. This is not an edge case: the
+sidecar sends `Priority::Interactive` unconditionally, so the clamp fires on
+*every* CI lease. `Policy::max_duration_ci` then applies to it, and extension
+inherits the clamp for free — `Scheduler::extend_lease` re-derives the duration
+from the **recorded** priority, so there is deliberately no second guard in
+`extend_lease`.
+
+#### The verb surface behind `/client`, walked
+
+The route allowlist now admits `Session` **and** `Workload` on `/client`;
+`/agent` and `/auth/keys` stay Session/Node, so a CI job cannot enroll a node or
+mint credentials. But a route allowlist is only a fence if the verbs behind the
+route have been walked, so they were:
+
+| verb | gate | workload |
+|---|---|---|
+| `Lease` / `Extend` / `Release` / `OpenChannel` / `CloseChannel` | `board_access` / `require_lease_control` | allowed — this is the CI story |
+| `ListBoards` / `Who` | access-scoped | allowed |
+| `Logs`, `GrantCreate` | `require_role(Admin)` | denied |
+| `GrantList` / `GrantRevoke` | `require_role(Member)` | denied |
+| **`Delegate`** | `board_access` **alone** | **explicitly refused** |
+
+`Delegate` was the one verb gated by `board_access` and nothing else, so a
+workload would otherwise be able to mint a capability token for a lab board and
+hand it to something else. It is refused in `Coordinator::delegate` rather than
+allowed by omission: nothing in the CI story needs it, v1 gives an operator no
+way to see that a CI job re-delegated their hardware, and allowing it later is a
+strictly smaller change than withdrawing it.
+
+#### Metering falls out; billing is not built
+
+`leases` rows are never deleted — `close_lease` sets `closed_at` and
+`close_reason` — and `holder` is the rendered subject key. So a released CI lease
+survives as a row with `holder = "gha/workload:owner/repo"` and
+`granted_at`/`closed_at` set: lease-seconds per repo, recoverable by
+construction. Beside it, each exchange writes one `workload.token.mint` audit
+row **per granting org** (each of them is lending hardware to this job, and each
+operator must be able to answer "who used what, for how long" from their own
+audit log alone), whose detail carries repo, owner, ref, workflow, run id and
+the matching grant ids. No billing is built.
+
+#### The auth-key fallback, which is the weak path
+
+A self-hosted Jenkins box has no workload identity to offer, and heterogeneous
+runners are a stated requirement, so `auth_key` grew a `purpose` (`node` | `ci`)
+and an `ops` column. `purpose` defaults to `node`, so no existing key changes
+meaning — widening what an auth key means would silently have turned every
+enrollment key in every deployment into a board-access credential.
+
+Redeeming a `ci` key at `grant_type: workload_key` does **not** widen
+`board_access`. It upserts an *ordinary grant* — the same row `grant --repo`
+writes, evaluated by the same code and revocable by the same verb — to an
+org-scoped subject `<org>/workload:key:<hash8>`, and then mints a workload
+token. The grant's id is deterministic (`ci-<key hash prefix>`), so a multi-use
+key redeemed by twenty runners upserts one row, one grant and one concurrency
+budget; the `ci-` prefix is a namespace no human-created grant id can occupy,
+since those are 32 random hex characters, which keeps `grant revoke <prefix>`
+unambiguous between the two.
+
+Stated plainly: this is a **long-lived bearer secret sitting in somebody else's
+CI configuration**, usable by anyone who reads that configuration or a leaked
+log. What bounds it is org scope, the selector (a `ci` key with **no tags** is
+refused at both the mint and the redemption, because an empty tag set is an
+empty selector and matches every board in the org), the ops, expiry, and
+revocability — and revoking the key cascades through the whole grant-revocation
+path of §6.5, so live leases are torn down rather than waiting out a TTL. A `ci`
+key's grant inherits the key's expiry, or gets a bounded 30-day one if the key
+never expires: a shell-minted perpetual key is an operator's informed choice
+about the *key*, not a choice to share the org's hardware forever.
+
+Prefer the OIDC path wherever the runner can mint an identity.
+
+#### Not built in v1
+
+**No per-ref or per-workflow conditions.** `ref`, `workflow`, `job_workflow_ref`
+and `run_id` are verified as claims where present and recorded on the token row,
+but nothing evaluates them: a grant to `owner/repo` is a grant to every ref and
+every workflow of that repo. Capturing the claims now is what makes adding the
+conditions later a pure code change. Recorded as a follow-up.
+
 
 ### Time-based *sharing* (decided requirement)
 

@@ -749,6 +749,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "directories",
  "fleet-agent",
@@ -759,8 +760,10 @@ dependencies = [
  "fleet-sidecar",
  "fleet-tls",
  "fleet-wire",
+ "jsonwebtoken",
  "rand_core 0.6.4",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

@@ -39,6 +39,11 @@ fleet-coordinator = { workspace = true }
 fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
 fleet-core = { workspace = true }
 axum = { workspace = true }
+# `ci_e2e.rs` stands up a stub GitHub Actions token service, which has to sign
+# a real RS256 JWT for the coordinator to verify.
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
