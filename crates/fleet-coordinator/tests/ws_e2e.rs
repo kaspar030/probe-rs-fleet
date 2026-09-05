@@ -200,7 +200,7 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
     assert_eq!(grant.board, board_id);
     assert_eq!(grant.agent, node_id);
 
-    let channel = session
+    let (channel, _channel_token) = session
         .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
         .await
         .unwrap();

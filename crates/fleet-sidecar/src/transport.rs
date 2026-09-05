@@ -234,7 +234,14 @@ impl CoordSession {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.next_ctrl()).await;
     }
 
-    /// Open a relay channel of `kind` for `lease`, returning the channel id.
+    /// Open a relay channel of `kind` for `lease`, returning the channel id
+    /// **and the data-plane capability token** the coordinator handed the
+    /// owning agent.
+    ///
+    /// The token is the credential the genuine probe-rs client must present to
+    /// `probe-rs serve` (`PROBE_RS_REMOTE_TOKEN`). It is deliberately *not*
+    /// `LeaseGrant::token`: the two are different mints and diverge after an
+    /// `Extend`, or whenever a grant attenuates the allowed ops.
     ///
     /// # Errors
     ///
@@ -243,10 +250,10 @@ impl CoordSession {
         &self,
         lease: fleet_proto::LeaseId,
         kind: ChannelKind,
-    ) -> Result<ChannelId, TransportError> {
+    ) -> Result<(ChannelId, Vec<u8>), TransportError> {
         self.send(SidecarToCoord::OpenChannel { lease, kind }).await?;
         match self.next_ctrl().await? {
-            CoordToSidecar::ChannelOpened { channel } => Ok(channel),
+            CoordToSidecar::ChannelOpened { channel, token } => Ok((channel, token)),
             CoordToSidecar::Error { message } => Err(TransportError::Declined(message)),
             other => Err(TransportError::Wire(format!(
                 "expected ChannelOpened, got {other:?}"
@@ -480,6 +487,7 @@ mod tests {
                 &mut coord_tx,
                 &CoordToSidecar::ChannelOpened {
                     channel: ChannelId(7),
+                    token: vec![0x11, 0x22],
                 },
             )
             .await
@@ -511,11 +519,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grant.board, board_ref);
-        let channel = session
+        let (channel, channel_token) = session
             .open_channel(grant.lease, ChannelKind::Data)
             .await
             .unwrap();
         assert_eq!(channel, ChannelId(7));
+        // The channel token is the coordinator's own, not the lease grant's.
+        assert_eq!(channel_token, vec![0x11, 0x22]);
+        assert_ne!(channel_token, grant.token);
 
         // A local "probe-rs client" over a duplex; the splice copies bytes to
         // the relay and the coordinator echoes them back.

@@ -257,7 +257,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     assert_eq!(grant.agent, AgentId("agent-a".to_owned()));
 
     // Open a data relay channel.
-    let channel = session
+    let (channel, _channel_token) = session
         .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
         .await
         .unwrap();

@@ -333,6 +333,23 @@ pub enum CoordToSidecar {
     ChannelOpened {
         /// The allocated channel id.
         channel: ChannelId,
+        /// The **exact wire bytes** of the capability token the coordinator
+        /// sent the owning agent in its `OpenSession` command.
+        ///
+        /// This is the data-plane credential: the agent writes these same
+        /// bytes (hex-encoded) into the per-board `.probe-rs.toml` as the
+        /// `probe-rs serve` user token, so the sidecar must export *this*
+        /// value as `PROBE_RS_REMOTE_TOKEN` — **not**
+        /// [`fleet_proto::LeaseGrant::token`].
+        ///
+        /// Before this field existed the two matched only by coincidence:
+        /// both mints produced `{lease, board, default_allowed_ops(),
+        /// expires}` and ed25519 signing is deterministic. That coincidence
+        /// already broke after an `Extend` (which rewrites the expiry
+        /// `open_channel` reads) and breaks by construction once grants
+        /// attenuate `allowed_ops`. Carrying the bytes removes the whole
+        /// class of "two mints must be byte-identical" bugs.
+        token: Vec<u8>,
     },
     /// A channel was closed (by request, agent, or lease expiry).
     ChannelClosed {

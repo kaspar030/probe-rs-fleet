@@ -222,7 +222,7 @@ async fn run_fleet_data(
 ) -> Result<i32, RunError> {
     use fleet_proto::ChannelKind;
 
-    let channel = session.open_channel(grant.lease, ChannelKind::Data).await?;
+    let (channel, channel_token) = session.open_channel(grant.lease, ChannelKind::Data).await?;
 
     // Bind a loopback listener the probe-rs client treats as its remote host.
     // The client builds `{host}/worker` and dials it as a WebSocket, so `host`
@@ -234,7 +234,11 @@ async fn run_fleet_data(
         .local_addr()
         .map_err(|e| transport::TransportError::Io(format!("reading local endpoint: {e}")))?;
     let remote_host = format!("ws://{local_addr}");
-    let token = transport::hex_encode(&grant.token);
+    // The **channel** token, not `grant.token`: this is the credential the
+    // coordinator handed the agent, and therefore the one `probe-rs serve`
+    // accepts. `grant.token` is the delegation artefact and diverges from it
+    // after an `Extend` or under an attenuating grant.
+    let token = transport::hex_encode(&channel_token);
 
     // Accept the single probe-rs client connection and splice it in a task that
     // borrows the session for the duration of the child process.
@@ -273,7 +277,7 @@ async fn run_fleet_gdb(
 ) -> Result<i32, RunError> {
     use fleet_proto::ChannelKind;
 
-    let channel = session.open_channel(grant.lease, ChannelKind::Gdb).await?;
+    let (channel, _token) = session.open_channel(grant.lease, ChannelKind::Gdb).await?;
     let addr = gdb::resolve_listen_addr(connection_string)?;
     let listener = gdb::bind(addr).await?;
     tracing::info!(%addr, "gdb tunnel listening; point your gdb client here");

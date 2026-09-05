@@ -62,5 +62,12 @@ pub struct LeaseGrant {
     /// Expiry as epoch seconds; extend via heartbeat before this.
     pub expires: u64,
     /// Opaque signed capability token (see `fleet-coordinator` auth).
+    ///
+    /// **This is not the data-plane credential.** It is the *delegation*
+    /// artefact (`ctl delegate` hands exactly these bytes to a sandbox) and
+    /// the lease cache's identity. The bytes a probe-rs client must present to
+    /// `probe-rs serve` are the ones the coordinator sent the agent, returned
+    /// per channel in `CoordToSidecar::ChannelOpened { token }` — they differ
+    /// as soon as the lease is extended or a grant attenuates `allowed_ops`.
     pub token: Vec<u8>,
 }

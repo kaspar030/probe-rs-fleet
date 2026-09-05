@@ -938,7 +938,7 @@ impl Coordinator {
             relay::OpenRequest {
                 lease,
                 board: board.clone(),
-                token: wire,
+                token: wire.clone(),
                 kind,
             },
         )
@@ -959,7 +959,14 @@ impl Coordinator {
             )),
         )
         .await?;
-        Ok(Some(CoordToSidecar::ChannelOpened { channel }))
+        // Return the *exact* bytes the agent got, so the sidecar can hand the
+        // genuine probe-rs client a credential `probe-rs serve` will accept.
+        // Re-minting on the sidecar side is what used to break after an
+        // `extend_lease`.
+        Ok(Some(CoordToSidecar::ChannelOpened {
+            channel,
+            token: wire,
+        }))
     }
 
     /// Forward a sidecar data frame to the owning agent.
@@ -1183,6 +1190,81 @@ mod tests {
             CoordToSidecar::Lease(g) => g,
             other => panic!("expected Lease, got {other:?}"),
         }
+    }
+
+    /// The token in `ChannelOpened` must be **exactly** the bytes the agent was
+    /// sent in `OpenSession` — and, in particular, must survive an `extend`.
+    ///
+    /// Before `ChannelOpened` carried the token, the sidecar exported
+    /// `LeaseGrant::token` as `PROBE_RS_REMOTE_TOKEN` and the two matched only
+    /// by coincidence (same fields, deterministic ed25519). `extend_lease`
+    /// rewrites the `BoardState::Leased { expires }` that `open_channel` reads,
+    /// so this exact sequence produced a token `probe-rs serve` rejected with an
+    /// opaque auth error. This test fails on the pre-fix tree.
+    #[tokio::test]
+    async fn channel_token_matches_the_agents_and_survives_an_extend() {
+        use crate::registry::{AgentHandle, AgentMessage};
+
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock.clone()).await;
+        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        coord
+            .agents()
+            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .await;
+
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+
+        // Extend, which rewrites the lease expiry the channel mint reads.
+        clock.0.store(1_200, Ordering::SeqCst);
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Extend {
+                    lease: grant.lease,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::Extended { .. }
+        ));
+
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::OpenChannel {
+                    lease: grant.lease,
+                    kind: fleet_proto::ChannelKind::Data,
+                },
+                &tx,
+            )
+            .await
+            .unwrap();
+        let CoordToSidecar::ChannelOpened { token: to_sidecar, .. } = rx.recv().await.unwrap()
+        else {
+            panic!("expected ChannelOpened");
+        };
+        let AgentMessage::Command(fleet_proto::CoordinatorCommand::OpenSession {
+            token: to_agent,
+            ..
+        }) = arx.recv().await.unwrap()
+        else {
+            panic!("expected OpenSession");
+        };
+
+        assert_eq!(
+            to_sidecar, to_agent,
+            "the sidecar must get the very bytes the agent will check"
+        );
+        assert_ne!(
+            to_sidecar, grant.token,
+            "after an extend the lease grant's token is stale — using it is the bug"
+        );
     }
 
     /// Full lease lifecycle through the coordinator: request -> grant -> verify

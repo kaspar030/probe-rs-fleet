@@ -83,4 +83,12 @@ pub struct ChannelId(pub u64);
 ///   declared in `boards.toml`. postcard is positional, so the added field
 ///   re-encodes every `AgentReport::Inventory`; `#[serde(default)]` would not
 ///   have saved it.
-pub const PROTOCOL_VERSION: u32 = 6;
+/// * 6 → 7: sharing (architecture §6.5) and the data-plane token fix.
+///   `CoordToSidecar::ChannelOpened` gained `token`, the exact capability-token
+///   bytes the coordinator sent the agent — previously the sidecar re-used
+///   [`LeaseGrant::token`] and the two matched only by coincidence, which an
+///   `Extend` (or an attenuating grant) breaks. The sidecar plane also gained
+///   the grant verbs (`GrantCreate`/`GrantList`/`GrantRevoke`) and `Delegate`,
+///   with their replies; adding variants to a postcard enum shifts every later
+///   discriminant, so this is not wire-compatible either way.
+pub const PROTOCOL_VERSION: u32 = 7;
