@@ -602,11 +602,7 @@ mod tests {
             // The sidecar never checks the signature: the coordinator does.
             signature: [0u8; fleet_proto::SIGNATURE_LEN],
         };
-        let hex: String = signed
-            .to_wire()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex = crate::transport::hex_encode(&signed.to_wire());
 
         let cfg = DelegatedConfig {
             coordinator: "https://coord.example".to_owned(),
