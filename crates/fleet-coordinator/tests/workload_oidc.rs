@@ -137,6 +137,11 @@ struct StubState {
     /// How many times the JWKS was fetched. The rotation and rate-limit tests
     /// are *about* this number.
     fetches: AtomicUsize,
+    /// When set, the endpoint answers `500`. An issuer outage is the case the
+    /// `get()` rate limit exists for, and it cannot be staged by simply not
+    /// starting the stub: a refused connection and a failing endpoint take
+    /// different paths, and it is the endpoint that must still be counted.
+    down: std::sync::atomic::AtomicBool,
 }
 
 /// A stub `token.actions.githubusercontent.com` JWKS endpoint on loopback.
@@ -157,6 +162,7 @@ impl StubIssuer {
         let state = Arc::new(StubState {
             keys: std::sync::Mutex::new(jwks(&[("k1", KEY_A_N)])),
             fetches: AtomicUsize::new(0),
+            down: std::sync::atomic::AtomicBool::new(false),
         });
         let router = Router::new()
             .route("/.well-known/jwks", get(serve_jwks))
@@ -197,11 +203,23 @@ impl StubIssuer {
     fn rotate_to(&self, entries: &[(&str, &str)]) {
         *self.state.keys.lock().unwrap() = jwks(entries);
     }
+
+    /// Start answering `500`, as an issuer having a bad day would.
+    fn take_down(&self) {
+        self.state
+            .down
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
-async fn serve_jwks(State(state): State<Arc<StubState>>) -> Json<Value> {
+async fn serve_jwks(
+    State(state): State<Arc<StubState>>,
+) -> Result<Json<Value>, axum::http::StatusCode> {
     state.fetches.fetch_add(1, Ordering::Relaxed);
-    Json(state.keys.lock().unwrap().clone())
+    if state.down.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    Ok(Json(state.keys.lock().unwrap().clone()))
 }
 
 fn jwks(entries: &[(&str, &str)]) -> Value {
@@ -604,6 +622,92 @@ async fn unknown_kids_cannot_amplify_fetches_at_the_issuer() {
     );
 }
 
+/// An issuer outage must not turn `POST /auth/token` into a 1:1 outbound
+/// amplifier.
+///
+/// The sharper half of the bound above, and the reason it has to live in
+/// `get()` and not only in the forced-refresh path: `/auth/token` is
+/// **unauthenticated**, so this needs no valid JWT and no invented `kid` — the
+/// requests below carry outright garbage. Without a floor on `get()`, a failed
+/// refresh leaves the cache permanently stale, every subsequent POST performs a
+/// fresh fetch, and each one holds the cache mutex for up to the fetch timeout,
+/// stalling every legitimate CI exchange behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_down_issuer_does_not_make_the_exchange_a_fetch_amplifier() {
+    let issuer = StubIssuer::start().await;
+    let mut config = issuer.config();
+    config.jwks_min_refetch_secs = 3_600;
+    let fleet = TestCoordinator::start_with(move |c| c.github_actions = Some(config)).await;
+
+    // Cold cache *and* a failing issuer: the worst case, since there is not
+    // even a stale set to fall back on.
+    issuer.take_down();
+    for _ in 0..25 {
+        let (status, body) = exchange(&fleet, "not-even-a-jwt").await;
+        assert_eq!(status, 401, "{body}");
+        // Still no oracle: an unreachable issuer is indistinguishable from a
+        // bad signature, exactly as it should be.
+        assert_eq!(body, r#"{"error":"invalid_grant"}"#);
+    }
+    assert!(
+        issuer.fetches() <= 2,
+        "25 unauthenticated POSTs against a down issuer caused {} fetches; \
+         `get()` is not honouring the rate limit",
+        issuer.fetches()
+    );
+
+    // And a well-formed token inside the floor is refused rather than made to
+    // dial the issuer again: the bound is time, not luck.
+    let before = issuer.fetches();
+    let jwt = sign("k1", KEY_A_DER_B64, &claims(&fleet, "ariel-os/ariel-os"));
+    let (status, _) = exchange(&fleet, &jwt).await;
+    assert_eq!(status, 401);
+    assert_eq!(issuer.fetches(), before, "still inside the refetch floor");
+}
+
+/// A *stale but present* key set is served through an outage rather than
+/// refused: GitHub's signing keys outlive the refresh interval by a wide
+/// margin, so an issuer having a bad day must not take the fleet's CI with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_warm_cache_survives_an_issuer_outage() {
+    let issuer = StubIssuer::start().await;
+    let mut config = issuer.config();
+    // Stale almost immediately, so every request takes the refresh branch — and
+    // the floor is what stops that becoming a fetch each time.
+    config.jwks_refresh_secs = 1;
+    config.jwks_min_refetch_secs = 3_600;
+    let fleet = TestCoordinator::start_with(move |c| c.github_actions = Some(config)).await;
+    let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    fleet
+        .seed_workload_grant(
+            &org.0,
+            "ariel-os/ariel-os",
+            "tag=nrf52",
+            &[AllowedOp::Flash],
+            None,
+        )
+        .await;
+
+    // Warm the cache while the issuer is healthy.
+    let jwt = sign("k1", KEY_A_DER_B64, &claims(&fleet, "ariel-os/ariel-os"));
+    let (status, body) = exchange(&fleet, &jwt).await;
+    assert_eq!(status, 200, "{body}");
+
+    issuer.take_down();
+    let warm = issuer.fetches();
+    for _ in 0..5 {
+        let jwt = sign("k1", KEY_A_DER_B64, &claims(&fleet, "ariel-os/ariel-os"));
+        let (status, body) = exchange(&fleet, &jwt).await;
+        assert_eq!(status, 200, "the cached keys must keep working: {body}");
+    }
+    assert_eq!(
+        issuer.fetches(),
+        warm,
+        "a warm cache inside the floor must not dial a down issuer at all"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 12. Route fences
 // ---------------------------------------------------------------------------
@@ -972,6 +1076,75 @@ async fn a_self_hosted_runner_can_authenticate_with_a_ci_auth_key() {
         .await
         .unwrap()
         .is_empty());
+}
+
+/// The grant a CI key synthesises is revocable **through `grant revoke`**, not
+/// only as a side effect of revoking the key.
+///
+/// `grant list` prints these ids, so a listing whose ids its own revoke verb
+/// rejects would be a dead end — and every prefix of `ci-<hex>` contains a
+/// non-hex character, so the plain hex rule refused all of them. The two routes
+/// differ in what survives: revoking the grant leaves the key valid (the next
+/// runner recreates the grant), revoking the key takes both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ci_keys_grant_is_revocable_through_grant_revoke() {
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+    let key = fleet
+        .seed_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires))
+        .await;
+    let (status, _) = redeem(&fleet, &key).await;
+    assert_eq!(status, 200);
+
+    let grants = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    assert_eq!(grants.len(), 1);
+    let id = grants[0].id.clone();
+    assert!(id.starts_with("ci-"), "{id}");
+
+    let alice = fleet.client_session(&alice_token).await;
+    // The id exactly as `grant list` prints it, and a `ci-` + 8 hex prefix of
+    // it: both must be accepted.
+    for spelling in [id.clone(), id[..11].to_owned()] {
+        match alice
+            .request(SidecarToCoord::GrantRevoke {
+                id: spelling.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            CoordToSidecar::GrantRevoked { ids } => assert_eq!(ids, vec![id.clone()]),
+            CoordToSidecar::Error { message } => {
+                panic!("`grant revoke {spelling}` was refused: {message}")
+            }
+            other => panic!("unexpected reply: {other:?}"),
+        }
+        // Redeem again so the second spelling has a row to delete — and to show
+        // the key itself survived.
+        let (status, _) = redeem(&fleet, &key).await;
+        assert_eq!(
+            status, 200,
+            "the key survives revoking its grant, and recreates it"
+        );
+    }
+
+    // The empty-prefix guard is untouched, and so is the hex rule for an
+    // ordinary grant id: `ci-` buys a namespace, not a way round the floor.
+    for bad in ["", "ci-", "ci-abc", "ci-nothex01", "abc", "nothexbutlong"] {
+        match alice
+            .request(SidecarToCoord::GrantRevoke {
+                id: bad.to_owned(),
+            })
+            .await
+            .unwrap()
+        {
+            CoordToSidecar::Error { message } => {
+                assert!(message.contains("8 hex characters"), "{bad:?}: {message}");
+            }
+            other => panic!("{bad:?} should have been refused, got {other:?}"),
+        }
+    }
 }
 
 /// A CI key with no tags is refused at redemption: an empty tag set is an empty

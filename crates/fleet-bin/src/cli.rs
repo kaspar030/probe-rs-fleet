@@ -871,6 +871,11 @@ pub struct GrantListArgs {
 pub struct GrantRevokeArgs {
     /// The grant id, or a prefix of at least 8 hex characters, from
     /// `probe-rs-fleet grant list`.
+    ///
+    /// A grant synthesised by redeeming a CI auth key is spelled `ci-<hex>`
+    /// (architecture §6.7); `ci-` plus 8 hex characters addresses one.
+    /// Revoking the key itself does the same thing and more, since it takes the
+    /// credential with it.
     pub id: String,
     #[command(flatten)]
     pub client: CtlClientArgs,

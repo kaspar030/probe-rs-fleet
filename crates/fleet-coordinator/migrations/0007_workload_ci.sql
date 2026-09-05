@@ -46,8 +46,32 @@
 -- `Db::ensure_org` refuses to let anybody else create or reuse the id, and
 -- `CoordinatorConfig::validate` refuses `default_org = "gha"`. Reserving the
 -- name in only one of the two creation paths is the trap this avoids.
+--
+-- ---------------------------------------------------------------------------
+-- Why the reserved row's SLUG is not `gha`
+-- ---------------------------------------------------------------------------
+--
+-- `org.slug` is `NOT NULL UNIQUE` (0001_init.sql), and `ON CONFLICT(id)` names
+-- only the *id* — so a pre-existing row with `slug = 'gha'` and a different id
+-- would abort this statement rather than be ignored, and a failed migration
+-- means the coordinator does not start after the upgrade. That row is
+-- reachable: `state.rs::unique_personal_slug` sanitises a GitHub login into a
+-- slug, so a user whose login is `gha` logging in before this migration lands
+-- leaves `org(id = 'gh-<n>', slug = 'gha')` behind.
+--
+-- Widening the conflict target would only trade the crash for silence: the
+-- reserved row would then not exist, and the audit-log foreign key described
+-- above would fire instead, on a path nobody tests. So the collision is
+-- removed **structurally**. The reserved slug is `system:gha`, and
+-- `unique_personal_slug` maps every character outside `[a-z0-9_-]` to `-`, so
+-- no login whatsoever can produce a slug containing `:`; its remaining
+-- candidates are `<sanitised>-<gh_id>` and the org id (`gh-<n>`), neither of
+-- which can collide either.
+--
+-- The slug is display-only — nothing resolves an org by it — and `ensure_org`
+-- binds `slug = id`, so the id reservation covers that path unchanged.
 INSERT INTO org (id, slug, kind, created_at)
-VALUES ('gha', 'gha', 'system', unixepoch())
+VALUES ('gha', 'system:gha', 'system', unixepoch())
 ON CONFLICT(id) DO NOTHING;
 
 -- A minted workload token.

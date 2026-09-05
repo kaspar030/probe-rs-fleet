@@ -292,6 +292,12 @@ code, revocable by the same verb — to an org-scoped subject
 runner redeeming the same key is the same subject, so they share one grant row
 and one concurrency budget.
 
+That grant shows up in `grant list` with an id spelled `ci-<hex>`, and
+`probe-rs-fleet grant revoke ci-<8 hex>` withdraws it — leaving the key itself
+valid, so the next runner to redeem it simply recreates the grant. To retire the
+runner's access for good, revoke the **key**: that takes the credential and the
+grant together.
+
 A `node` key cannot be redeemed this way (`403 forbidden`). That is the entire
 reason `purpose` exists: widening what an auth key means would have silently
 turned every existing enrollment key in every deployment into a board-access

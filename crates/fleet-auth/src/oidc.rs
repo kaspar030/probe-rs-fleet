@@ -356,10 +356,12 @@ mod cache {
     ///   have — is picked up by exactly one extra fetch
     ///   ([`JwksCache::refresh_for_unknown_kid`]), rather than by waiting out
     ///   the refresh interval, which would break every CI job in between;
-    /// * that refresh is **rate limited** (`min_refetch`), so an attacker
-    ///   feeding a stream of invented `kid`s cannot turn `POST /auth/token`
-    ///   into a fetch amplifier aimed at the issuer. Over the limit, the cached
-    ///   set is returned unchanged and the token is refused.
+    /// * **every** fetch, forced or ordinary, is rate limited by `min_refetch`.
+    ///   That bound has to cover [`JwksCache::get`] as well as the forced path,
+    ///   because `POST /auth/token` is unauthenticated: an attacker sending
+    ///   plain POSTs at a coordinator whose issuer is down needs no valid token
+    ///   at all, and an unbounded `get` would turn each one into an outbound
+    ///   request aimed at the issuer.
     ///
     /// A failed fetch never flushes a good cached set: an issuer outage must
     /// not take the fleet's CI down with it for as long as the cached keys
@@ -388,6 +390,15 @@ mod cache {
 
         /// The current key set, refetching it if it is missing or stale.
         ///
+        /// Rate-limited by `min_refetch` exactly as
+        /// [`JwksCache::refresh_for_unknown_kid`] is, and for a sharper reason:
+        /// `POST /auth/token` is **unauthenticated**, so without the floor an
+        /// attacker needs no valid JWT and no invented `kid` at all — once a
+        /// refresh fails (or on a cold cache) `fetched_at` stays unset, every
+        /// subsequent request performs a fresh outbound fetch, and plain POSTs
+        /// drive requests at the issuer 1:1 while serialising every legitimate
+        /// CI exchange behind this mutex for up to `FETCH_TIMEOUT` each.
+        ///
         /// # Errors
         ///
         /// Returns [`OidcError::Jwks`] only when there is *no* usable cached
@@ -401,6 +412,26 @@ mod cache {
                 if let Some(keys) = state.keys.as_ref() {
                     return Ok(Arc::clone(keys));
                 }
+            }
+            // Keyed on `last_attempt`, not `fetched_at`, so a *failing* issuer
+            // is bounded too: the failure case is precisely the one that would
+            // otherwise refetch on every request forever.
+            if state
+                .last_attempt
+                .is_some_and(|at| at.elapsed() < self.min_refetch)
+            {
+                return match state.keys.as_ref() {
+                    Some(keys) => {
+                        tracing::debug!("serving a stale JWKS: refetch is rate-limited");
+                        Ok(Arc::clone(keys))
+                    }
+                    // No keys and inside the floor: refuse cheaply rather than
+                    // dial the issuer again. The caller turns this into the
+                    // same flat 401 every other verification failure gets.
+                    None => Err(OidcError::Jwks(
+                        "no cached key set; refetch is rate-limited".to_owned(),
+                    )),
+                };
             }
             match self.fetch(&mut state).await {
                 Ok(keys) => Ok(keys),

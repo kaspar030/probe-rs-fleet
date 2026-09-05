@@ -1208,7 +1208,10 @@ token. The grant's id is deterministic (`ci-<key hash prefix>`), so a multi-use
 key redeemed by twenty runners upserts one row, one grant and one concurrency
 budget; the `ci-` prefix is a namespace no human-created grant id can occupy,
 since those are 32 random hex characters, which keeps `grant revoke <prefix>`
-unambiguous between the two.
+unambiguous between the two. That verb accepts the `ci-` spelling explicitly
+(`ci-` plus at least 8 hex characters) — `grant list` prints these ids, and a
+listing whose ids its own revoke verb rejects would be a dead end. Revoking the
+**key** does the same teardown and more, since it takes the credential with it.
 
 Stated plainly: this is a **long-lived bearer secret sitting in somebody else's
 CI configuration**, usable by anyone who reads that configuration or a leaked

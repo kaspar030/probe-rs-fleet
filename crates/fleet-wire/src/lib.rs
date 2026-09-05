@@ -320,7 +320,8 @@ pub enum SidecarToCoord {
     GrantList,
     /// Revoke a grant by id prefix (`grant revoke <id>`). Creator or admin.
     GrantRevoke {
-        /// The grant id, or a prefix of at least 8 hex characters.
+        /// The grant id, or a prefix of at least 8 hex characters (or `ci-`
+    /// followed by 8, for the grant a CI auth key synthesised).
         id: String,
     },
     /// Lease a board as yourself and hand back only its capability token, for

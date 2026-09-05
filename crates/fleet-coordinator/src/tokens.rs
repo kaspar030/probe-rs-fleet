@@ -244,4 +244,78 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
+
+    /// Migration 0007's reserved row must not collide with a **slug** a real
+    /// login could already have produced.
+    ///
+    /// `org.slug` is `NOT NULL UNIQUE` and the insert's `ON CONFLICT` names only
+    /// the id, so a pre-existing `org(id = 'gh-<n>', slug = 'gha')` — which
+    /// `unique_personal_slug` produces for a user whose GitHub login is `gha` —
+    /// would abort the migration and leave the coordinator refusing to start
+    /// after an upgrade. The reserved slug is therefore `system:gha`, which no
+    /// login can yield because the sanitiser maps everything outside
+    /// `[a-z0-9_-]` to `-`.
+    #[tokio::test]
+    async fn the_reserved_row_survives_a_pre_existing_gha_slug() {
+        // A connection with 0001..0006 applied but not 0007 is not expressible
+        // through `Db`, so the collision is staged against the finished schema
+        // and the reserved row's own statement is replayed — which is exactly
+        // what running the migration over such a database would do.
+        let db = Db::connect_in_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO org (id, slug, kind, created_at) VALUES (?1, 'gha', 'personal', 1)",
+        )
+        .bind("gh-42")
+        .execute(db.pool())
+        .await
+        .expect("a user whose login is `gha` may already own that slug");
+
+        sqlx::query(
+            "INSERT INTO org (id, slug, kind, created_at)
+             VALUES ('gha', 'system:gha', 'system', unixepoch())
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .execute(db.pool())
+        .await
+        .expect("the reserved row must not collide with an existing `gha` slug");
+
+        // Both rows coexist, and the reserved one still holds the `gha` *id*
+        // the audit-log foreign key needs.
+        let (kind,): (String,) = sqlx::query_as("SELECT kind FROM org WHERE id = 'gha'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(kind, "system");
+        let (slug,): (String,) = sqlx::query_as("SELECT slug FROM org WHERE id = 'gh-42'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(slug, "gha", "the pre-existing row is untouched");
+    }
+
+    /// The sanitiser cannot produce the reserved slug from any login, which is
+    /// what makes the collision above unrepresentable rather than merely
+    /// unlikely: `:` is not in the allowed set, so every candidate it builds is
+    /// `:`-free.
+    #[tokio::test]
+    async fn no_login_can_produce_the_reserved_slug() {
+        let db = Db::connect_in_memory().await.unwrap();
+        for (i, login) in ["system:gha", "system gha", "SYSTEM:GHA", "gha", "system-gha"]
+            .into_iter()
+            .enumerate()
+        {
+            let gh_id = 1000 + i64::try_from(i).unwrap();
+            let (_user, org, _created) = db
+                .upsert_github_user(gh_id, login, None, 1_000)
+                .await
+                .unwrap();
+            let (slug,): (String,) = sqlx::query_as("SELECT slug FROM org WHERE id = ?1")
+                .bind(org.0.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_ne!(slug, "system:gha", "login {login:?} reached the reserved slug");
+            assert!(!slug.contains(':'), "login {login:?} produced {slug:?}");
+        }
+    }
 }

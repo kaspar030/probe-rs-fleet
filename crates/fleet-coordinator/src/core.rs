@@ -1034,10 +1034,26 @@ impl Coordinator {
 
         let prefix = id_prefix.trim().to_ascii_lowercase();
         // Load-bearing, not hygiene: `delete_grants_by_prefix("")` is
-        // `LIKE '%'`, i.e. every grant in the org.
-        if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+        // `LIKE '%'`, i.e. every grant in the org. So a prefix must be long
+        // enough to address a grant on purpose, and drawn from the alphabet
+        // grant ids actually use.
+        //
+        // Two alphabets, because there are two kinds of id. A human-created
+        // grant is 32 random hex characters. A grant synthesised by redeeming
+        // a CI auth key (§6.7) is `ci-<29 hex>` — a reserved namespace no
+        // random id can occupy, which is what keeps the two unambiguous. That
+        // second shape has to be accepted here: `grant list` prints these ids,
+        // and a listing whose ids its own revoke verb rejects is a dead end.
+        // (`auth-key revoke` tears the row down too, as a side effect of
+        // revoking the key; this is the direct route.)
+        let body = prefix.strip_prefix("ci-").unwrap_or(&prefix);
+        // Either way, at least 8 characters of *entropy*: the `ci-` marker
+        // itself distinguishes nothing, so it does not count toward the floor.
+        if body.len() < 8 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
             return Ok(CoordToSidecar::Error {
-                message: "grant id prefix must be at least 8 hex characters".to_owned(),
+                message: "grant id prefix must be at least 8 hex characters \
+                          (or `ci-` followed by 8, for a CI key's grant)"
+                    .to_owned(),
             });
         }
 
