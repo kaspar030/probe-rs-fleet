@@ -938,9 +938,14 @@ revocation verbatim, including the `grant.revoke.denied` audit. Deleting the row
 is not enough — it would leave the grantee relaying bytes until the lease's TTL
 ran out — so revocation recomputes the grantee's access and, for every lease it
 holds on a board it may no longer use, goes through the *whole* release path:
-channels torn down, lease closed and audited, any promoted waiter persisted. It
-also drops the grantee's queued requests, which a scheduler `Waiter`'s access
-snapshot cannot invalidate itself. The honest limit: an already-minted
+channels torn down, lease closed and audited, any promoted waiter persisted. It also
+**refreshes** the grantee's queued requests — a scheduler `Waiter` holds an
+access snapshot that cannot notice a revocation, so the new access is pushed in
+and promotion re-decides per board. Refreshing rather than dropping matters:
+cancelling all of a subject's pending requests would silently kill ones for
+boards in *their own org*, collateral damage across a tenancy boundary suffered
+by someone who did nothing wrong, and would also be wrong for a subject still
+covered by a second overlapping grant. The honest limit: an already-minted
 capability token stays cryptographically valid until it expires; tearing down
 the relay is what makes it useless, since there is no path to the board without
 the coordinator. Delegation has exactly the same bound, which is why lease TTLs
@@ -955,9 +960,21 @@ add later and nobody has asked for it.
 be shared, two boards can answer to `nrf52840-dk-3`. A board acquired by grant
 must never shadow your own hardware for `ctl release` / `ctl power-cycle`, so
 candidates in the caller's own org win outright and ambiguity is reported only
-for a tie *within* the winning tier. The escape hatch is a qualified name —
-`<node>/<name>` or `<org>/<node>/<name>` — which is purely resolver-side, so
-`BoardName` stays an opaque wire string.
+for a tie *within* the winning tier.
+
+The escape hatch is a **qualified name**, and its grammar has one subtlety worth
+recording because getting it wrong made the escape hatch unreachable in the
+first implementation: a node id is **already org-namespaced**
+(`state.rs::node_id_for` builds `AgentId("{org}/{name}")`, so the same machine
+name in two tenants is two nodes), which means a `BoardRef` has *four*
+slash-separated segments, not three. Splitting a typed name into `[org, node,
+name]` therefore cannot address a single real board. Instead the board name is
+the **last** segment and any prefix is matched against the node's short name,
+its full id, or `org/node-id` — the last being the `BoardRef`'s own `Display`,
+so a key pasted out of `ctl list` works verbatim. The grammar lives on
+`BoardRef::answers_to` so the coordinator's resolver and `ctl release`'s lookup
+cannot drift apart. All of it is resolver-side: `BoardName` stays an opaque wire
+string.
 
 **Lease bookkeeping follows the board's org**, not the holder's: a lease on org
 A's hardware belongs in org A's lease table and audit log, whoever is holding

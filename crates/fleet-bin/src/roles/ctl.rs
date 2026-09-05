@@ -226,7 +226,7 @@ impl CtlClient {
         let lease = match session.request(SidecarToCoord::ListBoards).await? {
             CoordToSidecar::BoardList(boards) => boards
                 .into_iter()
-                .find(|b| board_matches(&b.board, &board.0))
+                .find(|b| b.board.answers_to(&board.0))
                 .and_then(|b| b.lease),
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
             other => anyhow::bail!("unexpected reply: {other:?}"),
@@ -402,23 +402,6 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-/// Does a board summary's fleet key answer to what the user typed?
-///
-/// Accepts the bare node-local name, `<node>/<name>`, and the full
-/// `<org>/<node>/<name>` — the same three forms the coordinator's resolver
-/// takes, so `ctl release` can name a board shared with you even when you have
-/// a same-named one of your own.
-fn board_matches(board: &fleet_proto::ids::BoardRef, typed: &str) -> bool {
-    match typed.split('/').collect::<Vec<_>>().as_slice() {
-        [name] => board.name == *name,
-        [node, name] => board.node.0 == *node && board.name == *name,
-        [org, node, name] => {
-            board.org.0 == *org && board.node.0 == *node && board.name == *name
-        }
-        _ => false,
-    }
 }
 
 /// Render the ops carried by a signed capability token, for the delegate

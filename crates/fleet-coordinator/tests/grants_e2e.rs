@@ -484,3 +484,97 @@ async fn the_boards_owner_can_release_a_grantees_lease() {
         other => panic!("the hardware's owner must be able to reclaim it, got {other:?}"),
     }
 }
+
+/// The qualified-name escape hatch, against **production-shaped** node ids.
+///
+/// `state.rs::node_id_for` namespaces node ids by org, so a real `BoardRef` is
+/// `org=gh-1, node="gh-1/rpi-1", name="dk-3"` — four slash-separated segments,
+/// not three. `seed_board` builds exactly that shape. Without a spelling that
+/// works against it, a shared board is unreachable for `ctl release` /
+/// `ctl power-cycle` the moment you own a same-named one, which is the failure
+/// the own-org-wins tiering is only half a fix for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (bob_token, bob_org, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+
+    // Both orgs have a board called `dk-3`. Bob owns one; alice shares hers.
+    let alices = fleet
+        .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
+        .await;
+    let bobs = fleet.seed_board(&bob_org, "lab-pi", "dk-3", &["nrf52"]).await;
+    // The shape this test exists to exercise.
+    assert_eq!(alices.node.0, format!("{}/rpi-1", alice_org.0));
+
+    let alice = fleet.client_session(&alice_token).await;
+    let _ = alice
+        .request(SidecarToCoord::GrantCreate {
+            subject: "bob".to_owned(),
+            selector: "tag=nrf52".to_owned(),
+            ops: vec![AllowedOp::Attach, AllowedOp::PowerCycle],
+            expires: Some(soon(&fleet)),
+        })
+        .await
+        .unwrap();
+
+    let bob = fleet.client_session(&bob_token).await;
+
+    // The bare name resolves to bob's *own* board: a shared board must never
+    // shadow your own hardware.
+    match bob
+        .request(SidecarToCoord::PowerCycle {
+            board: BoardName("dk-3".to_owned()),
+        })
+        .await
+        .unwrap()
+    {
+        // No agent is connected, so this is as far as resolution gets — but the
+        // message names the node, which is what proves *which* board won.
+        CoordToSidecar::Error { message } => assert!(
+            message.contains(&bobs.node.0),
+            "the bare name must resolve to bob's own board, got {message:?}"
+        ),
+        other => panic!("expected the agent-not-connected error, got {other:?}"),
+    }
+
+    // Every qualified spelling reaches alice's board instead — including the
+    // full `BoardRef` rendering a user copies out of `ctl list`.
+    for spelling in [
+        format!("rpi-1/{}", alices.name),                       // node short name
+        format!("{}/{}", alices.node.0, alices.name),           // full node id
+        format!("{}/{}/{}", alices.org.0, alices.node.0, alices.name), // Display
+        alices.to_string(),
+    ] {
+        match bob
+            .request(SidecarToCoord::PowerCycle {
+                board: BoardName(spelling.clone()),
+            })
+            .await
+            .unwrap()
+        {
+            CoordToSidecar::Error { message } => assert!(
+                message.contains(&alices.node.0),
+                "{spelling} should reach alice's board, got {message:?}"
+            ),
+            other => panic!("expected the agent-not-connected error, got {other:?}"),
+        }
+    }
+
+    // A qualified name for a board bob may not reach is still just "not found".
+    let (_carol, carol_org, _) = fleet.seed_github_user(3, "carol", Role::Admin).await;
+    let carols = fleet.seed_board(&carol_org, "rpi-9", "dk-3", &[]).await;
+    match bob
+        .request(SidecarToCoord::PowerCycle {
+            board: BoardName(carols.to_string()),
+        })
+        .await
+        .unwrap()
+    {
+        CoordToSidecar::Error { message } => assert!(
+            message.starts_with("no such board"),
+            "an unreachable board must not be distinguishable, got {message:?}"
+        ),
+        other => panic!("expected no-such-board, got {other:?}"),
+    }
+}

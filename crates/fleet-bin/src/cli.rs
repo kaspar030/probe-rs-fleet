@@ -647,15 +647,21 @@ pub enum CtlCommand {
     },
     /// Release a held board.
     Release {
-        /// Board to release: a node-local name, or `<node>/<name>` /
-        /// `<org>/<node>/<name>` to disambiguate a board shared with you from
-        /// a same-named one of your own.
+        /// Board to release.
+        ///
+        /// A bare node-local name resolves to your own org's board first, so a
+        /// board shared with you never shadows your own hardware. To reach a
+        /// shared one, qualify it: `<node>/<name>`, `<org>/<node>/<name>`, or
+        /// paste the full key `ctl list` prints.
         board: String,
     },
     /// Power-cycle a board.
     PowerCycle {
-        /// Board to power-cycle: a node-local name, or `<node>/<name>` /
-        /// `<org>/<node>/<name>` to reach a board shared with you.
+        /// Board to power-cycle.
+        ///
+        /// As for `release`: a bare name prefers your own org's board; qualify
+        /// it (`<node>/<name>`, `<org>/<node>/<name>`, or the full key from
+        /// `ctl list`) to reach one shared with you.
         board: String,
     },
     /// Show who holds which boards.

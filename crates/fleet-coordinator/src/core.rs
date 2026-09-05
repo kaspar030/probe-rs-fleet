@@ -547,10 +547,14 @@ impl Coordinator {
     /// which is the failure a flat "report the ambiguity" rule would produce
     /// for a bare name with no way to disambiguate.
     ///
-    /// The escape hatch is a **qualified name**: `<node>/<name>` or
-    /// `<org>/<node>/<name>`, which reaches a granted board even when a
-    /// same-named local one exists. It is purely resolver-side — [`BoardName`]
-    /// stays an opaque wire string.
+    /// The escape hatch is a **qualified name**, whose grammar lives on
+    /// [`fleet_proto::ids::BoardRef::answers_to`] so this resolver and
+    /// `ctl release`'s board lookup cannot disagree: the board name is the last
+    /// slash-separated segment, and any prefix is matched against the node's
+    /// short name, its full (org-namespaced) id, or `org/node-id` — the last
+    /// being the `BoardRef`'s own `Display`, so a key copied out of `ctl list`
+    /// works verbatim. Purely resolver-side: [`BoardName`] stays an opaque wire
+    /// string.
     ///
     /// Returns [`BoardLookup::NotFound`] for both an absent board and an
     /// unreachable one — deliberately indistinguishable. `Ambiguous` is
@@ -562,21 +566,10 @@ impl Coordinator {
         name: &BoardName,
         now: u64,
     ) -> BoardLookup {
-        // Split a qualified name. `a/b` is node/name, `a/b/c` is org/node/name.
-        let parts: Vec<&str> = name.0.split('/').collect();
-        let (want_org, want_node, want_name) = match parts.as_slice() {
-            [name] => (None, None, *name),
-            [node, name] => (None, Some(*node), *name),
-            [org, node, name] => (Some(*org), Some(*node), *name),
-            _ => return BoardLookup::NotFound,
-        };
-
         let sched = self.scheduler.lock().await;
         let candidates: Vec<&fleet_proto::board::Board> = sched
             .boards()
-            .filter(|b| b.id.name == want_name)
-            .filter(|b| want_node.is_none_or(|n| b.id.node.0 == n))
-            .filter(|b| want_org.is_none_or(|o| b.id.org.0 == o))
+            .filter(|b| b.id.answers_to(&name.0))
             .filter(|b| access.may_use(b, now))
             .collect();
 
@@ -1065,8 +1058,15 @@ impl Coordinator {
     ///
     /// Recomputes `grantee`'s access from scratch and releases every lease it
     /// holds on a board in `org` that it may no longer use, through the shared
-    /// release tail. Also drops its queued requests, which the scheduler cannot
-    /// invalidate itself (a waiter's access is a snapshot).
+    /// release tail. It also pushes the fresh access into the grantee's queued
+    /// requests, which the scheduler cannot invalidate itself (a waiter's
+    /// access is a snapshot taken when the request was made).
+    ///
+    /// The queued half **refreshes rather than drops**: cancelling all of a
+    /// subject's pending requests would silently kill ones for boards in their
+    /// own org that this revocation has nothing to do with, and would also be
+    /// wrong for a subject still covered by a second, overlapping grant.
+    /// Refreshing lets `promote_one` decide per board, exactly.
     async fn cascade_revocation(&self, grantee: &SubjectKey, org: &OrgId) -> Result<()> {
         let now = self.now();
         // Rebuild the grantee's access. A `Subject` is needed for the lookup;
@@ -1100,12 +1100,15 @@ impl Coordinator {
                 .await?;
         }
 
-        let dropped = {
+        let refreshed = {
             let mut sched = self.scheduler.lock().await;
-            sched.remove_waiters(grantee)
+            sched.refresh_waiter_access(grantee, &access)
         };
-        if dropped > 0 {
-            debug!(subject = %grantee, dropped, "dropped queued requests after revocation");
+        if refreshed > 0 {
+            debug!(
+                subject = %grantee, refreshed,
+                "refreshed queued requests' access after revocation"
+            );
         }
         Ok(())
     }
@@ -1171,8 +1174,22 @@ impl Coordinator {
         };
         if effective.is_empty() {
             // Undo the lease rather than hand back a token that does nothing.
-            let mut sched = self.scheduler.lock().await;
-            let _ = sched.release_lease(granted.lease, &subject.key(), now);
+            //
+            // Through the **shared release tail**, not a bare
+            // `Scheduler::release_lease`: there are awaits between the grant
+            // above and this check, so a waiter can have queued in the window
+            // and be promoted by the release. Dropping that promotion on the
+            // floor would leave it live in memory with no `record_lease` row
+            // and no `lease.promote` audit — precisely the drift factoring the
+            // tail out exists to prevent.
+            self.tear_down_lease(
+                granted.lease,
+                &subject.key(),
+                "delegation refused",
+                "lease.release",
+                subject,
+            )
+            .await?;
             return Ok(CoordToSidecar::Error {
                 message: "you do not hold any of the requested operations on that board".to_owned(),
             });
@@ -1848,14 +1865,28 @@ mod tests {
         Subject::new(org(org_name), SubjectKind::User, id)
     }
 
+    /// A board's fleet key, with a **production-shaped** node id.
+    ///
+    /// `state.rs::node_id_for` namespaces node ids by org, so a real `AgentId`
+    /// is `"{org}/{name}"` and a real `BoardRef` therefore has four
+    /// slash-separated segments. This helper used to build bare ids
+    /// (`"node-a"`), which is exactly why the qualified-name resolution tests
+    /// below passed while the parse they exercised could not address a single
+    /// production board. A fixture that cannot produce production-shaped data
+    /// cannot fail on production-shaped bugs — so it produces it.
     fn board_ref(org_name: &str, agent: &str, name: &str) -> BoardRef {
-        BoardRef::new(org(org_name), AgentId(agent.to_owned()), name)
+        BoardRef::new(org(org_name), node_id(org_name, agent), name)
+    }
+
+    /// The org-namespaced node id `state.rs::node_id_for` would mint.
+    fn node_id(org_name: &str, agent: &str) -> AgentId {
+        AgentId(format!("{org_name}/{agent}"))
     }
 
     fn board(org_name: &str, id: &str, agent: &str) -> Board {
         Board {
             id: board_ref(org_name, agent, id),
-            agent: AgentId(agent.to_owned()),
+            agent: node_id(org_name, agent),
             chip: "nRF52840_xxAA".to_owned(),
             tags: vec!["nrf52".to_owned()],
             exclusive: true,
@@ -1950,7 +1981,7 @@ mod tests {
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
         coord
             .agents()
-            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .insert(node_id(DEFAULT_ORG_ID, "agent-a"), AgentHandle::new(atx))
             .await;
 
         let alice = user(DEFAULT_ORG_ID, "alice");
@@ -2144,7 +2175,7 @@ mod tests {
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
         coord
             .agents()
-            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .insert(node_id(DEFAULT_ORG_ID, "agent-a"), AgentHandle::new(atx))
             .await;
 
         let alice = user(DEFAULT_ORG_ID, "alice");
@@ -2207,7 +2238,7 @@ mod tests {
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
         coord
             .agents()
-            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .insert(node_id(DEFAULT_ORG_ID, "agent-a"), AgentHandle::new(atx))
             .await;
 
         let grant = grant_lease(&coord, &user(DEFAULT_ORG_ID, "alice"), "b1").await;
@@ -2562,7 +2593,7 @@ mod tests {
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
         coord
             .agents()
-            .insert(AgentId("node-a".to_owned()), AgentHandle::new(atx))
+            .insert(node_id("org-a", "node-a"), AgentHandle::new(atx))
             .await;
 
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
@@ -2617,7 +2648,7 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         // Fresh coordinator with NO pre-seeded boards.
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
-        let agent_id = AgentId("agent-a".to_owned());
+        let agent_id = node_id(DEFAULT_ORG_ID, "agent-a");
         // The node row is what resolves the report's org: there is no default-org
         // fallback any more (see `org_and_policy_of_node`).
         coord
@@ -2800,7 +2831,7 @@ mod tests {
                 .scheduler()
                 .lock()
                 .await
-                .board(&board_ref(DEFAULT_ORG_ID, &node.0, "j-link-abc"))
+                .board(&BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-abc"))
                 .is_some();
             assert_eq!(
                 scheduled, expect_scheduled,
@@ -2839,7 +2870,7 @@ mod tests {
             .await
             .unwrap();
         let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
-        let key = board_ref(DEFAULT_ORG_ID, &node.0, "j-link-zzz");
+        let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
 
         // Plugged in.
         coord
@@ -2890,7 +2921,7 @@ mod tests {
             .await
             .unwrap();
         let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
-        let key = board_ref(DEFAULT_ORG_ID, &node.0, "j-link-zzz");
+        let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
 
         coord
             .handle_agent_report(
@@ -2972,7 +3003,7 @@ mod tests {
                     .scheduler()
                     .lock()
                     .await
-                    .board(&board_ref(DEFAULT_ORG_ID, &node.0, "b1"))
+                    .board(&BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "b1"))
                     .is_some(),
                 "a declared board must be scheduled under policy {policy}"
             );
@@ -3078,7 +3109,14 @@ mod tests {
         .await;
         let access = shared_access("org-b", "org-a");
 
-        for spelling in ["node-a/dk", "org-a/node-a/dk"] {
+        // Every qualified spelling, against a production-shaped node id
+        // (`org-a/node-a`) — including the BoardRef's own Display, which is
+        // what a user copies out of `ctl list`.
+        for spelling in [
+            "node-a/dk",
+            "org-a/node-a/dk",
+            "org-a/org-a/node-a/dk",
+        ] {
             assert_eq!(
                 coord
                     .resolve_board(&access, &BoardName(spelling.to_owned()), 1000)
@@ -3120,7 +3158,7 @@ mod tests {
             BoardLookup::Ambiguous(nodes) => {
                 assert_eq!(
                     nodes,
-                    vec![AgentId("node-1".to_owned()), AgentId("node-2".to_owned())],
+                    vec![node_id("org-b", "node-1"), node_id("org-b", "node-2")],
                     "only the caller's own nodes are named"
                 );
             }
@@ -3151,12 +3189,16 @@ mod tests {
     // Revocation cascade
     // ---------------------------------------------------------------------
 
-    /// Revoking a grant drops the grantee's *queued* requests too. A `Waiter`
-    /// carries an `Access` snapshot, which by construction cannot notice a
-    /// revocation, so without this the grantee would be promoted onto the board
-    /// it just lost access to.
+    /// Revoking a grant refreshes the grantee's *queued* requests too. A
+    /// `Waiter` carries an `Access` snapshot, which by construction cannot
+    /// notice a revocation, so without this the grantee would be promoted onto
+    /// the board it just lost access to.
+    ///
+    /// Note the waiter is refreshed, not dropped — `fleet-core` pins the
+    /// difference (a request for the grantee's *own* org must survive); this
+    /// asserts the coordinator actually pushes the new access in.
     #[tokio::test]
-    async fn revocation_drops_the_grantees_queued_requests() {
+    async fn revocation_refreshes_the_grantees_queued_requests() {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,

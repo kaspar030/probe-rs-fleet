@@ -89,6 +89,52 @@ impl BoardRef {
     pub fn board_name(&self) -> BoardName {
         BoardName(self.name.clone())
     }
+
+    /// Does this board answer to what a user typed?
+    ///
+    /// A board is normally named by its bare node-local name, but once boards
+    /// can be **shared** across orgs (§6.5) two boards can answer to
+    /// `nrf52840-dk-3`, so a caller needs a way to say which. This is that
+    /// grammar, and it lives here rather than in either caller because the
+    /// coordinator's resolver and `ctl release`'s board lookup must agree
+    /// exactly — two copies of it drifted once already.
+    ///
+    /// The board name is always the **last** slash-separated segment; anything
+    /// before it is a qualifier, matched against:
+    ///
+    /// * nothing — a bare `dk-3`;
+    /// * the node's short name — `rpi-1/dk-3`;
+    /// * the full node id — `gh-1/rpi-1/dk-3`;
+    /// * org + node id — `gh-1/gh-1/rpi-1/dk-3`, which is this type's own
+    ///   [`std::fmt::Display`], so a key copied out of `ctl list` works verbatim.
+    ///
+    /// # Why counting segments does not work
+    ///
+    /// A production [`AgentId`] is **already org-prefixed** (`gh-1/rpi-1`):
+    /// node ids are namespaced by org so the same machine name in two tenants
+    /// is two nodes. So a `BoardRef` has a variable number of segments, and the
+    /// obvious `split('/')` into `[org, node, name]` cannot address a real
+    /// board at all. Peel the name off the end instead, and compare the
+    /// remainder as a whole.
+    #[must_use]
+    pub fn answers_to(&self, typed: &str) -> bool {
+        let (qualifier, name) = match typed.rsplit_once('/') {
+            Some((qualifier, name)) => (Some(qualifier), name),
+            None => (None, typed),
+        };
+        if self.name != name {
+            return false;
+        }
+        let Some(qualifier) = qualifier else {
+            return true;
+        };
+        // The node's short name: the trailing segment of its id, which is what
+        // the machine calls itself and what `share` / `agent up` were given.
+        let node_short = self.node.0.rsplit('/').next().unwrap_or(&self.node.0);
+        qualifier == self.node.0
+            || qualifier == node_short
+            || qualifier == format!("{}/{}", self.org.0, self.node.0)
+    }
 }
 
 /// Which authentication path produced a [`Subject`].
@@ -398,5 +444,93 @@ mod tests {
             assert_eq!(Role::from_label(role.as_str()), Some(role));
         }
         assert_eq!(Role::from_label("root"), None);
+    }
+
+    /// A production node id is org-prefixed (`state.rs::node_id_for`), so a
+    /// `BoardRef` has **four** slash-separated segments, not three. Every
+    /// spelling below must work against that shape — the bug this pins is that
+    /// counting segments cannot address a real board at all.
+    #[test]
+    fn a_board_answers_to_every_qualified_spelling() {
+        let board = BoardRef::new(
+            OrgId("gh-1".to_owned()),
+            AgentId("gh-1/rpi-1".to_owned()),
+            "dk-3",
+        );
+        for spelling in [
+            "dk-3",                 // bare node-local name
+            "rpi-1/dk-3",           // the node's short name
+            "gh-1/rpi-1/dk-3",      // the full node id
+            "gh-1/gh-1/rpi-1/dk-3", // org + node id: this type's own Display
+        ] {
+            assert!(
+                board.answers_to(spelling),
+                "{spelling} should reach the board"
+            );
+        }
+        // And the Display rendering round-trips by construction.
+        assert!(board.answers_to(&board.to_string()));
+    }
+
+    #[test]
+    fn a_board_refuses_a_qualifier_that_is_not_its_own() {
+        let board = BoardRef::new(
+            OrgId("gh-1".to_owned()),
+            AgentId("gh-1/rpi-1".to_owned()),
+            "dk-3",
+        );
+        for spelling in [
+            "dk-4",                 // wrong board
+            "rpi-2/dk-3",           // wrong node
+            "gh-2/rpi-1/dk-3",      // right node name, wrong org prefix
+            "gh-2/gh-1/rpi-1/dk-3", // wrong org
+            "gh-1/dk-3",            // an org alone does not qualify a board
+            "/dk-3",                // empty qualifier
+            "dk-3/",                // empty name
+            "",
+        ] {
+            assert!(
+                !board.answers_to(spelling),
+                "{spelling} must not reach the board"
+            );
+        }
+    }
+
+    /// The whole reason the qualified form exists: two boards of the same name
+    /// in different orgs must be separable.
+    #[test]
+    fn qualified_names_separate_same_named_boards_in_two_orgs() {
+        let mine = BoardRef::new(
+            OrgId("gh-1".to_owned()),
+            AgentId("gh-1/rpi-1".to_owned()),
+            "dk-3",
+        );
+        let shared = BoardRef::new(
+            OrgId("gh-2".to_owned()),
+            AgentId("gh-2/lab-pi".to_owned()),
+            "dk-3",
+        );
+        // The bare name is ambiguous: both answer to it, which is why the
+        // coordinator tiers own-org first.
+        assert!(mine.answers_to("dk-3") && shared.answers_to("dk-3"));
+        // The qualified forms are not.
+        assert!(shared.answers_to("lab-pi/dk-3"));
+        assert!(!mine.answers_to("lab-pi/dk-3"));
+        assert!(mine.answers_to("rpi-1/dk-3"));
+        assert!(!shared.answers_to("rpi-1/dk-3"));
+    }
+
+    /// A node id with no org prefix (as `boards.toml` fixtures and older rows
+    /// can have) still works, so the grammar is not coupled to the prefix.
+    #[test]
+    fn an_unprefixed_node_id_still_resolves() {
+        let board = BoardRef::new(
+            OrgId("acme".to_owned()),
+            AgentId("rpi-1".to_owned()),
+            "dk-3",
+        );
+        for spelling in ["dk-3", "rpi-1/dk-3", "acme/rpi-1/dk-3"] {
+            assert!(board.answers_to(spelling), "{spelling} should resolve");
+        }
     }
 }

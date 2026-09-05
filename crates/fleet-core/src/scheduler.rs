@@ -149,10 +149,9 @@ struct Waiter {
     /// The requester's access as it stood when the request was queued.
     ///
     /// A snapshot, re-checked against `now` at promotion time so an *expired*
-    /// grant cannot be promoted onto. It does **not** close revocation while
-    /// queued — a revoked grant lives on in the snapshot — which is why the
-    /// coordinator's revocation cascade drops the waiter explicitly (see
-    /// [`Scheduler::remove_waiters`]).
+    /// grant cannot be promoted onto. A snapshot cannot notice a *revocation*,
+    /// so the coordinator's revocation cascade pushes a fresh one in via
+    /// [`Scheduler::refresh_waiter_access`].
     access: Access,
     request: LeaseRequest,
     seq: u64,
@@ -396,15 +395,40 @@ impl Scheduler {
             .collect()
     }
 
-    /// Drop every queued request from `key`, returning how many were removed.
+    /// Replace the [`Access`] snapshot on every queued request from `key`,
+    /// returning how many waiters were refreshed.
     ///
-    /// This is what closes revoke-while-queued: a [`Waiter`] carries an
-    /// [`Access`] *snapshot*, which by construction cannot notice a revocation,
-    /// so the revoking caller removes the waiter instead.
-    pub fn remove_waiters(&mut self, key: &SubjectKey) -> usize {
-        let before = self.queue.len();
-        self.queue.retain(|w| w.holder.key() != *key);
-        before - self.queue.len()
+    /// This is what closes revoke-while-queued. A [`Waiter`] carries a snapshot
+    /// taken when the request was made, which by construction cannot notice a
+    /// later revocation, so the revoking caller pushes the new access in.
+    ///
+    /// # Why refresh rather than drop
+    ///
+    /// Dropping the subject's queued requests outright would be simpler and is
+    /// wrong in two directions:
+    ///
+    /// * it is **too broad** — a grantee's pending request for a board in
+    ///   *their own org* has nothing to do with a grant revoked in someone
+    ///   else's, and cancelling it is collateral damage across a tenancy
+    ///   boundary. Worse, it is silent: the request simply never gets granted,
+    ///   to somebody who did nothing wrong and is not watching;
+    /// * it is **too coarse** — a subject covered by two overlapping grants
+    ///   keeps its access when one is revoked, and should keep its place in the
+    ///   queue with it.
+    ///
+    /// Refreshing handles both exactly rather than approximately: the waiter
+    /// stays, and [`Scheduler::promote_one`] re-checks the new snapshot at
+    /// promotion time, so it is promoted onto precisely the boards the subject
+    /// may still use.
+    pub fn refresh_waiter_access(&mut self, key: &SubjectKey, access: &Access) -> usize {
+        let mut refreshed = 0;
+        for waiter in &mut self.queue {
+            if waiter.holder.key() == *key {
+                waiter.access = access.clone();
+                refreshed += 1;
+            }
+        }
+        refreshed
     }
 
     /// Extend an active lease's expiry to `now + max_duration_for(priority)`.
@@ -1309,10 +1333,11 @@ mod tests {
         );
     }
 
-    /// `remove_waiters` is the revocation half: a snapshot cannot notice a
-    /// revoked grant, so the revoking caller drops the waiter.
+    /// `refresh_waiter_access` is the revocation half: a snapshot cannot notice
+    /// a revoked grant, so the revoking caller pushes a fresh one in and
+    /// promotion re-decides per board.
     #[test]
-    fn remove_waiters_drops_only_that_subjects_queued_requests() {
+    fn refreshing_a_waiters_access_stops_it_being_promoted() {
         let mut s = sched();
         s.upsert_board(tagged_board_in("org-a", "b1", "nrf52"));
         let alice = subject_in("org-a", "alice");
@@ -1325,6 +1350,8 @@ mod tests {
         };
         let carol = subject_in("org-a", "carol");
         let _ = request_as(&mut s, carol.clone(), req(by_board("b1"), 100, Priority::Ci), 0);
+        // Bob queues at the highest priority, so he would win any fair contest
+        // his access still admitted.
         let access = granted("org-b", "org-a", "nrf52", None);
         let _ = s.request_lease(
             bob.clone(),
@@ -1333,14 +1360,123 @@ mod tests {
             0,
         );
 
-        assert_eq!(s.remove_waiters(&bob.key()), 1);
-        assert_eq!(s.remove_waiters(&bob.key()), 0, "idempotent");
+        // Revoked: bob's access is now his own org only.
+        assert_eq!(
+            s.refresh_waiter_access(&bob.key(), &Access::own_org(org("org-b"))),
+            1
+        );
 
         let promoted = s
             .release_lease(g.lease, &alice.key(), 10)
             .expect("holder may release")
             .expect("carol is still queued");
-        assert_eq!(promoted.holder, carol, "the other waiter is untouched");
+        assert_eq!(
+            promoted.holder, carol,
+            "bob is skipped on the board he lost, and the other waiter is untouched"
+        );
+    }
+
+    /// The collateral-damage property: revoking a grant must not cancel the
+    /// subject's pending requests for boards the grant had nothing to do with.
+    ///
+    /// Dropping the waiters outright (the obvious implementation) fails this:
+    /// bob's queued request for his *own org's* board would silently never be
+    /// granted, to somebody who did nothing wrong and is not watching.
+    #[test]
+    fn refreshing_leaves_a_waiters_own_org_request_intact() {
+        let mut s = sched();
+        s.upsert_board(tagged_board_in("org-a", "shared", "nrf52"));
+        s.upsert_board(tagged_board_in("org-b", "mine", "nrf52"));
+        let alice = subject_in("org-a", "alice");
+        let bob_boss = subject_in("org-b", "boss");
+        let bob = subject_in("org-b", "bob");
+
+        // Both boards are busy, so bob queues for each.
+        let LeaseDecision::Granted(shared) =
+            request_as(&mut s, alice.clone(), req(by_board("shared"), 100, Priority::Ci), 0)
+        else {
+            panic!("expected grant");
+        };
+        let LeaseDecision::Granted(mine) =
+            request_as(&mut s, bob_boss.clone(), req(by_board("mine"), 100, Priority::Ci), 0)
+        else {
+            panic!("expected grant");
+        };
+
+        let access = granted("org-b", "org-a", "nrf52", None);
+        let _ = s.request_lease(bob.clone(), &access, req(by_board("shared"), 100, Priority::Ci), 0);
+        let _ = s.request_lease(bob.clone(), &access, req(by_board("mine"), 100, Priority::Ci), 0);
+
+        // Alice revokes her grant. Bob keeps his own org's membership.
+        assert_eq!(
+            s.refresh_waiter_access(&bob.key(), &Access::own_org(org("org-b"))),
+            2,
+            "both of bob's waiters are refreshed, neither is dropped"
+        );
+
+        // The shared board: bob is no longer eligible.
+        assert!(
+            s.release_lease(shared.lease, &alice.key(), 10)
+                .expect("holder may release")
+                .is_none(),
+            "bob must not be promoted onto the board he lost access to"
+        );
+        // His own org's board: still his, still queued, still promoted.
+        let promoted = s
+            .release_lease(mine.lease, &bob_boss.key(), 10)
+            .expect("holder may release")
+            .expect("bob is still queued for his own org's board");
+        assert_eq!(
+            promoted.holder, bob,
+            "revoking a grant in another org must not cancel this request"
+        );
+    }
+
+    /// A subject covered by two overlapping grants keeps its access — and its
+    /// place in the queue — when only one is revoked.
+    #[test]
+    fn a_partially_revoked_grantee_keeps_its_queue_position() {
+        let mut s = sched();
+        s.upsert_board(tagged_board_in("org-a", "b1", "nrf52"));
+        let alice = subject_in("org-a", "alice");
+        let bob = subject_in("org-b", "bob");
+
+        let LeaseDecision::Granted(g) =
+            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+        else {
+            panic!("expected grant");
+        };
+        let both = Access {
+            own_org: Some(org("org-b")),
+            grants: vec![
+                GrantScope {
+                    id: "g1".to_owned(),
+                    org: org("org-a"),
+                    selector: Constraint::Tags(vec!["nrf52".to_owned()]),
+                    ops: vec![AllowedOp::Attach],
+                    expires: None,
+                },
+                GrantScope {
+                    id: "g2".to_owned(),
+                    org: org("org-a"),
+                    selector: Constraint::Board(BoardName("b1".to_owned())),
+                    ops: vec![AllowedOp::Gdb],
+                    expires: None,
+                },
+            ],
+        };
+        let _ = s.request_lease(bob.clone(), &both, req(by_board("b1"), 100, Priority::Ci), 0);
+
+        // g1 is revoked; g2 still covers the board.
+        let mut remaining = both.clone();
+        remaining.grants.retain(|g| g.id == "g2");
+        assert_eq!(s.refresh_waiter_access(&bob.key(), &remaining), 1);
+
+        let promoted = s
+            .release_lease(g.lease, &alice.key(), 10)
+            .expect("holder may release")
+            .expect("the second grant still covers the board");
+        assert_eq!(promoted.holder, bob);
     }
 
     #[test]
