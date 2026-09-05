@@ -381,7 +381,7 @@ pub enum CoordToSidecar {
         /// [`fleet_proto::LeaseGrant::token`].
         ///
         /// Before this field existed the two matched only by coincidence:
-        /// both mints produced `{lease, board, default_allowed_ops(),
+        /// both mints produced `{lease, board, <all ops>,
         /// expires}` and ed25519 signing is deterministic. That coincidence
         /// already broke after an `Extend` (which rewrites the expiry
         /// `open_channel` reads) and breaks by construction once grants

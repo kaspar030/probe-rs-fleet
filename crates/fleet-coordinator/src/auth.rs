@@ -125,20 +125,18 @@ impl TokenVerifier for Ed25519Signer {
     }
 }
 
-/// The default operation set granted by a lease in v1: every operation.
+/// Every operation a board supports.
 ///
-/// Finer-grained scoping (per-request `allowed_ops`) is a future extension; for
-/// now a lease authorises the full set of board operations.
+/// Until architecture §6.5 landed this was the *default* op set a lease minted:
+/// v1 had no attenuation, so every token carried everything. It has no
+/// production caller any more — [`crate::authz::board_access`] computes the ops
+/// from the caller's [`fleet_core::access::Access`] at every mint, and it is
+/// *ownership* that expands to the full set. Kept as the name for "all of
+/// them", and deliberately renamed so nothing reads it as a fallback somebody
+/// still falls back to.
 #[must_use]
-pub fn default_allowed_ops() -> Vec<AllowedOp> {
-    vec![
-        AllowedOp::Flash,
-        AllowedOp::Attach,
-        AllowedOp::Gdb,
-        AllowedOp::Reset,
-        AllowedOp::Erase,
-        AllowedOp::PowerCycle,
-    ]
+pub fn all_allowed_ops() -> Vec<AllowedOp> {
+    AllowedOp::all()
 }
 
 fn hex32(bytes: &[u8; 32]) -> String {
@@ -246,7 +244,7 @@ mod tests {
             holder: Subject::new(OrgId("acme".to_owned()), SubjectKind::User, "alice"),
             expires: 2_000_000_000,
         };
-        let grant = s.grant_to_wire(&granted, default_allowed_ops()).unwrap();
+        let grant = s.grant_to_wire(&granted, all_allowed_ops()).unwrap();
         assert_eq!(grant.lease, granted.lease);
         assert_eq!(grant.board, granted.board);
         assert_eq!(grant.expires, granted.expires);
