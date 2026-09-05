@@ -5,6 +5,7 @@
 //! | `GET /healthz` | anyone | liveness, for the proxy |
 //! | `GET /agent` | nodes | `WebSocket` upgrade → the agent control plane |
 //! | `GET /client` | users, workloads | `WebSocket` upgrade → the sidecar/ctl plane |
+//! | `GET /delegate` | a sandboxed agent | `WebSocket` upgrade → a **crippled** relay-only plane |
 //! | `POST /auth/token` | node enrollment, session refresh | JSON token exchange |
 //! | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys |
 //! | `POST /auth/device/start` | anyone | begin a GitHub device flow |
@@ -125,6 +126,24 @@
 //! and a second minting site in a crate with no membership knowledge is exactly
 //! how tenancy holes appear.
 //!
+//! ## `GET /delegate` constructs none, by design
+//!
+//! The one route that does not go through [`authenticate_request`], and the
+//! reason is architectural rather than convenient: delegating a board to a
+//! sandboxed agent (§6.5) must create **no principal**. The sandbox presents a
+//! hex-encoded **capability token** as its bearer; [`delegate_ws`] verifies the
+//! ed25519 signature with the coordinator's own key, checks expiry, and hands
+//! the decoded token to a relay-only loop with a flat message allowlist
+//! ([`crate::server::handle_delegate`]). No `Subject` is minted, so there is no
+//! identity to escalate, to enumerate the fleet with, or to leave behind when
+//! the lease ends.
+//!
+//! `authenticate_request` could not serve this route even if we wanted it to:
+//! it only knows `prfn1_`/`prfs1_` opaque tokens, and its entire output is a
+//! `Subject`. The two credential types are kept apart in both directions — a
+//! capability token offered on `/client` is rejected, and a session token
+//! offered on `/delegate` is too, both with the same flat `401`.
+//!
 //! # Auditing rejections without an oracle
 //!
 //! Two rules pull against each other and are resolved deliberately:
@@ -174,6 +193,7 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         .route("/healthz", get(healthz))
         .route("/agent", get(agent_ws))
         .route("/client", get(client_ws))
+        .route("/delegate", get(delegate_ws))
         .route("/auth/token", post(auth_token))
         .route("/auth/keys", post(auth_keys))
         .route("/auth/device/start", post(auth_device_start))
@@ -365,6 +385,93 @@ async fn client_ws(
                 }
             }
         })
+}
+
+/// `GET /delegate` — a sandboxed agent holding nothing but a capability token.
+///
+/// The one authenticated route that mints **no [`Subject`]** (see the module
+/// docs). The bearer is the hex-encoded wire form of a
+/// [`fleet_proto::token::SignedToken`]; the coordinator verifies the signature
+/// with its own key — it minted the token, so no new key material is involved
+/// — and checks expiry. Everything else the connection may do is enforced by
+/// [`crate::server::handle_delegate`]'s message allowlist.
+///
+/// Every failure is the same flat `401`: a caller learns its token did not
+/// work, never why. The reason is logged, not returned. There is no audit row,
+/// for the reason the module docs give — a rejected token has no resolvable
+/// org, and `audit_log.org_id` is `NOT NULL` on purpose.
+async fn delegate_ws(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    use fleet_proto::token::{SignedToken, TokenVerifier as _};
+
+    let bearer = bearer_of(&headers).unwrap_or("");
+    let Some(wire) = decode_hex(bearer) else {
+        debug!("delegate: bearer is not a hex capability token");
+        return reject(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    let Ok(signed) = SignedToken::from_wire(&wire) else {
+        debug!("delegate: bearer is too short to be a signed token");
+        return reject(StatusCode::UNAUTHORIZED, "unauthorized");
+    };
+    let token = match coord.signer().verify(&signed) {
+        Ok(token) => token,
+        Err(e) => {
+            debug!(error = %e, "delegate: token did not verify");
+            return reject(StatusCode::UNAUTHORIZED, "unauthorized");
+        }
+    };
+    if !token.is_valid_at(coord.now()) {
+        debug!(lease = ?token.lease, "delegate: token expired");
+        return reject(StatusCode::UNAUTHORIZED, "unauthorized");
+    }
+    // The lease must still be live. Revocation of a delegation *is* releasing
+    // the lease, so this check is what makes that revocation immediate rather
+    // than "once the token expires".
+    {
+        let sched = coord.scheduler().lock().await;
+        if sched.lease_holder(token.lease).is_none() {
+            debug!(lease = ?token.lease, "delegate: lease is no longer live");
+            return reject(StatusCode::UNAUTHORIZED, "unauthorized");
+        }
+    }
+    debug!(lease = ?token.lease, board = %token.board, "delegated connection");
+
+    ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
+        .max_frame_size(fleet_wire::MAX_FRAME_LEN)
+        .on_upgrade(move |socket| async move {
+            let (tx, rx) = crate::ws_axum::split(socket);
+            if let Err(e) =
+                crate::server::handle_delegate(coord, Box::new(tx), Box::new(rx), token).await
+            {
+                if fleet_wire::is_benign_close(&e.as_wire()) {
+                    tracing::trace!("delegated connection closed by peer");
+                } else {
+                    debug!(error = %e, "delegated connection closed");
+                }
+            }
+        })
+}
+
+/// Decode a lowercase/uppercase hex string into bytes.
+///
+/// Local rather than a dependency: the only hex the coordinator decodes is a
+/// delegated capability token.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(u8::try_from(hi * 16 + lo).ok()?);
+    }
+    Some(out)
 }
 
 /// `POST /auth/token` — the JSON token exchange.

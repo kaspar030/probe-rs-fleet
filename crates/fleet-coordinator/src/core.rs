@@ -1579,6 +1579,149 @@ impl Coordinator {
         }
     }
 
+    /// Open a relay channel on behalf of a **delegated** connection.
+    ///
+    /// The caller has no [`Subject`] — that is the point of §6.5's delegation
+    /// — so authorization comes entirely from the capability token, which the
+    /// route already verified:
+    ///
+    /// 1. the lease it names must still be live and still target the board it
+    ///    names (a token outlives neither);
+    /// 2. the ops minted are `token.allowed_ops` ∩ the *holder's* current
+    ///    effective ops, recomputed now — so revoking the delegator's grant
+    ///    also narrows what the sandbox it handed a token to can do.
+    ///
+    /// The audit line lands in the **board's** org, which is known from the
+    /// token, so there is no nullable-org audit problem on this path.
+    pub(crate) async fn open_delegated_channel(
+        &self,
+        token: &fleet_proto::token::CapabilityToken,
+        kind: fleet_proto::ChannelKind,
+        sidecar_tx: mpsc::Sender<CoordToSidecar>,
+    ) -> Result<CoordToSidecar> {
+        let refused = || CoordToSidecar::Error {
+            message: AuthzError::lease_message(),
+        };
+
+        let now = self.now();
+        let (holder, board, agent_id, expires) = {
+            let sched = self.scheduler.lock().await;
+            let Some(holder) = sched.lease_holder(token.lease).cloned() else {
+                return Ok(refused());
+            };
+            let Some((board, agent_id)) = sched.lease_target(token.lease) else {
+                return Ok(refused());
+            };
+            let (board, agent_id) = (board.clone(), agent_id.clone());
+            let expires = sched
+                .board(&board)
+                .and_then(|b| match &b.state {
+                    BoardState::Leased { expires, .. } => Some(*expires),
+                    _ => None,
+                })
+                .unwrap_or(now);
+            (holder, board, agent_id, expires)
+        };
+
+        // The lease must still be on the board the token names. Boards can be
+        // removed and lease ids reused across restarts; a token must not
+        // silently follow.
+        if board != token.board {
+            return Ok(refused());
+        }
+
+        // Attenuate to the intersection: never more than the token says, and
+        // never more than the delegator currently holds.
+        let holder_access = authz::board_access(&self.db, &holder, now).await;
+        let ops: Vec<fleet_proto::token::AllowedOp> = {
+            let sched = self.scheduler.lock().await;
+            match sched.board(&board) {
+                Some(b) => {
+                    let mine = holder_access.effective_ops(b, now);
+                    token
+                        .allowed_ops
+                        .iter()
+                        .copied()
+                        .filter(|o| mine.contains(o))
+                        .collect()
+                }
+                None => Vec::new(),
+            }
+        };
+        if ops.is_empty() {
+            return Ok(refused());
+        }
+
+        let Some(agent) = self.agents.get(&agent_id).await else {
+            return Ok(CoordToSidecar::Error {
+                message: format!("agent {agent_id} not connected"),
+            });
+        };
+
+        let fresh = fleet_proto::token::CapabilityToken {
+            lease: token.lease,
+            board: board.clone(),
+            allowed_ops: ops,
+            expires,
+        };
+        let wire = self.signer.sign_to_wire(&fresh)?;
+
+        let channel = relay::open_channel(
+            &self.channels,
+            &agent,
+            agent_id,
+            sidecar_tx,
+            relay::OpenRequest {
+                lease: token.lease,
+                board: board.clone(),
+                token: wire.clone(),
+                kind,
+            },
+        )
+        .await?;
+
+        self.audit(
+            &board.org,
+            "delegate.channel.open",
+            // No subject: a delegated connection is not a principal. The lease
+            // and board identify it, and the lease names its holder.
+            None,
+            Some(&board.node.0),
+            Some(&board.name),
+            Some(token.lease),
+            Some(&format!("{channel:?}; delegated by {}", holder.key())),
+        )
+        .await?;
+
+        Ok(CoordToSidecar::ChannelOpened {
+            channel,
+            token: wire,
+        })
+    }
+
+    /// Relay a data frame from a delegated connection, refusing any channel not
+    /// belonging to the token's lease.
+    pub(crate) async fn relay_delegated(&self, lease: LeaseId, frame: fleet_proto::DataFrame) {
+        match self.channels.get(frame.channel).await {
+            Some(route) if route.lease == lease => {}
+            _ => return,
+        }
+        self.relay_from_sidecar(frame).await;
+    }
+
+    /// Close a channel from a delegated connection, refusing any channel not
+    /// belonging to the token's lease.
+    pub(crate) async fn close_delegated_channel(&self, lease: LeaseId, channel: fleet_proto::ChannelId) {
+        let Some(route) = self.channels.get(channel).await else {
+            return;
+        };
+        if route.lease != lease {
+            return;
+        }
+        let agent = self.agents.get(&route.agent).await;
+        relay::close_channel(&self.channels, agent.as_ref(), channel).await;
+    }
+
     /// Forward an agent data frame to the owning sidecar.
     ///
     /// # Errors

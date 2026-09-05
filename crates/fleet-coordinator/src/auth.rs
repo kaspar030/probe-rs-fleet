@@ -17,7 +17,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use fleet_core::scheduler::GrantedLease;
 use fleet_proto::lease::LeaseGrant;
 use fleet_proto::token::{
-    AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner,
+    AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner, TokenVerifier,
 };
 
 /// Signs capability tokens with the coordinator's ed25519 private key.
@@ -103,6 +103,25 @@ impl TokenSigner for Ed25519Signer {
             token_bytes,
             signature,
         })
+    }
+}
+
+/// The coordinator can verify the tokens it minted.
+///
+/// Normally only the agent verifies (it holds the public key and nothing else),
+/// which is the point of §6.3. The coordinator needs it for exactly one route:
+/// `GET /delegate`, where a sandboxed agent presents a capability token as its
+/// *only* credential. Deriving the verifying key from the signing key it
+/// already holds means no new key material and no new configuration.
+impl TokenVerifier for Ed25519Signer {
+    fn verify(&self, signed: &SignedToken) -> Result<CapabilityToken, TokenError> {
+        use ed25519_dalek::Verifier as _;
+        let sig = ed25519_dalek::Signature::from_bytes(&signed.signature);
+        self.key
+            .verifying_key()
+            .verify(&signed.token_bytes, &sig)
+            .map_err(|_| TokenError::BadSignature)?;
+        signed.decode_token()
     }
 }
 
@@ -240,6 +259,23 @@ mod tests {
         assert!(tok.allows(AllowedOp::Flash));
         assert!(tok.is_valid_at(granted.expires - 1));
         assert!(!tok.is_valid_at(granted.expires));
+    }
+
+    #[test]
+    fn the_signer_verifies_its_own_tokens_and_rejects_others() {
+        let s = signer();
+        let signed = s.sign(&token()).unwrap();
+        assert_eq!(s.verify(&signed).unwrap(), token());
+
+        // Another key's token does not verify — which is what makes `/delegate`
+        // safe to authenticate with nothing but a capability token.
+        let other = Ed25519Signer::from_seed(&[7u8; 32]);
+        let foreign = other.sign(&token()).unwrap();
+        assert_eq!(s.verify(&foreign).unwrap_err(), TokenError::BadSignature);
+
+        let mut tampered = signed.clone();
+        tampered.token_bytes[0] ^= 0xff;
+        assert_eq!(s.verify(&tampered).unwrap_err(), TokenError::BadSignature);
     }
 
     #[test]

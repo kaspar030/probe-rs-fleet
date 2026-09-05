@@ -371,6 +371,118 @@ async fn complete_rotation(
 ///
 /// Returns a [`CoordinatorError`] when the connection ends.
 pub async fn handle_sidecar(coord: Arc<Coordinator>, tx: BoxTx, rx: BoxRx, subject: Subject) -> Result<()> {
+    let (out_tx, ping_tx, writer_task) = spawn_sidecar_writer(tx);
+
+    let result = sidecar_pump(&coord, rx, &out_tx, &ping_tx, |msg| {
+        let coord = &coord;
+        let subject = &subject;
+        let out_tx = &out_tx;
+        async move { coord.handle_sidecar_message(subject, msg, out_tx).await }
+    })
+    .await;
+
+    // Release any leases this sidecar still held, then drop its channels.
+    coord.drop_sidecar(&subject);
+    writer_task.abort();
+    result
+}
+
+/// Drive a **delegated** connection: a sandboxed agent presenting nothing but a
+/// capability token (architecture §6.5).
+///
+/// This route is deliberately crippled. It shares the writer task, the
+/// handshake and the keepalive with [`handle_sidecar`] — factored, not copied,
+/// because a loop without ping/pong either leaks connections or dies at the
+/// first pong timeout — but its message handling is a flat **allowlist**:
+///
+/// * `OpenChannel`, only for the token's own lease;
+/// * `Data` and `CloseChannel`, on channels that lease owns;
+///
+/// and nothing else. In particular there is no `Lease`, no `Extend`, no
+/// `Release` (the delegator owns the lease lifecycle; the sandbox's only
+/// lease-affecting power is letting it expire), no `ListBoards`/`Who`/`Logs`
+/// (the sandbox cannot enumerate the fleet) and no grant verbs.
+///
+/// **No [`Subject`] is constructed anywhere on this path.** That is the design
+/// point, not an implementation detail: delegation creates no principal, so
+/// there is no identity to escalate, to enumerate with, or to leave behind when
+/// the lease ends.
+///
+/// # Errors
+///
+/// Returns a [`CoordinatorError`] when the connection ends.
+pub async fn handle_delegate(
+    coord: Arc<Coordinator>,
+    tx: BoxTx,
+    rx: BoxRx,
+    token: fleet_proto::token::CapabilityToken,
+) -> Result<()> {
+    let (out_tx, ping_tx, writer_task) = spawn_sidecar_writer(tx);
+
+    let result = sidecar_pump(&coord, rx, &out_tx, &ping_tx, |msg| {
+        let coord = &coord;
+        let token = &token;
+        let out_tx = &out_tx;
+        async move { handle_delegate_message(coord, token, msg, out_tx).await }
+    })
+    .await;
+
+    writer_task.abort();
+    result
+}
+
+/// The `/delegate` allowlist. Anything not named here is a flat error.
+async fn handle_delegate_message(
+    coord: &Coordinator,
+    token: &fleet_proto::token::CapabilityToken,
+    msg: SidecarToCoord,
+    out_tx: &mpsc::Sender<CoordToSidecar>,
+) -> Result<()> {
+    match msg {
+        SidecarToCoord::OpenChannel { lease, kind } => {
+            // The token authorises exactly one lease. Checked here rather than
+            // trusted from the request, so a sandbox cannot walk lease ids.
+            if lease != token.lease {
+                let _ = out_tx
+                    .send(CoordToSidecar::Error {
+                        message: "this token does not authorise that lease".to_owned(),
+                    })
+                    .await;
+                return Ok(());
+            }
+            let reply = coord
+                .open_delegated_channel(token, kind, out_tx.clone())
+                .await?;
+            let _ = out_tx.send(reply).await;
+        }
+        SidecarToCoord::Data(frame) => {
+            coord.relay_delegated(token.lease, frame).await;
+        }
+        SidecarToCoord::CloseChannel { channel } => {
+            coord.close_delegated_channel(token.lease, channel).await;
+        }
+        other => {
+            debug!(?other, lease = ?token.lease, "refused on the delegate route");
+            let _ = out_tx
+                .send(CoordToSidecar::Error {
+                    message: "not permitted on a delegated connection".to_owned(),
+                })
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Spawn the writer task both sidecar-direction routes share.
+///
+/// Returns the message sender, the ping trigger, and the task handle.
+fn spawn_sidecar_writer(
+    tx: BoxTx,
+) -> (
+    mpsc::Sender<CoordToSidecar>,
+    mpsc::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let (out_tx, mut out_rx) = mpsc::channel::<CoordToSidecar>(64);
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
 
@@ -394,21 +506,28 @@ pub async fn handle_sidecar(coord: Arc<Coordinator>, tx: BoxTx, rx: BoxRx, subje
         let _ = tx.close().await;
     });
 
-    let result = sidecar_read_loop(&coord, rx, &subject, &out_tx, &ping_tx).await;
-
-    // Release any leases this sidecar still held, then drop its channels.
-    coord.drop_sidecar(&subject);
-    writer_task.abort();
-    result
+    (out_tx, ping_tx, writer_task)
 }
 
-async fn sidecar_read_loop(
+/// Handshake, then read messages until the connection ends, handing each to
+/// `handle` — with the keepalive contract every sidecar-direction route must
+/// honour.
+///
+/// Shared rather than copied precisely because of that keepalive: a reverse
+/// proxy in front reaps idle `WebSocket`s on a timeout we do not control, so a
+/// route that forgets to ping (or to notice a missing pong) either leaks
+/// connections or dies mid-session.
+async fn sidecar_pump<F, Fut>(
     coord: &Coordinator,
     mut rx: BoxRx,
-    subject: &Subject,
     out_tx: &mpsc::Sender<CoordToSidecar>,
     ping_tx: &mpsc::Sender<()>,
-) -> Result<()> {
+    mut handle: F,
+) -> Result<()>
+where
+    F: FnMut(SidecarToCoord) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     // Expect a Hello first.
     let hello: SidecarToCoord = fleet_wire::recv(&mut *rx).await?;
     match hello {
@@ -454,7 +573,7 @@ async fn sidecar_read_loop(
                     WireEvent::Closed => return Err(CoordinatorError::Wire(WireError::Closed)),
                     WireEvent::Binary(bytes) => {
                         let msg: SidecarToCoord = fleet_wire::decode(&bytes)?;
-                        coord.handle_sidecar_message(subject, msg, out_tx).await?;
+                        handle(msg).await?;
                     }
                 }
             }
