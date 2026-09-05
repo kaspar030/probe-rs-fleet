@@ -27,10 +27,11 @@
 //! `axum` adapter lives in `fleet-coordinator`; the `tokio-tungstenite` one
 //! lives here behind the `tungstenite` feature.
 
-use fleet_proto::admin::{BoardSummary, LeaseHolderSummary, LogLine};
+use fleet_proto::admin::{BoardSummary, GrantSummary, LeaseHolderSummary, LogLine};
 use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
 use fleet_proto::ids::BoardName;
-use fleet_proto::lease::{LeaseGrant, LeaseRequest};
+use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest};
+use fleet_proto::token::AllowedOp;
 use fleet_proto::{ChannelId, ChannelKind, DataFrame, LeaseId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -296,9 +297,46 @@ pub enum SidecarToCoord {
     /// Operator: power-cycle a board (`ctl power-cycle`).
     PowerCycle {
         /// The board to power-cycle, by node-local name. The coordinator
-        /// resolves it to a fleet key **within the caller's org**, so a board
-        /// in another org is reported exactly as an absent one.
+        /// resolves it to a fleet key **among the boards the caller may
+        /// reach** — their own org's first, then any a grant covers — so an
+        /// unreachable board is reported exactly as an absent one.
         board: BoardName,
+    },
+    /// Share a subset of this org's boards with another subject
+    /// (`grant <subject> --select … --ops …`). Admin-gated.
+    GrantCreate {
+        /// The grantee: a GitHub login, a bare `gh-<id>`, or a rendered
+        /// `SubjectKey`. Resolved to an immutable user id coordinator-side.
+        subject: String,
+        /// The canonical selector string (see `Constraint`'s `Display`).
+        selector: String,
+        /// The operations conferred.
+        ops: Vec<AllowedOp>,
+        /// Expiry, epoch seconds. The `/client` path refuses `None`: an
+        /// unbounded grant of someone else's hardware outlives its reason.
+        expires: Option<u64>,
+    },
+    /// List this org's outbound grants (`grant list`). Membership suffices.
+    GrantList,
+    /// Revoke a grant by id prefix (`grant revoke <id>`). Creator or admin.
+    GrantRevoke {
+        /// The grant id, or a prefix of at least 8 hex characters.
+        id: String,
+    },
+    /// Lease a board as yourself and hand back only its capability token, for
+    /// a sandboxed agent (`ctl delegate`).
+    ///
+    /// Deliberately **not** a grant: it creates no principal and no fleet
+    /// identity. Replies with the ordinary [`CoordToSidecar::Lease`] /
+    /// [`CoordToSidecar::Queued`] / [`CoordToSidecar::Error`].
+    Delegate {
+        /// Which board to lease.
+        select: Constraint,
+        /// Requested hold duration in seconds.
+        duration_secs: u64,
+        /// Ops to attenuate the handed-out token to, intersected with what the
+        /// delegator may actually do.
+        ops: Vec<AllowedOp>,
     },
 }
 
@@ -373,6 +411,15 @@ pub enum CoordToSidecar {
     Error {
         /// Human-readable error description.
         message: String,
+    },
+    /// A grant was created (reply to [`SidecarToCoord::GrantCreate`]).
+    GrantCreated(GrantSummary),
+    /// This org's outbound grants (reply to [`SidecarToCoord::GrantList`]).
+    Grants(Vec<GrantSummary>),
+    /// Grants were revoked (reply to [`SidecarToCoord::GrantRevoke`]).
+    GrantRevoked {
+        /// The ids deleted.
+        ids: Vec<String>,
     },
 }
 
@@ -458,7 +505,7 @@ mod tests {
     use super::*;
     use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
     use fleet_proto::ids::{AgentId, BoardRef, OrgId};
-    use fleet_proto::lease::{Constraint, Priority};
+    use fleet_proto::lease::Priority;
 
     fn test_board_ref() -> BoardRef {
         BoardRef::new(OrgId("default".to_owned()), AgentId("agent-a".to_owned()), "b1")

@@ -13,6 +13,7 @@ pub mod paths;
 pub mod roles;
 pub mod secrets;
 pub mod signal;
+pub mod timearg;
 
 /// Test-only support shared across modules.
 #[cfg(test)]

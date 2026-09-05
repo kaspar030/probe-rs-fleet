@@ -12,9 +12,11 @@
 //! trust configuration (`fleet_tls::client_trust_config`), and one session type.
 
 use anyhow::{Context, Result};
+use std::process::ExitCode;
 
 use fleet_proto::ids::BoardName;
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use fleet_proto::token::AllowedOp;
 use fleet_sidecar::transport::CoordSession;
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
@@ -142,7 +144,14 @@ impl CtlClient {
     }
 
     /// Open a `/client` session, presenting the bearer token on the upgrade.
-    async fn connect(&self) -> Result<CoordSession> {
+    ///
+    /// Public because `roles::grant` speaks the same route with the same
+    /// credentials — one dial path, per this module's note above.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection or the Hello handshake fails.
+    pub async fn connect_session(&self) -> Result<CoordSession> {
         let cfg = fleet_sidecar::selector::FleetConfig {
             coordinator: self.conn.fleet_url.clone(),
             token: self.conn.token.clone(),
@@ -158,7 +167,7 @@ impl CtlClient {
 
     /// `ctl list` — fleet inventory.
     async fn list(&self) -> Result<()> {
-        let session = self.connect().await?;
+        let session = self.connect_session().await?;
         match session.request(SidecarToCoord::ListBoards).await? {
             CoordToSidecar::BoardList(boards) => {
                 if boards.is_empty() {
@@ -189,7 +198,7 @@ impl CtlClient {
 
     /// `ctl lease <selector> [--duration]`.
     async fn lease(&self, request: &LeaseRequest) -> Result<()> {
-        let session = self.connect().await?;
+        let session = self.connect_session().await?;
         match session
             .request(SidecarToCoord::Lease(request.clone()))
             .await?
@@ -213,11 +222,11 @@ impl CtlClient {
     /// `ctl release <board>`.
     async fn release(&self, board: &BoardName) -> Result<()> {
         // Resolve the lease holding `board` via the board list, then release it.
-        let session = self.connect().await?;
+        let session = self.connect_session().await?;
         let lease = match session.request(SidecarToCoord::ListBoards).await? {
             CoordToSidecar::BoardList(boards) => boards
                 .into_iter()
-                .find(|b| b.board.name == board.0)
+                .find(|b| board_matches(&b.board, &board.0))
                 .and_then(|b| b.lease),
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
             other => anyhow::bail!("unexpected reply: {other:?}"),
@@ -235,9 +244,57 @@ impl CtlClient {
         }
     }
 
+    /// `ctl delegate --select … --ops … --ttl …`.
+    ///
+    /// Prints **only** the capability token and the two environment variables a
+    /// sandbox needs. No session token, no fleet file, nothing that would give
+    /// the sandbox a fleet identity — that is the whole design point of
+    /// delegation (architecture §6.5).
+    ///
+    /// Returns the process exit code: a queue slip is a **failure**
+    /// (exit 1, no token). A handoff script must not mistake "contended" for
+    /// "here is your board", and blocking a sandbox-provisioning command on an
+    /// unbounded queue would be worse than failing fast.
+    async fn delegate(
+        &self,
+        select: Constraint,
+        ops: Vec<AllowedOp>,
+        ttl_secs: u64,
+    ) -> Result<ExitCode> {
+        let session = self.connect_session().await?;
+        match session
+            .request(SidecarToCoord::Delegate {
+                select,
+                duration_secs: ttl_secs,
+                ops,
+            })
+            .await?
+        {
+            CoordToSidecar::Lease(grant) => {
+                let token = fleet_sidecar::transport::hex_encode(&grant.token);
+                let ops = decode_token_ops(&grant.token);
+                println!("# board {} (lease {})", grant.board, grant.lease.0);
+                println!("# expires {} (epoch); ops: {ops}", grant.expires);
+                println!("PROBE_RS_FLEET_COORDINATOR={}", self.conn.fleet_url);
+                println!("PROBE_RS_FLEET_CAPABILITY={token}");
+                println!(
+                    "# revoke by releasing the lease: probe-rs-fleet ctl release {}",
+                    grant.board.name
+                );
+                Ok(ExitCode::SUCCESS)
+            }
+            CoordToSidecar::Queued { position } => {
+                eprintln!("board contended; queued at position {position} — no token issued");
+                Ok(ExitCode::FAILURE)
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
+    }
+
     /// `ctl power-cycle <board>`.
     async fn power_cycle(&self, board: &BoardName) -> Result<()> {
-        let session = self.connect().await?;
+        let session = self.connect_session().await?;
         match session
             .request(SidecarToCoord::PowerCycle {
                 board: board.clone(),
@@ -255,7 +312,7 @@ impl CtlClient {
 
     /// `ctl who` — current lease holders.
     async fn who(&self) -> Result<()> {
-        let session = self.connect().await?;
+        let session = self.connect_session().await?;
         match session.request(SidecarToCoord::Who).await? {
             CoordToSidecar::LeaseTable(holders) => {
                 if holders.is_empty() {
@@ -281,7 +338,7 @@ impl CtlClient {
 
     /// `ctl logs [board] [--follow]`.
     async fn logs(&self, board: Option<&BoardName>, follow: bool) -> Result<()> {
-        let session = self.connect().await?;
+        let session = self.connect_session().await?;
         match session
             .request(SidecarToCoord::Logs {
                 board: board.cloned(),
@@ -307,33 +364,75 @@ impl CtlClient {
     }
 }
 
-/// Run a `ctl` command.
+/// Run a `ctl` command, returning the process exit code.
+///
+/// Most verbs succeed or bail; `delegate` is the one that reports a *soft*
+/// failure (the board was contended, so no token was issued) as a non-zero
+/// exit rather than an error, because a handoff script needs to distinguish it.
 ///
 /// # Errors
 ///
 /// Returns an error if the connection config is incomplete or the coordinator
 /// RPC fails.
-pub async fn run(args: CtlArgs) -> Result<()> {
+pub async fn run(args: CtlArgs) -> Result<ExitCode> {
     let conn = CtlConnection::from_args(args.client).await?;
     let client = CtlClient::new(conn);
 
     match args.command {
-        CtlCommand::List => client.list().await,
+        CtlCommand::List => client.list().await?,
         CtlCommand::Lease { selector, duration } => {
             let request = LeaseRequest {
                 select: parse_selector(&selector).map_err(|e| anyhow::anyhow!("{e}"))?,
                 duration_secs: duration,
                 priority: Priority::Interactive,
             };
-            client.lease(&request).await
+            client.lease(&request).await?;
         }
-        CtlCommand::Release { board } => client.release(&BoardName(board)).await,
-        CtlCommand::PowerCycle { board } => client.power_cycle(&BoardName(board)).await,
-        CtlCommand::Who => client.who().await,
+        CtlCommand::Release { board } => client.release(&BoardName(board)).await?,
+        CtlCommand::PowerCycle { board } => client.power_cycle(&BoardName(board)).await?,
+        CtlCommand::Who => client.who().await?,
         CtlCommand::Logs { board, follow } => {
-            client.logs(board.map(BoardName).as_ref(), follow).await
+            client.logs(board.map(BoardName).as_ref(), follow).await?;
+        }
+        CtlCommand::Delegate { select, ops, ttl } => {
+            let select = parse_selector(&select).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let ops = crate::roles::grant::parse_ops_arg(&ops)?;
+            let ttl = crate::timearg::parse_duration(&ttl).map_err(|e| anyhow::anyhow!("{e}"))?;
+            return client.delegate(select, ops, ttl).await;
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Does a board summary's fleet key answer to what the user typed?
+///
+/// Accepts the bare node-local name, `<node>/<name>`, and the full
+/// `<org>/<node>/<name>` — the same three forms the coordinator's resolver
+/// takes, so `ctl release` can name a board shared with you even when you have
+/// a same-named one of your own.
+fn board_matches(board: &fleet_proto::ids::BoardRef, typed: &str) -> bool {
+    match typed.split('/').collect::<Vec<_>>().as_slice() {
+        [name] => board.name == *name,
+        [node, name] => board.node.0 == *node && board.name == *name,
+        [org, node, name] => {
+            board.org.0 == *org && board.node.0 == *node && board.name == *name
+        }
+        _ => false,
+    }
+}
+
+/// Render the ops carried by a signed capability token, for the delegate
+/// output. Decode-only — no signature check, since we just received it from
+/// the coordinator we authenticated to.
+fn decode_token_ops(wire: &[u8]) -> String {
+    let Ok(signed) = fleet_proto::token::SignedToken::from_wire(wire) else {
+        return "unknown".to_owned();
+    };
+    let Ok(token) = signed.decode_token() else {
+        return "unknown".to_owned();
+    };
+    let labels: Vec<&str> = token.allowed_ops.iter().map(|o| o.as_str()).collect();
+    labels.join(",")
 }
 
 #[cfg(test)]

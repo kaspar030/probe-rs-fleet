@@ -492,6 +492,33 @@ impl Coordinator {
                 let reply = self.operator_power_cycle(subject, &board).await?;
                 let _ = tx.send(reply).await;
             }
+            SidecarToCoord::GrantCreate {
+                subject: grantee,
+                selector,
+                ops,
+                expires,
+            } => {
+                let reply = self
+                    .grant_create(subject, &grantee, &selector, ops, expires)
+                    .await?;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::GrantList => {
+                let reply = self.grant_list(subject).await?;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::GrantRevoke { id } => {
+                let reply = self.grant_revoke(subject, &id).await?;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::Delegate {
+                select,
+                duration_secs,
+                ops,
+            } => {
+                let reply = self.delegate(subject, select, duration_secs, ops).await?;
+                let _ = tx.send(reply).await;
+            }
         }
         Ok(())
     }
@@ -747,6 +774,434 @@ impl Coordinator {
         Ok(CoordToSidecar::PowerCycled {
             board: board_ref.board_name(),
         })
+    }
+
+    /// Maximum lifetime of a grant created over the `/client` path.
+    ///
+    /// Mirrors the auth-key TTL cap of §6.4 and for the same reason: an
+    /// unbounded grant of *somebody else's* hardware is exactly the artefact
+    /// that outlives the reason it was created. A perpetual grant remains
+    /// expressible from a shell against the database; it is not a hosted
+    /// member's choice to make.
+    pub const MAX_GRANT_TTL_SECS: u64 = 365 * 24 * 3600;
+
+    /// Create a grant of this org's hardware to another subject.
+    ///
+    /// **Admin-gated**, deliberately diverging from `POST /auth/keys`, where
+    /// membership suffices. The two verbs have different blast radii: an auth
+    /// key cannot exceed the caller's own org (it enrolls a node *into* it),
+    /// while a grant points outward, handing the org's hardware to somebody who
+    /// is not in it at all. In a personal org you are the admin, so the
+    /// single-user story is unchanged.
+    ///
+    /// The grantee is resolved **now**, to an immutable user id, and it is that
+    /// which is stored — never the login. §6.4's rename/reuse takeover is
+    /// otherwise a hole: `grant bob` must mean the account that is `bob` today,
+    /// not whoever holds the name at evaluation time.
+    async fn grant_create(
+        &self,
+        subject: &Subject,
+        grantee: &str,
+        selector: &str,
+        ops: Vec<fleet_proto::token::AllowedOp>,
+        expires: Option<u64>,
+    ) -> Result<CoordToSidecar> {
+        use fleet_proto::lease::{parse_constraint, BareTerm};
+
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Admin)
+            .await
+            .is_err()
+        {
+            return Ok(Self::denied());
+        }
+        let now = self.now();
+
+        // Canonicalise the selector: what is stored is what `Display` produces,
+        // so a grant's meaning never depends on which CLI wrote it. An empty
+        // expression is refused by the parser, which is what stops
+        // `Tags([])` — a match-everything — from ever reaching the table.
+        let selector = match parse_constraint(selector, BareTerm::Tag) {
+            Ok(c) => c.to_string(),
+            Err(e) => {
+                return Ok(CoordToSidecar::Error {
+                    message: format!("invalid selector: {e}"),
+                })
+            }
+        };
+
+        let ops = fleet_proto::token::normalize_ops(ops);
+        if ops.is_empty() {
+            return Ok(CoordToSidecar::Error {
+                message: "a grant must confer at least one operation".to_owned(),
+            });
+        }
+
+        // No perpetual grants over the API, and no absurd ones.
+        let Some(expires) = expires else {
+            return Ok(CoordToSidecar::Error {
+                message: "a grant must expire; pass --until or --ttl".to_owned(),
+            });
+        };
+        if expires <= now || expires.saturating_sub(now) > Self::MAX_GRANT_TTL_SECS {
+            return Ok(CoordToSidecar::Error {
+                message: format!(
+                    "grant expiry must be in the future and within {} days",
+                    Self::MAX_GRANT_TTL_SECS / 86_400
+                ),
+            });
+        }
+
+        let Some(key) = self.resolve_grantee(grantee).await? else {
+            return Ok(CoordToSidecar::Error {
+                message: format!(
+                    "no such user `{grantee}`; ask them to run `probe-rs-fleet login` first"
+                ),
+            });
+        };
+
+        let id = crate::state::new_grant_id();
+        self.db
+            .scoped(org.clone())
+            .insert_grant(
+                &id,
+                &key,
+                &selector,
+                &ops,
+                Some(i64::try_from(expires).unwrap_or(i64::MAX)),
+                Some(subject.id.as_str()),
+                self.now_i64(),
+            )
+            .await?;
+        self.audit(
+            &org,
+            "grant.create",
+            Some(&subject.key().to_string()),
+            None,
+            None,
+            None,
+            Some(&format!("grant {id} to {key}: {selector} ops=[{}]", {
+                let labels: Vec<&str> = ops.iter().map(|o| o.as_str()).collect();
+                labels.join(",")
+            })),
+        )
+        .await?;
+
+        Ok(CoordToSidecar::GrantCreated(fleet_proto::GrantSummary {
+            id,
+            org,
+            subject: key,
+            selector,
+            ops,
+            expires: Some(expires),
+            created_by: Some(subject.id.clone()),
+            created_at: now,
+        }))
+    }
+
+    /// Resolve a grantee spelling to a [`SubjectKey`].
+    ///
+    /// Three accepted forms, narrowing in precision:
+    ///
+    /// * a rendered `SubjectKey` (`gh-2/user:gh-2`) — unambiguous, and the way
+    ///   to name a node or workload subject;
+    /// * a bare `gh-<id>` — a user's immutable id, personal org implied;
+    /// * a GitHub login — looked up in the `user` table and immediately
+    ///   resolved to the immutable id.
+    async fn resolve_grantee(&self, spec: &str) -> Result<Option<SubjectKey>> {
+        if let Some(key) = SubjectKey::parse(spec) {
+            return Ok(Some(key));
+        }
+        if let Some((user, org)) = self.db.user_by_login(spec).await? {
+            return Ok(Some(SubjectKey {
+                org,
+                kind: fleet_proto::ids::SubjectKind::User,
+                id: user,
+            }));
+        }
+        // A bare `gh-<id>`: the user's id is also its personal org's id (§6.4).
+        if spec.starts_with("gh-") {
+            return Ok(Some(SubjectKey {
+                org: OrgId(spec.to_owned()),
+                kind: fleet_proto::ids::SubjectKind::User,
+                id: spec.to_owned(),
+            }));
+        }
+        Ok(None)
+    }
+
+    /// List this org's outbound grants.
+    ///
+    /// **Membership** suffices, unlike creation: this names only grants the org
+    /// itself issued, which every member can already infer from `ctl list` /
+    /// `ctl who`. Note there is deliberately no "what am I granted?" verb for
+    /// the receiving side; `ctl list` is the grantee-facing view.
+    async fn grant_list(&self, subject: &Subject) -> Result<CoordToSidecar> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Ok(Self::denied());
+        }
+        let rows = self.db.scoped(org.clone()).list_grants().await?;
+        let grants = rows
+            .into_iter()
+            .map(|row| fleet_proto::GrantSummary {
+                subject: row.parsed_subject().unwrap_or_else(|| SubjectKey {
+                    org: row.org.clone(),
+                    kind: fleet_proto::ids::SubjectKind::User,
+                    id: row.subject.clone(),
+                }),
+                ops: row.parsed_ops(),
+                id: row.id,
+                org: row.org,
+                selector: row.selector,
+                expires: row.expires.map(|e| u64::try_from(e).unwrap_or(0)),
+                created_by: row.created_by,
+                created_at: u64::try_from(row.created_at).unwrap_or(0),
+            })
+            .collect();
+        Ok(CoordToSidecar::Grants(grants))
+    }
+
+    /// Revoke a grant by id prefix, and make the revocation *real*.
+    ///
+    /// Authorization mirrors auth-key revocation (§6.4/§6.5): the grant's
+    /// **creator** may revoke it, and an **org admin** may revoke any of the
+    /// org's, including rows with no recorded creator which would otherwise be
+    /// unrevokable from here.
+    ///
+    /// # The cascade is the point
+    ///
+    /// Deleting the row alone would leave the grantee holding whatever it had
+    /// already leased, relaying bytes, until the lease's TTL ran out. So after
+    /// the delete this recomputes the grantee's access and, for every lease it
+    /// holds on a board it may no longer use, goes through the *whole* release
+    /// path ([`Coordinator::tear_down_lease`]): channels down, lease closed and
+    /// audited, any promoted waiter persisted. Queued requests are dropped too,
+    /// since a [`fleet_core::access::Access`] snapshot cannot notice a
+    /// revocation.
+    ///
+    /// One honest limit: a capability token already minted stays
+    /// cryptographically valid until it expires. Tearing down the relay is what
+    /// makes it useless — there is no path to the board without the
+    /// coordinator. This is the same bound delegation has, and it is why lease
+    /// TTLs are short.
+    async fn grant_revoke(&self, subject: &Subject, id_prefix: &str) -> Result<CoordToSidecar> {
+        let org = subject.org.clone();
+        // Membership first: a non-member must not be able to probe which
+        // prefixes exist.
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Ok(Self::denied());
+        }
+
+        let prefix = id_prefix.trim().to_ascii_lowercase();
+        // Load-bearing, not hygiene: `delete_grants_by_prefix("")` is
+        // `LIKE '%'`, i.e. every grant in the org.
+        if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(CoordToSidecar::Error {
+                message: "grant id prefix must be at least 8 hex characters".to_owned(),
+            });
+        }
+
+        let scoped = self.db.scoped(org.clone());
+        let all = scoped.list_grants().await?;
+        let matches: Vec<_> = all.iter().filter(|g| g.id.starts_with(&prefix)).collect();
+        let target = match matches.len() {
+            0 => {
+                return Ok(CoordToSidecar::Error {
+                    message: format!("no grant matching {prefix}"),
+                })
+            }
+            1 => matches[0],
+            n => {
+                return Ok(CoordToSidecar::Error {
+                    message: format!("{n} grants match {prefix}; use a longer prefix"),
+                })
+            }
+        };
+
+        let owned = target.created_by.as_deref() == Some(subject.id.as_str());
+        if !owned && !authz::is_org_admin(&self.db, subject).await {
+            self.audit(
+                &org,
+                "grant.revoke.denied",
+                Some(&subject.key().to_string()),
+                None,
+                None,
+                None,
+                Some("neither the grant's creator nor an org admin"),
+            )
+            .await?;
+            return Ok(Self::denied());
+        }
+
+        let grantee = target.parsed_subject();
+        let deleted = scoped.delete_grants_by_prefix(&prefix).await?;
+        let ids: Vec<String> = deleted.iter().map(|g| g.id.clone()).collect();
+        self.audit(
+            &org,
+            "grant.revoke",
+            Some(&subject.key().to_string()),
+            None,
+            None,
+            None,
+            Some(&format!("revoked {}", ids.join(","))),
+        )
+        .await?;
+
+        if let Some(grantee) = grantee {
+            self.cascade_revocation(&grantee, &org).await?;
+        }
+
+        Ok(CoordToSidecar::GrantRevoked { ids })
+    }
+
+    /// After a grant is deleted, take back whatever it was still holding open.
+    ///
+    /// Recomputes `grantee`'s access from scratch and releases every lease it
+    /// holds on a board in `org` that it may no longer use, through the shared
+    /// release tail. Also drops its queued requests, which the scheduler cannot
+    /// invalidate itself (a waiter's access is a snapshot).
+    async fn cascade_revocation(&self, grantee: &SubjectKey, org: &OrgId) -> Result<()> {
+        let now = self.now();
+        // Rebuild the grantee's access. A `Subject` is needed for the lookup;
+        // `groups` is advisory and excluded from identity, so an empty one is
+        // faithful here.
+        let as_subject = Subject::new(grantee.org.clone(), grantee.kind, grantee.id.clone());
+        let access = authz::board_access(&self.db, &as_subject, now).await;
+
+        let held = {
+            let sched = self.scheduler.lock().await;
+            sched.leases_held_by(grantee)
+        };
+        for (lease, board_ref) in held {
+            if board_ref.org != *org {
+                continue;
+            }
+            let still_ok = {
+                let sched = self.scheduler.lock().await;
+                sched
+                    .board(&board_ref)
+                    .is_some_and(|b| access.may_use(b, now))
+            };
+            if still_ok {
+                continue;
+            }
+            warn!(
+                %board_ref, ?lease, subject = %grantee,
+                "revoking a lease the grantee may no longer hold"
+            );
+            self.tear_down_lease(lease, grantee, "revoked", "lease.revoke", &as_subject)
+                .await?;
+        }
+
+        let dropped = {
+            let mut sched = self.scheduler.lock().await;
+            sched.remove_waiters(grantee)
+        };
+        if dropped > 0 {
+            debug!(subject = %grantee, dropped, "dropped queued requests after revocation");
+        }
+        Ok(())
+    }
+
+    /// `ctl delegate`: lease a board **as the caller** and hand back only the
+    /// lease's capability token, for a sandboxed agent.
+    ///
+    /// Delegation is deliberately *not* a grant and creates **no principal**.
+    /// The sandbox gets no fleet identity, no session token, cannot enumerate
+    /// the fleet or request another board, and cannot outlive the lease.
+    /// Revocation is releasing the lease. Mechanically this is exactly
+    /// [`Coordinator::request_lease`] with the token attenuated further, to the
+    /// intersection of what the caller may do and what they asked to hand over
+    /// — you can never delegate more than you hold.
+    async fn delegate(
+        &self,
+        subject: &Subject,
+        select: fleet_proto::lease::Constraint,
+        duration_secs: u64,
+        ops: Vec<fleet_proto::token::AllowedOp>,
+    ) -> Result<CoordToSidecar> {
+        let ops = fleet_proto::token::normalize_ops(ops);
+        if ops.is_empty() {
+            return Ok(CoordToSidecar::Error {
+                message: "a delegation must confer at least one operation".to_owned(),
+            });
+        }
+
+        let now = self.now();
+        let access = authz::board_access(&self.db, subject, now).await;
+        if access.is_empty() {
+            return Ok(Self::denied());
+        }
+
+        let req = LeaseRequest {
+            select,
+            duration_secs,
+            priority: fleet_proto::lease::Priority::Interactive,
+        };
+        let decision = {
+            let mut sched = self.scheduler.lock().await;
+            sched.request_lease(subject.clone(), &access, req, now)
+        };
+        let granted = match decision {
+            LeaseDecision::Granted(g) => g,
+            // The caller decides what to do with a queue slip; `ctl delegate`
+            // fails fast rather than blocking a sandbox handoff on it.
+            LeaseDecision::Queued { position } => {
+                return Ok(CoordToSidecar::Queued { position })
+            }
+        };
+
+        // Never hand out more than the delegator holds.
+        let effective: Vec<fleet_proto::token::AllowedOp> = {
+            let sched = self.scheduler.lock().await;
+            match sched.board(&granted.board) {
+                Some(b) => {
+                    let mine = access.effective_ops(b, now);
+                    ops.iter().copied().filter(|o| mine.contains(o)).collect()
+                }
+                None => Vec::new(),
+            }
+        };
+        if effective.is_empty() {
+            // Undo the lease rather than hand back a token that does nothing.
+            let mut sched = self.scheduler.lock().await;
+            let _ = sched.release_lease(granted.lease, &subject.key(), now);
+            return Ok(CoordToSidecar::Error {
+                message: "you do not hold any of the requested operations on that board".to_owned(),
+            });
+        }
+
+        let grant = self.signer.grant_to_wire(&granted, effective.clone())?;
+        let org = granted.board.org.clone();
+        self.db
+            .scoped(org.clone())
+            .record_lease(
+                granted.lease,
+                &granted.board,
+                &granted.holder.key(),
+                self.now_i64(),
+                i64::try_from(granted.expires).unwrap_or(i64::MAX),
+            )
+            .await?;
+        let labels: Vec<&str> = effective.iter().map(|o| o.as_str()).collect();
+        self.audit(
+            &org,
+            "lease.delegate",
+            Some(&subject.key().to_string()),
+            Some(&granted.board.node.0),
+            Some(&granted.board.name),
+            Some(granted.lease),
+            Some(&format!("delegated ops=[{}]", labels.join(","))),
+        )
+        .await?;
+        Ok(CoordToSidecar::Lease(grant))
     }
 
     /// Process a lease request: resolve the caller's access, ask the scheduler,

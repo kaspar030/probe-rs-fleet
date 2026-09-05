@@ -54,6 +54,8 @@ pub enum Command {
     /// Mint, list and revoke this org's node-enrollment auth keys, using the
     /// login you already have.
     AuthKey(AuthKeyCliArgs),
+    /// Share a subset of this org's boards with another person.
+    Grant(GrantArgs),
     /// Node-side operator verbs. Today: approve a machine that is asking to
     /// join your org.
     Node(NodeArgs),
@@ -645,12 +647,15 @@ pub enum CtlCommand {
     },
     /// Release a held board.
     Release {
-        /// Board id to release.
+        /// Board to release: a node-local name, or `<node>/<name>` /
+        /// `<org>/<node>/<name>` to disambiguate a board shared with you from
+        /// a same-named one of your own.
         board: String,
     },
     /// Power-cycle a board.
     PowerCycle {
-        /// Board id to power-cycle.
+        /// Board to power-cycle: a node-local name, or `<node>/<name>` /
+        /// `<org>/<node>/<name>` to reach a board shared with you.
         board: String,
     },
     /// Show who holds which boards.
@@ -663,6 +668,101 @@ pub enum CtlCommand {
         #[arg(long)]
         follow: bool,
     },
+    /// Lease a board as yourself and print only its capability token, for a
+    /// sandboxed agent to use.
+    ///
+    /// This is **not** a grant and creates no principal: the sandbox gets no
+    /// fleet identity, cannot enumerate the fleet or ask for another board, and
+    /// cannot outlive the lease. Revoke by releasing the lease.
+    Delegate {
+        /// Which board to lease: `board=<name>`, `tag=<t> && <t>`, `chip=<c>`,
+        /// or a bare board name.
+        #[arg(long)]
+        select: String,
+        /// Operations to delegate, comma-separated
+        /// (`flash,attach,gdb,reset,erase,power-cycle`).
+        ///
+        /// Never more than you hold. A data-plane op (flash/erase/reset)
+        /// implies `attach`, without which the token could not open a data
+        /// channel at all.
+        #[arg(long, default_value = "flash,attach")]
+        ops: String,
+        /// How long to hold the lease (`90s`, `30m`, `2h`, `7d`, or seconds).
+        #[arg(long, default_value = "2h")]
+        ttl: String,
+    },
+}
+
+/// Arguments for `probe-rs-fleet grant`.
+///
+/// Two shapes in one verb, as `clap`'s `args_conflicts_with_subcommands`
+/// allows: `grant <subject> --select …` creates one, while `grant list` and
+/// `grant revoke <id>` manage them.
+///
+/// The cost of that ergonomics, stated: a user literally named `list` or
+/// `revoke` is shadowed by the subcommand. Name them by their id form
+/// (`gh-1234`) or rendered subject key instead.
+#[derive(Debug, Args)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct GrantArgs {
+    #[command(flatten)]
+    pub client: CtlClientArgs,
+    /// Who to share with: a GitHub login, a `gh-<id>`, or a rendered subject
+    /// key (`<org>/user:<id>`). Resolved to an immutable user id at creation —
+    /// a login can be renamed and reused, an id cannot.
+    pub subject: Option<String>,
+    /// Which boards to share: `tag=<t> && <t>`, `chip=<c>`, or `board=<name>`
+    /// for a single board (a degenerate selector, not a special case).
+    #[arg(long)]
+    pub select: Option<String>,
+    /// Operations to confer, comma-separated
+    /// (`flash,attach,gdb,reset,erase,power-cycle`).
+    ///
+    /// A data-plane op (flash/erase/reset) implies `attach`; without it the
+    /// grantee's token could not open a data channel, so the grant would be a
+    /// silent dud.
+    #[arg(long, default_value = "flash,attach")]
+    pub ops: String,
+    /// Expiry as a date (`2026-12-31`, UTC midnight) or epoch seconds.
+    #[arg(long, conflicts_with = "ttl")]
+    pub until: Option<String>,
+    /// Expiry as a duration from now (`30d`, `2h`, or seconds).
+    ///
+    /// A grant always expires: an unbounded share of your hardware outlives the
+    /// reason it was created. Defaults to 30 days when neither flag is given.
+    #[arg(long)]
+    pub ttl: Option<String>,
+    #[command(subcommand)]
+    pub command: Option<GrantCommand>,
+}
+
+/// `grant` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum GrantCommand {
+    /// List this org's outbound grants.
+    List(GrantListArgs),
+    /// Revoke a grant by id prefix.
+    ///
+    /// Revocation is immediate and real: the grantee's leases on boards they
+    /// can no longer reach are released and their relay channels torn down.
+    Revoke(GrantRevokeArgs),
+}
+
+/// Arguments for `probe-rs-fleet grant list`.
+#[derive(Debug, Args)]
+pub struct GrantListArgs {
+    #[command(flatten)]
+    pub client: CtlClientArgs,
+}
+
+/// Arguments for `probe-rs-fleet grant revoke`.
+#[derive(Debug, Args)]
+pub struct GrantRevokeArgs {
+    /// The grant id, or a prefix of at least 8 hex characters, from
+    /// `probe-rs-fleet grant list`.
+    pub id: String,
+    #[command(flatten)]
+    pub client: CtlClientArgs,
 }
 
 /// What argv0 inspection decided the process should do.
@@ -788,10 +888,7 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 Command::Sidecar(args) => {
                     roles::sidecar::run(args.probe_rs_args, &args.fleet).await
                 }
-                Command::Ctl(args) => {
-                    roles::ctl::run(args).await?;
-                    Ok(ExitCode::SUCCESS)
-                }
+                Command::Ctl(args) => roles::ctl::run(args).await,
                 Command::Login(args) => {
                     roles::login::run(args).await?;
                     Ok(ExitCode::SUCCESS)
@@ -802,6 +899,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 }
                 Command::AuthKey(args) => {
                     roles::auth_key::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Grant(args) => {
+                    roles::grant::run(args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::Node(args) => match args.command {
@@ -1319,6 +1420,122 @@ mod tests {
                 assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
             }
             other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_ctl_delegate() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "ctl", "delegate",
+            "--select", "tag=nrf52",
+            "--ops", "flash,attach",
+            "--ttl", "2h",
+        ]));
+        match cli.command {
+            Command::Ctl(a) => match a.command {
+                CtlCommand::Delegate { select, ops, ttl } => {
+                    assert_eq!(select, "tag=nrf52");
+                    assert_eq!(ops, "flash,attach");
+                    assert_eq!(ttl, "2h");
+                }
+                other => panic!("expected delegate, got {other:?}"),
+            },
+            other => panic!("expected ctl, got {other:?}"),
+        }
+    }
+
+    /// The defaults have to be usable on their own: a sandbox handoff should
+    /// not need three flags to be correct.
+    #[test]
+    fn ctl_delegate_defaults_to_flash_attach_for_two_hours() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "ctl", "delegate", "--select", "board=b1",
+        ]));
+        match cli.command {
+            Command::Ctl(a) => match a.command {
+                CtlCommand::Delegate { ops, ttl, .. } => {
+                    assert_eq!(ops, "flash,attach");
+                    assert_eq!(ttl, "2h");
+                }
+                other => panic!("expected delegate, got {other:?}"),
+            },
+            other => panic!("expected ctl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_grant_create() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "grant", "bob",
+            "--select", "tag=nrf52",
+            "--ops", "flash,attach",
+            "--until", "2026-12-31",
+        ]));
+        match cli.command {
+            Command::Grant(a) => {
+                assert_eq!(a.subject.as_deref(), Some("bob"));
+                assert_eq!(a.select.as_deref(), Some("tag=nrf52"));
+                assert_eq!(a.ops, "flash,attach");
+                assert_eq!(a.until.as_deref(), Some("2026-12-31"));
+                assert!(a.ttl.is_none());
+                assert!(a.command.is_none(), "no subcommand: this is a creation");
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_grant_list_and_revoke() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "grant", "list"]));
+        assert!(
+            matches!(cli.command, Command::Grant(a) if matches!(a.command, Some(GrantCommand::List(_))))
+        );
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "grant", "revoke", "a1b2c3d4"]));
+        match cli.command {
+            Command::Grant(a) => match a.command {
+                Some(GrantCommand::Revoke(r)) => assert_eq!(r.id, "a1b2c3d4"),
+                other => panic!("expected revoke, got {other:?}"),
+            },
+            other => panic!("expected grant, got {other:?}"),
+        }
+    }
+
+    /// `--until` and `--ttl` are two spellings of one thing, so clap must
+    /// refuse both — silently preferring one would be a surprise on a verb that
+    /// decides how long somebody keeps access.
+    #[test]
+    fn grant_until_and_ttl_conflict() {
+        let e = Cli::try_parse_from(os(&[
+            "probe-rs-fleet", "grant", "bob",
+            "--select", "tag=nrf52",
+            "--until", "2026-12-31",
+            "--ttl", "30d",
+        ]));
+        assert!(e.is_err(), "--until and --ttl must not be combinable");
+    }
+
+    /// The cost of `args_conflicts_with_subcommands`, pinned so it is a
+    /// recorded trade rather than a surprise: a user literally named `list` or
+    /// `revoke` is shadowed by the subcommand. The escape hatch is the id or
+    /// subject-key form, which is what the `--help` text tells you to use.
+    #[test]
+    fn a_user_named_like_a_subcommand_is_shadowed() {
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "grant", "list"]));
+        match cli.command {
+            Command::Grant(a) => {
+                assert!(a.subject.is_none(), "`list` parsed as the subcommand");
+                assert!(matches!(a.command, Some(GrantCommand::List(_))));
+            }
+            other => panic!("expected grant, got {other:?}"),
+        }
+        // The unambiguous spellings still reach the creation form.
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "grant", "gh-1234", "--select", "tag=nrf52",
+        ]));
+        match cli.command {
+            Command::Grant(a) => assert_eq!(a.subject.as_deref(), Some("gh-1234")),
+            other => panic!("expected grant, got {other:?}"),
         }
     }
 
