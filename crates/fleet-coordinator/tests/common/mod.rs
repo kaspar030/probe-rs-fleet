@@ -17,7 +17,7 @@ use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{AgentId, OrgId, Role};
+use fleet_proto::ids::{AgentId, BoardRef, OrgId, Role};
 
 /// The signing seed every test coordinator uses.
 pub const SEED: [u8; 32] = [7u8; 32];
@@ -246,5 +246,119 @@ impl TestCoordinator {
         let status = resp.status().as_u16();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+
+    /// Seed a GitHub-shaped user (so `grant <login>` can resolve it) plus a
+    /// session, and return the session token.
+    ///
+    /// The grant path resolves a login to the immutable `user.id`, so a test
+    /// that grants by name needs a real `user` row rather than the bare
+    /// membership `seed_session` creates.
+    pub async fn seed_github_user(
+        &self,
+        gh_id: i64,
+        login: &str,
+        role: Role,
+    ) -> (String, OrgId, String) {
+        let now = i64::try_from(self.coord.now()).unwrap();
+        let (user_id, org, _created) = self
+            .db()
+            .upsert_github_user(gh_id, login, None, now)
+            .await
+            .unwrap();
+        self.db()
+            .ensure_user_member(&org, &user_id, role)
+            .await
+            .unwrap();
+        let token = OpaqueToken::mint(TokenKind::Session);
+        self.db()
+            .insert_session(token.hash().as_str(), &org, &user_id, now, now + 3_600)
+            .await
+            .unwrap();
+        (token.to_secret_string(), org, user_id)
+    }
+
+    /// Put a board into the scheduler directly, bypassing an agent connection.
+    ///
+    /// Authorization tests care about who may reach a board, not about how it
+    /// got there; standing up a real agent for each one would drown the
+    /// property being tested.
+    pub async fn seed_board(&self, org: &OrgId, node: &str, name: &str, tags: &[&str]) -> BoardRef {
+        use fleet_proto::board::{Board, BoardState, PowerKind};
+
+        self.db().ensure_org(org, "personal").await.unwrap();
+        let agent = AgentId(format!("{}/{node}", org.0));
+        let now = i64::try_from(self.coord.now()).unwrap();
+        self.db()
+            .scoped(org.clone())
+            .ensure_node(&agent, now)
+            .await
+            .unwrap();
+        let board = Board {
+            id: BoardRef::new(org.clone(), agent.clone(), name),
+            agent,
+            chip: "nRF52840_xxAA".to_owned(),
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            exclusive: true,
+            power: PowerKind::None,
+            state: BoardState::Idle,
+        };
+        self.db()
+            .scoped(org.clone())
+            .record_board(&board, now)
+            .await
+            .unwrap();
+        let id = board.id.clone();
+        self.coord.scheduler().lock().await.upsert_board(board);
+        id
+    }
+
+    /// Open a `/client` session as the holder of `bearer`.
+    pub async fn client_session(&self, bearer: &str) -> fleet_sidecar::transport::CoordSession {
+        let (tx, rx) = self.dial("/client", bearer).await.unwrap();
+        fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
+            .await
+            .unwrap()
+    }
+}
+
+/// A stand-in for a connected agent, registered directly in the coordinator's
+/// registry.
+///
+/// The delegation tests care about which capability token the coordinator hands
+/// the node, not about running a real `probe-rs serve`; standing up a full
+/// agent for that would bury the property under scaffolding. `ws_e2e.rs`
+/// already covers the real agent end to end.
+pub struct AgentStub {
+    rx: tokio::sync::mpsc::Receiver<fleet_coordinator::registry::AgentMessage>,
+}
+
+impl AgentStub {
+    /// Register a stub handle for `node`.
+    pub async fn attach(fleet: &TestCoordinator, node: &AgentId) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        fleet
+            .coord
+            .agents()
+            .insert(
+                node.clone(),
+                fleet_coordinator::registry::AgentHandle::new(tx),
+            )
+            .await;
+        Self { rx }
+    }
+
+    /// Await the next `OpenSession` command, returning `(channel, token)`.
+    ///
+    /// The token is what makes this helper worth having: it is the byte string
+    /// the node will check, and therefore the one the client must present.
+    pub async fn expect_open_session(&mut self) -> (fleet_proto::ChannelId, Vec<u8>) {
+        match self.rx.recv().await.expect("agent connection closed") {
+            fleet_coordinator::registry::AgentMessage::Command(
+                fleet_proto::CoordinatorCommand::OpenSession { channel, token, .. },
+            ) => (channel, token),
+            other => panic!("expected OpenSession, got {other:?}"),
+        }
     }
 }
