@@ -1150,6 +1150,14 @@ inherits the clamp for free — `Scheduler::extend_lease` re-derives the duratio
 from the **recorded** priority, so there is deliberately no second guard in
 `extend_lease`.
 
+The clamp orders contention; it does not make contention painless. A workload
+whose request finds no free board is `Queued` like anybody else, and the sidecar
+turns that into a hard error rather than waiting — a build step cannot sit on a
+queue slip the way a human at `ctl lease` can. Since every job in a repo is the
+*same* subject, `max_concurrent_per_subject` is effectively a per-repo cap and a
+wide CI matrix hits it. `docs/ci-github-actions.md` says so in the operator's
+vocabulary.
+
 #### The verb surface behind `/client`, walked
 
 The route allowlist now admits `Session` **and** `Workload` on `/client`;

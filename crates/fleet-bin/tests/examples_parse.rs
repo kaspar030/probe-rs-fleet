@@ -139,6 +139,114 @@ fn coordinator_example_loads_and_its_github_block_works_uncommented() {
     assert_eq!(gh.api_base, "https://api.github.com");
 }
 
+/// The `[github_actions]` block must uncomment into TOML the **real** loader
+/// accepts, exactly as the `[github]` block above must.
+///
+/// The two blocks earn this treatment for the same reason: they are the parts
+/// of the file a reader has to edit, so a typo in one costs the most. This one
+/// has a sharper edge — `audience` is *required* and has no default, for the
+/// replay reason the block itself explains, so a reader who uncomments the
+/// block but not that key must get a clear config error rather than a fleet
+/// that accepts GitHub's fleet-unspecific default.
+#[test]
+fn coordinator_example_github_actions_block_works_uncommented() {
+    let path = examples_dir().join("coordinator.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("signing_key_path") {
+                format!("signing_key_hex = \"{}\"", "ab".repeat(32))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Commented out by default: a fleet with no CI is supported, and the
+    // exchange then answers a named 503.
+    let cfg = fleet_bin::config::load_coordinator_config_from_str(&text).unwrap();
+    assert!(cfg.github_actions.is_none());
+
+    // Uncomment the block the way a reader would: strip one `# ` from the
+    // table header and from every *key* line, leaving the prose comments
+    // (which start `# #`) as comments. That is the same mechanical rule the
+    // `[github]` test above uses, which is why the two blocks' comment style
+    // must stay identical.
+    let uncommented: String = text
+        .lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if t.starts_with("# [github_actions]")
+                || t.starts_with("# audience")
+                || t.starts_with("# issuer")
+                || t.starts_with("# jwks_url")
+                || t.starts_with("# jwks_refresh_secs")
+                || t.starts_with("# jwks_min_refetch_secs")
+                || t.starts_with("# workload_token_ttl_secs")
+            {
+                t.trim_start_matches("# ").to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let cfg = fleet_bin::config::load_coordinator_config_from_str(&uncommented).unwrap();
+    cfg.validate().unwrap();
+    let gha = cfg
+        .github_actions
+        .expect("[github_actions] parsed once uncommented");
+    assert_eq!(gha.audience, "https://fleet.example");
+    // Every optional key resolves to its documented default, whether the
+    // reader left it commented or not.
+    assert_eq!(gha.issuer, "https://token.actions.githubusercontent.com");
+    assert_eq!(
+        gha.jwks_url,
+        "https://token.actions.githubusercontent.com/.well-known/jwks"
+    );
+    assert_eq!(gha.jwks_refresh_secs, 3600);
+    assert_eq!(gha.jwks_min_refetch_secs, 60);
+    assert_eq!(gha.workload_token_ttl_secs, 3600);
+
+    // The block's own load-bearing claim: without `audience` it does not load.
+    let without_audience: String = uncommented
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("audience"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fleet_bin::config::load_coordinator_config_from_str(&without_audience).is_err(),
+        "`audience` is required, and the example must not parse without it"
+    );
+}
+
+/// The example must say, in the file itself, why `audience` has no default.
+///
+/// The prose is the control here: a reader who sets it to something arbitrary
+/// gets a fleet that accepts tokens minted for another service under the same
+/// GitHub owner. That is not recoverable from the key name alone.
+#[test]
+fn the_coordinator_example_explains_why_the_audience_has_no_default() {
+    let path = examples_dir().join("coordinator.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[github_actions]"));
+    assert!(
+        text.contains("https://github.com/<owner>"),
+        "the example must name GitHub's fleet-unspecific default audience"
+    );
+    assert!(
+        text.contains("replayable"),
+        "…and say what accepting it would cost"
+    );
+    assert!(
+        text.contains("grant --repo"),
+        "the per-repo grant is the other half a reader needs"
+    );
+}
+
 /// `examples/boards.toml` is a full worked inventory, not a stub, so it must
 /// pass the agent's validation as well as its parser.
 #[test]

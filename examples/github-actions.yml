@@ -142,19 +142,26 @@ jobs:
             target/thumbv7em-none-eabihf/release/deps/integration-*
 
       # ---------------------------------------------------------------------
-      # A matrix, if you want one. Two things to know before widening it:
+      # A matrix, if you want one. Three things to know before widening it:
       #
       #  * `max_concurrent_per_subject` (default 2) is keyed by SUBJECT, and
       #    every job in this repository authenticates as the same subject
-      #    (gha/workload:<owner>/<repo>). So the cap is effectively per repo. A
-      #    ten-leg matrix against two boards QUEUES rather than failing — the
-      #    cost of a wide matrix is wall-clock time, so set the job timeout
-      #    accordingly.
+      #    (gha/workload:<owner>/<repo>). So the cap is effectively per repo:
+      #    ten legs against a two-board pool are ten requests from ONE subject.
+      #  * a contended leg FAILS; it does not wait. The coordinator queues the
+      #    request, but the sidecar turns `Queued` into a hard error and exits
+      #    non-zero ("board contended; queued at position N") — a build step
+      #    cannot sit on a queue slip the way a human at `ctl lease` can. Set
+      #    `max-parallel` to no more than the cap, or retry with a delay.
       #  * the workload token's TTL is one hour by default and there is no
-      #    refresh path. A leg that waits in the queue and then runs long can
-      #    outlive its token; re-run `ci login` immediately before the long
-      #    step if that is a risk.
+      #    refresh path. Re-run `ci login` immediately before a long step
+      #    rather than once at the top of a slow job.
       #
       # A CI lease is always clamped to CI priority whatever it asks for, so a
-      # queued matrix can never outbid a developer at a desk.
+      # matrix can never outbid a developer at a desk.
+      #
+      # strategy:
+      #   max-parallel: 2          # <= max_concurrent_per_subject
+      #   matrix:
+      #     chip: [nRF52840_xxAA, nRF5340_xxAA]
       # ---------------------------------------------------------------------

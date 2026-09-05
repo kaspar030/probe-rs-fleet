@@ -148,23 +148,48 @@ past the expiry must re-run `ci login`; put it before the long step, or split th
 job. `ci login` prints the expiry and says this in one line, so it is not
 something to discover as a flake at 3am.
 
-### A wide matrix queues; it does not fail
+### A wide matrix contends, and contention is a job failure — not a wait
+
+Read this before widening a matrix; the intuitive reading is wrong.
 
 `max_concurrent_per_subject` (default 2) is keyed by the **subject**, and every
-job in the repo authenticates as the *same* subject
-(`gha/workload:owner/repo`) — so the cap is effectively **per repo**, not per
-job, per matrix leg or per workflow.
+job in the repo authenticates as the *same* subject (`gha/workload:owner/repo`)
+— so the cap is effectively **per repo**, not per job, per matrix leg or per
+workflow. Ten legs against a two-board pool are ten requests from one subject.
 
-A matrix of ten legs against two boards therefore does not error: the
-coordinator queues the requests FIFO within the CI priority class and drains
-them as boards free up. Two consequences worth planning for:
+When no board it may use is free, or the subject is at its cap, the coordinator
+**queues** the request and answers `Queued { position }` rather than refusing it.
+But the sidecar does not wait on that: `probe-rs run` turns `Queued` into a hard
+error and exits non-zero.
 
-- **wall-clock time, not failure, is the cost of a wide matrix.** Budget the job
-  timeout accordingly, and remember the token TTL bound above.
-- **a job's lease request is clamped to CI priority** whatever it asks for, so a
-  CI run can never outbid a developer sitting at a desk. That is §6.6's fairness
-  ordering (interactive dev > nightly CI > soak) being enforced rather than
-  trusted.
+```
+coordinator declined: board contended; queued at position 1
+```
+
+So the practical rule is: **a contended leg fails; it does not block.** Two
+consequences to plan for:
+
+- **Bound the concurrency yourself.** Set the matrix's `max-parallel` to no more
+  than `max_concurrent_per_subject`, or ask the fleet admin to raise the cap for
+  your subject. Retrying the step is the other option, but retry with a delay —
+  an immediate retry re-contends.
+- **A failed leg still leaves a queue entry.** Nothing removes a waiter when its
+  sidecar disconnects, so an abandoned request can later be promoted onto a
+  board that no one is listening for, holding it until the lease TTL expires.
+  With a wide matrix that is a real way to idle a small pool. This is v1
+  behaviour, recorded in `sweep.rs` ("notifying a *disconnected* sidecar of its
+  promotion is best-effort/deferred for v1") and filed as issue #384, not
+  something to work around in the workflow — keeping concurrency under the cap
+  is what avoids it.
+
+`ctl lease` behaves differently on purpose: it prints `queued at position N` and
+exits **zero**, because a human can come back to it. A build step cannot, which
+is why the sidecar fails fast rather than blocking a CI job on a queue slip.
+
+One thing you never have to plan for: **a CI lease is clamped to CI priority**
+whatever it asks for, so a CI run can never outbid a developer sitting at a
+desk. That is §6.6's fairness ordering (interactive dev > nightly CI > soak)
+being enforced rather than trusted.
 
 ### Exit codes still mean what they mean
 
@@ -179,6 +204,7 @@ changes that: the fleet relays bytes, it does not interpret them.
 
 | what you see | what happened | what to do |
 |---|---|---|
+| `coordinator declined: board contended; queued at position N` | every board matching your selector is busy, or the repo is at `max_concurrent_per_subject` | narrow the matrix (`max-parallel`), or retry with a delay. The sidecar fails fast rather than blocking a build step on a queue slip |
 | `403 no_grant` | the token verified fine; this **repo** has no grant | the fleet admin runs `grant --repo <owner>/<name> …`. Being under a granted owner is deliberately not enough |
 | `401 invalid_grant` | the coordinator refused the credential and will not say why | check `--audience` against the coordinator's configured one, then the runner's clock; the real reason is in the **coordinator's** log |
 | `503 workload_oidc_unconfigured` | that coordinator has no `[github_actions]` block | the operator adds one, or use `ci login --auth-key` |
@@ -200,8 +226,8 @@ A fork of a granted repo, or a new repo under a granted owner, gets
 `403 no_grant`. The coordinator's log names it exactly:
 
 ```
-WARN no grant for this repository; the owner is deliberately not sufficient
-     repository="acme/firmware-fork" repository_owner="acme"
+WARN repository=acme/firmware-fork repository_owner=acme
+     no grant for this repository; the owner is deliberately not sufficient
 ```
 
 The owner is logged beside the repo so the "but I granted the org!" case is one
