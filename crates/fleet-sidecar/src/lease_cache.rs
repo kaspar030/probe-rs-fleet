@@ -43,6 +43,19 @@ impl CacheKey {
 
 /// Produce a stable, collision-resistant-enough string fingerprint for a board
 /// selector. Tags are sorted so set-equal selectors map to the same key.
+///
+/// # Not the same job as `Constraint`'s `Display`
+///
+/// [`fleet_proto::lease::Constraint`] gained a canonical, **round-trippable**
+/// rendering in architecture §6.5, which is what a grant stores and what the
+/// evaluator re-parses. This function is a *cache key*: it sorts and dedups
+/// tags for set-equality, which is exactly what a cache wants and exactly what
+/// a round trip must not do (it would change the selector). The two must stay
+/// separate; unifying them would make one of them wrong.
+///
+/// Also note what a cached `CachedLease.grant.token` is since §6.5: an identity
+/// and delegation artefact, **not** the data-plane credential. That comes per
+/// channel in `ChannelOpened`.
 #[must_use]
 pub fn fingerprint(select: &Constraint) -> String {
     match select {

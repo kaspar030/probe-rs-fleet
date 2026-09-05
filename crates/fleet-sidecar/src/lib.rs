@@ -140,6 +140,14 @@ where
             let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
             rt.block_on(run_fleet(cfg, invocation, original_argv))
         }
+        Resolution::Delegated(cfg) => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| transport::TransportError::Io(format!("building runtime: {e}")))?;
+            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            rt.block_on(run_delegated(cfg, invocation, original_argv))
+        }
     }
 }
 
@@ -178,6 +186,10 @@ where
             let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
             run_fleet(cfg, invocation, original_argv).await
         }
+        Resolution::Delegated(cfg) => {
+            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            run_delegated(cfg, invocation, original_argv).await
+        }
     }
 }
 
@@ -203,8 +215,8 @@ async fn run_fleet(
     let result = match &invocation {
         cli::ProbeRsInvocation::Gdb {
             connection_string, ..
-        } => run_fleet_gdb(&session, &grant, connection_string.as_deref()).await,
-        _ => run_fleet_data(&session, &grant, &original_argv).await,
+        } => run_fleet_gdb(&session, grant.lease, connection_string.as_deref()).await,
+        _ => run_fleet_data(&session, grant.lease, &original_argv).await,
     };
 
     // Always release the lease before returning (best-effort).
@@ -212,17 +224,58 @@ async fn run_fleet(
     result
 }
 
-/// Data-plane fleet path: open a data channel, bind a loopback endpoint the
-/// genuine probe-rs client dials as its remote host, splice it onto the relay,
-/// and exec the real probe-rs.
+/// Drive the **delegated** path: a sandboxed agent using a board somebody else
+/// already leased for it (architecture §6.5).
+///
+/// The differences from [`run_fleet`] are all subtractions, and each is the
+/// point rather than a simplification:
+///
+/// * no `Lease` — the board is already held; the lease id is decoded from the
+///   token locally, which needs no key and no round trip;
+/// * **no `release`, and no extend** — the delegator owns the lease lifecycle.
+///   The sandbox's only lease-affecting power is letting it expire. This is
+///   enforced by the coordinator's `/delegate` allowlist, not by this
+///   politeness, but the politeness is what makes the intent readable;
+/// * no fleet identity of any kind: the connection carries the capability token
+///   and nothing else.
+async fn run_delegated(
+    cfg: selector::DelegatedConfig,
+    invocation: cli::ProbeRsInvocation,
+    original_argv: Vec<String>,
+) -> Result<i32, RunError> {
+    let Some(lease) = cfg.lease() else {
+        return Err(RunError::Selector(
+            selector::SelectorError::InvalidCapability,
+        ));
+    };
+    let session = transport::CoordSession::connect_delegated(&cfg).await?;
+    tracing::info!(?lease, "using a delegated lease");
+
+    match &invocation {
+        cli::ProbeRsInvocation::Gdb {
+            connection_string, ..
+        } => run_fleet_gdb(&session, lease, connection_string.as_deref()).await,
+        _ => run_fleet_data(&session, lease, &original_argv).await,
+    }
+    // Deliberately no `session.release(lease)`: the lease is not ours.
+}
+
+/// Data-plane path: open a data channel, bind a loopback endpoint the genuine
+/// probe-rs client dials as its remote host, splice it onto the relay, and exec
+/// the real probe-rs.
+///
+/// Takes a bare `lease` rather than a whole grant, because the delegated path
+/// has no grant — only a token, from which it decodes the lease locally. The
+/// data-plane credential comes from `ChannelOpened` either way, so the two
+/// paths converge here completely.
 async fn run_fleet_data(
     session: &transport::CoordSession,
-    grant: &fleet_proto::lease::LeaseGrant,
+    lease: fleet_proto::LeaseId,
     original_argv: &[String],
 ) -> Result<i32, RunError> {
     use fleet_proto::ChannelKind;
 
-    let (channel, channel_token) = session.open_channel(grant.lease, ChannelKind::Data).await?;
+    let (channel, channel_token) = session.open_channel(lease, ChannelKind::Data).await?;
 
     // Bind a loopback listener the probe-rs client treats as its remote host.
     // The client builds `{host}/worker` and dials it as a WebSocket, so `host`
@@ -234,10 +287,10 @@ async fn run_fleet_data(
         .local_addr()
         .map_err(|e| transport::TransportError::Io(format!("reading local endpoint: {e}")))?;
     let remote_host = format!("ws://{local_addr}");
-    // The **channel** token, not `grant.token`: this is the credential the
+    // The **channel** token, not the lease grant's: this is the credential the
     // coordinator handed the agent, and therefore the one `probe-rs serve`
-    // accepts. `grant.token` is the delegation artefact and diverges from it
-    // after an `Extend` or under an attenuating grant.
+    // accepts. A lease grant's token is the delegation artefact and diverges
+    // from it after an `Extend` or under an attenuating grant.
     let token = transport::hex_encode(&channel_token);
 
     // Accept the single probe-rs client connection and splice it in a task that
@@ -272,12 +325,12 @@ async fn run_fleet_data(
 /// user's gdb client connects to, and byte-splice it onto the relay.
 async fn run_fleet_gdb(
     session: &transport::CoordSession,
-    grant: &fleet_proto::lease::LeaseGrant,
+    lease: fleet_proto::LeaseId,
     connection_string: Option<&str>,
 ) -> Result<i32, RunError> {
     use fleet_proto::ChannelKind;
 
-    let (channel, _token) = session.open_channel(grant.lease, ChannelKind::Gdb).await?;
+    let (channel, _token) = session.open_channel(lease, ChannelKind::Gdb).await?;
     let addr = gdb::resolve_listen_addr(connection_string)?;
     let listener = gdb::bind(addr).await?;
     tracing::info!(%addr, "gdb tunnel listening; point your gdb client here");

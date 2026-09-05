@@ -47,6 +47,14 @@ pub mod env {
     /// Optional pinned coordinator server-certificate SHA-256 (64 hex chars),
     /// for a self-hosted deployment with no publicly trusted certificate.
     pub const SERVER_CERT_SHA256: &str = "PROBE_RS_FLEET_SERVER_CERT_SHA256";
+    /// A **capability token** (hex), from `probe-rs-fleet ctl delegate`.
+    ///
+    /// The sandboxed-agent credential (architecture §6.5). It is not a fleet
+    /// identity: it authorises exactly one lease on exactly one board, expires
+    /// with that lease, and can be revoked by releasing it. Setting it selects
+    /// the delegated path; a board selector must **not** also be set, because
+    /// the board is inside the token.
+    pub const CAPABILITY: &str = "PROBE_RS_FLEET_CAPABILITY";
 }
 
 /// A source of environment variables. Implemented for the real process
@@ -104,6 +112,61 @@ impl FleetConfig {
     }
 }
 
+/// A resolved **delegated** configuration: a sandboxed agent with a capability
+/// token and nothing else (architecture §6.5).
+///
+/// Note what is absent, deliberately: no session token, no selector, no
+/// identity. The board and the lease are inside the token, which is also the
+/// only thing that authorises anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegatedConfig {
+    /// Coordinator base URL.
+    pub coordinator: String,
+    /// The hex-encoded capability token, presented as the bearer on
+    /// `/delegate`.
+    pub capability: String,
+    /// Optional pinned coordinator server-certificate SHA-256.
+    pub server_cert_sha256: Option<String>,
+}
+
+impl DelegatedConfig {
+    /// The pinned server-certificate hash, decoded.
+    #[must_use]
+    pub fn server_pin(&self) -> Option<[u8; 32]> {
+        self.server_cert_sha256
+            .as_deref()
+            .and_then(fleet_tls::parse_fingerprint)
+    }
+
+    /// The lease id the token authorises, decoded locally.
+    ///
+    /// Decode-only — there is no signature check here, and there must not be:
+    /// the sandbox holds no public key, and the *coordinator* is what verifies
+    /// the token. This only saves a round trip to learn which lease to open a
+    /// channel on; a forged token gets a `401` at the door regardless.
+    #[must_use]
+    pub fn lease(&self) -> Option<fleet_proto::LeaseId> {
+        let wire = decode_hex(&self.capability)?;
+        let signed = fleet_proto::token::SignedToken::from_wire(&wire).ok()?;
+        signed.decode_token().ok().map(|t| t.lease)
+    }
+}
+
+/// Decode a hex string into bytes.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.is_empty() || s.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in s.as_bytes().chunks_exact(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(u8::try_from(hi * 16 + lo).ok()?);
+    }
+    Some(out)
+}
+
 /// The outcome of [`resolve`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
@@ -111,6 +174,8 @@ pub enum Resolution {
     Local,
     /// Lease a board from the coordinator and proxy the session.
     Fleet(FleetConfig),
+    /// Use a board already leased for us, via a delegated capability token.
+    Delegated(DelegatedConfig),
 }
 
 /// Errors arising from an incomplete or contradictory fleet configuration.
@@ -148,6 +213,35 @@ pub enum SelectorError {
     /// downgrade a deliberately pinned deployment to `WebPKI` verification.
     #[error("invalid {}: expected 64 hex characters", env::SERVER_CERT_SHA256)]
     InvalidPin,
+    /// A capability token was set *and* a board selector.
+    ///
+    /// Not merely redundant: the board is inside the token, so a selector could
+    /// only ever disagree with it, and honouring either one silently would make
+    /// which board you got depend on a guess.
+    #[error(
+        "{} selects a board already leased for you — do not also set {} or {}",
+        env::CAPABILITY,
+        env::BOARD,
+        env::SELECT
+    )]
+    CapabilityWithSelector,
+    /// A capability token was set together with a session token.
+    ///
+    /// Refused so a sandbox cannot be handed a fleet identity by accident: the
+    /// whole point of delegation is that it has none.
+    #[error(
+        "{} and {} are different credentials — set exactly one",
+        env::CAPABILITY,
+        env::TOKEN
+    )]
+    CapabilityWithToken,
+    /// The capability token was not decodable as a signed capability token.
+    ///
+    /// Decoded (not verified) locally only to learn which lease to open a
+    /// channel on. A token that will not decode cannot be used, and saying so
+    /// here is far more useful than a `401` from the coordinator.
+    #[error("invalid {}: not a hex-encoded capability token", env::CAPABILITY)]
+    InvalidCapability,
 }
 
 /// Resolve the fleet configuration from an [`EnvSource`].
@@ -162,16 +256,45 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     let select = env.get(env::SELECT).filter(|s| !s.is_empty());
     let coordinator = env.get(env::COORDINATOR).filter(|s| !s.is_empty());
     let token = env.get(env::TOKEN).filter(|s| !s.is_empty());
+    let capability = env.get(env::CAPABILITY).filter(|s| !s.is_empty());
     let pin = env
         .get(env::SERVER_CERT_SHA256)
         .filter(|s| !s.is_empty());
 
-    let any_fleet =
-        board.is_some() || select.is_some() || coordinator.is_some() || token.is_some() || pin.is_some();
+    let any_fleet = board.is_some()
+        || select.is_some()
+        || coordinator.is_some()
+        || token.is_some()
+        || capability.is_some()
+        || pin.is_some();
 
     // No fleet variables at all → transparent local fallback.
     if !any_fleet {
         return Ok(Resolution::Local);
+    }
+
+    if let Some(pin) = &pin {
+        if fleet_tls::parse_fingerprint(pin).is_none() {
+            return Err(SelectorError::InvalidPin);
+        }
+    }
+
+    // The delegated path: a capability token names its own board, so a selector
+    // or a session token alongside it is a contradiction rather than extra
+    // information.
+    if let Some(capability) = capability {
+        if board.is_some() || select.is_some() {
+            return Err(SelectorError::CapabilityWithSelector);
+        }
+        if token.is_some() {
+            return Err(SelectorError::CapabilityWithToken);
+        }
+        let coordinator = coordinator.ok_or(SelectorError::MissingCoordinator)?;
+        return Ok(Resolution::Delegated(DelegatedConfig {
+            coordinator,
+            capability,
+            server_cert_sha256: pin,
+        }));
     }
 
     // Resolve the board selector.
@@ -184,12 +307,6 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
 
     let coordinator = coordinator.ok_or(SelectorError::MissingCoordinator)?;
     let token = token.ok_or(SelectorError::MissingAuth)?;
-
-    if let Some(pin) = &pin {
-        if fleet_tls::parse_fingerprint(pin).is_none() {
-            return Err(SelectorError::InvalidPin);
-        }
-    }
 
     Ok(Resolution::Fleet(FleetConfig {
         coordinator,
@@ -397,5 +514,117 @@ mod tests {
             parse_select("chip=x && tag=y"),
             Err(SelectorError::InvalidSelect { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // The delegated path (architecture §6.5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_capability_token_resolves_to_the_delegated_path() {
+        let env = MapEnv::new(&[
+            (env::CAPABILITY, "deadbeef"),
+            (env::COORDINATOR, "https://coord.example"),
+        ]);
+        let Resolution::Delegated(cfg) = resolve(&env).unwrap() else {
+            panic!("expected Delegated");
+        };
+        assert_eq!(cfg.coordinator, "https://coord.example");
+        assert_eq!(cfg.capability, "deadbeef");
+        assert!(cfg.server_cert_sha256.is_none());
+    }
+
+    /// The board is inside the token, so a selector alongside it could only
+    /// ever disagree — and silently honouring either would make which board you
+    /// got depend on a guess.
+    #[test]
+    fn a_capability_token_refuses_a_selector() {
+        for (key, value) in [(env::BOARD, "b1"), (env::SELECT, "tag=nrf52")] {
+            let env = MapEnv::new(&[
+                (env::CAPABILITY, "deadbeef"),
+                (env::COORDINATOR, "https://coord.example"),
+                (key, value),
+            ]);
+            assert_eq!(
+                resolve(&env),
+                Err(SelectorError::CapabilityWithSelector),
+                "{key} must not be combinable with a capability"
+            );
+        }
+    }
+
+    /// A sandbox must not be handed a fleet identity by accident: the whole
+    /// point of delegation is that it has none.
+    #[test]
+    fn a_capability_token_refuses_a_session_token() {
+        let env = MapEnv::new(&[
+            (env::CAPABILITY, "deadbeef"),
+            (env::TOKEN, "prfs1_secret"),
+            (env::COORDINATOR, "https://coord.example"),
+        ]);
+        assert_eq!(resolve(&env), Err(SelectorError::CapabilityWithToken));
+    }
+
+    #[test]
+    fn a_capability_token_still_needs_a_coordinator() {
+        let env = MapEnv::new(&[(env::CAPABILITY, "deadbeef")]);
+        assert_eq!(resolve(&env), Err(SelectorError::MissingCoordinator));
+    }
+
+    #[test]
+    fn a_malformed_pin_is_refused_on_the_delegated_path_too() {
+        let env = MapEnv::new(&[
+            (env::CAPABILITY, "deadbeef"),
+            (env::COORDINATOR, "https://coord.example"),
+            (env::SERVER_CERT_SHA256, "nope"),
+        ]);
+        assert_eq!(resolve(&env), Err(SelectorError::InvalidPin));
+    }
+
+    /// The lease is decoded from the token locally — no key, no round trip.
+    #[test]
+    fn the_lease_is_decodable_from_the_capability_token() {
+        use fleet_proto::ids::{AgentId, BoardRef, OrgId};
+        use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
+
+        let token = CapabilityToken {
+            lease: fleet_proto::LeaseId(42),
+            board: BoardRef::new(
+                OrgId("acme".to_owned()),
+                AgentId("rpi-1".to_owned()),
+                "nrf52840-dk-3",
+            ),
+            allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],
+            expires: 2_000_000_000,
+        };
+        let signed = SignedToken {
+            token_bytes: token.serialize_for_signing().unwrap(),
+            // The sidecar never checks the signature: the coordinator does.
+            signature: [0u8; fleet_proto::SIGNATURE_LEN],
+        };
+        let hex: String = signed
+            .to_wire()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        let cfg = DelegatedConfig {
+            coordinator: "https://coord.example".to_owned(),
+            capability: hex,
+            server_cert_sha256: None,
+        };
+        assert_eq!(cfg.lease(), Some(fleet_proto::LeaseId(42)));
+    }
+
+    #[test]
+    fn an_undecodable_capability_yields_no_lease() {
+        for capability in ["", "zz", "abc", "deadbeef"] {
+            let cfg = DelegatedConfig {
+                coordinator: "https://coord.example".to_owned(),
+                capability: capability.to_owned(),
+                server_cert_sha256: None,
+            };
+            assert_eq!(cfg.lease(), None, "{capability} should not decode");
+        }
     }
 }

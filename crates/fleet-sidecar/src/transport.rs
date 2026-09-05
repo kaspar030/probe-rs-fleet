@@ -24,7 +24,7 @@ use fleet_proto::{ChannelId, ChannelKind, DataFrame, PROTOCOL_VERSION};
 use fleet_wire::client::{dial, DialOpts};
 use fleet_wire::{CoordToSidecar, SidecarToCoord, WireEvent, WireRx, WireTx};
 
-use crate::selector::FleetConfig;
+use crate::selector::{DelegatedConfig, FleetConfig};
 
 /// Errors from the live relay transport.
 #[derive(Debug, thiserror::Error)]
@@ -79,6 +79,30 @@ impl CoordSession {
             url: cfg.coordinator.clone(),
             path: "/client",
             bearer: cfg.token.clone(),
+            pin: cfg.server_pin(),
+        })
+        .await
+        .map_err(|e| TransportError::Connect(format!("dialing {}: {e}", cfg.coordinator)))?;
+        Self::start(Box::new(tx), Box::new(rx)).await
+    }
+
+    /// Dial the coordinator's `/delegate` route with a **capability token**.
+    ///
+    /// The sandboxed-agent path (architecture §6.5). The credential is the
+    /// hex-encoded capability token `ctl delegate` printed; there is no session
+    /// token and no fleet identity. The connection that comes back is
+    /// deliberately crippled coordinator-side: it can open a channel on the
+    /// token's own lease and relay bytes, and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError`] on a TLS, connection, or version mismatch.
+    /// A refused token is indistinguishable from any other 401 by design.
+    pub async fn connect_delegated(cfg: &DelegatedConfig) -> Result<Self, TransportError> {
+        let (tx, rx) = dial(DialOpts {
+            url: cfg.coordinator.clone(),
+            path: "/delegate",
+            bearer: cfg.capability.clone(),
             pin: cfg.server_pin(),
         })
         .await
