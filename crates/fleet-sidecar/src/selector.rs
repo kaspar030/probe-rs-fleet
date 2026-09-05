@@ -202,58 +202,17 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
 /// Parse a `PROBE_RS_FLEET_SELECT` constraint expression into a
 /// [`Constraint`].
 ///
-/// Supported grammar (small by design; the coordinator does the real matching):
-///
-/// * `tag=<name>` or just `<name>` — a single required tag.
-/// * `<a> && <b> && …` — a conjunction of required tags.
-/// * `chip=<name>` — match by probe-rs chip name.
-///
-/// Tag conjunctions map to [`Constraint::Tags`]; a sole `chip=` term maps to
-/// [`Constraint::Chip`]. Mixing `chip=` with tags, or an empty expression, is
-/// an error — those cannot be expressed by the (deliberately narrow) wire
-/// [`Constraint`] enum.
+/// A thin delegate to [`fleet_proto::lease::parse_constraint`], the fleet's one
+/// selector grammar (architecture §6.5), with a bare term meaning a **tag** —
+/// `PROBE_RS_FLEET_SELECT=nrf52 && bluetooth` describes a set of boards.
+/// `PROBE_RS_FLEET_BOARD` remains the way to name one board; `board=<name>`
+/// works here too.
 fn parse_select(expr: &str) -> Result<Constraint, SelectorError> {
-    let terms: Vec<&str> = expr
-        .split("&&")
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .collect();
-
-    if terms.is_empty() {
-        return Err(SelectorError::InvalidSelect { reason: "expression is empty".to_owned() });
-    }
-
-    // A single `chip=<name>` term selects by chip.
-    if terms.len() == 1 {
-        if let Some(chip) = terms[0].strip_prefix("chip=") {
-            let chip = chip.trim();
-            if chip.is_empty() {
-                return Err(SelectorError::InvalidSelect { reason: "empty chip name".to_owned() });
-            }
-            return Ok(Constraint::Chip(chip.to_owned()));
+    fleet_proto::lease::parse_constraint(expr, fleet_proto::lease::BareTerm::Tag).map_err(|e| {
+        SelectorError::InvalidSelect {
+            reason: e.to_string(),
         }
-    }
-
-    // Otherwise every term must be a tag (`tag=<name>` or bare `<name>`).
-    let mut tags = Vec::with_capacity(terms.len());
-    for term in terms {
-        if term.starts_with("chip=") {
-            return Err(SelectorError::InvalidSelect {
-                reason: "chip= cannot be combined with tags".to_owned(),
-            });
-        }
-        let tag = term.strip_prefix("tag=").unwrap_or(term).trim();
-        if tag.is_empty() {
-            return Err(SelectorError::InvalidSelect { reason: "empty tag".to_owned() });
-        }
-        if tag.contains('=') {
-            return Err(SelectorError::InvalidSelect {
-                reason: format!("unsupported term `{term}`"),
-            });
-        }
-        tags.push(tag.to_owned());
-    }
-    Ok(Constraint::Tags(tags))
+    })
 }
 
 #[cfg(test)]

@@ -112,21 +112,21 @@ impl CtlConnection {
 
 /// Parse a `lease`/board selector into a [`Constraint`].
 ///
-/// Grammar:
-/// - `tag=<t>` → [`Constraint::Tags`] with a single tag (repeatable on the
-///   wire; the CLI takes one token, callers can refine later),
-/// - `chip=<c>` → [`Constraint::Chip`],
-/// - anything else → [`Constraint::Board`] (a bare, node-local board name; the
-///   coordinator resolves it within the caller's org).
-#[must_use]
-pub fn parse_selector(selector: &str) -> Constraint {
-    if let Some(tag) = selector.strip_prefix("tag=") {
-        Constraint::Tags(vec![tag.to_owned()])
-    } else if let Some(chip) = selector.strip_prefix("chip=") {
-        Constraint::Chip(chip.to_owned())
-    } else {
-        Constraint::Board(BoardName(selector.to_owned()))
-    }
+/// A thin delegate to [`fleet_proto::lease::parse_constraint`], the fleet's one
+/// selector grammar (architecture §6.5), with a bare term meaning a **board**:
+/// `ctl lease nrf52840-dk-3` names a board, unlike the sidecar's
+/// `PROBE_RS_FLEET_SELECT`, where a bare word is a tag. That difference is a
+/// real property of the two surfaces, not an accident — hence the parameter.
+///
+/// The explicit forms (`board=`, `chip=`, `tag=`, and `a && b` tag
+/// conjunctions) mean the same thing on both.
+///
+/// # Errors
+///
+/// Returns the parse error's message for a malformed expression.
+pub fn parse_selector(selector: &str) -> Result<Constraint, String> {
+    fleet_proto::lease::parse_constraint(selector, fleet_proto::lease::BareTerm::Board)
+        .map_err(|e| e.to_string())
 }
 
 /// A thin client of the coordinator's admin/operator surface.
@@ -321,7 +321,7 @@ pub async fn run(args: CtlArgs) -> Result<()> {
         CtlCommand::List => client.list().await,
         CtlCommand::Lease { selector, duration } => {
             let request = LeaseRequest {
-                select: parse_selector(&selector),
+                select: parse_selector(&selector).map_err(|e| anyhow::anyhow!("{e}"))?,
                 duration_secs: duration,
                 priority: Priority::Interactive,
             };
@@ -359,7 +359,17 @@ mod tests {
     #[test]
     fn bare_id_is_a_board_constraint() {
         assert_eq!(
-            parse_selector("nrf52840-dk-3"),
+            parse_selector("nrf52840-dk-3").unwrap(),
+            Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
+        );
+    }
+
+    /// The explicit `board=` form is the one grants use, and means the same
+    /// thing here.
+    #[test]
+    fn explicit_board_prefix_is_a_board_constraint() {
+        assert_eq!(
+            parse_selector("board=nrf52840-dk-3").unwrap(),
             Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
         );
     }
@@ -367,7 +377,7 @@ mod tests {
     #[test]
     fn tag_prefix_is_a_tags_constraint() {
         assert_eq!(
-            parse_selector("tag=nrf52"),
+            parse_selector("tag=nrf52").unwrap(),
             Constraint::Tags(vec!["nrf52".to_owned()])
         );
     }
@@ -375,14 +385,20 @@ mod tests {
     #[test]
     fn chip_prefix_is_a_chip_constraint() {
         assert_eq!(
-            parse_selector("chip=nRF52840_xxAA"),
+            parse_selector("chip=nRF52840_xxAA").unwrap(),
             Constraint::Chip("nRF52840_xxAA".to_owned())
         );
     }
 
+    /// Now that the grammar is shared, an empty term value is an error rather
+    /// than a constraint on the empty tag: `Tags([""])` matches nothing and
+    /// `Tags([])` matches everything, and neither is what the user typed.
     #[test]
-    fn empty_tag_value_is_preserved() {
-        assert_eq!(parse_selector("tag="), Constraint::Tags(vec![String::new()]));
+    fn empty_term_values_are_refused() {
+        assert!(parse_selector("tag=").is_err());
+        assert!(parse_selector("chip=").is_err());
+        assert!(parse_selector("board=").is_err());
+        assert!(parse_selector("").is_err());
     }
 
     #[test]

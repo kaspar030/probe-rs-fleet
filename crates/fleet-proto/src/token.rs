@@ -26,20 +26,141 @@ use crate::ids::{BoardRef, LeaseId};
 
 /// One capability a token may grant. A token carries the set of operations its
 /// holder is allowed to perform against the leased board.
+///
+/// # Where each op is actually enforced
+///
+/// Be honest about this, because "the agent enforces `--ops`" is true for only
+/// two of the six labels:
+///
+/// | op | enforced where |
+/// |---|---|
+/// | [`AllowedOp::Attach`] | agent, at data-channel open (`ChannelKind::Data`) |
+/// | [`AllowedOp::Gdb`] | agent, at gdb-channel open (`ChannelKind::Gdb`) |
+/// | [`AllowedOp::PowerCycle`] | coordinator, in the operator power-cycle handler |
+/// | [`AllowedOp::Flash`], [`AllowedOp::Erase`], [`AllowedOp::Reset`] | **not enforced** |
+///
+/// Flash, erase and reset all happen *in band*, as probe-rs RPC inside an open
+/// data channel, which the fleet relays without parsing. Recording them is
+/// intent and audit, not a control. Enforcing them would mean the agent parsing
+/// probe-rs postcard-rpc frames; that is deliberately out of scope.
+///
+/// The practical consequence, handled by [`normalize_ops`]: a token with
+/// `Flash` but not `Attach` cannot open a data channel at all, so it cannot
+/// flash either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum AllowedOp {
-    /// Flash/download firmware to the target.
+    /// Flash/download firmware to the target. In-band; not enforced.
     Flash,
-    /// Attach to a running target (RTT, monitor).
+    /// Attach to a running target (RTT, monitor). Enforced by the agent at
+    /// data-channel open.
     Attach,
     /// Open a gdb session (raw-TCP tunnel; see architecture §4.2 gap).
+    /// Enforced by the agent at gdb-channel open.
     Gdb,
-    /// Reset the target.
+    /// Reset the target. In-band; not enforced.
     Reset,
-    /// Erase the target's flash.
+    /// Erase the target's flash. In-band; not enforced.
     Erase,
-    /// Cut/restore USB power to the board.
+    /// Cut/restore USB power to the board. Enforced coordinator-side.
     PowerCycle,
+}
+
+impl AllowedOp {
+    /// Every operation, in canonical order.
+    #[must_use]
+    pub fn all() -> Vec<AllowedOp> {
+        vec![
+            AllowedOp::Flash,
+            AllowedOp::Attach,
+            AllowedOp::Gdb,
+            AllowedOp::Reset,
+            AllowedOp::Erase,
+            AllowedOp::PowerCycle,
+        ]
+    }
+
+    /// The CLI/DB label for this op.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AllowedOp::Flash => "flash",
+            AllowedOp::Attach => "attach",
+            AllowedOp::Gdb => "gdb",
+            AllowedOp::Reset => "reset",
+            AllowedOp::Erase => "erase",
+            AllowedOp::PowerCycle => "power-cycle",
+        }
+    }
+
+    /// Parse an op from its label. `power_cycle` and `powercycle` are accepted
+    /// as spellings of `power-cycle`.
+    #[must_use]
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "flash" => Some(AllowedOp::Flash),
+            "attach" => Some(AllowedOp::Attach),
+            "gdb" => Some(AllowedOp::Gdb),
+            "reset" => Some(AllowedOp::Reset),
+            "erase" => Some(AllowedOp::Erase),
+            "power-cycle" | "power_cycle" | "powercycle" => Some(AllowedOp::PowerCycle),
+            _ => None,
+        }
+    }
+
+    /// Whether the fleet actually *enforces* this op somewhere, as opposed to
+    /// merely recording it. See the type docs for the table.
+    #[must_use]
+    pub fn is_enforced(self) -> bool {
+        matches!(
+            self,
+            AllowedOp::Attach | AllowedOp::Gdb | AllowedOp::PowerCycle
+        )
+    }
+
+    /// Whether this op is carried in band inside an open data channel, and
+    /// therefore needs [`AllowedOp::Attach`] to be usable at all.
+    #[must_use]
+    pub fn needs_data_channel(self) -> bool {
+        matches!(self, AllowedOp::Flash | AllowedOp::Erase | AllowedOp::Reset)
+    }
+}
+
+impl std::fmt::Display for AllowedOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Parse a comma-separated op list (`"flash,attach"`).
+///
+/// # Errors
+///
+/// Returns the first unrecognised label.
+pub fn parse_ops(s: &str) -> Result<Vec<AllowedOp>, String> {
+    let mut out = Vec::new();
+    for label in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let op = AllowedOp::from_label(label).ok_or_else(|| label.to_owned())?;
+        out.push(op);
+    }
+    Ok(out)
+}
+
+/// Canonicalise an op set: sort, dedup, and **add [`AllowedOp::Attach`]** if a
+/// data-plane op (flash/erase/reset) is present without it.
+///
+/// Without the implication, `--ops flash` mints a token that cannot open a data
+/// channel and is therefore useless — a silent dud from a security verb, which
+/// is worse than an error. With it, `--ops flash` means what the user meant.
+/// Callers should tell the user when the implication fired.
+#[must_use]
+pub fn normalize_ops(ops: Vec<AllowedOp>) -> Vec<AllowedOp> {
+    let mut ops = ops;
+    if ops.iter().any(|o| o.needs_data_channel()) && !ops.contains(&AllowedOp::Attach) {
+        ops.push(AllowedOp::Attach);
+    }
+    ops.sort_unstable();
+    ops.dedup();
+    ops
 }
 
 /// A signed capability scoped to `{lease, board, allowed_ops}` with an expiry.
@@ -242,6 +363,71 @@ mod tests {
             allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],
             expires: 1_780_000_000,
         }
+    }
+
+    #[test]
+    fn op_labels_round_trip_and_reject_junk() {
+        for op in AllowedOp::all() {
+            assert_eq!(AllowedOp::from_label(op.as_str()), Some(op));
+            assert_eq!(AllowedOp::from_label(&op.to_string().to_uppercase()), Some(op));
+        }
+        assert_eq!(AllowedOp::from_label("power_cycle"), Some(AllowedOp::PowerCycle));
+        assert_eq!(AllowedOp::from_label("root"), None);
+    }
+
+    #[test]
+    fn parse_ops_takes_a_comma_list() {
+        assert_eq!(
+            parse_ops("flash, attach").unwrap(),
+            vec![AllowedOp::Flash, AllowedOp::Attach]
+        );
+        assert_eq!(parse_ops("").unwrap(), vec![]);
+        assert_eq!(parse_ops("flash,nope").unwrap_err(), "nope");
+    }
+
+    /// `--ops flash` alone would mint a token that cannot open a data channel,
+    /// and therefore cannot flash. Adding `Attach` is what stops the verb from
+    /// silently producing a dud.
+    #[test]
+    fn normalize_adds_attach_for_in_band_ops() {
+        assert_eq!(
+            normalize_ops(vec![AllowedOp::Flash]),
+            vec![AllowedOp::Flash, AllowedOp::Attach]
+        );
+        assert_eq!(
+            normalize_ops(vec![AllowedOp::Erase]),
+            vec![AllowedOp::Attach, AllowedOp::Erase]
+        );
+        assert_eq!(
+            normalize_ops(vec![AllowedOp::Reset]),
+            vec![AllowedOp::Attach, AllowedOp::Reset]
+        );
+        // Ops that stand on their own are left alone.
+        assert_eq!(normalize_ops(vec![AllowedOp::Gdb]), vec![AllowedOp::Gdb]);
+        assert_eq!(
+            normalize_ops(vec![AllowedOp::PowerCycle]),
+            vec![AllowedOp::PowerCycle]
+        );
+        // Sorted and deduped.
+        assert_eq!(
+            normalize_ops(vec![AllowedOp::Attach, AllowedOp::Flash, AllowedOp::Attach]),
+            vec![AllowedOp::Flash, AllowedOp::Attach]
+        );
+        assert_eq!(normalize_ops(vec![]), vec![]);
+    }
+
+    /// The enforcement table in the type docs, asserted so the docs cannot
+    /// drift from the code.
+    #[test]
+    fn only_three_ops_are_actually_enforced() {
+        let enforced: Vec<AllowedOp> = AllowedOp::all()
+            .into_iter()
+            .filter(|o| o.is_enforced())
+            .collect();
+        assert_eq!(
+            enforced,
+            vec![AllowedOp::Attach, AllowedOp::Gdb, AllowedOp::PowerCycle]
+        );
     }
 
     #[test]

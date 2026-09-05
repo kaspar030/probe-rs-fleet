@@ -230,6 +230,34 @@ pub struct SubjectKey {
     pub id: String,
 }
 
+impl SubjectKey {
+    /// Parse a rendered subject key (`<org>/<kind>:<id>`).
+    ///
+    /// The inverse of [`std::fmt::Display`], used to read back the `subject`
+    /// column of a grant row. Returns `None` on any shape or kind it does not
+    /// recognise — a grant whose subject will not parse must be dropped closed,
+    /// never widened into a match-anything.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let (org, rest) = s.split_once('/')?;
+        let (kind, id) = rest.split_once(':')?;
+        if org.is_empty() || id.is_empty() {
+            return None;
+        }
+        let kind = match kind {
+            "user" => SubjectKind::User,
+            "node" => SubjectKind::Node,
+            "workload" => SubjectKind::Workload,
+            _ => return None,
+        };
+        Some(SubjectKey {
+            org: OrgId(org.to_owned()),
+            kind,
+            id: id.to_owned(),
+        })
+    }
+}
+
 impl std::fmt::Display for OrgId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -309,6 +337,40 @@ mod tests {
     #[test]
     fn subject_key_renders_org_kind_id() {
         assert_eq!(subject("acme", "alice").key().to_string(), "acme/user:alice");
+    }
+
+    #[test]
+    fn subject_key_parses_back_from_its_rendering() {
+        for s in [
+            subject("acme", "alice").key(),
+            Subject::new(OrgId("gh-42".to_owned()), SubjectKind::Node, "rpi-1").key(),
+            Subject::new(OrgId("gh-42".to_owned()), SubjectKind::Workload, "ci").key(),
+        ] {
+            assert_eq!(SubjectKey::parse(&s.to_string()), Some(s));
+        }
+    }
+
+    /// An id containing `:` still parses: the split is at the *first* colon
+    /// after the first slash, and ids are opaque.
+    #[test]
+    fn subject_key_parse_splits_at_the_first_separators() {
+        let k = SubjectKey::parse("acme/user:gh-1:2").unwrap();
+        assert_eq!(k.id, "gh-1:2");
+        assert_eq!(k.org, OrgId("acme".to_owned()));
+    }
+
+    #[test]
+    fn malformed_subject_keys_are_rejected_not_guessed() {
+        for bad in [
+            "acme/user",
+            "acme:user:alice",
+            "acme/root:alice",
+            "/user:alice",
+            "acme/user:",
+            "alice",
+        ] {
+            assert_eq!(SubjectKey::parse(bad), None, "{bad} should not parse");
+        }
     }
 
     #[test]

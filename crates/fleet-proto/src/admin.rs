@@ -9,7 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::board::PowerKind;
-use crate::ids::{AgentId, BoardRef, LeaseId, Subject};
+use crate::ids::{AgentId, BoardRef, LeaseId, OrgId, Subject, SubjectKey};
+use crate::token::AllowedOp;
 
 /// A coarse, operator-facing lifecycle label for a board in `ctl list`.
 ///
@@ -80,4 +81,33 @@ pub struct LogLine {
     pub board: Option<String>,
     /// Free-form detail.
     pub detail: Option<String>,
+}
+
+/// One row of the `grant list` table (architecture §6.5).
+///
+/// `selector` is the **canonical rendered** [`crate::lease::Constraint`] (see
+/// its `Display`), which is exactly what is stored; evaluation re-parses it.
+/// Keeping it a string on the wire means a row that fails to re-parse is a
+/// visible, listable artefact rather than a decode failure that hides the whole
+/// table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantSummary {
+    /// Opaque grant id (32 hex chars). Revoked by id prefix.
+    pub id: String,
+    /// The org whose hardware is being shared.
+    pub org: OrgId,
+    /// Who the hardware is shared with.
+    pub subject: SubjectKey,
+    /// The canonical selector string.
+    pub selector: String,
+    /// The operations granted.
+    pub ops: Vec<AllowedOp>,
+    /// Expiry as epoch seconds. `None` means no expiry, which the `/client`
+    /// path refuses to create.
+    pub expires: Option<u64>,
+    /// The user who created the grant, if recorded. `None` for rows created
+    /// outside the API; an org admin can still revoke those.
+    pub created_by: Option<String>,
+    /// When the grant was created (epoch seconds).
+    pub created_at: u64,
 }

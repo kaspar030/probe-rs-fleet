@@ -19,7 +19,7 @@ pub mod lease;
 pub mod token;
 
 pub use adopt::AdoptPolicy;
-pub use admin::{BoardAvailability, BoardSummary, LeaseHolderSummary, LogLine};
+pub use admin::{BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine};
 pub use agent_api::{
     AgentReport, BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe,
     LogLevel, PowerAction, ProbeInventory,
@@ -29,9 +29,12 @@ pub use ids::{
     AgentId, BoardName, BoardRef, Group, LeaseId, NodeId, OrgId, Role, Subject, SubjectKey,
     SubjectKind, UserId,
 };
-pub use lease::{Constraint, LeaseGrant, LeaseRequest};
+pub use lease::{
+    parse_constraint, BareTerm, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest,
+};
 pub use token::{
-    AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner, TokenVerifier, SIGNATURE_LEN,
+    normalize_ops, parse_ops, AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner,
+    TokenVerifier, SIGNATURE_LEN,
 };
 
 /// An opaque chunk of data-plane bytes (probe-rs postcard-rpc frames).
