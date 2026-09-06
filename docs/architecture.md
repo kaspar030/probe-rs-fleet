@@ -1601,6 +1601,10 @@ Proposed selector convention (additive, no laze change required):
   (e.g. `nrf52840-dk-3`), or
 - `PROBE_RS_FLEET_SELECT` — constraint expr (e.g. `tag=nrf52 && bluetooth`).
 - `PROBE_RS_FLEET_TOKEN` / `…_COORDINATOR` — auth + endpoint.
+- `PROBE_RS_FLEET_QUEUE_WAIT` — how many seconds to wait for a queued lease to
+  be promoted before giving up (default 300; `0` = do not wait). A client-side
+  patience bound, not a coordinator policy knob: how long *this* invocation is
+  willing to sit in the queue is the caller's business (§6.6).
 - Absent ⇒ sidecar falls back to local probe-rs (transparent local DX).
 - Setting more than one of the three selector vars is `AmbiguousSelector`, not
   a precedence rule.
