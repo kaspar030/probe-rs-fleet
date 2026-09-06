@@ -298,3 +298,86 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
+
+/// The bounded queue wait cleans up after itself, over a real socket.
+///
+/// This is the property #381 is really about, and it arrives *by side effect*:
+/// there is no cancel message on the wire, so when the sidecar's deadline fires
+/// it drops its session, tungstenite closes the socket, and the coordinator's
+/// `drop_sidecar` removes the queued request. Asserting on the scheduler's
+/// queue rather than on the `Declined` return is deliberate — the `Declined`
+/// assertion would keep passing if the cleanup broke, which is exactly the
+/// regression worth catching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_fires_leaves_no_waiter_behind() {
+    let fleet = TestCoordinator::start().await;
+    let org = OrgId("default".to_owned());
+    let board = fleet.seed_board(&org, "rpi-lab-1", "b1", &["nrf52"]).await;
+
+    let alice = fleet.seed_session("default", "alice", Role::Member).await;
+    let bob = fleet.seed_session("default", "bob", Role::Member).await;
+
+    // alice takes the board.
+    let alice_session = fleet.client_session(&alice).await;
+    let request = LeaseRequest {
+        select: Constraint::Id(BoardName("b1".to_owned())),
+        duration_secs: 600,
+        priority: Priority::Interactive,
+    };
+    let grant = alice_session
+        .lease(&request, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(grant.board, board);
+
+    // bob waits, briefly, and gives up.
+    {
+        let bob_session = fleet.client_session(&bob).await;
+        let err = bob_session
+            .lease(&request, std::time::Duration::from_millis(200))
+            .await
+            .expect_err("the board is held; the wait must expire");
+        assert!(
+            err.to_string().contains("still queued"),
+            "the failure should name the wait: {err}"
+        );
+        assert_eq!(
+            fleet.coord.scheduler().lock().await.queued_len(),
+            1,
+            "bob is still queued while his session is alive"
+        );
+        // Dropping the session here is what closes the socket.
+    }
+
+    // The close is asynchronous; wait for the coordinator to notice.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if fleet.coord.scheduler().lock().await.queued_len() == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a sidecar that gave up must not leave a waiter behind"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // And the board goes back to being free rather than to the ghost.
+    alice_session.release(grant.lease).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        {
+            let sched = fleet.coord.scheduler().lock().await;
+            if sched.board(&board).map(|b| b.state.clone())
+                == Some(fleet_proto::board::BoardState::Idle)
+            {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the freed board must be idle, not leased to a departed waiter"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}

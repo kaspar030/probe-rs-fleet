@@ -143,6 +143,7 @@ impl SidecarRegistry {
     /// Starts at 1: [`RequesterId::DETACHED`] is 0 and must never collide with
     /// a real connection, or a detached call path would inherit somebody's
     /// promotion channel.
+    #[must_use]
     pub fn mint(&self) -> RequesterId {
         RequesterId(self.next.fetch_add(1, Ordering::Relaxed) + 1)
     }

@@ -258,4 +258,58 @@ mod tests {
             other => panic!("expected ReleaseLease, got {other:?}"),
         }
     }
+
+    /// The expiry path pushes a promotion too, not just the release path: a
+    /// waiter whose turn comes round because the holder's TTL ran out is told
+    /// so on its own connection.
+    #[tokio::test]
+    async fn sweep_pushes_a_promotion_to_the_waiting_sidecar() {
+        let time = Arc::new(AtomicU64::new(1000));
+        let coord = coord_with_board(time.clone()).await;
+        coord
+            .db()
+            .ensure_user_member(&org(), "bob", Role::Member)
+            .await
+            .unwrap();
+
+        let req = || LeaseRequest {
+            select: Constraint::Id(BoardName("b1".to_owned())),
+            duration_secs: 10,
+            priority: Priority::Interactive,
+        };
+        let alice = Subject::new(org(), SubjectKind::User, "alice");
+        let bob = Subject::new(org(), SubjectKind::User, "bob");
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(&alice, SidecarToCoord::Lease(req()), &tx, RequesterId::DETACHED)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
+
+        let (bob_tx, mut bob_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let bob_id = coord.sidecars().mint();
+        coord.sidecars().insert(bob_id, bob_tx.clone()).await;
+        coord
+            .handle_sidecar_message(&bob, SidecarToCoord::Lease(req()), &bob_tx, bob_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            bob_rx.recv().await.unwrap(),
+            CoordToSidecar::Queued { .. }
+        ));
+
+        time.store(2000, Ordering::SeqCst);
+        sweep_once(&coord).await;
+
+        match bob_rx.recv().await.unwrap() {
+            CoordToSidecar::Lease(g) => assert_eq!(g.holder, bob),
+            other => panic!("expected a promotion push, got {other:?}"),
+        }
+        assert_eq!(
+            coord.db().scoped(org()).open_lease_count().await.unwrap(),
+            1,
+            "alice's expired lease is closed, bob's promotion is open"
+        );
+    }
 }

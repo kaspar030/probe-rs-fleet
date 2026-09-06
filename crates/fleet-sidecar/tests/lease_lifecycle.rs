@@ -359,3 +359,164 @@ async fn a_long_session_is_kept_alive() {
     assert_eq!((first, second), (1, 2), "the session is heartbeat repeatedly");
     peer.await.unwrap();
 }
+
+/// #384: a queued lease request **waits** for its turn instead of failing.
+///
+/// The headline behaviour: the peer replies `Queued`, then later pushes the
+/// promotion `Lease` on the same connection, and `lease()` returns that grant.
+/// Before this, a CI matrix wider than the fleet failed legs it should merely
+/// have delayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_request_returns_the_grant_when_it_is_promoted() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            SidecarToCoord::Lease(_) => {}
+            other => panic!("expected Lease, got {other:?}"),
+        }
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 1 })
+            .await
+            .unwrap();
+        // Some other traffic in the meantime must not abort the wait.
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::BoardList(Vec::new()))
+            .await
+            .unwrap();
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+            .await
+            .unwrap();
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let granted = session
+        .lease(&lease_request(), Duration::from_secs(300))
+        .await
+        .expect("a queued request is promoted, not refused");
+    assert_eq!(granted.lease, LeaseId(1));
+    peer.await.unwrap();
+}
+
+/// The wait is bounded: a peer that queues us and then says nothing must not
+/// park the invocation forever. Time is virtual (`start_paused`), so this
+/// exercises the real 300s-shaped deadline without sleeping.
+#[tokio::test(start_paused = true)]
+async fn a_queued_request_gives_up_at_its_deadline() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            SidecarToCoord::Lease(_) => {}
+            other => panic!("expected Lease, got {other:?}"),
+        }
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 3 })
+            .await
+            .unwrap();
+        // ...and then nothing at all. Hold the connection open so the failure
+        // is the deadline, not a close.
+        std::future::pending::<()>().await;
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let err = session
+        .lease(&lease_request(), Duration::from_secs(300))
+        .await
+        .expect_err("the wait must be bounded");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("still queued at position 3") && msg.contains("300s"),
+        "the failure must name the wait: {msg}"
+    );
+    peer.abort();
+}
+
+/// `queue_wait_secs: 0` is the escape hatch: fail fast on contention exactly as
+/// the sidecar did before the wait existed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_wait_fails_fast_on_contention() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap();
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 2 })
+            .await
+            .unwrap();
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let err = session
+        .lease(&lease_request(), Duration::ZERO)
+        .await
+        .expect_err("zero wait means do not wait");
+    assert!(err.to_string().contains("queued at position 2"), "{err}");
+    peer.await.unwrap();
+}
+
+/// `NoCandidate` fails immediately and says what is actually wrong: waiting for
+/// a board that does not exist can only ever time out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_candidate_fails_fast_with_a_useful_message() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap();
+        fleet_wire::send(
+            &mut coord_tx,
+            &CoordToSidecar::NoCandidate {
+                selector: "id=b9".to_owned(),
+                reachable: 4,
+            },
+        )
+        .await
+        .unwrap();
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    // A long wait, to prove the failure is the decision and not a timeout.
+    let err = session
+        .lease(&lease_request(), Duration::from_secs(300))
+        .await
+        .expect_err("no candidate must not wait");
+    let msg = err.to_string();
+    assert!(msg.contains("no board matches `id=b9`"), "{msg}");
+    assert!(msg.contains("4 boards you can reach"), "{msg}");
+    peer.await.unwrap();
+}
+
+/// `AtCap` likewise: the caller's own budget is the problem, and the message
+/// names the knob rather than blaming the fleet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_cap_fails_fast_and_blames_the_right_thing() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap();
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::AtCap { held: 2, cap: 2 })
+            .await
+            .unwrap();
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let err = session
+        .lease(&lease_request(), Duration::from_secs(300))
+        .await
+        .expect_err("at cap must not wait");
+    let msg = err.to_string();
+    assert!(msg.contains("you already hold 2 leases"), "{msg}");
+    assert!(msg.contains("max_concurrent_per_subject = 2"), "{msg}");
+    peer.await.unwrap();
+}

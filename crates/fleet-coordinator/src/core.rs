@@ -3259,6 +3259,423 @@ mod tests {
             CoordToSidecar::Queued { position } => assert_eq!(position, 0),
             other => panic!("expected Queued, got {other:?}"),
         }
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 1);
+    }
+
+    /// A selector matching nothing reaches the wire as its own variant, with
+    /// the count of boards the caller *can* see — and queues nothing.
+    #[tokio::test]
+    async fn a_selector_matching_nothing_is_no_candidate_on_the_wire() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "alice"),
+                SidecarToCoord::Lease(lease_req("no-such-board")),
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::NoCandidate {
+                selector,
+                reachable,
+            } => {
+                assert_eq!(selector, "id=no-such-board");
+                assert_eq!(reachable, 1, "alice can reach the org's one board");
+            }
+            other => panic!("expected NoCandidate, got {other:?}"),
+        }
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 0);
+    }
+
+    /// At the cap, the caller is told so — not that the board is contended —
+    /// and nothing is queued.
+    #[tokio::test]
+    async fn an_at_cap_request_is_at_cap_on_the_wire() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[
+                board(DEFAULT_ORG_ID, "b1", "agent-a"),
+                board(DEFAULT_ORG_ID, "b2", "agent-a"),
+                board(DEFAULT_ORG_ID, "b3", "agent-a"),
+            ],
+            &[(DEFAULT_ORG_ID, "alice", Role::Member)],
+        )
+        .await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        // The default cap is 2.
+        let cap = Policy::default().max_concurrent_per_subject;
+        for i in 1..=cap {
+            let _ = grant_lease(&coord, &alice, &format!("b{i}")).await;
+        }
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &alice,
+                // b3 is idle, so "contended" would have been a lie too.
+                SidecarToCoord::Lease(lease_req("b3")),
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::AtCap { held, cap: got } => {
+                assert_eq!(held, cap);
+                assert_eq!(got, cap);
+            }
+            other => panic!("expected AtCap, got {other:?}"),
+        }
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 0);
+    }
+
+    /// #452: `ctl delegate` on a contended board reports the slip and leaves
+    /// the queue **exactly** as it found it. Asserting on the scheduler's queue
+    /// rather than only on the reply is the point — the reply was already
+    /// right before the fix.
+    #[tokio::test]
+    async fn delegate_on_a_contended_board_leaves_no_waiter() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let _ = grant_lease(&coord, &alice, "b1").await;
+
+        let before = coord.scheduler().lock().await.queued_len();
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "bob"),
+                SidecarToCoord::Delegate {
+                    select: Constraint::Id(BoardName("b1".to_owned())),
+                    duration_secs: 600,
+                    ops: vec![fleet_proto::token::AllowedOp::Flash],
+                },
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::Queued { .. }
+        ));
+        assert_eq!(
+            coord.scheduler().lock().await.queued_len(),
+            before,
+            "delegate must not enqueue: a waiter it leaves behind can be promoted \
+             onto a board nobody is holding"
+        );
+    }
+
+    /// #384: a queued sidecar is *pushed* its grant when the board frees up,
+    /// instead of learning about it the next time it happens to ask.
+    #[tokio::test]
+    async fn a_queued_sidecar_is_pushed_its_grant_on_promotion() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let bob = user(DEFAULT_ORG_ID, "bob");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+
+        // bob queues on a *registered* connection, so a promotion can reach him.
+        let (bob_tx, mut bob_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let bob_id = coord.sidecars().mint();
+        coord.sidecars().insert(bob_id, bob_tx.clone()).await;
+        coord
+            .handle_sidecar_message(&bob, SidecarToCoord::Lease(lease_req("b1")), &bob_tx, bob_id)
+            .await
+            .unwrap();
+        assert!(matches!(
+            bob_rx.recv().await.unwrap(),
+            CoordToSidecar::Queued { .. }
+        ));
+
+        // alice releases; bob is promoted and told so on his own connection.
+        let (tx, _rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Release {
+                    lease: grant.lease,
+                },
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match bob_rx.recv().await.unwrap() {
+            CoordToSidecar::Lease(g) => {
+                assert_eq!(g.board, grant.board);
+                assert_ne!(g.lease, grant.lease, "a promotion is a new lease");
+            }
+            other => panic!("expected a promotion push, got {other:?}"),
+        }
+        assert_eq!(
+            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            1,
+            "the promoted lease is persisted"
+        );
+    }
+
+    /// #381: a queued waiter whose sidecar disconnects is gone, and the board
+    /// goes to the next waiter rather than to the ghost.
+    #[tokio::test]
+    async fn a_disconnected_sidecars_waiter_is_dropped_and_the_next_one_wins() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[
+                (DEFAULT_ORG_ID, "alice", Role::Member),
+                (DEFAULT_ORG_ID, "bob", Role::Member),
+                (DEFAULT_ORG_ID, "carol", Role::Member),
+            ],
+        )
+        .await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let bob = user(DEFAULT_ORG_ID, "bob");
+        let carol = user(DEFAULT_ORG_ID, "carol");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+
+        // bob queues first, then carol.
+        let (bob_tx, _bob_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let bob_id = coord.sidecars().mint();
+        coord.sidecars().insert(bob_id, bob_tx.clone()).await;
+        coord
+            .handle_sidecar_message(&bob, SidecarToCoord::Lease(lease_req("b1")), &bob_tx, bob_id)
+            .await
+            .unwrap();
+
+        let (carol_tx, mut carol_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let carol_id = coord.sidecars().mint();
+        coord.sidecars().insert(carol_id, carol_tx.clone()).await;
+        coord
+            .handle_sidecar_message(
+                &carol,
+                SidecarToCoord::Lease(lease_req("b1")),
+                &carol_tx,
+                carol_id,
+            )
+            .await
+            .unwrap();
+        let _ = carol_rx.recv().await.unwrap();
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 2);
+
+        // bob's sidecar goes away.
+        coord.drop_sidecar(&bob, bob_id).await;
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 1);
+
+        // The board goes to carol, who is still there.
+        let (tx, _rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Release {
+                    lease: grant.lease,
+                },
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match carol_rx.recv().await.unwrap() {
+            CoordToSidecar::Lease(g) => assert_eq!(g.holder, carol),
+            other => panic!("expected carol's promotion, got {other:?}"),
+        }
+    }
+
+    /// The guard on the above not over-reaching: a **held** lease survives its
+    /// sidecar disconnecting, and goes away at TTL like any other.
+    #[tokio::test]
+    async fn a_disconnected_sidecars_held_lease_survives_to_ttl() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+        let requester = coord.sidecars().mint();
+
+        coord.drop_sidecar(&alice, requester).await;
+
+        assert_eq!(
+            coord.scheduler().lock().await.lease_holder(grant.lease),
+            Some(&alice),
+            "a lease outlives the connection that requested it"
+        );
+        assert_eq!(
+            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            1
+        );
+    }
+
+    /// The D2 regression: two connections, one subject. Closing one must not
+    /// cancel the other's queued request — the `ctl list` while `probe-rs run`
+    /// waits scenario, which a `SubjectKey`-keyed drop would break.
+    #[tokio::test]
+    async fn closing_one_connection_leaves_the_same_subjects_other_waiter() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let bob = user(DEFAULT_ORG_ID, "bob");
+        let _ = grant_lease(&coord, &alice, "b1").await;
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+            let id = coord.sidecars().mint();
+            coord.sidecars().insert(id, tx.clone()).await;
+            coord
+                .handle_sidecar_message(&bob, SidecarToCoord::Lease(lease_req("b1")), &tx, id)
+                .await
+                .unwrap();
+            let _ = rx.recv().await.unwrap();
+            ids.push(id);
+        }
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 2);
+
+        coord.drop_sidecar(&bob, ids[0]).await;
+        assert_eq!(
+            coord.scheduler().lock().await.queued_len(),
+            1,
+            "only the closed connection's waiter goes"
+        );
+    }
+
+    /// An undeliverable promotion must not leave a board leased to nobody: it
+    /// is released again and handed to the next waiter, with both the
+    /// `record_lease` and the `close_lease` landing so the lease count returns
+    /// to where it started.
+    #[tokio::test]
+    async fn an_undeliverable_promotion_is_torn_down_and_the_next_waiter_wins() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[
+                (DEFAULT_ORG_ID, "alice", Role::Member),
+                (DEFAULT_ORG_ID, "bob", Role::Member),
+                (DEFAULT_ORG_ID, "carol", Role::Member),
+            ],
+        )
+        .await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let bob = user(DEFAULT_ORG_ID, "bob");
+        let carol = user(DEFAULT_ORG_ID, "carol");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+
+        // bob queues on an id that is never registered: he is the ghost whose
+        // deadline fired between queueing and promotion.
+        let ghost = RequesterId(9_999);
+        let (bob_tx, _bob_rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(&bob, SidecarToCoord::Lease(lease_req("b1")), &bob_tx, ghost)
+            .await
+            .unwrap();
+
+        let (carol_tx, mut carol_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let carol_id = coord.sidecars().mint();
+        coord.sidecars().insert(carol_id, carol_tx.clone()).await;
+        coord
+            .handle_sidecar_message(
+                &carol,
+                SidecarToCoord::Lease(lease_req("b1")),
+                &carol_tx,
+                carol_id,
+            )
+            .await
+            .unwrap();
+        let _ = carol_rx.recv().await.unwrap();
+
+        // alice releases: bob wins the promotion, cannot be reached, and the
+        // board is passed to carol in the same call.
+        let (tx, _rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Release {
+                    lease: grant.lease,
+                },
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+
+        match carol_rx.recv().await.unwrap() {
+            CoordToSidecar::Lease(g) => assert_eq!(g.holder, carol),
+            other => panic!("expected carol's promotion, got {other:?}"),
+        }
+        assert_eq!(
+            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            1,
+            "bob's stillborn lease was recorded and then closed; only carol's is open"
+        );
+        assert_eq!(coord.scheduler().lock().await.queued_len(), 0);
+    }
+
+    /// The chain terminates: two undeliverable waiters ahead of a live one.
+    #[tokio::test]
+    async fn a_chain_of_undeliverable_promotions_terminates_on_a_live_one() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[
+                (DEFAULT_ORG_ID, "alice", Role::Member),
+                (DEFAULT_ORG_ID, "bob", Role::Member),
+                (DEFAULT_ORG_ID, "carol", Role::Member),
+                (DEFAULT_ORG_ID, "dave", Role::Member),
+            ],
+        )
+        .await;
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let grant = grant_lease(&coord, &alice, "b1").await;
+
+        let (ghost_tx, _ghost_rx) = mpsc::channel::<CoordToSidecar>(16);
+        for (i, name) in ["bob", "carol"].iter().enumerate() {
+            coord
+                .handle_sidecar_message(
+                    &user(DEFAULT_ORG_ID, name),
+                    SidecarToCoord::Lease(lease_req("b1")),
+                    &ghost_tx,
+                    RequesterId(5_000 + i as u64),
+                )
+                .await
+                .unwrap();
+        }
+        let dave = user(DEFAULT_ORG_ID, "dave");
+        let (dave_tx, mut dave_rx) = mpsc::channel::<CoordToSidecar>(16);
+        let dave_id = coord.sidecars().mint();
+        coord.sidecars().insert(dave_id, dave_tx.clone()).await;
+        coord
+            .handle_sidecar_message(&dave, SidecarToCoord::Lease(lease_req("b1")), &dave_tx, dave_id)
+            .await
+            .unwrap();
+        let _ = dave_rx.recv().await.unwrap();
+
+        let (tx, _rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Release {
+                    lease: grant.lease,
+                },
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match dave_rx.recv().await.unwrap() {
+            CoordToSidecar::Lease(g) => assert_eq!(g.holder, dave),
+            other => panic!("expected dave's promotion, got {other:?}"),
+        }
+        assert_eq!(
+            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            1
+        );
     }
 
     #[tokio::test]

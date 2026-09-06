@@ -315,16 +315,14 @@ impl CoordSession {
         let deadline = tokio::time::Instant::now() + queue_wait;
         loop {
             let next = if queued_at.is_some() {
-                match tokio::time::timeout_at(deadline, self.next_ctrl()).await {
-                    Ok(next) => next?,
-                    Err(_) => {
-                        let position = queued_at.unwrap_or(0);
-                        return Err(TransportError::Declined(format!(
-                            "still queued at position {position} after {}s; giving up",
-                            queue_wait.as_secs()
-                        )));
-                    }
-                }
+                let Ok(next) = tokio::time::timeout_at(deadline, self.next_ctrl()).await else {
+                    let position = queued_at.unwrap_or(0);
+                    return Err(TransportError::Declined(format!(
+                        "still queued at position {position} after {}s; giving up",
+                        queue_wait.as_secs()
+                    )));
+                };
+                next?
             } else {
                 self.next_ctrl().await?
             };

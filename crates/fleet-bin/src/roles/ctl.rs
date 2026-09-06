@@ -209,6 +209,18 @@ impl CtlClient {
     }
 
     /// `ctl lease <selector> [--duration]`.
+    ///
+    /// Deliberately **does not** grow the sidecar's bounded wait: this prints a
+    /// queue position and exits 0, the same as it always has. The two paths
+    /// stay distinct because they answer different questions — `probe-rs run`
+    /// wants a board and will wait for one, an operator running `ctl lease`
+    /// wants to know the state of the queue.
+    ///
+    /// The slip it reports now lasts only while the command runs: `ctl` opens
+    /// one connection per command, and a connection closing drops its queued
+    /// requests. That is the point — an abandoned `ctl lease` waiter used to
+    /// sit in the queue forever and could be promoted onto a board nobody was
+    /// holding — but it does mean the position is a snapshot, not a booking.
     async fn lease(&self, request: &LeaseRequest) -> Result<()> {
         let session = self.connect_session().await?;
         match session
@@ -223,9 +235,23 @@ impl CtlClient {
                 Ok(())
             }
             CoordToSidecar::Queued { position } => {
-                println!("queued at position {position}");
+                println!(
+                    "queued at position {position} (the slip lasts only while this command runs)"
+                );
                 Ok(())
             }
+            CoordToSidecar::NoCandidate {
+                selector,
+                reachable,
+            } => {
+                anyhow::bail!(
+                    "no board matches `{selector}`; ctl list shows {reachable} boards you can reach"
+                )
+            }
+            CoordToSidecar::AtCap { held, cap } => anyhow::bail!(
+                "you already hold {held} leases (cap max_concurrent_per_subject = {cap}); \
+                 release one or raise the cap"
+            ),
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
             other => anyhow::bail!("unexpected reply: {other:?}"),
         }
@@ -264,9 +290,11 @@ impl CtlClient {
     /// delegation (architecture §6.5).
     ///
     /// Returns the process exit code: a queue slip is a **failure**
-    /// (exit 1, no token). A handoff script must not mistake "contended" for
-    /// "here is your board", and blocking a sandbox-provisioning command on an
-    /// unbounded queue would be worse than failing fast.
+    /// (exit 1, no token), as are `NoCandidate` and `AtCap`. A handoff script
+    /// must not mistake "contended" for "here is your board", and blocking a
+    /// sandbox-provisioning command on an unbounded queue would be worse than
+    /// failing fast. Nothing is left queued behind a refusal either — the
+    /// coordinator answers this verb without enqueueing.
     async fn delegate(
         &self,
         select: Constraint,
@@ -297,6 +325,22 @@ impl CtlClient {
             }
             CoordToSidecar::Queued { position } => {
                 eprintln!("board contended; queued at position {position} — no token issued");
+                Ok(ExitCode::FAILURE)
+            }
+            CoordToSidecar::NoCandidate {
+                selector,
+                reachable,
+            } => {
+                eprintln!(
+                    "no board matches `{selector}`; ctl list shows {reachable} boards you can reach"
+                );
+                Ok(ExitCode::FAILURE)
+            }
+            CoordToSidecar::AtCap { held, cap } => {
+                eprintln!(
+                    "you already hold {held} leases (cap max_concurrent_per_subject = {cap}); \
+                     release one or raise the cap"
+                );
                 Ok(ExitCode::FAILURE)
             }
             CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),

@@ -586,6 +586,17 @@ impl Scheduler {
         LeaseDecision::Queued { position }
     }
 
+    /// How many requests are currently queued, across all subjects and
+    /// selectors.
+    ///
+    /// Observation only — the coordinator uses it for diagnostics, and tests
+    /// use it to assert the property that matters about the decision split:
+    /// which outcomes enqueue and which do not.
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+
     /// Drop every queued request made by `requester`, returning how many were
     /// removed.
     ///

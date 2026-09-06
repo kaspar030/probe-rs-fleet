@@ -441,6 +441,44 @@ mod tests {
         assert_eq!(resolve(&env).unwrap(), Resolution::Local);
     }
 
+    /// The queue wait defaults to five minutes, is overridable, and treats a
+    /// malformed value as "use the default" rather than failing the run — it
+    /// tunes patience, and refusing to start over it would be the worse
+    /// outcome.
+    #[test]
+    fn the_queue_wait_defaults_and_can_be_overridden() {
+        let base = [
+            (env::ID, "b1"),
+            (env::COORDINATOR, "coord.example:4443"),
+            (env::TOKEN, "secret"),
+        ];
+        let fleet = |pairs: &[(&str, &str)]| {
+            let Resolution::Fleet(cfg) = resolve(&MapEnv::new(pairs)).unwrap() else {
+                panic!("expected Fleet");
+            };
+            cfg
+        };
+
+        assert_eq!(
+            fleet(&base).queue_wait_secs,
+            DEFAULT_QUEUE_WAIT_SECS,
+            "low minutes by default"
+        );
+
+        let mut with_wait = base.to_vec();
+        with_wait.push((env::QUEUE_WAIT, "30"));
+        assert_eq!(fleet(&with_wait).queue_wait_secs, 30);
+
+        // 0 is the documented escape hatch: fail fast on contention.
+        let mut no_wait = base.to_vec();
+        no_wait.push((env::QUEUE_WAIT, "0"));
+        assert_eq!(fleet(&no_wait).queue_wait_secs, 0);
+
+        let mut junk = base.to_vec();
+        junk.push((env::QUEUE_WAIT, "soon"));
+        assert_eq!(fleet(&junk).queue_wait_secs, DEFAULT_QUEUE_WAIT_SECS);
+    }
+
     #[test]
     fn unrelated_env_still_local() {
         // A function-based EnvSource that returns None for everything.
