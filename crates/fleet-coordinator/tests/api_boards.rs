@@ -197,6 +197,49 @@ async fn an_owner_power_cycles_a_board_and_the_agent_is_commanded() {
     );
 }
 
+/// **The exact string the web UI sends resolves to the right board.**
+///
+/// `web/pages/devices.mjs` builds its body from `BoardKeyView`'s `node` and
+/// `name` — `"{org}/{node}/{board}"`, since a node id is already `{org}/{name}`
+/// — rather than sending a bare board name, so that a name which is ambiguous
+/// across two nodes cannot resolve to the wrong one. That spelling only works
+/// because of `BoardRef::answers_to`'s `qualifier == self.node.0` branch, which
+/// is a contract between a JavaScript file and a Rust function with nothing in
+/// between to catch a drift. Pinned here, with the ambiguity actually present:
+/// two nodes, both offering `dk-3`, and the qualified request cycling exactly
+/// one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_qualified_board_spelling_the_ui_sends_resolves_unambiguously() {
+    let fleet = TestCoordinator::start().await;
+    let org = OrgId("acme".to_owned());
+    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let first = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let second = fleet.seed_board(&org, "rpi-2", "dk-3", &["nrf52"]).await;
+    let mut agent_one = AgentStub::attach(&fleet, &first.node).await;
+    let mut agent_two = AgentStub::attach(&fleet, &second.node).await;
+
+    // Exactly what the page puts in the body: `BoardKeyView.node` (already
+    // `{org}/{name}`) then a slash then the node-local board name.
+    let (status, body) = as_browser(
+        &fleet,
+        "POST",
+        "/api/v1/boards/power-cycle",
+        &alice,
+        Some(&power_cycle_body(&format!("{}/dk-3", second.node.0))),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(parse(&body)["board"], "dk-3");
+
+    // The *second* node's board, and only it. A bare `dk-3` would have been
+    // free to pick either.
+    assert_eq!(agent_two.expect_power_cycle().await.0, "dk-3");
+    assert!(
+        agent_one.is_idle(),
+        "a qualified request reached the wrong node's agent"
+    );
+}
+
 /// **A grantee without `AllowedOp::PowerCycle` is refused** — the coordinator's
 /// one op check, and the whole reason this endpoint cannot be a thin passthrough.
 ///
