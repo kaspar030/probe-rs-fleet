@@ -30,6 +30,17 @@
 //!
 //! The environment is read through an injectable [`EnvSource`] so tests never
 //! touch the real process environment.
+//!
+//! That injectability is also how the CLI selector flags work: this crate still
+//! resolves purely from an `EnvSource`, but `probe-rs-fleet sidecar --board` /
+//! `--select` layers the flag over the process environment in `fleet-bin`
+//! (`roles::sidecar::SelectorFlags`). The flag wins and *replaces both*
+//! selector variables, so it never produces [`SelectorError::AmbiguousSelector`]
+//! against a stale one; `PROBE_RS_FLEET_CAPABILITY` is not intercepted, so a
+//! capability token plus a flag is still
+//! [`SelectorError::CapabilityWithSelector`]. The argv0 `probe-rs` shim carries
+//! no flags at all (it forwards every argument verbatim to stay transparent to
+//! laze), so there the environment remains the only mechanism.
 
 use fleet_proto::ids::BoardName;
 use fleet_proto::lease::Constraint;

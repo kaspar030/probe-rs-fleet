@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use crate::roles;
+use crate::roles::sidecar::SelectorFlags;
 
 /// The single multi-role probe-rs-fleet binary.
 #[derive(Debug, Parser)]
@@ -686,11 +687,33 @@ impl AgentUpArgs {
 }
 
 /// Arguments for the explicit `sidecar` subcommand.
+///
+/// The selector flags must come **before** the probe-rs subcommand (and before
+/// `--`): everything from the first positional onwards is forwarded verbatim,
+/// so `sidecar -- --select tag=x` hands `--select tag=x` to probe-rs rather
+/// than to us.
+///
+/// The argv0 `probe-rs` symlink path carries **no** flags at all — it forwards
+/// every argument verbatim so the shim stays transparent to laze — so there the
+/// selector still comes only from the environment. Do not "fix" that.
 #[derive(Debug, Args)]
 pub struct SidecarArgs {
     /// The fleet whose `[user]` credential the shim connects with.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
     pub fleet: String,
+    /// Explicit board id to lease (e.g. `nrf52840-dk-1`).
+    ///
+    /// Overrides both `PROBE_RS_FLEET_BOARD` and `_SELECT` in the environment.
+    /// An empty value is treated as if the flag were absent.
+    #[arg(long, conflicts_with = "select")]
+    pub board: Option<String>,
+    /// Board selector expression: `tag=<t> && <t>`, `chip=<c>`, `board=<n>`, or
+    /// a bare term (a tag).
+    ///
+    /// Overrides both `PROBE_RS_FLEET_BOARD` and `_SELECT` in the environment.
+    /// An empty value is treated as if the flag were absent.
+    #[arg(long, conflicts_with = "board")]
+    pub select: Option<String>,
     /// The probe-rs subcommand and its arguments, forwarded verbatim.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub probe_rs_args: Vec<OsString>,
@@ -960,7 +983,9 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 .ok()
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| crate::paths::DEFAULT_FLEET.to_owned());
-            roles::sidecar::run(probe_rs_args, &fleet).await
+            // No selector flags here by contract: the argv0 shim forwards every
+            // argument verbatim to probe-rs, so the selector stays env-only.
+            roles::sidecar::run(probe_rs_args, &fleet, SelectorFlags::default()).await
         }
         Dispatch::Clap => {
             let cli = Cli::parse_from(process_args);
@@ -1002,7 +1027,8 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     }
                 },
                 Command::Sidecar(args) => {
-                    roles::sidecar::run(args.probe_rs_args, &args.fleet).await
+                    let flags = SelectorFlags::new(args.board, args.select);
+                    roles::sidecar::run(args.probe_rs_args, &args.fleet, flags).await
                 }
                 Command::Ctl(args) => roles::ctl::run(args).await,
                 Command::Login(args) => {
@@ -1537,9 +1563,110 @@ mod tests {
         match cli.command {
             Command::Sidecar(a) => {
                 assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
+                assert_eq!(a.board, None);
+                assert_eq!(a.select, None);
             }
             other => panic!("expected sidecar, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sidecar_select_flag_parses_and_leaves_trailing_args_verbatim() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "sidecar",
+            "--select",
+            "tag=nrf52",
+            "--",
+            "run",
+            "--chip",
+            "nRF52840_xxAA",
+            "app.elf",
+        ]));
+        match cli.command {
+            Command::Sidecar(a) => {
+                assert_eq!(a.select.as_deref(), Some("tag=nrf52"));
+                assert_eq!(a.board, None);
+                assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
+            }
+            other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_board_flag_parses_without_a_double_dash() {
+        // The ergonomic form people actually type: `--` is optional.
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "sidecar",
+            "--board",
+            "nrf52840-dk-1",
+            "list",
+        ]));
+        match cli.command {
+            Command::Sidecar(a) => {
+                assert_eq!(a.board.as_deref(), Some("nrf52840-dk-1"));
+                assert_eq!(a.select, None);
+                assert_eq!(a.probe_rs_args, os(&["list"]));
+            }
+            other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_selector_flags_after_the_double_dash_go_to_probe_rs() {
+        // The "flags before `--`" contract: anything after is probe-rs's.
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "sidecar", "--", "--select", "foo"]));
+        match cli.command {
+            Command::Sidecar(a) => {
+                assert_eq!(a.select, None);
+                assert_eq!(a.probe_rs_args, os(&["--select", "foo"]));
+            }
+            other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_selector_flags_after_the_probe_rs_subcommand_are_forwarded() {
+        // Once the trailing positional starts, a `--select` belongs to probe-rs
+        // — a future `#[arg]` tweak must not start eating it.
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "sidecar",
+            "run",
+            "--chip",
+            "nRF52840_xxAA",
+            "--select",
+            "tag=x",
+        ]));
+        match cli.command {
+            Command::Sidecar(a) => {
+                assert_eq!(a.select, None);
+                assert_eq!(
+                    a.probe_rs_args,
+                    os(&["run", "--chip", "nRF52840_xxAA", "--select", "tag=x"])
+                );
+            }
+            other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_select_and_board_conflict() {
+        let err = Cli::try_parse_from(os(&[
+            "probe-rs-fleet",
+            "sidecar",
+            "--select",
+            "tag=x",
+            "--board",
+            "nrf52840-dk-1",
+            "--",
+            "list",
+        ]))
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--board"), "{msg}");
+        assert!(msg.contains("--select"), "{msg}");
     }
 
     #[test]

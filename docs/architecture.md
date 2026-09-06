@@ -319,7 +319,8 @@ the inventory). They describe the *machine*, not the fleet, so they are not
 per-fleet and are not duplicated when a machine joins a second one.
 
 Credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`; the selector
-vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) are unchanged. `PROBE_RS_FLEET_PROFILE`
+vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) keep their names (`sidecar --board` /
+`--select` override them, §7). `PROBE_RS_FLEET_PROFILE`
 is gone, replaced by `PROBE_RS_FLEET` (a fleet name).
 
 **Writers are read-modify-write plus atomic rename.** A laptop has two
@@ -647,8 +648,9 @@ different sets of env var names, bridged by the shim) is deleted along with the
 rest of the client-cert model.
 
 Resolution precedence is **explicit flag / env var > fleet config**. The
-selector env vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) are unchanged; the
-credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`.
+credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`. The *selector*
+vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) keep their names but are no longer the
+only mechanism: `sidecar --board` / `--select` override them (§7).
 
 **A sandboxed agent is never given these credentials.** It receives a
 lease-bound capability token instead (`ctl delegate`, §6.5).
@@ -1438,6 +1440,23 @@ Proposed selector convention (additive, no laze change required):
 - `PROBE_RS_FLEET_SELECT` — constraint expr (e.g. `tag=nrf52 && bluetooth`).
 - `PROBE_RS_FLEET_TOKEN` / `…_COORDINATOR` — auth + endpoint.
 - Absent ⇒ sidecar falls back to local probe-rs (transparent local DX).
+
+For interactive use the explicit subcommand also takes the selector as a flag:
+
+```sh
+probe-rs-fleet sidecar --select 'tag=nrf52840dk' -- list
+probe-rs-fleet sidecar --board nrf52840-dk-1 -- run --chip nRF52840_xxAA app.elf
+```
+
+- **Flag > env**, and a flag *replaces both* selector vars (so `--select` next
+  to a stale `PROBE_RS_FLEET_BOARD` is the flag, not an ambiguity error). It is
+  layered over the environment as an `EnvSource` overlay, not written into it.
+- `--board` and `--select` conflict in clap; a capability token plus either is
+  still refused (the board is inside the token, §6.5).
+- Flags go **before** the probe-rs subcommand / `--`; everything after is
+  forwarded verbatim.
+- **The argv0 `probe-rs` shim has no flags** — it forwards every argument
+  verbatim so laze sees a vanilla probe-rs — so laze/CI stay env-only.
 
 ## 8. boards.toml (agent-local, decided)
 
