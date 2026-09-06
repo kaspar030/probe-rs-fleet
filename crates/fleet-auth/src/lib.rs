@@ -259,6 +259,17 @@ pub mod api {
             /// Empty means the coordinator's default set.
             #[serde(default, skip_serializing_if = "Vec::is_empty")]
             ops: Vec<String>,
+            /// For a `ci` key: a stable **identity** name (`--as <name>`).
+            ///
+            /// Absent means the historical behaviour — the subject and grant
+            /// id are derived from the key hash, so rotating the key forks the
+            /// identity. Present, they are derived from `(org, name)` instead,
+            /// so re-minting rotates only the secret (architecture §6.7).
+            ///
+            /// A name alongside `purpose: "node"` is a `400`: a node key
+            /// confers no subject for a name to attach to.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            subject_name: Option<String>,
         },
         /// List the caller's org's auth keys (hashes only).
         List {},
@@ -286,6 +297,13 @@ pub mod api {
         /// and an operator can see which credential they just minted.
         #[serde(default = "default_auth_key_purpose")]
         pub purpose: String,
+        /// The identity the key speaks as (`--as <name>`), echoed so the CLI
+        /// can print it — and so it can tell a coordinator that **ignored**
+        /// the field from one that honoured it. `/auth/keys` does not
+        /// `deny_unknown_fields`, so an older coordinator would otherwise mint
+        /// an unnamed key while the CLI reported success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject_name: Option<String>,
         /// Expiry (epoch seconds). Always set on this path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expires: Option<i64>,
@@ -307,6 +325,15 @@ pub mod api {
         /// see which kind they are about to revoke.
         #[serde(default = "default_auth_key_purpose")]
         pub purpose: String,
+        /// The identity the key speaks as (`--as <name>`), or `None` for the
+        /// hash-derived subject.
+        ///
+        /// Listed for a sharper version of `purpose`'s reason: keys sharing a
+        /// name are **one identity sharing one grant**, so revoking any of them
+        /// tears that grant down and releases every lease held under the name —
+        /// including another key's runner (§6.7).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subject_name: Option<String>,
         /// Expiry (epoch seconds), or `None` for a key that never expires.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub expires: Option<i64>,

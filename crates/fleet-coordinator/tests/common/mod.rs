@@ -217,6 +217,22 @@ impl TestCoordinator {
         tags: &[String],
         expires: Option<i64>,
     ) -> String {
+        self.seed_named_ci_auth_key(org, tags, expires, None).await
+    }
+
+    /// Seed a CI auth key carrying an operator-chosen **identity name**
+    /// (`auth-key create --as <name>`), the shape whose redemption builds
+    /// `<org>/workload:agent:<name>` instead of `<org>/workload:key:<hash8>`.
+    ///
+    /// `None` is exactly [`TestCoordinator::seed_ci_auth_key`], so a test that
+    /// does not care about identities keeps the shorter spelling.
+    pub async fn seed_named_ci_auth_key(
+        &self,
+        org: &str,
+        tags: &[String],
+        expires: Option<i64>,
+        subject_name: Option<&str>,
+    ) -> String {
         let org = OrgId(org.to_owned());
         self.db().ensure_org(&org, "personal").await.unwrap();
         let token = OpaqueToken::mint(TokenKind::AuthKey);
@@ -232,6 +248,7 @@ impl TestCoordinator {
                 now,
                 "ci",
                 &[],
+                subject_name,
             )
             .await
             .unwrap();

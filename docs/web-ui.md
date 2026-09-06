@@ -489,7 +489,7 @@ turns "one minute from now" into a `400`).
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
 | `GET /api/v1/auth-keys` | — | `AuthKeyList` (hashes only) | `http::list_auth_keys` (**unchanged**) | member |
-| `POST /api/v1/auth-keys` | `{"tags":[…],"ttl_secs":N,"multi_use":false,"purpose":"node"\|"ci","ops":[…]}` | `AuthKeyCreated` — **the only time the secret exists** | `http::create_auth_key` (**unchanged**) | member |
+| `POST /api/v1/auth-keys` | `{"tags":[…],"ttl_secs":N,"multi_use":false,"purpose":"node"\|"ci","ops":[…],"subject_name":"builder"\|null}` | `AuthKeyCreated` — **the only time the secret exists** | `http::create_auth_key` (**unchanged**) | member |
 | `DELETE /api/v1/auth-keys/{hash_prefix}` | — | `AuthKeyRevoked` | `http::revoke_auth_key` (**unchanged**) | key creator, or admin |
 
 `ttl_secs = 0` is a `400` and the TTL is capped at 30 days
@@ -500,6 +500,28 @@ redemption synthesised. The prefix must be at least 8 hex characters. Both
 numbers are also reported by `GET /api/v1/grants/limits`. The UI shows the key
 once, in a panel that says it will not be shown again, and never stores it
 anywhere.
+
+`subject_name` names the **identity** a `ci` key speaks as — architecture §6.7's
+named auth-key identity, `<org>/workload:agent:<name>`, which survives rotating
+the key. It is optional; absent (or `null`) keeps the historical hash-derived
+subject, so an existing UI needs no change. Three things are `400`, and all
+three are that same shared function's rules:
+
+- a `subject_name` alongside `"purpose":"node"` — a node key confers no subject
+  for a name to attach to, so it is refused rather than stored inert;
+- a name outside `[a-z0-9._-]`, not starting with a letter or digit, empty, or
+  longer than 64 characters. Names are **lowercased** on the way in, so the
+  echoed `AuthKeyCreated.subject_name` may differ from what was sent — display
+  the echo, not the input;
+- `"purpose":"agent"`. That spelling is **CLI-only sugar** for `ci` and is not a
+  wire value; the allowlist here is still exactly `node` / `ci`.
+
+`AuthKeyCreated` and each `AuthKeyInfo` echo `subject_name`, so a listing can
+show which keys share an identity. That is worth surfacing rather than hiding:
+keys sharing a name share **one grant**, so revoking any one of them tears that
+grant down and releases every live lease under the identity — including another
+key's runner. A surviving key with the same name re-creates the grant on its
+next redemption.
 
 `POST /api/v1/auth-keys` is the **one** place this surface returns a long-lived
 bearer secret, and it is not a counter-example to "no capability token ever

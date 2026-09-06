@@ -85,11 +85,17 @@ pub struct CiAuthKeyMeta {
     pub ops: Vec<String>,
     /// The key's expiry, which the synthesised grant inherits.
     pub expires: Option<i64>,
+    /// The operator-chosen identity name (`auth-key create --as`), if any.
+    ///
+    /// `None` means the redemption path derives the subject from the key hash,
+    /// exactly as it did before migration 0009 — see that file for why absence
+    /// has exactly one spelling.
+    pub subject_name: Option<String>,
 }
 
 /// One `auth_key` row as `SQLite` hands it back.
 ///
-/// Named rather than written inline so the seven-tuple does not become an
+/// Named rather than written inline so the eight-tuple does not become an
 /// unreadable annotation at the query site.
 type AuthKeyRow = (
     String,
@@ -100,6 +106,7 @@ type AuthKeyRow = (
     i64,
     Option<String>,
     String,
+    Option<String>,
 );
 
 /// One `grant` row as `SQLite` hands it back.
@@ -264,6 +271,15 @@ pub struct AuthKeyListing {
     /// An operator who cannot see which kind a key is will revoke one and be
     /// surprised by what else disappears.
     pub purpose: String,
+    /// The identity this key speaks as (`auth-key create --as`), or `None` for
+    /// the hash-derived subject.
+    ///
+    /// Load-bearing in a listing for the same reason `purpose` is, and more
+    /// sharply: keys sharing a name share **one grant row**, so revoking any
+    /// one of them tears that grant down and releases the leases held under
+    /// the identity — including another key's runner. An operator must be able
+    /// to see which keys share a name before revoking one (§6.7).
+    pub subject_name: Option<String>,
 }
 
 /// One `pending_node` row as `SQLite` hands it back.
@@ -899,17 +915,18 @@ impl Db {
     ///
     /// Returns a database error if the query fails.
     pub async fn ci_auth_key_meta(&self, key_hash: &str) -> Result<Option<CiAuthKeyMeta>> {
-        let row: Option<(String, String, Option<i64>)> = sqlx::query_as(
-            "SELECT purpose, ops, expires FROM auth_key
+        let row: Option<(String, String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT purpose, ops, expires, subject_name FROM auth_key
              WHERE key_hash = ?1 AND consumed_at IS NULL",
         )
         .bind(key_hash)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(purpose, ops, expires)| CiAuthKeyMeta {
+        Ok(row.map(|(purpose, ops, expires, subject_name)| CiAuthKeyMeta {
             purpose,
             ops: split_tags(&ops),
             expires,
+            subject_name,
         }))
     }
 
@@ -942,6 +959,7 @@ impl Db {
             created_at,
             AUTH_KEY_PURPOSE_NODE,
             &[],
+            None,
         )
         .await
     }
@@ -953,6 +971,12 @@ impl Db {
     /// deliberate: a key that can lease hardware is a different credential from
     /// one that can offer it, and the difference must be visible at the call
     /// site rather than in a boolean at the end of an argument list.
+    ///
+    /// `subject_name` is the operator-chosen identity a `ci` key speaks as
+    /// (`--as <name>`), already normalised by
+    /// `fleet_proto::ids::normalise_agent_name`; `None` keeps the historical
+    /// hash-derived subject. It is refused for a `node` key at every mint path,
+    /// because a node key confers no subject for it to name.
     ///
     /// # Errors
     ///
@@ -969,11 +993,13 @@ impl Db {
         created_at: i64,
         purpose: &str,
         ops: &[String],
+        subject_name: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO auth_key
-               (key_hash, org_id, tags, single_use, expires, created_by, created_at, purpose, ops)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+               (key_hash, org_id, tags, single_use, expires, created_by, created_at, purpose, ops,
+                subject_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(key_hash)
         .bind(org.0.as_str())
@@ -984,6 +1010,7 @@ impl Db {
         .bind(created_at)
         .bind(purpose)
         .bind(ops.join("\n"))
+        .bind(subject_name)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1023,7 +1050,8 @@ impl Db {
     /// Returns a database error if the query fails.
     pub async fn list_auth_keys(&self, org: &OrgId) -> Result<Vec<AuthKeyListing>> {
         let rows: Vec<AuthKeyRow> = sqlx::query_as(
-            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at, created_by, purpose
+            "SELECT key_hash, tags, single_use, expires, consumed_at, created_at, created_by,
+                    purpose, subject_name
              FROM auth_key WHERE org_id = ?1 ORDER BY created_at DESC",
         )
         .bind(org.0.as_str())
@@ -1041,6 +1069,7 @@ impl Db {
                     created_at,
                     created_by,
                     purpose,
+                    subject_name,
                 )| {
                     AuthKeyListing {
                         key_hash,
@@ -1051,6 +1080,7 @@ impl Db {
                         created_at,
                         created_by,
                         purpose,
+                        subject_name,
                     }
                 },
             )
@@ -3478,6 +3508,76 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// A named `ci` key's identity round-trips through both read paths, and an
+    /// unnamed one reads back as `None` — not `Some("")`, which migration 0009
+    /// exists to make unrepresentable.
+    #[tokio::test]
+    async fn an_auth_keys_identity_name_round_trips_and_absence_is_null() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        db.ensure_org(&o, "personal").await.unwrap();
+
+        db.insert_auth_key_with_purpose(
+            &o,
+            "named111",
+            &["lab".to_owned()],
+            false,
+            Some(9_999),
+            Some("alice"),
+            1_000,
+            AUTH_KEY_PURPOSE_CI,
+            &[],
+            Some("builder"),
+        )
+        .await
+        .unwrap();
+        db.insert_auth_key_with_purpose(
+            &o,
+            "plain222",
+            &["lab".to_owned()],
+            false,
+            Some(9_999),
+            None,
+            1_001,
+            AUTH_KEY_PURPOSE_CI,
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
+
+        let named = db.ci_auth_key_meta("named111").await.unwrap().unwrap();
+        assert_eq!(named.subject_name.as_deref(), Some("builder"));
+        let plain = db.ci_auth_key_meta("plain222").await.unwrap().unwrap();
+        assert_eq!(plain.subject_name, None);
+
+        let keys = db.list_auth_keys(&o).await.unwrap();
+        let by_hash = |h: &str| {
+            keys.iter()
+                .find(|k| k.key_hash == h)
+                .expect("the key is listed")
+                .subject_name
+                .clone()
+        };
+        assert_eq!(by_hash("named111").as_deref(), Some("builder"));
+        assert_eq!(by_hash("plain222"), None);
+
+        // The node-enrollment spelling stores no name, so every pre-0009 row
+        // and every node key keeps the hash-derived meaning.
+        db.insert_auth_key(&o, "node3333", &[], true, None, None, 1_002)
+            .await
+            .unwrap();
+        assert_eq!(by_hash("named111").as_deref(), Some("builder"));
+        assert_eq!(
+            db.ci_auth_key_meta("node3333")
+                .await
+                .unwrap()
+                .unwrap()
+                .subject_name,
+            None
+        );
     }
 
     /// Seed a pending registration with a fixed code, for the state-machine

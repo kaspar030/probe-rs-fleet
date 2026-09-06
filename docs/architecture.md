@@ -736,8 +736,16 @@ node     { id, org_id, owner_user_id, name, tags[], token_hash,
            adopt_policy, last_seen }
 board    { org_id, node_id, name, chip, tags[], … }   -- PK (org_id, node_id, name)
 grant    { id, org_id, subject, selector, ops[], expires }
-auth_key { org_id, key_hash, tags[], single_use, expires, created_by }
+auth_key { org_id, key_hash, tags[], single_use, expires, created_by,
+           purpose: node | ci, ops[], subject_name? }
 ```
+
+A workload subject's id has three shapes, all of them rendered into the same
+`<ns>/<kind>:<id>` key: `gha/workload:<owner>/<repo>` for the GitHub Actions
+OIDC path (§6.7), `<org>/workload:key:<hash8>` for an unnamed `ci` auth key, and
+`<org>/workload:agent:<name>` for one minted `--as <name>` — an identity that
+survives rotating the credential. `auth_key.subject_name` is nullable, and NULL
+means the hash-derived spelling, so no pre-existing key changes meaning.
 
 Three decisions are load-bearing:
 
@@ -1441,7 +1449,9 @@ enrollment key in every deployment into a board-access credential.
 Redeeming a `ci` key at `grant_type: workload_key` does **not** widen
 `board_access`. It upserts an *ordinary grant* — the same row `grant --repo`
 writes, evaluated by the same code and revocable by the same verb — to an
-org-scoped subject `<org>/workload:key:<hash8>`, and then mints a workload
+org-scoped subject `<org>/workload:key:<hash8>` (or
+`<org>/workload:agent:<name>` for a key minted `--as <name>` — see below), and
+then mints a workload
 token. The grant's id is deterministic (`ci-<key hash prefix>`), so a multi-use
 key redeemed by twenty runners upserts one row, one grant and one concurrency
 budget; the `ci-` prefix is a namespace no human-created grant id can occupy,
@@ -1463,6 +1473,79 @@ never expires: a shell-minted perpetual key is an operator's informed choice
 about the *key*, not a choice to share the org's hardware forever.
 
 Prefer the OIDC path wherever the runner can mint an identity.
+
+#### Named identities: an agent that survives key rotation
+
+Both the subject (`key:<hash8>`) and the grant id (`ci-<hash[..29]>`) above are
+functions of the *credential*. So rotating a key — mint a new one, retire the
+old — produces a **new subject and a new grant row**: the audit trail forks, the
+per-subject concurrency cap resets, and the old grant lingers. A long-running
+agent or CI runner has no persistent identity at all.
+
+`auth-key create --purpose ci --as <name>` gives it one. The name is stored in
+`auth_key.subject_name`, and redemption then builds the subject
+`<org>/workload:agent:<name>` and a grant id derived from `(org, name)`. Because
+`upsert_grant` is keyed on the grant id, a re-minted key with the same `--as`
+re-upserts the **same row**: same audit history, same concurrency budget, same
+revocation handle. Nothing downstream changes — `board_access`, `Access`, the
+scheduler and the audit log are all subject-key-generic, and `SubjectKey::parse`
+splits at the *first* `:`, so `agent:<name>` round-trips exactly as
+`key:<hash8>` does.
+
+The name is validated at mint time (`normalise_agent_name`) with the same
+discipline as `normalise_repo`: trimmed, **lowercased** — so a rotation typed
+months later is the same identity rather than a silent fork — restricted to
+`[a-z0-9._-]` starting with a letter or digit, and capped at 64 characters. The
+charset is what makes a chosen name structurally unable to spell the
+`key:<hash>` form (no `:`) or to be mistaken for a `gha/workload:owner/repo`
+repo subject (no `/`). It is org-scoped, since the subject carries the org, so
+two tenants may each have a `builder`.
+
+**The grant id mixes the org into a digest, and that is not decoration.**
+`grant.id` is a *global* `PRIMARY KEY`, and `upsert_grant`'s `ON CONFLICT(id)`
+updates the selector, ops and expiry without touching `org_id`. An id spelled
+from the name alone would therefore let org B's redemption silently rewrite org
+A's grant row while leaving it owned by A — a cross-tenant write. So the id is
+`ci-` plus 29 hex characters of `SHA-256(org, "agent:", name)`: globally unique,
+inside the `ci-` namespace no human-created id occupies, and still **hex**, so
+`grant revoke`'s ≥8-hex-character floor accepts it untouched. The cost is that
+the id is opaque; the row's `subject` column, which `grant list` also prints,
+shows `<org>/workload:agent:<name>` in clear text.
+
+A named identity is also an ordinary grantee, so
+`grant acme/workload:agent:builder --select …` works and gives it access beyond
+what its redemption synthesises. Such a grant has an ordinary random id and is
+*not* touched by the key-revocation cascade below, which keys on the synthesised
+id — it is the one grant that survives.
+
+**The trade, which is the whole point and a security-relevant surprise if
+unstated: two live keys sharing an `--as` are one identity, and the grant
+belongs to the identity, not to the key.** Revoking one of them tears down that
+shared grant and every live lease held under the name — including another key's
+runner, mid-job. It does not end the identity: a surviving key with the same
+name re-creates the grant on its next redemption, and workload tokens already
+minted stay **authenticated** for the rest of their TTL (nothing deletes
+`workload_token` rows on revocation; the sweep only removes expired ones), so
+the moment any surviving key redeems, that still-live token has access again
+without having redeemed itself. Revoking one key of a shared identity is
+therefore a **disruption, not a revocation**. To actually retire the agent:
+revoke every key carrying the name, then `grant revoke` the row.
+
+The alternative — suppressing the cascade when a sibling key shares the name —
+was rejected on two grounds. Its guard cannot be made correct: "does a live
+sibling key share this `subject_name`?" is a read whose answer is stale the
+instant it returns, since any org member may mint a key between the check and
+the delete, so it would cascade or not by race. And it inverts the failure
+direction: its silent-success mode is "the operator revoked a credential and
+nothing was torn down, while a runner keeps the board", where the chosen
+behaviour's is "more went down than expected" — loud, immediate and recoverable,
+which is the direction §6.5 already picked for every other revocation.
+
+`--purpose agent` is accepted as a spelling of `ci` on both mint verbs, so the
+vocabulary stops saying "per job" about a persistent identity. It is normalised
+at the parse boundary and **stores `ci`**, so the database holds exactly two
+purposes and a listing shows `ci` for such a key — because it is one. It is
+CLI-only sugar: `"purpose": "agent"` on the wire is a `400`.
 
 #### Not built in v1
 

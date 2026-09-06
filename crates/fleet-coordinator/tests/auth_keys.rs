@@ -474,3 +474,140 @@ async fn an_ambiguous_prefix_is_a_conflict_and_deletes_nothing() {
         "an ambiguous revocation deletes nothing"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Named identities (`--as <name>`), architecture §6.7
+// ---------------------------------------------------------------------------
+
+/// A `subject_name` is echoed on create and carried into the listing.
+///
+/// The echo is not decoration: `/auth/keys` does not `deny_unknown_fields`, so
+/// an older coordinator would ignore the field and mint an *unnamed* key while
+/// returning `200`. The CLI compares what it asked for against this echo, so
+/// the field being present and correct is a contract, not a convenience.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subject_name_is_echoed_on_create_and_listed() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+
+    let (status, body) = fleet
+        .http_auth(
+            "POST",
+            "/auth/keys",
+            Some(&alice),
+            Some(
+                serde_json::json!({
+                    "action": "create",
+                    "tags": ["nrf52"],
+                    "ttl_secs": DAY,
+                    "purpose": "ci",
+                    // Mixed case on the way in: the identity is normalised, so
+                    // a rotation months later can be typed either way.
+                    "subject_name": "Builder-1",
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    let created: AuthKeyCreated = serde_json::from_str(&body).unwrap();
+    assert_eq!(created.subject_name.as_deref(), Some("builder-1"));
+    assert_eq!(created.purpose, "ci");
+
+    let (status, body) = fleet
+        .http_auth("POST", "/auth/keys", Some(&alice), Some(list_body()))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    let list: AuthKeyList = serde_json::from_str(&body).unwrap();
+    assert_eq!(list.keys.len(), 1);
+    assert_eq!(list.keys[0].subject_name.as_deref(), Some("builder-1"));
+}
+
+/// The refusals, all `400`: a name on a `node` key (which confers no subject
+/// for one to attach to), a name that breaks the charset or length rule, and —
+/// the one a UI author would otherwise discover the hard way — `purpose:
+/// "agent"`, which is **CLI-only sugar and not a wire value**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_identity_name_or_purpose_is_refused() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+
+    for (label, request) in [
+        (
+            "a name on a node key",
+            serde_json::json!({"action": "create", "ttl_secs": DAY,
+                               "purpose": "node", "subject_name": "builder"}),
+        ),
+        (
+            "a name with no purpose at all (i.e. node)",
+            serde_json::json!({"action": "create", "ttl_secs": DAY,
+                               "subject_name": "builder"}),
+        ),
+        (
+            "a name containing a colon, which would spell the `key:<hash>` form",
+            serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
+                               "purpose": "ci", "subject_name": "key:deadbeef"}),
+        ),
+        (
+            "a name containing a slash, which would look like a repo subject",
+            serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
+                               "purpose": "ci", "subject_name": "owner/repo"}),
+        ),
+        (
+            "an empty name",
+            serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
+                               "purpose": "ci", "subject_name": ""}),
+        ),
+        (
+            "a name starting with a dash",
+            serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
+                               "purpose": "ci", "subject_name": "-builder"}),
+        ),
+        (
+            "an over-length name",
+            serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
+                               "purpose": "ci", "subject_name": "x".repeat(65)}),
+        ),
+        (
+            "`agent` is CLI sugar, not a wire purpose",
+            serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
+                               "purpose": "agent", "subject_name": "builder"}),
+        ),
+    ] {
+        let (status, body) = fleet
+            .http_auth(
+                "POST",
+                "/auth/keys",
+                Some(&alice),
+                Some(request.to_string()),
+            )
+            .await;
+        assert_eq!(status, 400, "{label}: {body}");
+    }
+
+    // Nothing was minted along the way.
+    let (status, body) = fleet
+        .http_auth("POST", "/auth/keys", Some(&alice), Some(list_body()))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    let list: AuthKeyList = serde_json::from_str(&body).unwrap();
+    assert!(list.keys.is_empty(), "a refused mint must store nothing");
+}
+
+/// Absence has one spelling: a key minted without `subject_name` reads back as
+/// absent, not as an empty string, so nothing downstream can synthesise the
+/// nameless identity `<org>/workload:agent:`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_minted_without_a_name_has_no_identity() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let created = create_key(&fleet, &alice, &["nrf52"]).await;
+    assert_eq!(created.subject_name, None);
+
+    let (status, body) = fleet
+        .http_auth("POST", "/auth/keys", Some(&alice), Some(list_body()))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    let list: AuthKeyList = serde_json::from_str(&body).unwrap();
+    assert_eq!(list.keys[0].subject_name, None);
+}

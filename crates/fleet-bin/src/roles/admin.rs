@@ -45,6 +45,7 @@ use fleet_proto::ids::{OrgId, Role};
 
 use crate::cli::{AuthKeyArgs, UserTokenArgs};
 use crate::paths;
+use crate::roles::auth_key::{PURPOSE_AGENT_ALIAS, identity_epilogue, normalise_identity_name};
 
 /// Open the coordinator's database from its config file.
 async fn open_db(config_dir: Option<std::path::PathBuf>) -> Result<(Db, OrgId, u64)> {
@@ -111,7 +112,11 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     // `open_db`: `ensure_org` below has a permanent `kind` side effect, so a
     // rejected invocation must not have created an org on its way out (nor need
     // a reachable coordinator config to be told it was wrong).
-    let purpose = if args.purpose == AUTH_KEY_PURPOSE_CI {
+    //
+    // `--purpose agent` is normalised to `ci` here, at the parse boundary, so
+    // the database still holds exactly two purposes and nothing downstream has
+    // to learn a third. Only the epilogue branches on what the operator typed.
+    let purpose = if args.purpose == AUTH_KEY_PURPOSE_CI || args.purpose == PURPOSE_AGENT_ALIAS {
         AUTH_KEY_PURPOSE_CI
     } else {
         AUTH_KEY_PURPOSE_NODE
@@ -145,6 +150,23 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
             "`--ops` only takes effect for a `--purpose ci` key; a node key confers no operations"
         );
     }
+    // The identity name, validated locally so a bad one names the rule rather
+    // than being repaired into a *different* identity — the whole point is that
+    // the operator can retype the same name on the next rotation.
+    let subject_name: Option<String> = match &args.subject_name {
+        None => None,
+        Some(raw) => {
+            // A node key confers no subject, so there is nothing for a name to
+            // attach to. Refused rather than stored, so the flag cannot look
+            // effective and be discovered inert months later.
+            anyhow::ensure!(
+                purpose == AUTH_KEY_PURPOSE_CI,
+                "`--as` names the identity a `--purpose ci` (or `agent`) key speaks as; \
+                 a node key enrolls a machine and confers no subject for a name to attach to"
+            );
+            Some(normalise_identity_name(raw)?)
+        }
+    };
 
     let (db, default_org, _) = open_db(args.config_dir.clone()).await?;
     let explicit_org = args.org.is_some();
@@ -170,11 +192,19 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
         now,
         purpose,
         &ops,
+        subject_name.as_deref(),
     )
     .await
     .context("recording the auth key")?;
 
-    print_auth_key(&org, &token.to_secret_string(), &args, purpose, expires);
+    print_auth_key(
+        &org,
+        &token.to_secret_string(),
+        &args,
+        purpose,
+        subject_name.as_deref(),
+        expires,
+    );
     Ok(())
 }
 
@@ -188,6 +218,7 @@ fn print_auth_key(
     secret: &str,
     args: &AuthKeyArgs,
     purpose: &str,
+    subject_name: Option<&str>,
     expires: Option<i64>,
 ) {
     println!("Auth key for org '{org}':");
@@ -198,6 +229,13 @@ fn print_auth_key(
     println!();
     println!("  single use : {}", !args.multi_use);
     println!("  purpose    : {purpose}");
+    if let Some(name) = subject_name {
+        println!("  identity   : agent:{name}");
+        println!(
+            "  subject    : {}",
+            fleet_proto::ids::agent_subject_key(org, name)
+        );
+    }
     match expires {
         Some(e) => println!("  expires    : {e} (epoch seconds)"),
         None => println!("  expires    : never"),
@@ -219,6 +257,10 @@ fn print_auth_key(
             println!();
             println!("This key never expires, but the grant it creates is capped at 30 days");
             println!("and renewed on each redemption — a rolling share, not a perpetual one.");
+        }
+        if let Some(name) = subject_name {
+            println!();
+            println!("{}", identity_epilogue(org.0.as_str(), name));
         }
         println!();
         println!("This key is a bearer credential and is not stored anywhere (only its");
@@ -259,8 +301,8 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
     println!("Auth keys for org '{org}' ({} total):", keys.len());
     println!();
     println!(
-        "  {:<16}  {:<10}  {:<12}  {:<12}  {:<16}  TAGS",
-        "HASH PREFIX", "SINGLE-USE", "EXPIRES", "STATE", "CREATED BY"
+        "  {:<16}  {:<10}  {:<12}  {:<12}  {:<16}  {:<16}  TAGS",
+        "HASH PREFIX", "SINGLE-USE", "EXPIRES", "STATE", "CREATED BY", "IDENTITY"
     );
     for key in &keys {
         let prefix: String = key.key_hash.chars().take(16).collect();
@@ -278,8 +320,11 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
         // `(shell)` rather than blank: now that members can mint over the API,
         // an operator reading this wants to know which keys are theirs.
         let created_by = key.created_by.as_deref().unwrap_or("(shell)");
+        // Load-bearing rather than decorative: keys sharing an identity share
+        // one grant, so an operator must be able to see which before revoking.
+        let identity = key.subject_name.as_deref().unwrap_or("-");
         println!(
-            "  {prefix:<16}  {:<10}  {expires:<12}  {state:<12}  {created_by:<16}  {}",
+            "  {prefix:<16}  {:<10}  {expires:<12}  {state:<12}  {created_by:<16}  {identity:<16}  {}",
             key.single_use,
             key.tags.join(",")
         );
@@ -287,6 +332,13 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
     println!();
     println!("Revoke one with:");
     println!("  probe-rs-fleet coordinator auth-key-revoke <hash-prefix> --org {org}");
+    if keys.iter().any(|k| k.subject_name.is_some()) {
+        println!();
+        println!("Keys sharing an IDENTITY share ONE grant, so revoking any one of them takes");
+        println!("that grant and every live lease under the name down with it — including");
+        println!("another key's runner. A surviving key with the same identity re-creates the");
+        println!("grant on its next redemption.");
+    }
     Ok(())
 }
 
@@ -415,6 +467,7 @@ mod tests {
             ttl: 86_400,
             multi_use: false,
             purpose: AUTH_KEY_PURPOSE_NODE.to_owned(),
+            subject_name: None,
             ops: None,
             config_dir,
         }
@@ -628,5 +681,90 @@ mod tests {
         };
         let err = auth_key(args).await.unwrap_err().to_string();
         assert!(err.contains("bogus"), "the refusal must name the op: {err}");
+    }
+
+    /// `--as` stores the **normalised** name, so a rotation typed with
+    /// different capitalisation months later is the same identity.
+    #[tokio::test]
+    async fn an_identity_name_is_stored_normalised() {
+        let (dir, sqlite) = coordinator_config_dir();
+        let args = AuthKeyArgs {
+            tag: vec!["desk".to_owned()],
+            purpose: AUTH_KEY_PURPOSE_CI.to_owned(),
+            subject_name: Some("  Builder-1 ".to_owned()),
+            ..args_for(Some(dir.path().to_owned()))
+        };
+        auth_key(args).await.unwrap();
+
+        let db = Db::connect(sqlite.to_str().unwrap()).await.unwrap();
+        let org = OrgId(DEFAULT_ORG_ID.to_owned());
+        let keys = db.list_auth_keys(&org).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].subject_name.as_deref(), Some("builder-1"));
+        assert_eq!(keys[0].purpose, AUTH_KEY_PURPOSE_CI);
+    }
+
+    /// `--purpose agent` is a *spelling* of `ci`: the row stores `ci`, so the
+    /// database still holds exactly two purposes and the redemption check is
+    /// untouched.
+    #[tokio::test]
+    async fn the_agent_purpose_alias_stores_ci() {
+        let (dir, sqlite) = coordinator_config_dir();
+        let args = AuthKeyArgs {
+            tag: vec!["desk".to_owned()],
+            purpose: PURPOSE_AGENT_ALIAS.to_owned(),
+            subject_name: Some("builder".to_owned()),
+            ..args_for(Some(dir.path().to_owned()))
+        };
+        auth_key(args).await.unwrap();
+
+        let db = Db::connect(sqlite.to_str().unwrap()).await.unwrap();
+        let org = OrgId(DEFAULT_ORG_ID.to_owned());
+        let keys = db.list_auth_keys(&org).await.unwrap();
+        assert_eq!(keys[0].purpose, AUTH_KEY_PURPOSE_CI, "stored as `ci`");
+        assert_eq!(keys[0].subject_name.as_deref(), Some("builder"));
+        // And it really is redeemable at the CI path, which is the point of
+        // normalising at the parse boundary rather than storing a third value.
+        let meta = db
+            .ci_auth_key_meta(&keys[0].key_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.purpose, AUTH_KEY_PURPOSE_CI);
+        assert_eq!(meta.subject_name.as_deref(), Some("builder"));
+    }
+
+    /// A node key confers no subject, so `--as` on one is refused rather than
+    /// stored as a flag that looks effective and is not — and refused before
+    /// any database work, like the other argument-only judgements.
+    #[tokio::test]
+    async fn an_identity_name_on_a_node_key_is_refused() {
+        let args = AuthKeyArgs {
+            subject_name: Some("builder".to_owned()),
+            ..args_for(Some(std::path::PathBuf::from(
+                "/nonexistent/coordinator/config/dir",
+            )))
+        };
+        let err = auth_key(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("confers no subject"),
+            "the refusal must say why: {err}"
+        );
+    }
+
+    /// A name that breaks the charset rule names the rule, rather than being
+    /// repaired into a *different* identity.
+    #[tokio::test]
+    async fn an_invalid_identity_name_names_the_rule() {
+        let args = AuthKeyArgs {
+            tag: vec!["desk".to_owned()],
+            purpose: AUTH_KEY_PURPOSE_CI.to_owned(),
+            subject_name: Some("key:deadbeef".to_owned()),
+            ..args_for(Some(std::path::PathBuf::from(
+                "/nonexistent/coordinator/config/dir",
+            )))
+        };
+        let err = auth_key(args).await.unwrap_err().to_string();
+        assert!(err.contains("[a-z0-9._-]"), "got: {err}");
     }
 }

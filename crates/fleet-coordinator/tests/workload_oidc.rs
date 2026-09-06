@@ -1230,3 +1230,350 @@ async fn the_api_refuses_to_mint_a_tagless_ci_key() {
     assert_eq!(parsed["purpose"], json!("ci"));
     assert!(parsed["key"].as_str().unwrap().starts_with("prffk1_"));
 }
+
+// ---------------------------------------------------------------------------
+// Named identities (`auth-key create --as <name>`), architecture §6.7
+// ---------------------------------------------------------------------------
+
+/// The headline: **rotating a named key does not move the identity.**
+///
+/// Mint key A `--as builder`, redeem it, lease a board. Mint key B with the
+/// same name and a different secret, redeem that. Both redemptions must produce
+/// the *same* subject and re-upsert the *same* grant row — which is what keeps
+/// the audit trail, the per-subject concurrency budget and the revocation
+/// handle whole across a rotation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_keys_identity_survives_rotating_the_key() {
+    let fleet = TestCoordinator::start().await;
+    let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let board = fleet
+        .seed_board(&org, "rpi-1", "nrf52840-dk-3", &["nrf52"])
+        .await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+
+    let key_a = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+    let (status, body) = redeem(&fleet, &key_a).await;
+    assert_eq!(status, 200, "{body}");
+    let token_a: Value = serde_json::from_str(&body).unwrap();
+    let token_a = token_a["token"].as_str().unwrap().to_owned();
+
+    let grants = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    assert_eq!(grants.len(), 1);
+    let grant_id = grants[0].id.clone();
+    let subject = grants[0].subject.clone();
+    assert_eq!(
+        subject,
+        format!("{}/workload:agent:builder", org.0),
+        "the identity is the name, not the credential"
+    );
+    assert!(grant_id.starts_with("ci-"), "{grant_id}");
+
+    // The token works: it is a real board-access credential, not just a row.
+    let ci_a = fleet.client_session(&token_a).await;
+    let lease_a = match ci_a
+        .request(lease_by_tag("nrf52", Priority::Interactive))
+        .await
+        .unwrap()
+    {
+        CoordToSidecar::Lease(g) => {
+            assert_eq!(g.board, board);
+            g.lease
+        }
+        other => panic!("expected a lease, got {other:?}"),
+    };
+    ci_a.request(SidecarToCoord::Release { lease: lease_a })
+        .await
+        .unwrap();
+
+    // The rotation: a *different secret*, the same `--as`.
+    let key_b = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+    assert_ne!(key_a, key_b, "a rotation is a new secret");
+    let (status, body) = redeem(&fleet, &key_b).await;
+    assert_eq!(status, 200, "{body}");
+
+    let grants = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    assert_eq!(
+        grants.len(),
+        1,
+        "the rotated key re-upserts the identity's row rather than adding one"
+    );
+    assert_eq!(grants[0].id, grant_id, "same grant id across the rotation");
+    assert_eq!(grants[0].subject, subject, "same subject across the rotation");
+
+    // And the identity is on the token rows too, so the audit trail does not
+    // fork: both workload tokens speak as the same subject.
+    let key_c = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("BUILDER"))
+        .await;
+    let (status, body) = redeem(&fleet, &key_c).await;
+    assert_eq!(status, 200, "{body}");
+    let grants = fleet.db().scoped(org).list_grants().await.unwrap();
+    assert_eq!(
+        grants.len(),
+        1,
+        "the name is normalised, so `BUILDER` is the same identity as `builder`"
+    );
+    assert_eq!(grants[0].id, grant_id);
+}
+
+/// The accepted trade, asserted so it cannot be "fixed" by accident.
+///
+/// Two live keys sharing an `--as` are **one identity**, and the grant belongs
+/// to the identity, not to the key. So revoking key A tears down the shared
+/// grant and key B's runner's live lease — a disruption, not a revocation:
+/// key B redeeming again re-creates the grant with the same id and subject.
+///
+/// The alternative (suppressing the cascade when a sibling key shares the name)
+/// was rejected because the "does a sibling share this name" query's answer is
+/// stale the instant it returns — a concurrent mint between the check and the
+/// delete flips it — so it would cascade or not by coin-flip. See §6.7 and the
+/// epilogue `auth-key create --as` prints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_one_key_of_a_shared_identity_is_a_disruption_not_a_revocation() {
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+
+    let key_a = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+    let key_b = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+
+    let (status, body) = redeem(&fleet, &key_a).await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = redeem(&fleet, &key_b).await;
+    assert_eq!(status, 200, "{body}");
+    let token_b: Value = serde_json::from_str(&body).unwrap();
+    let token_b = token_b["token"].as_str().unwrap().to_owned();
+
+    let grants = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    assert_eq!(grants.len(), 1, "two keys, one identity, one grant");
+    let grant_id = grants[0].id.clone();
+    let subject = grants[0].subject.clone();
+
+    // B's runner takes a lease under the shared identity.
+    let ci_b = fleet.client_session(&token_b).await;
+    let lease_b = match ci_b
+        .request(lease_by_tag("nrf52", Priority::Interactive))
+        .await
+        .unwrap()
+    {
+        CoordToSidecar::Lease(g) => g.lease,
+        other => panic!("expected a lease, got {other:?}"),
+    };
+
+    // Revoke key A only.
+    let hash_prefix = {
+        let hash = fleet_auth::OpaqueToken::parse(&key_a).unwrap().hash();
+        hash.as_str()[..16].to_owned()
+    };
+    let (status, body) = fleet
+        .http_auth(
+            "POST",
+            "/auth/keys",
+            Some(&alice_token),
+            Some(serde_json::to_string(&json!({
+                "action": "revoke",
+                "prefix": hash_prefix,
+            }))
+            .unwrap()),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The accepted trade, both halves. The grant belonged to the identity, so
+    // it is gone — along with *another key's* live lease.
+    assert!(
+        fleet
+            .coord
+            .scheduler()
+            .lock()
+            .await
+            .lease_holder(lease_b)
+            .is_none(),
+        "revoking one key of a shared identity tears down the identity's leases"
+    );
+    let after = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    assert!(
+        !after.iter().any(|g| g.id == grant_id),
+        "the shared grant is gone, not merely orphaned"
+    );
+
+    // …and it is a disruption, not a revocation: key B still redeems, and the
+    // identity comes back with the same id and the same subject.
+    let (status, body) = redeem(&fleet, &key_b).await;
+    assert_eq!(status, 200, "the surviving key still works: {body}");
+    let back = fleet.db().scoped(org).list_grants().await.unwrap();
+    let restored = back
+        .iter()
+        .find(|g| g.id == grant_id)
+        .expect("a surviving key re-creates the identity's grant on its next redemption");
+    assert_eq!(restored.subject, subject);
+}
+
+/// An **unnamed** CI key keeps its exact previous meaning: the subject is
+/// `<org>/workload:key:<hash8>` and the grant id is `ci-<hash[..29]>`, asserted
+/// as literal strings because "byte for byte" is the requirement — migration
+/// 0009's NULL means precisely this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unnamed_ci_key_keeps_its_hash_derived_identity_byte_for_byte() {
+    let fleet = TestCoordinator::start().await;
+    let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+    let key = fleet
+        .seed_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires))
+        .await;
+
+    let (status, body) = redeem(&fleet, &key).await;
+    assert_eq!(status, 200, "{body}");
+
+    let hash = fleet_auth::OpaqueToken::parse(&key).unwrap().hash();
+    let grants = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(
+        grants[0].subject,
+        format!("{}/workload:key:{}", org.0, hash.short())
+    );
+    assert_eq!(grants[0].id, format!("ci-{}", &hash.as_str()[..29]));
+}
+
+/// The cross-tenant trap D1 exists to close: `grant.id` is a **global** primary
+/// key and `upsert_grant`'s `ON CONFLICT(id)` does not rewrite `org_id`, so a
+/// grant id spelled from the name alone would let one org's redemption
+/// overwrite another org's row. Mixing the org into the digest makes that
+/// unrepresentable — asserted here, because without this test the trap is
+/// invisible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_identity_name_in_two_orgs_is_two_grants() {
+    let fleet = TestCoordinator::start().await;
+    let (_alice, org_a, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (_bob, org_b, _id) = fleet.seed_github_user(2, "bob", Role::Admin).await;
+    assert_ne!(org_a, org_b);
+    fleet.seed_board(&org_a, "rpi-1", "dk-3", &["nrf52"]).await;
+    fleet.seed_board(&org_b, "rpi-2", "dk-4", &["stm32"]).await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+
+    let key_a = fleet
+        .seed_named_ci_auth_key(&org_a.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+    let key_b = fleet
+        .seed_named_ci_auth_key(&org_b.0, &["stm32".to_owned()], Some(expires), Some("builder"))
+        .await;
+    assert_eq!(redeem(&fleet, &key_a).await.0, 200);
+    assert_eq!(redeem(&fleet, &key_b).await.0, 200);
+
+    let grants_a = fleet.db().scoped(org_a.clone()).list_grants().await.unwrap();
+    let grants_b = fleet.db().scoped(org_b.clone()).list_grants().await.unwrap();
+    assert_eq!(grants_a.len(), 1);
+    assert_eq!(grants_b.len(), 1);
+    assert_ne!(grants_a[0].id, grants_b[0].id, "two orgs, two grant rows");
+    assert_eq!(grants_a[0].subject, format!("{}/workload:agent:builder", org_a.0));
+    assert_eq!(grants_b[0].subject, format!("{}/workload:agent:builder", org_b.0));
+    // Neither redemption rewrote the other's selector or ops.
+    assert!(grants_a[0].selector.contains("nrf52"), "{}", grants_a[0].selector);
+    assert!(grants_b[0].selector.contains("stm32"), "{}", grants_b[0].selector);
+
+    // Redeeming A again must still not touch B.
+    assert_eq!(redeem(&fleet, &key_a).await.0, 200);
+    let after_b = fleet.db().scoped(org_b).list_grants().await.unwrap();
+    assert_eq!(after_b, grants_b, "org B's row is untouched");
+}
+
+/// A named key's revocation cascade must recompute the *name*-derived grant id,
+/// not `ci-<hash>`: the old code would have silently found nothing and left the
+/// identity's grant and its live lease standing while reporting success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_a_named_key_cascades_to_the_name_derived_grant() {
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+    let key = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+
+    let (status, body) = redeem(&fleet, &key).await;
+    assert_eq!(status, 200, "{body}");
+    let parsed: Value = serde_json::from_str(&body).unwrap();
+    let ci = fleet
+        .client_session(parsed["token"].as_str().unwrap())
+        .await;
+    let lease = match ci
+        .request(lease_by_tag("nrf52", Priority::Interactive))
+        .await
+        .unwrap()
+    {
+        CoordToSidecar::Lease(g) => g.lease,
+        other => panic!("expected a lease, got {other:?}"),
+    };
+
+    let hash_prefix = {
+        let hash = fleet_auth::OpaqueToken::parse(&key).unwrap().hash();
+        hash.as_str()[..16].to_owned()
+    };
+    let (status, body) = fleet
+        .http_auth(
+            "POST",
+            "/auth/keys",
+            Some(&alice_token),
+            Some(serde_json::to_string(&json!({
+                "action": "revoke",
+                "prefix": hash_prefix,
+            }))
+            .unwrap()),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        fleet
+            .coord
+            .scheduler()
+            .lock()
+            .await
+            .lease_holder(lease)
+            .is_none(),
+        "the cascade must find the name-derived grant, not `ci-<hash>`"
+    );
+    assert!(fleet.db().scoped(org).list_grants().await.unwrap().is_empty());
+}
+
+/// A name-derived grant id stays inside the shape `grant revoke` accepts: the
+/// `ci-` namespace with a hex body of at least 8 characters. `grant list`
+/// prints these ids, so an id its own revoke verb rejected would be a dead end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_grant_id_is_revocable_by_id_and_by_prefix() {
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
+    let key = fleet
+        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .await;
+    assert_eq!(redeem(&fleet, &key).await.0, 200);
+
+    let grants = fleet.db().scoped(org).list_grants().await.unwrap();
+    let id = grants[0].id.clone();
+    let alice = fleet.client_session(&alice_token).await;
+    for spelling in [id.clone(), id[..11].to_owned()] {
+        match alice
+            .request(SidecarToCoord::GrantRevoke {
+                id: spelling.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            CoordToSidecar::GrantRevoked { ids } => assert_eq!(ids, vec![id.clone()]),
+            other => panic!("`grant revoke {spelling}` was refused: {other:?}"),
+        }
+        // Redeem again so the second spelling has a row to delete.
+        assert_eq!(redeem(&fleet, &key).await.0, 200);
+    }
+}

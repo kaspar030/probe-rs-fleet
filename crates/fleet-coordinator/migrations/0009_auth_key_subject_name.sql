@@ -1,0 +1,63 @@
+-- Named auth-key identities: a CI/agent subject that survives key rotation
+-- (architecture §6.7).
+--
+-- ---------------------------------------------------------------------------
+-- The problem
+-- ---------------------------------------------------------------------------
+--
+-- A `purpose = 'ci'` auth key's redemption derives *both* the workload subject
+-- (`<org>/workload:key:<hash8>`) and the grant id (`ci-<hash[..29]>`) from the
+-- key hash. Both are therefore a function of the credential, so rotating the
+-- secret — minting a fresh key and retiring the old one — produces a **new
+-- subject and a new grant row**: the audit trail forks, the per-subject
+-- concurrency cap resets, and the old grant lingers until it expires. A
+-- long-running CI runner or agent has no persistent identity at all.
+--
+-- This column gives one: an operator-chosen name, so re-minting rotates the
+-- credential without changing who it speaks as. Redemption then builds the
+-- subject `<org>/workload:agent:<name>` and a grant id derived from
+-- `(org, name)`, and because `upsert_grant` is keyed on the grant id, the
+-- rotated key re-upserts the *same row* — same audit history, same concurrency
+-- budget, same revocation handle.
+--
+-- ---------------------------------------------------------------------------
+-- Why nullable, with no default
+-- ---------------------------------------------------------------------------
+--
+-- **NULL means "derive the subject from the key hash, exactly as before".**
+-- That is the whole backward-compatibility story: every pre-0009 row keeps its
+-- identity byte for byte, and the redemption path's unnamed arm is the old
+-- expressions moved verbatim, not a re-derivation that might round differently.
+--
+-- `NOT NULL DEFAULT ''` was the alternative and is worse: an empty string is a
+-- *second* spelling of "no name", and the first query that checks
+-- `subject_name IS NOT NULL` without also checking `!= ''` would synthesise the
+-- subject `<org>/workload:agent:` — a real, shared, nameless identity. One
+-- spelling of absence, enforced by the type, removes that class of bug.
+--
+-- ---------------------------------------------------------------------------
+-- Why the name is org-scoped, and not unique
+-- ---------------------------------------------------------------------------
+--
+-- The subject the name renders into carries the org (`<org>/workload:agent:…`),
+-- and the grant id mixes the org into its digest, so two tenants may each have
+-- a `builder` with no interaction. There is deliberately **no** unique index
+-- within an org either: two live keys sharing a name is not a mistake, it is
+-- the feature — that is what makes a rotation overlap possible (mint the new
+-- key, deploy it, then revoke the old one). The accepted consequence, printed
+-- by the mint verbs and documented in §6.7, is that such keys are one identity
+-- and share one grant.
+--
+-- ---------------------------------------------------------------------------
+-- Why validation lives in Rust, not in a CHECK
+-- ---------------------------------------------------------------------------
+--
+-- `fleet_proto::ids::normalise_agent_name` is the single validator — trim,
+-- lowercase, `[a-z0-9._-]`, leading `[a-z0-9]`, length-capped — and it is
+-- shared by all three mint paths (the API route, the browser route that calls
+-- it, and the shell verb). SQLite cannot express that charset rule readably,
+-- so a CHECK would be a second, weaker opinion that could disagree with the
+-- Rust one; and a name only ever enters this column through the validator. The
+-- redemption path re-runs it on read and refuses a row that fails, so a
+-- hand-edited value cannot construct a subject id out of unvalidated text.
+ALTER TABLE auth_key ADD COLUMN subject_name TEXT;

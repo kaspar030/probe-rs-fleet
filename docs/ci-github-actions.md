@@ -319,6 +319,71 @@ turned every existing enrollment key in every deployment into a board-access
 credential. Existing keys default to `purpose = "node"` and change meaning not at
 all.
 
+### A named identity, so rotating the key does not fork the agent
+
+Everything above derives the runner's identity from the **credential**: the
+subject is `key:<hash8>` and the grant id is `ci-<hash prefix>`. So rotating the
+key — mint a new one, deploy it, retire the old — gives you a *new subject and a
+new grant row*. The audit trail forks, the concurrency budget resets, and the
+old grant lingers until it expires. For a long-running agent, that is the wrong
+shape.
+
+Give it a name instead:
+
+```sh
+probe-rs-fleet auth-key create --purpose agent --as builder \
+    --tag nrf52 \
+    --ops flash,attach \
+    --ttl 30d
+```
+
+(`--purpose agent` is a spelling of `--purpose ci` — same credential, same code
+path, better vocabulary for a key that is not per job. Listings show `ci`.)
+
+That key redeems as `<org>/workload:agent:builder`, and its grant id is derived
+from `(org, name)` rather than from the hash. The rotation then looks like this,
+and the identity never moves:
+
+```sh
+# 1. Mint the replacement with the SAME --as.
+probe-rs-fleet auth-key create --purpose agent --as builder \
+    --tag nrf52 --ops flash,attach --ttl 30d
+
+# 2. Deploy the new secret to the runner and restart it.
+
+# 3. Retire the old key, once nothing is using it.
+probe-rs-fleet auth-key list          # find its hash prefix; check the IDENTITY column
+probe-rs-fleet auth-key revoke <prefix>
+```
+
+Step 1's redemption re-upserts the *same grant row*: same id, same subject, same
+audit history, same concurrency budget. `auth-key list` shows an `IDENTITY`
+column so you can see which keys carry the name.
+
+The name is lowercased and restricted to `[a-z0-9._-]`, starting with a letter
+or digit, at most 64 characters — so you can retype it months later and get the
+same identity, and so a name can never be mistaken for the `key:<hash>` form or
+for a `gha/workload:owner/repo` repo subject. It is scoped to your org: two orgs
+may each have a `builder`.
+
+**The trade, and it is the important paragraph on this page.** Two live keys
+sharing an `--as` are **one identity, and the grant belongs to the identity, not
+to the key**. So step 3 above is not a no-op on the identity and it is not a
+clean revocation either:
+
+- revoking one key tears down the **shared** grant, and with it every live lease
+  held under the name — including the *other* key's runner, mid-job;
+- it does not end the identity: the surviving key re-creates the grant on its
+  next redemption;
+- and workload tokens already minted stay valid for the rest of their TTL (up to
+  an hour; there is no refresh), so such a token regains access the instant any
+  surviving key redeems.
+
+Revoking one key of a shared identity is therefore a **disruption, not a
+revocation**. Do step 3 when the old runner is idle. To retire the agent for
+good: revoke *every* key carrying the name, then `probe-rs-fleet grant revoke
+<id from grant list>`. Tokens already issued expire on their own within the hour.
+
 ---
 
 ## What is not built

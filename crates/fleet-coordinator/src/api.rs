@@ -1373,6 +1373,13 @@ struct AuthKeyCreateRequest {
     /// For a `ci` key: the ops its synthesised grant confers.
     #[serde(default)]
     ops: Vec<String>,
+    /// For a `ci` key: a stable identity name (`--as` on the CLI).
+    ///
+    /// A name alongside `purpose: "node"`, or one outside `[a-z0-9._-]`, is a
+    /// `400` — the validation is [`crate::http::create_auth_key`]'s, as
+    /// everything else here is.
+    #[serde(default)]
+    subject_name: Option<String>,
 }
 
 /// `POST /api/v1/auth-keys` — mint an enrollment key.
@@ -1430,6 +1437,7 @@ async fn create_auth_key(
         request.multi_use,
         request.purpose.as_deref(),
         request.ops,
+        request.subject_name.as_deref(),
         now,
     )
     .await

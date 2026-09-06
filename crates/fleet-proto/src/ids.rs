@@ -439,6 +439,80 @@ pub fn workload_subject_key(repo: &str) -> SubjectKey {
     }
 }
 
+/// Length cap on an auth-key identity name (`auth-key create --as <name>`).
+///
+/// Bounds what an operator-chosen string can write into a subject id, in the
+/// same spirit as [`normalise_repo`]'s owner/name caps. 64 characters is far
+/// more than a readable agent name needs and far less than anything that could
+/// make a rendered key unwieldy in a terminal, a log line or an audit row.
+pub const MAX_AGENT_NAME_LEN: usize = 64;
+
+/// Validate and normalise an auth-key identity name.
+///
+/// Returns the **lowercased** name, or `None` if it is not a non-empty string
+/// of at most [`MAX_AGENT_NAME_LEN`] characters over `[a-z0-9._-]` starting
+/// with `[a-z0-9]`. Never repairs: a name that does not pass is refused at mint
+/// time, with the rule named, rather than silently becoming a different
+/// identity.
+///
+/// # Why each rule exists
+///
+/// * **Lowercasing.** An identity is a name an operator retypes months later
+///   when rotating the credential. `Builder` and `builder` producing two
+///   subjects would silently fork the audit trail and the concurrency budget —
+///   which is exactly the bug named identities exist to remove. Same reasoning
+///   as [`normalise_repo`]'s lowercasing, and normalising in one function is
+///   what stops the mint path and the redemption path from disagreeing.
+/// * **The charset.** The name is rendered into `<org>/workload:agent:<name>`.
+///   Excluding `:` makes it structurally impossible to spell the unnamed
+///   `key:<hash8>` form (`--as key:deadbeef` is refused, not accepted as a
+///   look-alike) or to introduce a second separator into the rendered key.
+///   Excluding `/` makes it impossible to be mistaken for a
+///   `gha/workload:owner/repo` repo subject.
+/// * **The first character.** A leading `-` reads as a flag in every message,
+///   shell recipe and CLI example that quotes the name, and a leading `.`
+///   invites `.` or `..`, which look like paths.
+///
+/// The name is **org-scoped**: the subject carries the org, so two tenants may
+/// each have a `builder` without collision.
+#[must_use]
+pub fn normalise_agent_name(name: &str) -> Option<String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() || name.len() > MAX_AGENT_NAME_LEN {
+        return None;
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return None;
+    }
+    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(name)
+}
+
+/// The [`SubjectKey`] an auth key minted with `--as <name>` speaks as.
+///
+/// `name` must already have passed [`normalise_agent_name`]. The **only** place
+/// the `agent:` prefix is spelled, for the reason [`workload_subject_key`]'s
+/// doc comment gives: two spellings of one identity is the failure mode, and
+/// here it would fork precisely the audit trail and concurrency budget the
+/// named identity exists to keep whole.
+///
+/// Org-scoped, so it can never collide with a `gha/workload:owner/repo` repo
+/// subject, and — because the charset excludes `:` — never with the unnamed
+/// `key:<hash8>` spelling either.
+#[must_use]
+pub fn agent_subject_key(org: &OrgId, name: &str) -> SubjectKey {
+    SubjectKey {
+        org: org.clone(),
+        kind: SubjectKind::Workload,
+        id: format!("agent:{name}"),
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -542,6 +616,64 @@ mod tests {
         }
         assert_eq!(normalise_repo(&format!("{}/b", "x".repeat(65))), None);
         assert_eq!(normalise_repo(&format!("a/{}", "x".repeat(129))), None);
+    }
+
+    /// The rule set that makes a chosen name safe to render into a subject id,
+    /// and the lowercasing that keeps a rotation from forking the identity.
+    #[test]
+    fn agent_name_normalisation_lowercases_and_validates() {
+        assert_eq!(normalise_agent_name("Builder").as_deref(), Some("builder"));
+        assert_eq!(normalise_agent_name("  ci-2 ").as_deref(), Some("ci-2"));
+        assert_eq!(
+            normalise_agent_name("a_b.c-9").as_deref(),
+            Some("a_b.c-9")
+        );
+
+        for bad in [
+            "",
+            " ",
+            "a b",
+            // A `/` would make the name look like a `gha/workload:owner/repo`
+            // repo subject once rendered.
+            "a/b",
+            // A `:` would let a name spell the unnamed `key:<hash>` form.
+            "key:deadbeef",
+            "a:b",
+            // A leading `-` reads as a flag; a leading `.` invites `..`.
+            "-x",
+            "..",
+            ".hidden",
+            "naïve",
+            "a\nb",
+        ] {
+            assert_eq!(
+                normalise_agent_name(bad),
+                None,
+                "{bad:?} should not normalise"
+            );
+        }
+        assert_eq!(
+            normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN))
+                .as_deref(),
+            Some("x".repeat(MAX_AGENT_NAME_LEN).as_str())
+        );
+        assert_eq!(normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN + 1)), None);
+    }
+
+    /// The named identity's shape, and that it round-trips through
+    /// `SubjectKey::parse` — which is what lets a grant row store it as text
+    /// and read it back as the same subject.
+    #[test]
+    fn an_agent_subject_key_round_trips_through_parse() {
+        let key = agent_subject_key(&OrgId("acme".to_owned()), "builder");
+        assert_eq!(key.to_string(), "acme/workload:agent:builder");
+        assert_eq!(SubjectKey::parse(&key.to_string()), Some(key.clone()));
+        assert_eq!(key.kind, SubjectKind::Workload);
+        // Org-scoped: the same name in two orgs is two subjects.
+        assert_ne!(key, agent_subject_key(&OrgId("other".to_owned()), "builder"));
+        // And it cannot collide with the unnamed spelling, whose id starts
+        // `key:` and which the charset rule makes unrepresentable as a name.
+        assert_ne!(key.id, "key:deadbeef");
     }
 
     #[test]

@@ -56,8 +56,11 @@ pub struct AuthKeyRecord {
 ///
 /// Deliberately **not** org-scoped: a workload belongs to no tenant. The
 /// `subject` it renders as is `gha/workload:<owner>/<repo>` for the OIDC path
-/// (a reserved namespace, not an org) or `<key org>/workload:key:<hash8>` for
-/// the auth-key fallback, and it reaches boards only through grants.
+/// (a reserved namespace, not an org), or for the auth-key fallback either
+/// `<key org>/workload:key:<hash8>` (unnamed — derived from the credential, so
+/// rotating the key forks the identity) or `<key org>/workload:agent:<name>`
+/// (a key minted `--as <name>`, an identity that survives rotation, §6.7). It
+/// reaches boards only through grants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkloadRecord {
     /// The namespace half of the subject key, used as
@@ -67,7 +70,8 @@ pub struct WorkloadRecord {
     /// `org` row — every caller that writes an org-scoped row for a workload
     /// must therefore key it on the *granting* org, not on this.
     pub org_id: String,
-    /// The id half of the subject key (`<owner>/<repo>`, or `key:<hash8>`).
+    /// The id half of the subject key (`<owner>/<repo>`, `key:<hash8>`, or
+    /// `agent:<name>`).
     pub id: String,
     /// Expiry, epoch seconds. Always set: a workload token is per job.
     pub expires: u64,

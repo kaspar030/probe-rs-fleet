@@ -127,6 +127,9 @@ fn create_args(config_dir: &std::path::Path, tags: &[&str]) -> AuthKeyCreateArgs
         // caller who says nothing gets — the CI purpose is a deliberate opt-in
         // (architecture §6.7).
         purpose: "node".to_owned(),
+        // Likewise: an identity name belongs to a `ci` key, and node
+        // enrollment confers no subject for one to attach to.
+        subject_name: None,
         ops: None,
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),

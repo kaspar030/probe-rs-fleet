@@ -1022,12 +1022,48 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
     }
 
     // Subject: org-scoped, so it can never collide with a `gha/workload:` repo
-    // subject, and derived from the key hash so every runner redeeming the same
-    // key is the same subject (one grant row, one concurrency budget).
-    let key_subject = fleet_proto::ids::SubjectKey {
-        org: org.clone(),
-        kind: SubjectKind::Workload,
-        id: format!("key:{}", hash.short()),
+    // subject. Two spellings, and which one applies is the whole of this
+    // feature:
+    //
+    // * **named** (`--as <name>`) — an identity. The subject and the grant id
+    //   are functions of `(org, name)`, so re-minting the key rotates the
+    //   secret without changing who it speaks as: `upsert_grant` re-upserts the
+    //   same row, keeping the audit trail, the concurrency budget and the
+    //   revocation handle whole.
+    // * **unnamed** — today's behaviour, byte for byte. Derived from the key
+    //   hash, so every runner redeeming the same key is the same subject (one
+    //   grant row, one concurrency budget) and rotating the key forks the
+    //   identity. Migration 0009's NULL means exactly this, so no pre-existing
+    //   key changes meaning.
+    //
+    // The name is re-validated on read. A name only ever enters the column
+    // through `normalise_agent_name` at mint time, so a failure here means the
+    // row was hand-edited — and constructing a subject id from unvalidated text
+    // is precisely what the charset rule exists to prevent.
+    let (key_subject, grant_id) = match meta.subject_name.as_deref() {
+        Some(raw) => {
+            let Some(name) = fleet_proto::ids::normalise_agent_name(raw) else {
+                warn!(
+                    key = %hash.short(),
+                    "auth key carries an invalid identity name; refusing to mint a workload token"
+                );
+                return reject(StatusCode::FORBIDDEN, "forbidden");
+            };
+            let subject = fleet_proto::ids::agent_subject_key(&org, &name);
+            let id = named_ci_grant_id(&org, &name);
+            (subject, id)
+        }
+        None => (
+            fleet_proto::ids::SubjectKey {
+                org: org.clone(),
+                kind: SubjectKind::Workload,
+                id: format!("key:{}", hash.short()),
+            },
+            // Prefixed `ci-` and therefore in a namespace no human-created
+            // grant id can occupy (those are 32 random hex characters), which
+            // is what keeps `grant revoke <prefix>` unambiguous between the two.
+            format!("ci-{}", hash.as_str().get(..29).unwrap_or(hash.as_str())),
+        ),
     };
 
     let selector = tags
@@ -1054,12 +1090,10 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
         )
     };
 
-    // A deterministic grant id derived from the key hash, so a multi-use key
-    // upserts one row however many runners redeem it. Prefixed `ci-` and
-    // therefore in a namespace no human-created grant id can occupy (those are
-    // 32 random hex characters), which is what keeps `grant revoke <prefix>`
-    // unambiguous between the two.
-    let grant_id = format!("ci-{}", hash.as_str().get(..29).unwrap_or(hash.as_str()));
+    // A deterministic grant id derived above, so a multi-use key upserts one
+    // row however many runners redeem it (and a rotated named key re-upserts
+    // the identity's row rather than creating a second one).
+    //
     // The grant inherits the key's expiry; a shell-minted perpetual key gets a
     // bounded one rather than an unbounded share of the org's hardware.
     let grant_expires = meta
@@ -1112,10 +1146,18 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
     }
 
     let subject_rendered = key_subject.to_string();
-    let detail = format!(
-        "auth key {} selector={selector} grant={grant_id}",
-        hash.short()
-    );
+    // `as=<name>` when named, so the audit trail says which identity the key
+    // spoke as — the fact that survives the rotation the name exists for.
+    let detail = match meta.subject_name.as_deref() {
+        Some(name) => format!(
+            "auth key {} as={name} selector={selector} grant={grant_id}",
+            hash.short()
+        ),
+        None => format!(
+            "auth key {} selector={selector} grant={grant_id}",
+            hash.short()
+        ),
+    };
     let _ = coord
         .db()
         .scoped(org.clone())
@@ -1154,6 +1196,58 @@ const DEFAULT_CI_KEY_OPS: [fleet_proto::token::AllowedOp; 4] = [
     fleet_proto::token::AllowedOp::Reset,
     fleet_proto::token::AllowedOp::Erase,
 ];
+
+/// The deterministic grant id a **named** CI key's redemption upserts:
+/// `ci-` followed by 29 hex characters of `SHA-256(org \n "agent:" name)`.
+///
+/// The single spelling, shared by the mint/redeem path
+/// ([`exchange_workload_key`]) and the revocation cascade
+/// ([`revoke_auth_key`]), because a cascade that computed a different id from
+/// the same key would silently do nothing.
+///
+/// # Why the org is mixed into the digest
+///
+/// `grant.id` is a **global** `PRIMARY KEY` (`0001_init.sql`), not `(org_id, id)`,
+/// and `OrgDb::upsert_grant` does `ON CONFLICT(id) DO UPDATE SET selector, ops,
+/// expires` without touching `org_id`. So an id derived from the name alone
+/// (`ci-name-builder`) would let org B's redemption silently rewrite org A's
+/// grant row's selector and ops while leaving it owned by A: a cross-tenant
+/// write. Mixing the org in makes that unrepresentable rather than merely
+/// unlikely.
+///
+/// # Why hex, and why the `ci-` prefix
+///
+/// [`crate::core::Coordinator::grant_revoke_core`] accepts a prefix only if,
+/// after stripping an optional `ci-`, the body is at least 8 **hex**
+/// characters. `grant list` prints these ids, so a non-hex id would be printed
+/// and then refused by its own revoke verb. Staying inside the `ci-` namespace
+/// also keeps a synthesised id distinguishable from a human-created one (32
+/// random hex with no prefix).
+///
+/// The cost, stated openly: the id is opaque, so an operator cannot read the
+/// name off it in `grant list`. The row's **subject** column — which that
+/// listing also prints — renders `<org>/workload:agent:<name>` in clear text,
+/// and the mint epilogue prints both. Do not "improve" this into a readable id
+/// without re-reading the paragraph above about `grant.id` being global.
+///
+/// Named ids and unnamed ones (`ci-` + 29 characters of a key hash) now share
+/// the `ci-` namespace by construction rather than by accident; a collision
+/// between them is a ~116-bit coincidence, and the namespace still excludes
+/// human-created ids entirely.
+pub(crate) fn named_ci_grant_id(org: &OrgId, name: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(org.0.as_bytes());
+    hasher.update(b"\nagent:");
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("ci-{}", &hex[..29])
+}
 
 /// Bound on the grant synthesised for a key that never expires.
 ///
@@ -1447,6 +1541,7 @@ async fn auth_keys(
             multi_use,
             purpose,
             ops,
+            subject_name,
         } => {
             create_auth_key(
                 &coord,
@@ -1457,6 +1552,7 @@ async fn auth_keys(
                 multi_use,
                 purpose.as_deref(),
                 ops,
+                subject_name.as_deref(),
                 now_i64,
             )
             .await
@@ -1531,6 +1627,10 @@ pub(crate) async fn require_membership_for_auth_keys(
 // whole definition and bundling them would only move the same list down a
 // level.
 #[allow(clippy::too_many_arguments)]
+// Linear for the same reason [`exchange_workload_key`] is: this is a sequence of
+// independent refusals, each with its own paragraph saying why, and splitting it
+// would scatter the mint's validation across functions that must agree.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn create_auth_key(
     coord: &Coordinator,
     org: &OrgId,
@@ -1540,6 +1640,7 @@ pub(crate) async fn create_auth_key(
     multi_use: bool,
     purpose: Option<&str>,
     ops: Vec<String>,
+    subject_name: Option<&str>,
     now: i64,
 ) -> Response {
     // A forever-key over the API is refused rather than silently capped: the
@@ -1559,6 +1660,25 @@ pub(crate) async fn create_auth_key(
         }
         Some(p) if p == crate::state::AUTH_KEY_PURPOSE_CI => crate::state::AUTH_KEY_PURPOSE_CI,
         Some(_) => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+
+    // The identity name (`--as <name>`), validated by the one shared validator.
+    //
+    // A name on a `node` key is a `400`, not a stored no-op: a node key confers
+    // no subject for a name to attach to, so silently accepting it would leave
+    // an operator holding a flag that looks effective and is not. An invalid
+    // name is likewise a `400` rather than a repair — a repaired name is a
+    // *different identity*, and the whole point is that the operator can retype
+    // the same one months later.
+    let subject_name = match subject_name {
+        None => None,
+        Some(_) if purpose != crate::state::AUTH_KEY_PURPOSE_CI => {
+            return reject(StatusCode::BAD_REQUEST, "invalid_request");
+        }
+        Some(raw) => match fleet_proto::ids::normalise_agent_name(raw) {
+            Some(name) => Some(name),
+            None => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
+        },
     };
 
     let mut tags = tags;
@@ -1604,6 +1724,7 @@ pub(crate) async fn create_auth_key(
             now,
             purpose,
             &normalized_ops,
+            subject_name.as_deref(),
         )
         .await
     {
@@ -1614,11 +1735,18 @@ pub(crate) async fn create_auth_key(
     // Subject is the **user**, as in `self_register` and unlike
     // `redeem_auth_key`: a human's authority created this credential, and that
     // is the fact worth being able to look up later.
-    let detail = format!(
-        "minted by {user_id} (purpose={purpose}, single_use={}, tags=[{}])",
-        !multi_use,
-        tags.join(",")
-    );
+    let detail = match subject_name.as_deref() {
+        Some(name) => format!(
+            "minted by {user_id} (purpose={purpose}, as={name}, single_use={}, tags=[{}])",
+            !multi_use,
+            tags.join(",")
+        ),
+        None => format!(
+            "minted by {user_id} (purpose={purpose}, single_use={}, tags=[{}])",
+            !multi_use,
+            tags.join(",")
+        ),
+    };
     let _ = coord
         .db()
         .scoped(org.clone())
@@ -1632,7 +1760,11 @@ pub(crate) async fn create_auth_key(
             detail: Some(&detail),
         })
         .await;
-    info!(org = %org, subject = %user_id, key = %token.hash().short(), %purpose, "auth key minted");
+    info!(
+        org = %org, subject = %user_id, key = %token.hash().short(), %purpose,
+        identity = subject_name.as_deref().unwrap_or("-"),
+        "auth key minted"
+    );
 
     Json(AuthKeyCreated {
         key: token.to_secret_string(),
@@ -1641,6 +1773,7 @@ pub(crate) async fn create_auth_key(
         tags,
         single_use: !multi_use,
         purpose: purpose.to_owned(),
+        subject_name,
         expires: Some(expires),
     })
     .into_response()
@@ -1666,6 +1799,7 @@ pub(crate) async fn list_auth_keys(coord: &Coordinator, org: &OrgId) -> Response
                 tags: k.tags,
                 single_use: k.single_use,
                 purpose: k.purpose,
+                subject_name: k.subject_name,
                 expires: k.expires,
                 consumed_at: k.consumed_at,
                 created_at: k.created_at,
@@ -1760,7 +1894,17 @@ pub(crate) async fn revoke_auth_key(
     // promoted — so revocation here is as real as it is there.
     let mut cascaded: Vec<String> = Vec::new();
     for hash in &revoked {
-        let grant_id = format!("ci-{}", hash.get(..29).unwrap_or(hash));
+        // The same two-arm selection the redemption path uses — a named key's
+        // grant id is a function of `(org, name)`, not of the hash, so
+        // recomputing `ci-<hash>` here would leave the identity's grant (and
+        // every lease under it) standing while reporting success.
+        //
+        // Safe to read `target.subject_name`: an ambiguous prefix was refused
+        // above, so exactly one key row is in play.
+        let grant_id = match target.subject_name.as_deref() {
+            Some(name) => named_ci_grant_id(org, name),
+            None => format!("ci-{}", hash.get(..29).unwrap_or(hash)),
+        };
         match coord.revoke_grant_by_id(org, &grant_id).await {
             Ok(ids) => cascaded.extend(ids),
             // A failure here must not swallow the revocation that already
@@ -2703,5 +2847,32 @@ mod tests {
         assert_eq!(bearer_of(&headers), None);
 
         assert_eq!(bearer_of(&HeaderMap::new()), None);
+    }
+
+    /// The properties `named_ci_grant_id`'s doc comment claims, pinned: the id
+    /// is deterministic, hex-bodied (so `grant_revoke_core`'s hex floor accepts
+    /// it), inside the `ci-` namespace, and **org-separated** — which is the
+    /// one that matters, because `grant.id` is a global primary key and
+    /// `upsert_grant` does not rewrite `org_id`.
+    #[test]
+    fn a_named_grant_id_is_deterministic_hex_and_org_separated() {
+        let acme = OrgId("acme".to_owned());
+        let other = OrgId("other".to_owned());
+
+        let id = named_ci_grant_id(&acme, "builder");
+        assert_eq!(id, named_ci_grant_id(&acme, "builder"), "deterministic");
+        assert!(id.starts_with("ci-"), "got {id}");
+        assert_eq!(id.len(), 3 + 29);
+        let body = id.strip_prefix("ci-").unwrap();
+        assert!(
+            body.chars().all(|c| c.is_ascii_hexdigit()),
+            "the body must stay hex so `grant revoke` accepts it: {id}"
+        );
+        assert!(body.len() >= 8, "and long enough to be a legal prefix");
+
+        // The cross-tenant trap: the same name in two orgs must be two rows.
+        assert_ne!(id, named_ci_grant_id(&other, "builder"));
+        // And two names in one org, obviously.
+        assert_ne!(id, named_ci_grant_id(&acme, "builder2"));
     }
 }

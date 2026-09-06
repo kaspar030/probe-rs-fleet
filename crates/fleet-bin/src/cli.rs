@@ -206,8 +206,33 @@ pub struct AuthKeyArgs {
     /// else's CI config. It requires at least one `--tag`, because the tags
     /// become the selector of the grant its redemption synthesises and an empty
     /// selector matches every board in the org.
-    #[arg(long, default_value = "node", value_parser = ["node", "ci"])]
+    ///
+    /// `agent` is a **spelling of `ci`**, not a third credential: it stores
+    /// `ci` and behaves identically. It exists so the vocabulary stops saying
+    /// "per job" about a key minted `--as <name>`, which is a persistent
+    /// identity. A listing shows `ci` for such a key, because it is one.
+    #[arg(long, default_value = "node", value_parser = ["node", "ci", "agent"])]
     pub purpose: String,
+    /// Give this `ci`/`agent` key a stable subject name, so re-minting rotates
+    /// the secret without changing the identity.
+    ///
+    /// Without it, both the workload subject (`<org>/workload:key:<hash8>`) and
+    /// the grant its redemption creates are derived from the key hash, so
+    /// rotating the key forks the audit trail, resets the concurrency budget
+    /// and leaves the old grant behind. With it, both are derived from
+    /// `(org, name)`: the rotated key re-upserts the same grant row.
+    ///
+    /// `[a-z0-9._-]`, starting with a letter or digit, at most 64 characters;
+    /// lowercased. Refused for a `--purpose node` key, which confers no subject.
+    ///
+    /// **The trade:** two live keys sharing a name are one identity, and the
+    /// grant belongs to the identity, not to the key. Revoking either one tears
+    /// down the shared grant and every live lease held under the name —
+    /// including another key's runner, mid-job — and a surviving key with the
+    /// same name re-creates the grant on its next redemption. See the epilogue
+    /// the mint prints, and architecture §6.7.
+    #[arg(long = "as", value_name = "NAME")]
+    pub subject_name: Option<String>,
     /// For `--purpose ci`: the operations the key's grant confers,
     /// comma-separated. Defaults to `flash,attach,reset,erase`.
     ///
@@ -402,8 +427,33 @@ pub struct AuthKeyCreateArgs {
     /// else's CI config. It requires at least one `--tag`, because the tags
     /// become the selector of the grant its redemption synthesises and an empty
     /// selector matches every board in the org.
-    #[arg(long, default_value = "node", value_parser = ["node", "ci"])]
+    ///
+    /// `agent` is a **spelling of `ci`**, not a third credential: it stores
+    /// `ci` and behaves identically. It exists so the vocabulary stops saying
+    /// "per job" about a key minted `--as <name>`, which is a persistent
+    /// identity. `auth-key list` shows `ci` for such a key, because it is one.
+    #[arg(long, default_value = "node", value_parser = ["node", "ci", "agent"])]
     pub purpose: String,
+    /// Give this `ci`/`agent` key a stable subject name, so re-minting rotates
+    /// the secret without changing the identity.
+    ///
+    /// Without it, both the workload subject (`<org>/workload:key:<hash8>`) and
+    /// the grant its redemption creates are derived from the key hash, so
+    /// rotating the key forks the audit trail, resets the concurrency budget
+    /// and leaves the old grant behind. With it, both are derived from
+    /// `(org, name)`: the rotated key re-upserts the same grant row.
+    ///
+    /// `[a-z0-9._-]`, starting with a letter or digit, at most 64 characters;
+    /// lowercased. Refused for a `--purpose node` key, which confers no subject.
+    ///
+    /// **The trade:** two live keys sharing a name are one identity, and the
+    /// grant belongs to the identity, not to the key. Revoking either one tears
+    /// down the shared grant and every live lease held under the name —
+    /// including another key's runner, mid-job — and a surviving key with the
+    /// same name re-creates the grant on its next redemption. See the epilogue
+    /// the mint prints, and architecture §6.7.
+    #[arg(long = "as", value_name = "NAME")]
+    pub subject_name: Option<String>,
     /// For `--purpose ci`: the operations the key's grant confers,
     /// comma-separated. Defaults to `flash,attach,reset,erase`.
     ///
@@ -2229,6 +2279,66 @@ mod tests {
             .is_err(),
             "an unrecognised purpose must be a parse error, never a silent default"
         );
+    }
+
+    /// `--as` is spelled `as` on the command line and `subject_name` in Rust
+    /// (`as` is a keyword), and `--purpose agent` parses — it is the third
+    /// accepted *spelling*, normalised to `ci` before anything is stored.
+    #[test]
+    fn auth_key_create_parses_an_identity_name_and_the_agent_purpose() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "auth-key", "create", "--purpose", "agent", "--tag", "nrf52",
+            "--as", "builder",
+        ]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => {
+                    assert_eq!(c.purpose, "agent");
+                    assert_eq!(c.subject_name.as_deref(), Some("builder"));
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+
+        // Absent by default, so an existing invocation keeps its meaning.
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => assert!(c.subject_name.is_none()),
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+    }
+
+    /// The same two flags on the shell verb: the two minting verbs must not
+    /// disagree about what a purpose or an identity is.
+    #[test]
+    fn coordinator_auth_key_parses_an_identity_name_and_the_agent_purpose() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet", "coordinator", "auth-key", "--purpose", "agent", "--tag", "desk",
+            "--as", "builder", "--ttl", "0",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::AuthKey(k)) => {
+                    assert_eq!(k.purpose, "agent");
+                    assert_eq!(k.subject_name.as_deref(), Some("builder"));
+                }
+                other => panic!("expected auth-key, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "auth-key"]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::AuthKey(k)) => assert!(k.subject_name.is_none()),
+                other => panic!("expected auth-key, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
     }
 
     /// The scriptable shape from the spec: every value a flag, no terminal

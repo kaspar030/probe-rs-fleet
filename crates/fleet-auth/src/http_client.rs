@@ -403,6 +403,7 @@ pub async fn create_auth_key(
         multi_use,
         None,
         Vec::new(),
+        None,
     )
     .await
 }
@@ -419,7 +420,14 @@ pub async fn create_auth_key(
 ///
 /// See [`exchange`]. An unrecognised purpose, or a `ci` key with no tags, is a
 /// `400 invalid_request`: an empty tag set is an empty selector, which would
-/// match every board in the org.
+/// match every board in the org. So is a `subject_name` on a `node` key, or one
+/// outside `[a-z0-9._-]`.
+///
+/// **Check the echo.** `/auth/keys` does not `deny_unknown_fields`, so an older
+/// coordinator silently ignores `subject_name` and mints an *unnamed* key while
+/// returning `200`. [`AuthKeyCreated::subject_name`] echoes what was stored, so
+/// a caller that asked for a name must compare the two rather than believe it
+/// has a stable identity.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_auth_key_with_purpose(
     base_url: &str,
@@ -430,6 +438,7 @@ pub async fn create_auth_key_with_purpose(
     multi_use: bool,
     purpose: Option<&str>,
     ops: Vec<String>,
+    subject_name: Option<&str>,
 ) -> Result<AuthKeyCreated, ClientError> {
     post_json(
         &route_uri(base_url, "/auth/keys")?,
@@ -441,6 +450,7 @@ pub async fn create_auth_key_with_purpose(
             multi_use,
             purpose: purpose.map(ToOwned::to_owned),
             ops,
+            subject_name: subject_name.map(ToOwned::to_owned),
         },
     )
     .await

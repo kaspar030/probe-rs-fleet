@@ -525,6 +525,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
             now,
             "ci",
             &[],
+            None,
         )
         .await
         .unwrap();
@@ -558,5 +559,55 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
         .unwrap();
     assert_eq!(grants.len(), 1);
     assert!(grants[0].id.starts_with("ci-"));
+    assert_eq!(grants[0].selector, "tag=nrf52");
+}
+
+/// The same fallback with a **named** key (`auth-key create --as builder`):
+/// `ci login` is unchanged, but the subject the runner speaks as is the
+/// identity rather than the credential — so re-minting the key would keep it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_ci_auth_key_authenticates_as_its_identity() {
+    let _guard = lock_env();
+    let fleet = start_fleet(None).await;
+    let org = OrgId("default".to_owned());
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let key = fleet_auth::OpaqueToken::mint(fleet_auth::TokenKind::AuthKey);
+    fleet
+        .coord
+        .db()
+        .insert_auth_key_with_purpose(
+            &org,
+            key.hash().as_str(),
+            &["nrf52".to_owned()],
+            false,
+            Some(now + 86_400),
+            None,
+            now,
+            "ci",
+            &[],
+            Some("builder"),
+        )
+        .await
+        .unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let github_env = dir.path().join("github.env");
+    std::fs::write(&github_env, "").unwrap();
+    let _env = RunnerEnv::set(&[("GITHUB_ENV", github_env.to_string_lossy().into_owned())]);
+    let _no_identity = RunnerEnv::unset(&["ACTIONS_ID_TOKEN_REQUEST_URL"]);
+
+    let mut a = args(&fleet, dir.path());
+    a.auth_key = Some(key.to_secret_string());
+    fleet_bin::roles::ci::run(a).await.expect("ci login --auth-key");
+
+    let written = std::fs::read_to_string(&github_env).unwrap();
+    assert!(written.contains("PROBE_RS_FLEET_TOKEN=prfw1_"), "{written}");
+
+    let grants = fleet.coord.db().scoped(org).list_grants().await.unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(
+        grants[0].subject, "default/workload:agent:builder",
+        "the runner speaks as the identity, not as the key hash"
+    );
     assert_eq!(grants[0].selector, "tag=nrf52");
 }
