@@ -2221,7 +2221,6 @@ mod tests {
         let on = ("--interactive", Some(true));
         let off = ("--no-interactive", Some(false));
         for (flag, expected) in [on, off] {
-
             let cli = Cli::parse_from(os(&["probe-rs-fleet", "node", "board", "add", flag]));
             match cli.command {
                 Command::Node(n) => match n.command {

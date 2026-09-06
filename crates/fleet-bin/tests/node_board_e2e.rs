@@ -226,10 +226,43 @@ async fn no_probes_at_all_is_a_clear_refusal() {
 async fn a_missing_probe_rs_binary_names_the_flag() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("config");
-    let mut args = add_args(&config_dir, &tmp.path().join("definitely-not-here"));
+    let missing = tmp.path().join("definitely-not-here");
+    let mut args = add_args(&config_dir, &missing);
     args.id = Some("b1".to_owned());
 
     let err = fleet_bin::roles::node_board::add(&args).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("--probe-rs"), "{text}");
+    assert!(
+        text.contains(&missing.display().to_string()),
+        "the error must name the binary the operator chose: {text}"
+    );
+}
+
+/// The same, for `list`.
+///
+/// `list_with` used to hardcode the literal `"probe-rs"` in this message, so an
+/// operator who passed `--probe-rs /some/path` was told to check whether
+/// `probe-rs` was on PATH — naming a binary they had deliberately not used.
+#[tokio::test]
+async fn a_failing_list_names_the_binary_the_operator_chose() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_dir = tmp.path().join("config");
+    let missing = tmp.path().join("definitely-not-here");
+
+    let err = fleet_bin::roles::node_board::list(&NodeBoardListArgs {
+        boards_path: None,
+        config_dir: Some(config_dir),
+        probe_rs: missing.display().to_string(),
+    })
+    .await
+    .unwrap_err();
+
+    let text = format!("{err:#}");
+    assert!(text.contains("--probe-rs"), "{text}");
+    assert!(
+        text.contains(&missing.display().to_string()),
+        "the error must name the binary the operator chose, not a hardcoded \
+         `probe-rs`: {text}"
+    );
 }

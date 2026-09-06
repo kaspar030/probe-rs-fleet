@@ -84,7 +84,7 @@ pub async fn list(args: &NodeBoardListArgs) -> Result<()> {
         .adopt
         .unwrap_or_default();
     let lister = ProbeRsListLister::new(args.probe_rs.clone());
-    list_with(&lister, &boards_path, adopt).await
+    list_with(&lister, &boards_path, adopt, &args.probe_rs).await
 }
 
 /// The node-settings directory: `<config_dir>/node`, or the XDG default.
@@ -342,8 +342,17 @@ async fn add_with(
 }
 
 /// The core of `node board list`, with the lister and path injected.
-async fn list_with(lister: &dyn ProbeLister, boards_path: &Path, adopt: AdoptPolicy) -> Result<()> {
-    let probes = enumerate(lister, "probe-rs").await?;
+///
+/// `program` is the `probe-rs` binary the lister will invoke, carried purely so
+/// an enumeration failure names the binary the operator actually chose rather
+/// than a hardcoded `probe-rs` they never passed.
+async fn list_with(
+    lister: &dyn ProbeLister,
+    boards_path: &Path,
+    adopt: AdoptPolicy,
+    program: &str,
+) -> Result<()> {
+    let probes = enumerate(lister, program).await?;
     let existing = read_existing(boards_path)?;
     let boards = BoardsConfig::from_str(&existing).with_context(|| {
         format!(
