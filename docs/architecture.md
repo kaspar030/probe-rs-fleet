@@ -139,15 +139,20 @@ Routes:
 | `POST /node/register/start` | headless nodes | begin an approval-pending registration (§4.2 rung 3) |
 | `POST /node/register/poll` | headless nodes | redeem an approved registration for a node token |
 | `POST /node/register/approve` | org members | inspect / approve / deny a pending registration |
-| `GET /node/approve` | anyone | static page: what to run to approve one |
+| `GET /node/approve` | anyone | static page: what to run to approve one (and a link to `/ui/approve`) |
 | `GET /auth/github/start` | a browser | 302 to GitHub's authorize endpoint (browser login, `docs/web-ui.md` D1) |
 | `GET /auth/github/callback` | a browser holding a valid `state` | exchange the code, set the session cookies, 302 `/ui` |
 | `GET /api/v1/*` | a browser session, or a bearer | the browser-facing JSON API (`docs/web-ui.md` §3) |
+| `GET /` , `GET /ui` | a browser | 302 to `/ui/` |
+| `GET /ui/` and each client-side route | a browser | the web UI's shell, embedded in the binary (`docs/web-ui.md` D3) |
+| `GET /ui/a/{hash}/*` | a browser | one embedded asset, immutably cacheable |
 | `GET /healthz` | proxy | liveness |
 
-The last three are the **browser surface**, added by `docs/web-ui.md` and
-designed there rather than here. Two properties of it belong in this table
-rather than only in that document:
+`/auth/github/*`, `/api/v1/*` and `/ui*` are the **browser surface**, added by
+`docs/web-ui.md` and designed there rather than here — named by prefix rather
+than by position, so the next row anyone adds to this table does not silently
+leave this sentence pointing at the wrong rows. Three properties of it belong
+here rather than only in that document:
 
 * `/api/v1/*` is the **only** prefix on which a session cookie is an accepted
   credential. Every other route in this table requires an explicit
@@ -159,9 +164,18 @@ rather than only in that document:
   anywhere**, which is what makes that header a second independent control.
   Phase 1a shipped exactly one mutating route (`POST /api/v1/session/logout`),
   so the machinery was exercised before there was anything worth abusing
-  through it; phase 1b adds the node verbs (`PATCH` / `DELETE
-  /api/v1/nodes/{name}`, `POST /api/v1/nodes/pending/{code}`) behind the same
-  single check.
+  through it; phase 1b added the node verbs (`PATCH` / `DELETE
+  /api/v1/nodes/{name}`, `POST /api/v1/nodes/pending/{code}`) and phase 1c the
+  outward-pointing ones (grants, auth keys, power-cycle, lease release) behind
+  the same single check.
+* **The `/ui*` routes authenticate nothing and there is no global router
+  fallback.** The shell has to load before a session exists, since login is a
+  page inside it, so the asset routes are unauthenticated and set no cookies;
+  they serve only bytes compiled into the binary. Every catch-all is scoped
+  under `/ui/`, which is what makes "the UI cannot swallow another prefix" a
+  property of the router's shape rather than of a test — an unknown top-level
+  path is an empty 404. Please do not add `.fallback(...)` to fix a
+  client-side route that 404s; add the route.
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
 reaped on a timeout we do not control, so the node connection must run
@@ -507,7 +521,8 @@ It obtains a node token by whichever of these applies, in order:
 > * **`GET /node/approve` did not grow the form.** It stays informational and
 >   reflects nothing — no code in the URL, no query parameter echoed — so it
 >   cannot become a confused-deputy surface, and the URL every deployed agent
->   prints keeps meaning what it meant.
+>   prints keeps meaning what it meant. Phase 2 added a static link from it to
+>   `/ui/approve`, which is where the form lives.
 > * **There is no pending-registration listing.** `pending_node.org_id` is
 >   `NULL` until approval binds it, so a listing could only show every live
 >   code in the deployment: a cross-tenant index that would turn §6.4's
@@ -863,7 +878,11 @@ mints its node token through the same code path `share` uses, so the resulting
   `GET /node/approve` is **still** informational and **reflects nothing** — no
   code in the URL, no query parameter echoed — so it cannot become a
   confused-deputy surface, and the URL deployed agents print keeps its meaning.
-  Please do not "finish the job" by putting the form there.
+  Phase 2 of `docs/web-ui.md` added one static paragraph linking it to
+  `/ui/approve`, where the same JSON endpoint is driven from a real form behind
+  the session; that is a link, not a form, and the page still renders
+  byte-identically whatever the query string. Please do not "finish the job" by
+  putting the form there.
 
   There is deliberately **no** browser listing of pending registrations:
   `pending_node.org_id` is `NULL` until approval binds it, so a listing could

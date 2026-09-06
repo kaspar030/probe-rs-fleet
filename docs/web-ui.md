@@ -1,12 +1,19 @@
 # probe-rs-fleet — coordinator web UI and browser-facing HTTP API
 
-Status: **design, accepted; not implemented.** This document fixes the shape of
+Status: **implemented; phases 1–4 shipped.** This document fixes the shape of
 a browser surface for the coordinator: how a browser authenticates, what the
 JSON API looks like, who may call each endpoint, how the assets are served, and
 what the first version deliberately does not do. It is written in the register
 of `docs/architecture.md` — decisions *with their costs*, accepted risks
 recorded rather than fixed, and explicit "please do not 'fix' this" notes where
 a future reader would otherwise undo something deliberate.
+
+The implementation lives in `crates/fleet-coordinator/src/browser_auth.rs`
+(cookies, CSRF, the two login flows), `src/api.rs` (the `/api/v1` handlers),
+`src/assets.rs` (the asset routes) and `web/` (the UI itself). Where this
+document and the code disagree, the code is the fact and this document is the
+bug; the sections below were amended as each phase landed rather than left as
+the older plan.
 
 **It reverses a recorded decision.** See [D1](#d1-browser-identity) — the
 reversal is named there, with the file and section it reverses, because a silent
@@ -202,6 +209,45 @@ the binary. No npm, no bundler, no TypeScript compile, no build step at all.**
   plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. No
   inline script, no CDN.
 
+**What shipped, and the four things the implementation had to decide** (phase 2;
+`crates/fleet-coordinator/src/assets.rs` carries the same notes at the call
+site):
+
+1. **One tree hash, not per-file hashes.** Nothing hashes filenames at build
+   time, because there is no build. Assets are served under
+   `/ui/a/{tree-hash}/{path}` — SHA-256 over every embedded file's path and
+   bytes in sorted order, first 16 hex characters — with a one-year `immutable`
+   `Cache-Control`, and `index.html`'s `__ASSETS__` token is rendered once into
+   that prefix. Per-file hashes are the obvious "improvement" and they are
+   wrong: a module at `/ui/a/H/app.mjs` doing `import './api.mjs'` resolves to
+   `/ui/a/H/api.mjs`, so a per-file scheme would serve one file under another's
+   hash and break its invalidation silently. The hash segment is a **cache key,
+   not a check** — a stale hash still serves current bytes, because 404ing it
+   would break an open page across a restart that changed the assets.
+2. **No global `Router::fallback`, anywhere.** Every catch-all is scoped under
+   `/ui/`, and the client-side routes are listed explicitly. That is what makes
+   "the shell cannot swallow `/api/*`, `/agent`, `/client`, `/delegate`,
+   `/healthz` or `/node/approve`" a property of the router's *shape* rather than
+   of a test that samples it, and it is why an unknown top-level path is an
+   empty 404. The instinct when a new client-side route 404s is to add
+   `.fallback(shell)`; the answer is to add the route to `SHELL_ROUTES`.
+3. **Every frontend module is `.mjs`, and there is no `package.json`.** A `.js`
+   module is resolved as CommonJS by node < 22.7 and by any node whose upward
+   walk finds a package scope it dislikes — including an unparseable
+   `package.json` anywhere above the checkout, which is outside this repository's
+   control. `.mjs` is unambiguous on every version with no configuration, so the
+   JS tests need no file whose only job is to placate a resolver, in a tree whose
+   headline decision is "no npm, no bundler".
+4. **Text safety is structural, not a review habit.** `web/dom.mjs` is the only
+   place anything enters the DOM: `textContent` only, plus an allowlist of
+   settable attributes and a `/`-or-`#` check on `href` (the CSP is the primary
+   control there; the allowlist is the second). Handlers travel in a vnode `on`
+   channel and never as an `on*=` attribute, and nothing carries a `style=`
+   attribute — under `script-src 'self'` / `style-src 'self'` with no
+   `unsafe-inline`, both are dead code. `tests/ui_assets.rs` lints the embedded
+   tree for all of it, plus for any client-side storage API and any absolute-URL
+   import.
+
 **Cost, recorded:** no type checking, and hand-rolled DOM code. If the UI
 outgrows it, adding a bundled TypeScript build later does not move the API — the
 seam is the JSON contract, and the endpoints in §3 do not change.
@@ -210,11 +256,23 @@ seam is the JSON contract, and the endpoints in §3 do not change.
 `docs/ci-github-actions.md` is the *consumer* workload-identity guide, not a
 build-pipeline document. So "how the frontend is built in CI" has nowhere to
 land — and with a zero-build frontend there is nothing to add. This is recorded
-rather than silently omitted. If D3 is ever revisited, the revisit has to bring
+rather than silently omitted, and phase 2 deliberately did **not** touch that
+file. If D3 is ever revisited, the revisit has to bring
 a pipeline with it: a bundled frontend means a build step whose output must be
 in the binary, which means either a checked-in artifact (drifts) or a `cargo
 build` that needs node (breaks the cross-compilation story in
 `docs/cross-compiling.md`).
+
+The one wrinkle phase 2 *did* add: the frontend's unit tests
+(`crates/fleet-coordinator/web-tests/*.test.mjs`, node's built-in runner, zero
+npm dependencies) want `node` on `PATH`. `tests/ui_js.rs` runs them when it is
+there and prints a loud skip when it is not, so neither `cargo build` nor `cargo
+test` requires a JavaScript toolchain — at the honest cost that on a machine
+without node that coverage silently disappears. **A pipeline that ever exists
+should install node**: one line, no npm, no network. Note also that
+`include_dir!` embeds the *whole* subtree, which is why those tests live in
+`web-tests/` beside `web/` rather than inside it — anything under `web/` ships in
+the binary and is publicly served.
 
 ### D4. v1 scope fence
 
@@ -447,13 +505,23 @@ first reviewer of the UI does not read "audit log" and expect one.
 
 | Method + path | Response |
 |---|---|
-| `GET /ui` , `GET /ui/*` | the embedded asset tree (D3), with the CSP and hardening headers above |
-| `GET /node/approve` | unchanged URL, grows a real approval form behind the session (phase 2) |
+| `GET /` , `GET /ui` | `302` → `/ui/`, so relative asset URLs resolve against the canonical path |
+| `GET /ui/` and each client-side route (`/ui/devices`, `/ui/agents`, `/ui/approve`, `/ui/access`, `/ui/keys`, `/ui/audit`) | the shell, `Cache-Control: no-cache` |
+| `GET /ui/a/{tree-hash}/{path}` | one embedded asset, `public, max-age=31536000, immutable` |
+| `GET /node/approve` | unchanged URL, unchanged reflection-free page, plus one static link to `/ui/approve` |
+
+All of them carry the CSP and hardening headers above, authenticate nothing and
+set no cookies — the shell has to load before a session exists, because login is
+a page inside it. A `/ui/` path whose last segment has an extension is a `404`
+rather than the shell, which is what makes a typo'd `import` surface as a broken
+import instead of as HTML parsed as JavaScript.
 
 `/node/approve` keeps its path because deployed agents print it. The page's
-current "reflects nothing" property must survive: the code is typed into a form,
-never echoed from a query parameter, and the *unauthenticated* rendering stays
-byte-identical whatever the query string.
+"reflects nothing" property survived phase 2 intact: it grew a static paragraph
+linking to `/ui/approve`, where the same JSON endpoint is driven from a real
+form, and it still reads no query parameter and renders byte-identically
+whatever the query string. It did **not** grow the form itself — that would put
+attacker-supplied text on an unauthenticated page.
 
 ---
 
@@ -584,23 +652,30 @@ not smuggled in with a UI.
 
 ## 6. Phased plan
 
-**Phase 1 — read-only inventory.** Login (D1), `/ui`, boards + leases + nodes
-list, `GET /api/v1/session` / `org` / `org/members`, audit log for admins. **No
-mutating endpoint at all**, so the cookie, CSP and CSRF machinery ship and get
-exercised before anything exists that could be abused through them.
+All four phases have shipped. The API phases (1a–1c below, tracked as tasks
+#3572/#3573/#3574) landed first, and the UI that consumes them landed as one
+deliverable (#3540) once every endpoint it needed existed — which is the order
+the fence below was designed to produce.
 
-**Phase 2 — node management and pending approvals.** `PATCH` / `DELETE` on
-nodes and `POST /api/v1/nodes/pending/{code}` — the §4.2 commitment cashed in,
-calling the existing `decide_pending_node`. (`/node/approve` growing a real form
-behind the session is *not* part of it: the browser approves through the JSON
-API, and that page stays informational and reflection-free.)
+**Phase 1 — read-only inventory.** *Shipped.* Login (D1), `/ui`, boards + leases
++ nodes list, `GET /api/v1/session` / `org` / `org/members`, audit log for
+admins. **No mutating endpoint at all**, so the cookie, CSP and CSRF machinery
+shipped and got exercised before anything existed that could be abused through
+them.
 
-**Phase 3 — grants and auth keys.** The admin-gated, outward-pointing verbs, and
-the shown-once auth-key panel. Deliberately after phase 2: these are the two
-surfaces where a mistake hands hardware to someone else.
+**Phase 2 — node management and pending approvals.** *Shipped.* `PATCH` /
+`DELETE` on nodes and `POST /api/v1/nodes/pending/{code}` — the §4.2 commitment
+cashed in, calling the existing `decide_pending_node`. (`/node/approve` growing
+a real form behind the session is *not* part of it: the browser approves through
+the JSON API, and that page stays informational and reflection-free.)
 
-**Phase 4 — board actions.** Power-cycle, and admin release of someone else's
-lease.
+**Phase 3 — grants and auth keys.** *Shipped.* The admin-gated,
+outward-pointing verbs, and the shown-once auth-key panel. Deliberately after
+phase 2: these are the two surfaces where a mistake hands hardware to someone
+else.
+
+**Phase 4 — board actions.** *Shipped.* Power-cycle, and admin release of
+someone else's lease.
 
 **Deliberately unscheduled:** lease acquisition, delegation, board console, org
 creation, invites and membership management.
@@ -609,7 +684,9 @@ creation, invites and membership management.
 
 ## 7. Changes required in existing files
 
-Named so follow-up tasks can be scoped precisely.
+Named so follow-up tasks could be scoped precisely; all of them have now been
+made. Retained as the record of what each phase was expected to touch — and, at
+the bottom, of the one item that was deliberately *not* touched.
 
 - **`crates/fleet-coordinator/src/http.rs`** — the new `/api/v1/*` and
   `/auth/github/*` routes; a cookie-aware sibling of `authenticate_request`
@@ -640,7 +717,19 @@ Named so follow-up tasks can be scoped precisely.
   prefer reusing `sha2` over adding a cookie framework). The
   cross-compilation constraint applies to any new dependency: `ring`, no C
   toolchain, `armv7-musl` (see `docs/cross-compiling.md`).
-- **`crates/fleet-coordinator/web/`** — new asset tree (D3).
+- **`crates/fleet-coordinator/web/`** — new asset tree (D3), plus
+  `src/assets.rs` to serve it and a four-line `build.rs` whose only job is
+  `cargo:rerun-if-changed=web` (`include_dir!` rebuilds on a file's *contents*
+  changing but not on one being added, and a contributor who hits that concludes
+  the embedding is broken). The frontend's own tests live in `web-tests/`,
+  **beside** `web/` and not inside it, because `include_dir!` embeds and serves
+  the whole subtree.
+- **`docs/ci-github-actions.md`** — deliberately **not** touched, and that is
+  the answer rather than an omission: it is the consumer workload-identity
+  guide, not a build-pipeline document, and this repository has no
+  `.github/workflows/` at all. The one CI-relevant fact the UI introduces — the
+  JavaScript tests want `node` while `cargo build` and `cargo test` never do —
+  is recorded in D3 above, in `src/assets.rs` and in `tests/ui_js.rs`.
 - **`docs/architecture.md`** — §3.5's route table, §6.2's carrier description,
   and §6.4's "no callback origin is involved" paragraph, plus §4.2's "approval
   is a CLI verb, not a browser form" note. Amendments the implementation must
