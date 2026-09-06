@@ -137,7 +137,7 @@
 //!   change; noted as a follow-up.
 
 #[cfg(unix)]
-mod imp {
+mod unix_imp {
     use std::collections::BTreeMap;
     use std::fs::{File, OpenOptions};
     use std::io::Write as _;
@@ -1078,7 +1078,7 @@ mod imp {
 /// is simply off and the sidecar behaves exactly as it did before the store
 /// existed (lease and release per invocation).
 #[cfg(not(unix))]
-mod imp {
+mod other_imp {
     use fleet_proto::ids::{AgentId, BoardRef, Subject, SubjectKey};
     use fleet_proto::lease::{Constraint, LeaseGrant};
     use fleet_proto::LeaseId;
@@ -1236,4 +1236,11 @@ mod imp {
     }
 }
 
-pub use imp::{Disposition, LeaseStore, Record, UseGuard};
+// Two `mod`s, one API. The re-export is what keeps every call site cfg-free;
+// the modules are named apart rather than both called `imp` so that tooling
+// which reads the file without evaluating `cfg` (the merge queue's structural
+// check, for one) does not see two definitions of every symbol.
+#[cfg(not(unix))]
+pub use other_imp::{Disposition, LeaseStore, Record, UseGuard};
+#[cfg(unix)]
+pub use unix_imp::{Disposition, LeaseStore, Record, UseGuard};
