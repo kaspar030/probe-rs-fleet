@@ -26,11 +26,13 @@ first. This document assumes them and does not restate them.
 
 ---
 
-## 1. What exists today
+## 1. What existed before this shipped
 
-Every management operation is CLI-only:
+The starting point this design reacted to, kept because [D1](#d1-browser-identity)'s
+recorded reversal is only legible against it. Every management operation was
+CLI-only:
 
-| what | today |
+| what | before |
 |---|---|
 | inventory, leases, logs | `ctl list` / `ctl who` / `ctl logs` |
 | board actions | `ctl lease` / `ctl release` / `ctl power-cycle` / `ctl delegate` |
@@ -38,11 +40,14 @@ Every management operation is CLI-only:
 | credentials | `auth-key create` / `auth-key list` / `auth-key revoke` |
 | enrollment | `share`, `agent up`, `node approve <code>` |
 
-The only browser surface the coordinator has is `GET /node/approve`
+The only browser surface the coordinator had was `GET /node/approve`
 (`crates/fleet-coordinator/src/http.rs`, `NODE_APPROVE_PAGE`): a static,
-reflects-nothing page that tells you which command to run. Users have asked for
-a web UI where they can see their devices and agents, approve machines, and hand
-out access. This document is the design for that; it produces no code.
+reflects-nothing page that tells you which command to run. It is still there and
+still informational (see [§7](#7-changes-required-in-existing-files)), but `/ui`
+and the `/api/v1` surface now sit alongside it. Users had asked for a web UI
+where they could see their devices and agents, approve machines, and hand out
+access. This document is the design for that; the code it produced is the
+`browser_auth.rs` / `api.rs` / `assets.rs` / `web/` set named in the preamble.
 
 ---
 
@@ -337,8 +342,8 @@ Two path-shape decisions, both forced by the id grammar:
 | `GET /api/v1/auth/methods` | — | `{"login":"authorization_code"\|"device"\|"none"}` | config only | anyone (unauthenticated; reveals only which login this deployment offers) |
 | `GET /auth/github/start` | — | `302` to GitHub; PKCE verifier + `state` in a short-lived `HttpOnly` cookie | new | anyone |
 | `GET /auth/github/callback?code&state` | — | `302 /ui`, `Set-Cookie: prfs_session`, `Set-Cookie: prfs_csrf` | `mint_session_for_user` | anyone with a valid `state` |
-| `POST /api/v1/session/device/start` | `{}` | `{"user_code","verification_uri","interval","expires_in"}` — **no `device_code` in the body**; it is stashed in a short-lived `HttpOnly` cookie | `github::device_start` (as `/auth/device/start`) | anyone |
-| `POST /api/v1/session/device/poll` | `{}` | `{"status":"pending"\|"ok"}`; on `ok`, `Set-Cookie` as above. **Never returns a token.** | `github::device_poll` + `mint_session_for_user` | anyone holding the device cookie |
+| `POST /api/v1/session/device/start` | `{}` | `{"user_code","verification_uri","interval","expires_in"}` — **no `device_code` in the body**; it is stashed in a short-lived `HttpOnly` cookie | `http::auth_device_start` (as `/auth/device/start`) | anyone |
+| `POST /api/v1/session/device/poll` | `{}` | `{"status":"pending"\|"ok"}`; on `ok`, `Set-Cookie` as above. **Never returns a token.** | `http::auth_device_poll` + `mint_session_for_user` | anyone holding the device cookie |
 | `GET /api/v1/session` | — | `{"user","login","org","org_slug","role","expires"}` | `db.role_of` | any session |
 | `POST /api/v1/session/logout` | `{}` | `204`, cookies cleared | `Db::delete_session` | any session |
 
@@ -348,7 +353,9 @@ session token *in the response body*, i.e. to JavaScript, which is precisely the
 exposure D1 rejects. The two `/api/v1/session/device/*` routes are the same
 stateless brokering with both secrets moved into `HttpOnly` cookies. No new
 table; the device code still round-trips through the client, so a coordinator
-restart mid-login is still survivable.
+restart mid-login is still survivable. The `http::` names above are the
+coordinator handlers; the CLI calls the same two routes through
+`fleet_auth::http_client::{device_start, device_poll}`.
 
 Which login the page offers is chosen by `GET /api/v1/auth/methods`, driven by
 one config field (see [§7](#7-changes-required-in-existing-files)) — not by a
