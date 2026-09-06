@@ -259,6 +259,21 @@ type PendingNodeRow = (
     Option<i64>,
 );
 
+/// One `node` row as `SQLite` hands it back to [`OrgDb::list_nodes`].
+///
+/// Named rather than written inline for the reason [`PendingNodeRow`] is: a
+/// seven-tuple is an unreadable annotation, and this one is read twice (once as
+/// the query's type, once as the destructuring).
+type NodeDbRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<i64>,
+    i64,
+);
+
 /// A node registration awaiting a human's approval (architecture §4.2 rung 3).
 ///
 /// The one object in the schema with **no org until it is decided** — which org
@@ -1605,6 +1620,28 @@ impl Db {
         Ok(row.map(|r| r.0))
     }
 
+    /// The cached GitHub login of a user, for **display only**.
+    ///
+    /// The inverse of [`Db::user_by_login`], and the asymmetry is deliberate:
+    /// that one exists because a grant resolves a typed name to an immutable
+    /// id *once*, while this one never feeds a decision. `None` for a user
+    /// created by the interim `coordinator user-token` verb, which has no
+    /// GitHub identity to cache — and it stays `None` all the way to the JSON
+    /// rather than being defaulted to the id, because a UI that showed the id
+    /// as a login would be showing something the human never chose.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn user_login(&self, user_id: &str) -> Result<Option<String>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT login FROM user WHERE id = ?1")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
     /// Look up a user by their GitHub login, returning `(user id, personal org)`.
     ///
     /// The **only** place the mutable `login` column is used as a lookup key,
@@ -2062,6 +2099,119 @@ impl OrgDb<'_> {
         Ok(())
     }
 
+    /// Every member of this org, with their role and cached login.
+    ///
+    /// New for the browser API (`GET /api/v1/org/members`); membership is
+    /// **read-only** in v1, so there is deliberately no counterpart that
+    /// writes. Lives on [`OrgDb`] rather than [`Db`] even though `member` is
+    /// keyed `(org_id, user_id)` and a `Db` method could take the org as an
+    /// argument: an org-taking method on `Db` is a call site that can be
+    /// handed the wrong org, and the whole point of the handle is that it
+    /// cannot.
+    ///
+    /// `login` is `user.login`, which is a **cache for display** and never an
+    /// identity key (see [`Db::upsert_github_user`]); it is `NULL` for a user
+    /// created by the interim `coordinator user-token` verb, so it stays an
+    /// `Option` all the way to the JSON rather than being defaulted to the id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn list_members(&self) -> Result<Vec<MemberRow>> {
+        let rows: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT member.user_id, user.login, member.role
+             FROM member JOIN user ON user.id = member.user_id
+             WHERE member.org_id = ?1 ORDER BY member.user_id",
+        )
+        .bind(self.org.0.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(user_id, login, role)| MemberRow {
+                user_id,
+                login,
+                // An unparseable role is `Member`, the *lesser* of the two:
+                // this is a listing, and a display that guessed `admin` would
+                // be the one guess with a consequence.
+                role: Role::from_label(&role).unwrap_or(Role::Member),
+            })
+            .collect())
+    }
+
+    /// Every node in this org, with its board names.
+    ///
+    /// New for the browser API (`GET /api/v1/nodes`); there is no wire verb for
+    /// it — `ctl list` is board-shaped, and a machine that has plugged in no
+    /// probes is invisible to it.
+    ///
+    /// Two rows-per-node deliberately are **not** joined into one query: the
+    /// board join would multiply the node columns by the board count and make
+    /// `last_seen` arrive once per board. Two statements, assembled here.
+    ///
+    /// `online` is not a column and is not answered here: liveness lives in the
+    /// in-memory [`crate::registry::AgentRegistry`], and a database column that
+    /// tried to track it would be wrong every time a process died. The caller
+    /// composes the two.
+    ///
+    /// One honest wart, reported rather than papered over: [`OrgDb::ensure_node`]
+    /// — the inventory-report path, which runs for a node that reports before
+    /// it is registered — writes the **full node id** into `name`, because at
+    /// that point it has an [`AgentId`] and nothing else. Every registration
+    /// path ([`Db::register_node`], [`Db::register_node_full`]) writes the
+    /// node-local name, and `ensure_node`'s `ON CONFLICT` leaves an existing
+    /// row's `name` alone, so a machine that enrolled properly is unaffected.
+    /// Normalising it here would be a listing that disagreed with the column;
+    /// fixing the column is a migration, and this listing is not the place to
+    /// smuggle one in.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if either query fails, or
+    /// [`CoordinatorError::State`](crate::error::CoordinatorError::State) if a
+    /// stored `adopt_policy` is unrecognised — the same loud failure
+    /// [`Db::node_org_and_policy`] takes, and for the same reason.
+    pub async fn list_nodes(&self) -> Result<Vec<NodeRow>> {
+        let rows: Vec<NodeDbRow> = sqlx::query_as(
+            "SELECT id, name, tags, owner_user_id, adopt_policy, last_seen, created_at
+             FROM node WHERE org_id = ?1 ORDER BY name",
+        )
+        .bind(self.org.0.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+
+        let boards: Vec<(String, String)> =
+            sqlx::query_as("SELECT node_id, name FROM board WHERE org_id = ?1 ORDER BY name")
+                .bind(self.org.0.as_str())
+                .fetch_all(self.db.pool())
+                .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, name, tags, owner, adopt, last_seen, created_at) in rows {
+            let adopt = AdoptPolicy::from_label(&adopt).ok_or_else(|| {
+                crate::error::CoordinatorError::State(format!(
+                    "node {id} has unknown adopt_policy `{adopt}`"
+                ))
+            })?;
+            let node_boards = boards
+                .iter()
+                .filter(|(node_id, _)| node_id == &id)
+                .map(|(_, board)| board.clone())
+                .collect();
+            out.push(NodeRow {
+                id: AgentId(id),
+                name,
+                tags: split_tags(&tags),
+                owner_user_id: owner,
+                adopt,
+                last_seen,
+                created_at,
+                boards: node_boards,
+            });
+        }
+        Ok(out)
+    }
+
     /// Every grant this org has issued, newest first.
     ///
     /// # Errors
@@ -2104,6 +2254,46 @@ impl OrgDb<'_> {
         .await?;
         Ok(rows.into_iter().map(GrantRow::from_row).collect())
     }
+}
+
+/// One row of [`OrgDb::list_members`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRow {
+    /// The member's immutable user id.
+    pub user_id: String,
+    /// The cached GitHub login, for display only. `None` for a user created by
+    /// the interim `coordinator user-token` verb.
+    pub login: Option<String>,
+    /// The role held in this org.
+    pub role: Role,
+}
+
+/// One row of [`OrgDb::list_nodes`].
+///
+/// Deliberately not a `fleet-proto` type: nothing on the wire carries a node
+/// listing, and inventing one in the shared crate for the sake of one HTTP
+/// endpoint would put a browser-shaped struct where the postcard protocol
+/// lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeRow {
+    /// The node's fleet id (`{org}/{name}`).
+    pub id: AgentId,
+    /// The node-local name, `UNIQUE (org_id, name)`.
+    pub name: String,
+    /// Free-form tags.
+    pub tags: Vec<String>,
+    /// The owning user, if the node was enrolled by a logged-in human. `None`
+    /// for an auth-key enrollment, which has no owning human by construction.
+    pub owner_user_id: Option<String>,
+    /// Whether undeclared probes on this node are adopted.
+    pub adopt: AdoptPolicy,
+    /// Epoch seconds of the last inventory report, if the node has ever
+    /// connected.
+    pub last_seen: Option<i64>,
+    /// Epoch seconds the row was created.
+    pub created_at: i64,
+    /// The node-local names of the boards recorded for this node.
+    pub boards: Vec<String>,
 }
 
 /// One audit-log entry to append. The org comes from the [`OrgDb`] it is
@@ -3178,6 +3368,86 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// The two browser-API listings are scoped by the `OrgDb` handle, which is
+    /// the property that makes "no code path can forget the org check" true
+    /// rather than aspirational.
+    #[tokio::test]
+    async fn member_and_node_listings_are_org_scoped() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
+        let theirs = seeded(&db, "other", "rpi-2").await;
+
+        db.ensure_user_member(&mine, "alice", Role::Admin)
+            .await
+            .unwrap();
+        db.ensure_user_member(&mine, "bob", Role::Member)
+            .await
+            .unwrap();
+        db.ensure_user_member(&theirs, "mallory", Role::Admin)
+            .await
+            .unwrap();
+
+        let members = db.scoped(mine.clone()).list_members().await.unwrap();
+        let ids: Vec<&str> = members.iter().map(|m| m.user_id.as_str()).collect();
+        assert_eq!(ids, ["alice", "bob"]);
+        assert_eq!(members[0].role, Role::Admin);
+        assert_eq!(members[1].role, Role::Member);
+        // `user-token`-created users carry no login; it stays absent rather
+        // than being defaulted to the id.
+        assert_eq!(members[0].login, None);
+
+        let mine_nodes = db.scoped(mine.clone()).list_nodes().await.unwrap();
+        assert_eq!(mine_nodes.len(), 1);
+        assert_eq!(mine_nodes[0].name, "rpi-1");
+        assert_eq!(mine_nodes[0].boards, Vec::<String>::new());
+
+        // The other tenant's node is not merely filtered out of the listing:
+        // it is unreachable through this handle at all.
+        let their_nodes = db.scoped(theirs).list_nodes().await.unwrap();
+        assert_eq!(their_nodes.len(), 1);
+        assert_eq!(their_nodes[0].name, "rpi-2");
+    }
+
+    /// A node's boards come back with it, and a board of another org's node
+    /// never attaches to this one.
+    #[tokio::test]
+    async fn node_listing_carries_its_boards() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
+        let theirs = seeded(&db, "other", "rpi-2").await;
+        db.scoped(mine.clone())
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), 10)
+            .await
+            .unwrap();
+        db.scoped(mine.clone())
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-2"), 10)
+            .await
+            .unwrap();
+        db.scoped(theirs)
+            .record_board(&board_in("other", "rpi-2", "dk-1"), 10)
+            .await
+            .unwrap();
+
+        let nodes = db.scoped(mine).list_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].boards, ["dk-1", "dk-2"]);
+    }
+
+    /// An unparseable `adopt_policy` is an error, not a default — the same
+    /// loud failure `node_org_and_policy` takes, for the same reason: guessing
+    /// `auto` would report probes as adoptable that nobody shared.
+    #[tokio::test]
+    async fn node_listing_refuses_an_unknown_adopt_policy() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let org = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
+        sqlx::query("UPDATE node SET adopt_policy = 'sometimes' WHERE org_id = ?1")
+            .bind(DEFAULT_ORG_ID)
+            .execute(db.pool_for_test())
+            .await
+            .unwrap();
+        assert!(db.scoped(org).list_nodes().await.is_err());
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
-//! GitHub user login through the OAuth 2.0 **device flow** (RFC 8628), feature
-//! `client`.
+//! GitHub user login: the OAuth 2.0 **device flow** (RFC 8628) for the CLI and
+//! the **authorization-code flow** for a browser, feature `client`.
 //!
 //! # Why this is not an OIDC client
 //!
@@ -18,7 +18,34 @@
 //! `fleet ctl login` runs on a terminal that may be an SSH session on a
 //! headless box. The device flow needs no loopback listener and no registered
 //! redirect URI: print a URL and a short code, let the human finish on whatever
-//! machine has a browser, and poll.
+//! machine has a browser, and poll. It remains the only login the CLI uses and
+//! the fallback for a deployment that has not registered a callback URL.
+//!
+//! # The browser flow, and why PKCE is not what protects it
+//!
+//! [`authorization_url`] / [`exchange_code`] add the redirect half, for the
+//! coordinator's web UI (`docs/web-ui.md` D1): the browser is sent to GitHub
+//! and comes back to `<public_url>/auth/github/callback` with a `code` that is
+//! spent here for an access token. From there the identity step is the same
+//! [`fetch_user`] call the device flow ends in — one flow, two front doors.
+//!
+//! **GitHub does not implement PKCE.** Its OAuth App implementation ignores
+//! `code_challenge` and `code_verifier` entirely: an exchange succeeds with a
+//! wrong verifier, and one with no verifier at all. The parameters are sent
+//! anyway because they cost nothing and are correct for a GHES or non-GitHub
+//! `IdP` later, but a comment claiming "PKCE protects the callback" would be
+//! false, and the next reader would then rely on a control that does not exist.
+//! What actually protects the callback is (a) the `state` value bound to an
+//! `HttpOnly` cookie, which is what makes a code delivered to this coordinator
+//! attributable to a login *this* coordinator started, and (b) the **client
+//! secret**, which is what makes the code unspendable by whoever else obtains
+//! it.
+//!
+//! The consequence is recorded in the configuration layer: a `client_secret` is
+//! effectively **required** once browser login is enabled, unlike the device
+//! flow, where an OAuth App needs none because the device code is itself the
+//! proof of possession. `CoordinatorConfig::validate` refuses the combination
+//! rather than letting the last step of every browser login fail at GitHub.
 //!
 //! # Token handling
 //!
@@ -33,8 +60,11 @@
 //!
 //! Parsing is split out into pure `&[u8]` -> `Result<_, _>` functions
 //! ([`parse_device_code_response`], [`parse_poll_response`],
-//! [`parse_user_response`]) so the wire contract is unit-testable against
-//! captured payloads with no network and no mock server.
+//! [`parse_access_token_response`], [`parse_user_response`]) so the wire
+//! contract is unit-testable against captured payloads with no network and no
+//! mock server. [`authorization_url`] and [`pkce_challenge`] are pure for the
+//! same reason: the redirect target is a security-relevant string, so it is
+//! asserted rather than eyeballed in a browser.
 
 use std::time::Duration;
 
@@ -44,6 +74,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::Deserialize;
+use sha2::Digest as _;
 
 /// How long a single GitHub request may take before it is abandoned.
 ///
@@ -64,7 +95,7 @@ const DEFAULT_EXPIRES_IN: u64 = 900;
 /// Fallback poll interval when GitHub omits `interval`.
 const DEFAULT_INTERVAL: u64 = 5;
 
-/// The three GitHub URLs the device flow touches.
+/// The GitHub URLs the login flows touch.
 ///
 /// Split out from [`GithubApp`] so tests and GitHub Enterprise Server
 /// deployments (which serve the same protocol from a different origin) can
@@ -77,6 +108,12 @@ pub struct GithubEndpoints {
     pub access_token_url: String,
     /// Origin of the REST API, without a trailing slash; `/user` is appended.
     pub api_base: String,
+    /// Browser-facing `GET` target the authorization-code flow redirects to.
+    ///
+    /// Unused by the device flow, which has no redirect at all; it is here
+    /// rather than in a second struct because a deployment that overrides one
+    /// origin (GHES, a loopback stub) always has to override all of them.
+    pub authorize_url: String,
 }
 
 impl Default for GithubEndpoints {
@@ -91,6 +128,7 @@ impl Default for GithubEndpoints {
             device_code_url: "https://github.com/login/device/code".to_owned(),
             access_token_url: "https://github.com/login/oauth/access_token".to_owned(),
             api_base: "https://api.github.com".to_owned(),
+            authorize_url: "https://github.com/login/oauth/authorize".to_owned(),
         }
     }
 }
@@ -110,13 +148,19 @@ pub struct GithubApp {
     /// device code is the proof of possession), but some GitHub App
     /// configurations reject the token request without it, so it is optional
     /// rather than absent.
+    ///
+    /// The **authorization-code flow is different**: GitHub's token endpoint
+    /// refuses a code exchange without the secret, and since GitHub ignores
+    /// PKCE (see the module docs) the secret is also the only thing stopping
+    /// someone else from spending an intercepted code. Browser login therefore
+    /// requires it in practice.
     pub client_secret: Option<String>,
     /// Space-separated scopes to request, e.g. `read:user user:email`.
     ///
     /// Empty means "no scope": the resulting token can still read public
     /// profile data, which is all [`fetch_user`] needs for identity.
     pub scope: String,
-    /// Where to send the three requests.
+    /// Where to send the requests.
     pub endpoints: GithubEndpoints,
 }
 
@@ -201,7 +245,7 @@ pub struct GithubUser {
     pub email: Option<String>,
 }
 
-/// Errors from the GitHub device flow.
+/// Errors from the GitHub login flows.
 #[derive(Debug, thiserror::Error)]
 pub enum GithubError {
     /// A configured endpoint URL could not be parsed.
@@ -400,6 +444,50 @@ pub fn parse_poll_response(body: &[u8]) -> Result<DevicePoll, GithubError> {
     })
 }
 
+/// Parse a token-endpoint response from the **authorization-code** exchange.
+///
+/// Separate from [`parse_poll_response`] despite sharing the wire shape,
+/// because the two have different vocabularies: there is no
+/// `authorization_pending` here and nothing to keep polling for, so every
+/// `error` is terminal and becomes a [`GithubError::Oauth`] carrying GitHub's
+/// code (`bad_verification_code` for a reused, expired or wrong code,
+/// `incorrect_client_credentials` for a missing/typo'd secret). Folding this
+/// into `DevicePoll` would have invented states the callback cannot be in.
+///
+/// # Errors
+///
+/// Returns [`GithubError::Oauth`] for an OAuth error object and
+/// [`GithubError::Malformed`] if the body is not JSON, carries neither
+/// `access_token` nor `error`, or carries an empty token.
+pub fn parse_access_token_response(body: &[u8]) -> Result<String, GithubError> {
+    let parsed: PollBody =
+        serde_json::from_slice(body).map_err(|e| GithubError::Malformed(e.to_string()))?;
+
+    // The error branch is checked first: GitHub answers a failed exchange with
+    // **HTTP 200** and an `error` field (same as the device flow), so a caller
+    // that trusted the status would treat a failure as a success with a
+    // missing token.
+    if let Some(code) = parsed.error {
+        return Err(GithubError::Oauth {
+            code,
+            description: parsed.error_description,
+        });
+    }
+
+    let Some(token) = parsed.access_token else {
+        return Err(GithubError::Malformed(
+            "response has neither `access_token` nor `error`".to_owned(),
+        ));
+    };
+    if token.is_empty() {
+        return Err(GithubError::Malformed(
+            "response carried an empty `access_token`".to_owned(),
+        ));
+    }
+    Ok(token)
+}
+
+
 /// Parse a `GET /user` response.
 ///
 /// # Errors
@@ -588,6 +676,143 @@ pub async fn poll_device_flow(
     }
     parse_poll_response(&body)
 }
+
+// ---------------------------------------------------------------------------
+// Authorization-code flow (browser)
+// ---------------------------------------------------------------------------
+
+/// The `code_challenge` for a PKCE verifier: base64url-no-pad SHA-256, i.e.
+/// RFC 7636's `S256` method.
+///
+/// Sent, but not relied on: GitHub ignores it (module docs). It is computed
+/// here rather than skipped because the parameter is free, and because an
+/// implementation that emits `code_challenge_method=S256` while sending a
+/// challenge that is not the hash of its verifier would break the day the
+/// endpoint *is* a real PKCE implementation (GHES, Gitea, an internal `IdP`) —
+/// and would break at the last step of every login, on someone else's
+/// deployment.
+///
+/// The verifier itself is minted by the caller (the coordinator, which must
+/// keep it in the same short-lived `HttpOnly` cookie as the `state`), so this
+/// function stays pure and testable against RFC 7636 §4.6's vector.
+#[must_use]
+pub fn pkce_challenge(verifier: &str) -> String {
+    let digest = sha2::Sha256::digest(verifier.as_bytes());
+    base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, digest)
+}
+
+/// Build the URL to redirect a browser to, to start an authorization-code
+/// login.
+///
+/// `redirect_uri` **must** be derived from the coordinator's configured
+/// `public_url` and never from the request's `Host` / `X-Forwarded-Host`: the
+/// coordinator runs behind a reverse proxy and does not see its own public
+/// name, so a Host-derived callback is a host-header-injection route to an
+/// attacker-controlled redirect — i.e. account takeover. That derivation is the
+/// caller's job; this function only encodes what it is given.
+///
+/// `state` is the value that actually protects the callback (again: not PKCE).
+/// It must be unguessable and bound to an `HttpOnly` cookie the callback
+/// compares against, or the callback accepts codes from logins it never
+/// started.
+///
+/// `scope` is omitted when empty, matching [`start_device_flow`]: identity-only
+/// login needs none, and an empty `scope=` is a needless difference from
+/// GitHub's documented request.
+///
+/// `allow_signup=false` is sent deliberately. The default (`true`) offers a
+/// "create an account" path on GitHub's own page to anyone who reaches this
+/// coordinator's login; a fleet's login page is not a GitHub signup funnel, and
+/// a brand-new account is a member of nothing here anyway, so the friendlier
+/// default only produces a user who authenticates successfully and is then told
+/// they have no access. The cost is one query parameter, and a slightly less
+/// welcoming page for a human who genuinely has no GitHub account; they can
+/// sign up on github.com and come back.
+#[must_use]
+pub fn authorization_url(
+    app: &GithubApp,
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> String {
+    // Query values go through the same percent-encoder as form values: it
+    // escapes everything outside RFC 3986's unreserved set, so `:` and `/` in
+    // the redirect URI and any `&`/`=` in an opaque state survive as data
+    // rather than becoming extra parameters.
+    let mut pairs = vec![
+        ("client_id", app.client_id.as_str()),
+        ("redirect_uri", redirect_uri),
+        ("state", state),
+    ];
+    if !app.scope.is_empty() {
+        pairs.push(("scope", app.scope.as_str()));
+    }
+    pairs.push(("code_challenge", code_challenge));
+    pairs.push(("code_challenge_method", "S256"));
+    pairs.push(("allow_signup", "false"));
+
+    let separator = if app.endpoints.authorize_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    format!(
+        "{}{separator}{}",
+        app.endpoints.authorize_url,
+        form_body(&pairs)
+    )
+}
+
+/// Exchange an authorization code for the user's GitHub access token.
+///
+/// The callback's last step before [`fetch_user`]. The caller must already have
+/// checked that the `state` on the callback matches the one it stored, and must
+/// pass the *same* `redirect_uri` string it sent to [`authorization_url`] —
+/// GitHub compares them byte-for-byte and answers `redirect_uri_mismatch`
+/// otherwise.
+///
+/// `code_verifier` is sent for the reasons [`pkce_challenge`] gives; on
+/// github.com it is ignored, so the security of this exchange rests on the
+/// `state` check above and on `client_secret` being set.
+///
+/// # Errors
+///
+/// Returns [`GithubError`] on a transport failure, a non-2xx status, a
+/// malformed body, or an OAuth error object — notably `bad_verification_code`
+/// (code reused, expired, or not ours) and `incorrect_client_credentials` (no
+/// secret configured, or the wrong one), both of which GitHub reports **with
+/// HTTP 200**.
+pub async fn exchange_code(
+    app: &GithubApp,
+    code: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+) -> Result<String, GithubError> {
+    let mut pairs = vec![
+        ("client_id", app.client_id.as_str()),
+        ("code", code),
+        ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
+    ];
+    // Unlike the device flow, this is not optional in practice: GitHub's token
+    // endpoint refuses a code exchange without it. It stays an `Option` here
+    // because the type is shared with the device flow; the configuration layer
+    // is where "browser login without a secret" is refused, because that is
+    // where an operator can act on the message.
+    if let Some(secret) = app.client_secret.as_deref() {
+        pairs.push(("client_secret", secret));
+    }
+
+    let (status, body) = post_form(&app.endpoints.access_token_url, form_body(&pairs)).await?;
+    if !(200..300).contains(&status) {
+        return Err(GithubError::Http {
+            status,
+            body: body_text(&body),
+        });
+    }
+    parse_access_token_response(&body)
+}
+
 
 /// Resolve an access token to the GitHub account that authorised it.
 ///
@@ -836,6 +1061,122 @@ mod tests {
         // Unreserved characters must survive untouched, or the device code
         // would be corrupted on the way back to GitHub.
         assert_eq!(percent_encode("aZ0-._~"), "aZ0-._~");
+    }
+
+    /// RFC 7636 §4.6's worked example. GitHub ignores the challenge, but this
+    /// must still be the real S256 value — see [`pkce_challenge`]'s docs.
+    #[test]
+    fn pkce_challenge_matches_rfc7636() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        // base64url, never base64: no `+`, no `/`, and no `=` padding, or the
+        // value would have to be escaped again in the query string.
+        let challenge = pkce_challenge("another-verifier");
+        assert!(!challenge.contains(['+', '/', '=']), "{challenge}");
+    }
+
+    fn test_app() -> GithubApp {
+        GithubApp {
+            client_id: "Iv1.abc".to_owned(),
+            client_secret: None,
+            scope: String::new(),
+            endpoints: GithubEndpoints::default(),
+        }
+    }
+
+    #[test]
+    fn authorization_url_is_built_from_the_configured_endpoint() {
+        let app = test_app();
+        let url = authorization_url(
+            &app,
+            "https://fleet.example/auth/github/callback",
+            "st4te",
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+        );
+        assert_eq!(
+            url,
+            "https://github.com/login/oauth/authorize\
+             ?client_id=Iv1.abc\
+             &redirect_uri=https%3A%2F%2Ffleet.example%2Fauth%2Fgithub%2Fcallback\
+             &state=st4te\
+             &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+             &code_challenge_method=S256\
+             &allow_signup=false"
+        );
+        // An empty scope is omitted entirely, as in `start_device_flow`.
+        assert!(!url.contains("scope"));
+    }
+
+    #[test]
+    fn authorization_url_carries_a_scope_and_escapes_opaque_values() {
+        let app = GithubApp {
+            scope: "read:user user:email".to_owned(),
+            ..test_app()
+        };
+        let url = authorization_url(&app, "https://fleet.example/cb", "a&b=c", "chal");
+        assert!(url.contains("&scope=read%3Auser%20user%3Aemail&"), "{url}");
+        // A state carrying query metacharacters must not be able to inject
+        // extra parameters into GitHub's authorize request.
+        assert!(url.contains("&state=a%26b%3Dc&"), "{url}");
+    }
+
+    /// A GHES or stub endpoint may already carry a query string; the separator
+    /// has to follow, or the first parameter is swallowed into the last value.
+    #[test]
+    fn authorization_url_appends_to_an_existing_query() {
+        let app = GithubApp {
+            endpoints: GithubEndpoints {
+                authorize_url: "https://ghes.example/login/oauth/authorize?tenant=eng".to_owned(),
+                ..GithubEndpoints::default()
+            },
+            ..test_app()
+        };
+        let url = authorization_url(&app, "https://fleet.example/cb", "s", "c");
+        assert!(url.starts_with("https://ghes.example/login/oauth/authorize?tenant=eng&client_id="));
+    }
+
+    #[test]
+    fn access_token_response_parses() {
+        let body = br#"{
+            "access_token": "gho_16C7e42F292c6912E7710c838347Ae178B4a",
+            "token_type": "bearer",
+            "scope": ""
+        }"#;
+        assert_eq!(
+            parse_access_token_response(body).unwrap(),
+            "gho_16C7e42F292c6912E7710c838347Ae178B4a"
+        );
+    }
+
+    /// A failed exchange arrives as **HTTP 200** with an `error` field, exactly
+    /// as in the device flow, so the status tells the caller nothing.
+    #[test]
+    fn access_token_error_object_is_an_oauth_error() {
+        let body = br#"{"error":"bad_verification_code","error_description":"The code passed is incorrect or expired.","error_uri":"https://docs.github.com/"}"#;
+        match parse_access_token_response(body).unwrap_err() {
+            GithubError::Oauth { code, description } => {
+                assert_eq!(code, "bad_verification_code");
+                assert_eq!(
+                    description.as_deref(),
+                    Some("The code passed is incorrect or expired.")
+                );
+            }
+            other => panic!("expected an OAuth error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn access_token_response_without_token_or_error_is_malformed() {
+        assert!(matches!(
+            parse_access_token_response(br#"{"token_type":"bearer"}"#).unwrap_err(),
+            GithubError::Malformed(_)
+        ));
+        assert!(matches!(
+            parse_access_token_response(br#"{"access_token":""}"#).unwrap_err(),
+            GithubError::Malformed(_)
+        ));
     }
 
     #[test]

@@ -358,6 +358,75 @@ impl TestCoordinator {
     }
 
 
+    /// As [`TestCoordinator::http_auth`], but with arbitrary request headers
+    /// and the **response** headers returned.
+    ///
+    /// The browser surface is defined by its headers as much as by its bodies:
+    /// a test that cannot see `Set-Cookie` cannot check that a session cookie
+    /// is `HttpOnly`, `Secure`, `SameSite=Lax` and no longer-lived than the
+    /// `session` row — which is most of what `docs/web-ui.md` D1 promises.
+    /// Returns `(status, response headers, body)`.
+    pub async fn http_full(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<String>,
+    ) -> (u16, Vec<(String, String)>, String) {
+        use http_body_util::BodyExt as _;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+
+        let client: Client<_, http_body_util::Full<hyper::body::Bytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri(format!("{}{path}", self.base_url))
+            .header(http::header::CONTENT_TYPE, "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
+            .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                body.unwrap_or_default(),
+            )))
+            .unwrap();
+        // The browser flows answer with 302s that a following client would
+        // chase; this one deliberately does not, because the redirect target
+        // and the cookies riding with it are the thing under test.
+        let resp = client.request(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let response_headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            response_headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// The `Cookie` header and `X-Fleet-Csrf` value a browser holding `token`
+    /// would send.
+    ///
+    /// The CSRF value is derived **the way the server derives it** — from
+    /// [`SEED`], through the production code's own helper — so a test cannot
+    /// pass by agreeing with itself about a value the coordinator would never
+    /// produce.
+    pub fn browser_session(&self, token: &str) -> (String, String) {
+        let hash = OpaqueToken::parse(token).unwrap().hash();
+        let csrf = fleet_coordinator::browser_auth::csrf_token_for_test(&self.coord, hash.as_str());
+        (format!("prfs_session={token}"), csrf)
+    }
+
     /// Seed a GitHub-shaped user (so `grant <login>` can resolve it) plus a
     /// session, and return the session token.
     ///

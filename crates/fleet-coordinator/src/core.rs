@@ -66,6 +66,71 @@ pub struct Coordinator {
     jwks: std::sync::OnceLock<Arc<fleet_auth::oidc::JwksCache>>,
 }
 
+/// The transport-neutral failure of an operator verb.
+///
+/// Every operator verb exists twice: as a `*_core` method returning
+/// `Result<T, OpError>`, and as a thin adapter that maps that onto the
+/// postcard [`CoordToSidecar`] wire enum. A second surface (HTTP/JSON) maps
+/// the *same* `OpError` onto status codes. That is the whole point: the wire
+/// enum's failure channel is a flat `Error { message: String }`, and a JSON
+/// handler that had to recover a status code from it would be string-matching
+/// prose — prose that would then be frozen by the HTTP surface's tests and
+/// could no longer be improved for `ctl`.
+///
+/// The rule that makes this hold: **the authorization checks live inside the
+/// cores**, never in a handler. Both surfaces then get deny-by-default
+/// (architecture §6.5) by construction, and adding a verb to one surface
+/// cannot silently ship it without the other's checks. The failure mode this
+/// design exists to prevent is a future handler reaching for [`crate::state::OrgDb`]
+/// (or the scheduler) directly instead of calling a core: such a handler has
+/// no authorization at all, and nothing in the type system would say so. If
+/// you are writing a handler and find yourself touching the `Db`, stop and
+/// add a core instead.
+///
+/// The variants are the *decision*, not its wording; each carries today's
+/// operator-facing message where there is one, so the wire adapters reproduce
+/// today's bytes exactly.
+pub(crate) enum OpError {
+    /// Refused. Deliberately says nothing about *why*, nor whether the object
+    /// exists in another org — wire: [`Coordinator::denied`] (`"not
+    /// authorized"`); HTTP: 403 `forbidden`.
+    Denied,
+    /// The named object does not exist, or is not reachable by this caller —
+    /// the two are indistinguishable on purpose. Wire: `Error { message }`;
+    /// HTTP: 404 `not_found`.
+    NotFound(String),
+    /// The request itself is malformed: a bad selector, an empty op set, a
+    /// missing expiry. Wire: `Error { message }`; HTTP: 400 `invalid_request`.
+    Invalid(String),
+    /// The request is well-formed and permitted but cannot be satisfied in the
+    /// current state — an ambiguous prefix, a disconnected agent. Wire:
+    /// `Error { message }`; HTTP: 409.
+    Conflict(String),
+    /// A fault in the coordinator itself (database, token signing). Propagated
+    /// by the adapters as `Err(..)` exactly as `?` did before; HTTP: 500
+    /// `server_error`. Never rendered to the operator verbatim.
+    Internal(crate::error::CoordinatorError),
+}
+
+impl OpError {
+    /// Render this failure the way today's sidecar wire renders it.
+    ///
+    /// `Ok(reply)` is a request-level failure the operator sees as a
+    /// [`CoordToSidecar::Error`]; `Err` is a fatal one, propagated exactly as
+    /// the `?` in the pre-split methods did. Keeping the mapping in one place
+    /// is what makes "the adapters emit today's bytes" checkable by reading
+    /// one function instead of eight.
+    fn into_wire(self) -> Result<CoordToSidecar> {
+        match self {
+            OpError::Denied => Ok(Coordinator::denied()),
+            OpError::NotFound(message) | OpError::Invalid(message) | OpError::Conflict(message) => {
+                Ok(CoordToSidecar::Error { message })
+            }
+            OpError::Internal(e) => Err(e),
+        }
+    }
+}
+
 impl Coordinator {
     /// Build a coordinator from its parts.
     #[must_use]
@@ -614,7 +679,7 @@ impl Coordinator {
         }
     }
 
-    /// Build the operator board-inventory reply (`ctl list`).
+    /// The operator board inventory (`ctl list`).
     ///
     /// Shows the caller's own org's boards (membership is enough — "membership
     /// alone is enough to add a node and to use the org's boards", §6.5) plus
@@ -625,12 +690,19 @@ impl Coordinator {
     /// Note a grantee therefore sees the *holder* of a granted board. That is
     /// necessary — "busy" is useless without "busy with whom" — and bounded:
     /// only boards already shared with them.
-    async fn list_boards(&self, subject: &Subject) -> CoordToSidecar {
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] when the caller can reach no board at all.
+    pub(crate) async fn list_boards_core(
+        &self,
+        subject: &Subject,
+    ) -> std::result::Result<Vec<fleet_proto::admin::BoardSummary>, OpError> {
         use fleet_proto::admin::{BoardAvailability, BoardSummary};
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
         if access.is_empty() {
-            return Self::denied();
+            return Err(OpError::Denied);
         }
         let sched = self.scheduler.lock().await;
         let boards = sched
@@ -662,17 +734,117 @@ impl Coordinator {
                 }
             })
             .collect();
-        CoordToSidecar::BoardList(boards)
+        Ok(boards)
     }
 
-    /// Build the operator lease-holder reply (`ctl who`), over the boards the
+    /// Wire adapter for [`Coordinator::list_boards_core`]: renders the board
+    /// list, or the flat refusal, as a [`CoordToSidecar`].
+    async fn list_boards(&self, subject: &Subject) -> CoordToSidecar {
+        match self.list_boards_core(subject).await {
+            Ok(boards) => CoordToSidecar::BoardList(boards),
+            // Only `Denied` is reachable here — the core does no fallible I/O.
+            // The remaining variants still have to go somewhere: this reply
+            // has no error channel of its own (the signature predates the
+            // core split and `handle_sidecar_message`'s call site must not
+            // change), so they render as the flat refusal rather than panic.
+            Err(e) => e.into_wire().unwrap_or_else(|_| Self::denied()),
+        }
+    }
+
+    /// The org's membership, for the browser API.
+    ///
+    /// **New surface, no wire counterpart**, so there is no adapter: nothing on
+    /// the postcard protocol lists members, and inventing a verb for it would
+    /// mean shipping a `ctl members` nobody asked for. It is still a core
+    /// rather than a handler-level query, because the rule the `OpError` doc
+    /// records has no exceptions: a handler that reached for
+    /// [`crate::state::OrgDb`] itself would have no authorization at all.
+    ///
+    /// Membership suffices — a member can already infer the roster from
+    /// `grant list` and the audit log — and membership is **read-only** in v1
+    /// (`docs/web-ui.md` D4), so there is deliberately no counterpart that
+    /// writes.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-member; [`OpError::Internal`] on a
+    /// database failure.
+    pub(crate) async fn list_members_core(
+        &self,
+        subject: &Subject,
+    ) -> std::result::Result<Vec<crate::state::MemberRow>, OpError> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Err(OpError::Denied);
+        }
+        self.db
+            .scoped(org)
+            .list_members()
+            .await
+            .map_err(OpError::Internal)
+    }
+
+    /// The org's machines, with live connection state.
+    ///
+    /// **New surface, no wire counterpart** — see [`Coordinator::list_members_core`]
+    /// for why it is a core anyway. `ctl list` is board-shaped, so a machine
+    /// that has plugged in no probes is invisible to it; a fleet UI has to be
+    /// able to say "this Pi is enrolled and online but is offering nothing".
+    ///
+    /// `online` is composed here rather than stored: liveness is the
+    /// [`crate::registry::AgentRegistry`]'s in-memory answer to "is the
+    /// control-plane `WebSocket` up *right now*", and a database column
+    /// tracking it would be wrong from the moment a process died. The cost is
+    /// that the flag is per-coordinator-process, which is correct — there is
+    /// one process, and a node is connected to it or is not.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-member; [`OpError::Internal`] on a
+    /// database failure, including an unrecognised stored `adopt_policy`.
+    pub(crate) async fn list_nodes_core(
+        &self,
+        subject: &Subject,
+    ) -> std::result::Result<Vec<NodeStatus>, OpError> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Err(OpError::Denied);
+        }
+        let rows = self
+            .db
+            .scoped(org)
+            .list_nodes()
+            .await
+            .map_err(OpError::Internal)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let online = self.agents.get(&row.id).await.is_some();
+            out.push(NodeStatus { row, online });
+        }
+        Ok(out)
+    }
+
+    /// The operator lease-holder table (`ctl who`), over the boards the
     /// caller may reach — their own org's, plus any a live grant covers.
-    async fn who(&self, subject: &Subject) -> CoordToSidecar {
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] when the caller can reach no board at all.
+    pub(crate) async fn who_core(
+        &self,
+        subject: &Subject,
+    ) -> std::result::Result<Vec<fleet_proto::admin::LeaseHolderSummary>, OpError> {
         use fleet_proto::admin::LeaseHolderSummary;
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
         if access.is_empty() {
-            return Self::denied();
+            return Err(OpError::Denied);
         }
         let sched = self.scheduler.lock().await;
         let holders = sched
@@ -688,30 +860,68 @@ impl Coordinator {
                 _ => None,
             })
             .collect();
-        CoordToSidecar::LeaseTable(holders)
+        Ok(holders)
     }
 
-    /// Build the operator logs reply (`ctl logs`).
+    /// Wire adapter for [`Coordinator::who_core`]: renders the lease table, or
+    /// the flat refusal, as a [`CoordToSidecar`].
+    async fn who(&self, subject: &Subject) -> CoordToSidecar {
+        match self.who_core(subject).await {
+            Ok(holders) => CoordToSidecar::LeaseTable(holders),
+            // As in `list_boards`: only `Denied` is reachable, and this reply
+            // has no error channel to carry anything else.
+            Err(e) => e.into_wire().unwrap_or_else(|_| Self::denied()),
+        }
+    }
+
+    /// The operator audit-log view (`ctl logs`).
     ///
     /// Two independent fences: the audit log is admin-only (§6.5), *and* the
     /// rows are read through the caller's [`crate::state::OrgDb`], so even a bug
     /// in the role check cannot surface another tenant's log.
+    ///
+    /// The follow flag is a transport concern (the sidecar keeps the socket
+    /// open), so it is not a parameter here: the core answers one snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-admin; [`OpError::Internal`] on a database
+    /// failure.
+    pub(crate) async fn logs_core(
+        &self,
+        subject: &Subject,
+        board: Option<&BoardName>,
+    ) -> std::result::Result<Vec<fleet_proto::admin::LogLine>, OpError> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Admin)
+            .await
+            .is_err()
+        {
+            return Err(OpError::Denied);
+        }
+        let board = board.map(|b| b.0.as_str());
+        self.db
+            .scoped(org)
+            .recent_audit(board, 200)
+            .await
+            .map_err(OpError::Internal)
+    }
+
+    /// Wire adapter for [`Coordinator::logs_core`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
     async fn logs(
         &self,
         subject: &Subject,
         board: Option<&BoardName>,
         _follow: bool,
     ) -> Result<CoordToSidecar> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Admin)
-            .await
-            .is_err()
-        {
-            return Ok(Self::denied());
+        match self.logs_core(subject, board).await {
+            Ok(lines) => Ok(CoordToSidecar::LogLines(lines)),
+            Err(e) => e.into_wire(),
         }
-        let board = board.map(|b| b.0.as_str());
-        let lines = self.db.scoped(org).recent_audit(board, 200).await?;
-        Ok(CoordToSidecar::LogLines(lines))
     }
 
     /// Operator power-cycle: command the owning agent to power-cycle the board.
@@ -721,33 +931,39 @@ impl Coordinator {
     /// [`AllowedOp::PowerCycle`] op — this is the one op enforced here rather
     /// than by the agent, because the agent's power-cycle command carries no
     /// capability token to check.
-    async fn operator_power_cycle(
+    ///
+    /// Returns the board's node-local name, as echoed back to the operator.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] when the caller may not reach the board, or may see
+    /// it but not cut its power; [`OpError::NotFound`] for an absent or
+    /// unreachable board; [`OpError::Conflict`] for an ambiguous name and for
+    /// an agent that is not connected; [`OpError::Internal`] on a database
+    /// failure.
+    pub(crate) async fn operator_power_cycle_core(
         &self,
         subject: &Subject,
         board: &BoardName,
-    ) -> Result<CoordToSidecar> {
+    ) -> std::result::Result<BoardName, OpError> {
         use fleet_proto::token::AllowedOp;
 
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
         if access.is_empty() {
-            return Ok(Self::denied());
+            return Err(OpError::Denied);
         }
         let board_ref = match self.resolve_board(&access, board, now).await {
             BoardLookup::Found(b) => b,
             BoardLookup::NotFound => {
-                return Ok(CoordToSidecar::Error {
-                    message: format!("no such board {board}"),
-                })
+                return Err(OpError::NotFound(format!("no such board {board}")))
             }
             BoardLookup::Ambiguous(nodes) => {
                 let nodes: Vec<&str> = nodes.iter().map(|n| n.0.as_str()).collect();
-                return Ok(CoordToSidecar::Error {
-                    message: format!(
-                        "ambiguous board name {board}: present on nodes {}",
-                        nodes.join(", ")
-                    ),
-                });
+                return Err(OpError::Conflict(format!(
+                    "ambiguous board name {board}: present on nodes {}",
+                    nodes.join(", ")
+                )));
             }
         };
         // Re-check with the op: resolution proved the caller may *see* the
@@ -759,14 +975,20 @@ impl Coordinator {
                 .is_some_and(|b| access.allows(b, AllowedOp::PowerCycle, now))
         };
         if !allowed {
-            return Ok(Self::denied());
+            return Err(OpError::Denied);
         }
         let org = board_ref.org.clone();
         let agent_id = board_ref.node.clone();
+        // Both agent-connection failures are `Conflict`, not `Internal` and not
+        // `NotFound`: the request was well-formed and authorized, the fleet is
+        // just momentarily unable to serve it. The enum has no "temporarily
+        // unavailable" bucket, and `Conflict` is the one whose HTTP mapping
+        // (409) tells the caller to retry rather than to re-authorize or to
+        // stop asking for that board.
         let Some(agent) = self.agents.get(&agent_id).await else {
-            return Ok(CoordToSidecar::Error {
-                message: format!("agent {agent_id} for board {board} is not connected"),
-            });
+            return Err(OpError::Conflict(format!(
+                "agent {agent_id} for board {board} is not connected"
+            )));
         };
         if agent
             .send_command(fleet_proto::CoordinatorCommand::PowerCycle {
@@ -775,9 +997,9 @@ impl Coordinator {
             .await
             .is_err()
         {
-            return Ok(CoordToSidecar::Error {
-                message: format!("agent {agent_id} connection closed"),
-            });
+            return Err(OpError::Conflict(format!(
+                "agent {agent_id} connection closed"
+            )));
         }
         self.audit(
             &org,
@@ -788,10 +1010,25 @@ impl Coordinator {
             None,
             Some("operator request"),
         )
-        .await?;
-        Ok(CoordToSidecar::PowerCycled {
-            board: board_ref.board_name(),
-        })
+        .await
+        .map_err(OpError::Internal)?;
+        Ok(board_ref.board_name())
+    }
+
+    /// Wire adapter for [`Coordinator::operator_power_cycle_core`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
+    async fn operator_power_cycle(
+        &self,
+        subject: &Subject,
+        board: &BoardName,
+    ) -> Result<CoordToSidecar> {
+        match self.operator_power_cycle_core(subject, board).await {
+            Ok(board) => Ok(CoordToSidecar::PowerCycled { board }),
+            Err(e) => e.into_wire(),
+        }
     }
 
     /// Maximum lifetime of a grant created over the `/client` path.
@@ -816,14 +1053,20 @@ impl Coordinator {
     /// which is stored — never the login. §6.4's rename/reuse takeover is
     /// otherwise a hole: `grant bob` must mean the account that is `bob` today,
     /// not whoever holds the name at evaluation time.
-    async fn grant_create(
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-admin; [`OpError::Invalid`] for an
+    /// unparseable selector, an empty op set, a missing or out-of-range expiry,
+    /// or an unknown grantee; [`OpError::Internal`] on a database failure.
+    pub(crate) async fn grant_create_core(
         &self,
         subject: &Subject,
         grantee: &str,
         selector: &str,
         ops: Vec<fleet_proto::token::AllowedOp>,
         expires: Option<u64>,
-    ) -> Result<CoordToSidecar> {
+    ) -> std::result::Result<fleet_proto::GrantSummary, OpError> {
         use fleet_proto::lease::{parse_constraint, BareTerm};
 
         let org = subject.org.clone();
@@ -831,7 +1074,7 @@ impl Coordinator {
             .await
             .is_err()
         {
-            return Ok(Self::denied());
+            return Err(OpError::Denied);
         }
         let now = self.now();
 
@@ -841,41 +1084,37 @@ impl Coordinator {
         // `Tags([])` — a match-everything — from ever reaching the table.
         let selector = match parse_constraint(selector, BareTerm::Tag) {
             Ok(c) => c.to_string(),
-            Err(e) => {
-                return Ok(CoordToSidecar::Error {
-                    message: format!("invalid selector: {e}"),
-                })
-            }
+            Err(e) => return Err(OpError::Invalid(format!("invalid selector: {e}"))),
         };
 
         let ops = fleet_proto::token::normalize_ops(ops);
         if ops.is_empty() {
-            return Ok(CoordToSidecar::Error {
-                message: "a grant must confer at least one operation".to_owned(),
-            });
+            return Err(OpError::Invalid(
+                "a grant must confer at least one operation".to_owned(),
+            ));
         }
 
         // No perpetual grants over the API, and no absurd ones.
         let Some(expires) = expires else {
-            return Ok(CoordToSidecar::Error {
-                message: "a grant must expire; pass --until or --ttl".to_owned(),
-            });
+            return Err(OpError::Invalid(
+                "a grant must expire; pass --until or --ttl".to_owned(),
+            ));
         };
         if expires <= now || expires.saturating_sub(now) > Self::MAX_GRANT_TTL_SECS {
-            return Ok(CoordToSidecar::Error {
-                message: format!(
-                    "grant expiry must be in the future and within {} days",
-                    Self::MAX_GRANT_TTL_SECS / 86_400
-                ),
-            });
+            return Err(OpError::Invalid(format!(
+                "grant expiry must be in the future and within {} days",
+                Self::MAX_GRANT_TTL_SECS / 86_400
+            )));
         }
 
-        let Some(key) = self.resolve_grantee(grantee).await? else {
-            return Ok(CoordToSidecar::Error {
-                message: format!(
-                    "no such user `{grantee}`; ask them to run `probe-rs-fleet login` first"
-                ),
-            });
+        let Some(key) = self
+            .resolve_grantee(grantee)
+            .await
+            .map_err(OpError::Internal)?
+        else {
+            return Err(OpError::Invalid(format!(
+                "no such user `{grantee}`; ask them to run `probe-rs-fleet login` first"
+            )));
         };
 
         let id = crate::state::new_grant_id();
@@ -890,7 +1129,8 @@ impl Coordinator {
                 Some(subject.id.as_str()),
                 self.now_i64(),
             )
-            .await?;
+            .await
+            .map_err(OpError::Internal)?;
         self.audit(
             &org,
             "grant.create",
@@ -903,9 +1143,10 @@ impl Coordinator {
                 labels.join(",")
             })),
         )
-        .await?;
+        .await
+        .map_err(OpError::Internal)?;
 
-        Ok(CoordToSidecar::GrantCreated(fleet_proto::GrantSummary {
+        Ok(fleet_proto::GrantSummary {
             id,
             org,
             subject: key,
@@ -914,7 +1155,29 @@ impl Coordinator {
             expires: Some(expires),
             created_by: Some(subject.id.clone()),
             created_at: now,
-        }))
+        })
+    }
+
+    /// Wire adapter for [`Coordinator::grant_create_core`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
+    async fn grant_create(
+        &self,
+        subject: &Subject,
+        grantee: &str,
+        selector: &str,
+        ops: Vec<fleet_proto::token::AllowedOp>,
+        expires: Option<u64>,
+    ) -> Result<CoordToSidecar> {
+        match self
+            .grant_create_core(subject, grantee, selector, ops, expires)
+            .await
+        {
+            Ok(summary) => Ok(CoordToSidecar::GrantCreated(summary)),
+            Err(e) => e.into_wire(),
+        }
     }
 
     /// Resolve a grantee spelling to a [`SubjectKey`].
@@ -969,15 +1232,28 @@ impl Coordinator {
     /// itself issued, which every member can already infer from `ctl list` /
     /// `ctl who`. Note there is deliberately no "what am I granted?" verb for
     /// the receiving side; `ctl list` is the grantee-facing view.
-    async fn grant_list(&self, subject: &Subject) -> Result<CoordToSidecar> {
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-member; [`OpError::Internal`] on a database
+    /// failure.
+    pub(crate) async fn grant_list_core(
+        &self,
+        subject: &Subject,
+    ) -> std::result::Result<Vec<fleet_proto::GrantSummary>, OpError> {
         let org = subject.org.clone();
         if authz::require_role(&self.db, subject, &org, Role::Member)
             .await
             .is_err()
         {
-            return Ok(Self::denied());
+            return Err(OpError::Denied);
         }
-        let rows = self.db.scoped(org.clone()).list_grants().await?;
+        let rows = self
+            .db
+            .scoped(org.clone())
+            .list_grants()
+            .await
+            .map_err(OpError::Internal)?;
         let grants = rows
             .into_iter()
             .map(|row| fleet_proto::GrantSummary {
@@ -995,7 +1271,19 @@ impl Coordinator {
                 created_at: u64::try_from(row.created_at).unwrap_or(0),
             })
             .collect();
-        Ok(CoordToSidecar::Grants(grants))
+        Ok(grants)
+    }
+
+    /// Wire adapter for [`Coordinator::grant_list_core`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
+    async fn grant_list(&self, subject: &Subject) -> Result<CoordToSidecar> {
+        match self.grant_list_core(subject).await {
+            Ok(grants) => Ok(CoordToSidecar::Grants(grants)),
+            Err(e) => e.into_wire(),
+        }
     }
 
     /// Revoke a grant by id prefix, and make the revocation *real*.
@@ -1021,7 +1309,23 @@ impl Coordinator {
     /// makes it useless — there is no path to the board without the
     /// coordinator. This is the same bound delegation has, and it is why lease
     /// TTLs are short.
-    async fn grant_revoke(&self, subject: &Subject, id_prefix: &str) -> Result<CoordToSidecar> {
+    ///
+    /// Returns the ids actually deleted (a prefix that matched one grant can
+    /// still delete only that grant — the list is what the operator is shown).
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-member, and for a caller who is neither
+    /// the grant's creator nor an org admin (the `grant.revoke.denied` audit row
+    /// is written first, so a refused revoke is still on the record);
+    /// [`OpError::Invalid`] for a prefix that is too short or not hex;
+    /// [`OpError::NotFound`] when nothing matches; [`OpError::Conflict`] when
+    /// more than one grant does; [`OpError::Internal`] on a database failure.
+    pub(crate) async fn grant_revoke_core(
+        &self,
+        subject: &Subject,
+        id_prefix: &str,
+    ) -> std::result::Result<Vec<String>, OpError> {
         let org = subject.org.clone();
         // Membership first: a non-member must not be able to probe which
         // prefixes exist.
@@ -1029,7 +1333,7 @@ impl Coordinator {
             .await
             .is_err()
         {
-            return Ok(Self::denied());
+            return Err(OpError::Denied);
         }
 
         let prefix = id_prefix.trim().to_ascii_lowercase();
@@ -1050,27 +1354,23 @@ impl Coordinator {
         // Either way, at least 8 characters of *entropy*: the `ci-` marker
         // itself distinguishes nothing, so it does not count toward the floor.
         if body.len() < 8 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Ok(CoordToSidecar::Error {
-                message: "grant id prefix must be at least 8 hex characters \
-                          (or `ci-` followed by 8, for a CI key's grant)"
+            return Err(OpError::Invalid(
+                "grant id prefix must be at least 8 hex characters \
+                 (or `ci-` followed by 8, for a CI key's grant)"
                     .to_owned(),
-            });
+            ));
         }
 
         let scoped = self.db.scoped(org.clone());
-        let all = scoped.list_grants().await?;
+        let all = scoped.list_grants().await.map_err(OpError::Internal)?;
         let matches: Vec<_> = all.iter().filter(|g| g.id.starts_with(&prefix)).collect();
         let target = match matches.len() {
-            0 => {
-                return Ok(CoordToSidecar::Error {
-                    message: format!("no grant matching {prefix}"),
-                })
-            }
+            0 => return Err(OpError::NotFound(format!("no grant matching {prefix}"))),
             1 => matches[0],
             n => {
-                return Ok(CoordToSidecar::Error {
-                    message: format!("{n} grants match {prefix}; use a longer prefix"),
-                })
+                return Err(OpError::Conflict(format!(
+                    "{n} grants match {prefix}; use a longer prefix"
+                )))
             }
         };
 
@@ -1085,12 +1385,16 @@ impl Coordinator {
                 None,
                 Some("neither the grant's creator nor an org admin"),
             )
-            .await?;
-            return Ok(Self::denied());
+            .await
+            .map_err(OpError::Internal)?;
+            return Err(OpError::Denied);
         }
 
         let grantee = target.parsed_subject();
-        let deleted = scoped.delete_grants_by_prefix(&prefix).await?;
+        let deleted = scoped
+            .delete_grants_by_prefix(&prefix)
+            .await
+            .map_err(OpError::Internal)?;
         let ids: Vec<String> = deleted.iter().map(|g| g.id.clone()).collect();
         self.audit(
             &org,
@@ -1101,13 +1405,28 @@ impl Coordinator {
             None,
             Some(&format!("revoked {}", ids.join(","))),
         )
-        .await?;
+        .await
+        .map_err(OpError::Internal)?;
 
         if let Some(grantee) = grantee {
-            self.cascade_revocation(&grantee, &org).await?;
+            self.cascade_revocation(&grantee, &org)
+                .await
+                .map_err(OpError::Internal)?;
         }
 
-        Ok(CoordToSidecar::GrantRevoked { ids })
+        Ok(ids)
+    }
+
+    /// Wire adapter for [`Coordinator::grant_revoke_core`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
+    async fn grant_revoke(&self, subject: &Subject, id_prefix: &str) -> Result<CoordToSidecar> {
+        match self.grant_revoke_core(subject, id_prefix).await {
+            Ok(ids) => Ok(CoordToSidecar::GrantRevoked { ids }),
+            Err(e) => e.into_wire(),
+        }
     }
 
     /// Revoke a **specific** grant by exact id, cascading as `grant revoke`
@@ -1472,29 +1791,55 @@ impl Coordinator {
     }
 
     /// Release a lease, tearing down its channels and persisting the close.
-    async fn release_lease(&self, subject: &Subject, lease: LeaseId) -> Result<CoordToSidecar> {
+    ///
+    /// Returns the released lease id.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::NotFound`] carrying [`AuthzError::lease_message`] — *not*
+    /// [`OpError::Denied`] — both when the caller may not control the lease and
+    /// when the teardown finds nothing to close. This deliberately does not
+    /// distinguish "someone else's lease" from "no such lease": telling them
+    /// apart would let anyone probe which lease ids are live, and across orgs it
+    /// would enumerate other tenants' leases. [`OpError::Internal`] on a
+    /// database failure during teardown.
+    pub(crate) async fn release_lease_core(
+        &self,
+        subject: &Subject,
+        lease: LeaseId,
+    ) -> std::result::Result<LeaseId, OpError> {
         // Authorize *before* any teardown: a refused release must have no
         // observable effect at all.
         let holder = {
             let sched = self.scheduler.lock().await;
             match authz::require_lease_control(&self.db, &sched, subject, lease).await {
                 Ok(holder) => holder,
-                Err(_) => {
-                    return Ok(CoordToSidecar::Error {
-                        message: AuthzError::lease_message(),
-                    })
-                }
+                Err(_) => return Err(OpError::NotFound(AuthzError::lease_message())),
             }
         };
 
-        match self
+        if self
             .tear_down_lease(lease, &holder, "released", "lease.release", subject)
-            .await?
+            .await
+            .map_err(OpError::Internal)?
         {
-            true => Ok(CoordToSidecar::Released { lease }),
-            false => Ok(CoordToSidecar::Error {
-                message: AuthzError::lease_message(),
-            }),
+            Ok(lease)
+        } else {
+            // The lease vanished between the authorization check and the
+            // teardown. Same message as the refusal above, for the same reason.
+            Err(OpError::NotFound(AuthzError::lease_message()))
+        }
+    }
+
+    /// Wire adapter for [`Coordinator::release_lease_core`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
+    async fn release_lease(&self, subject: &Subject, lease: LeaseId) -> Result<CoordToSidecar> {
+        match self.release_lease_core(subject, lease).await {
+            Ok(lease) => Ok(CoordToSidecar::Released { lease }),
+            Err(e) => e.into_wire(),
         }
     }
 
@@ -1935,6 +2280,20 @@ impl Coordinator {
 
 /// A shared, cheaply-cloneable coordinator handle.
 pub type SharedCoordinator = Arc<Coordinator>;
+
+/// One row of [`Coordinator::list_nodes_core`]: a node row plus its live
+/// connection state.
+///
+/// The two halves come from different places on purpose — the row from the
+/// database, `online` from the in-memory registry — and are joined here rather
+/// than in the handler, so both are answered under one authorization check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeStatus {
+    /// The persisted node row.
+    pub row: crate::state::NodeRow,
+    /// Whether the node holds its control-plane `WebSocket` right now.
+    pub online: bool,
+}
 
 /// The outcome of resolving a node-local board name inside one org.
 ///

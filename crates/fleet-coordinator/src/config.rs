@@ -35,29 +35,36 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
-/// The GitHub OAuth app the coordinator brokers the device flow with.
+/// The GitHub OAuth app the coordinator brokers user login with.
 ///
 /// **`OAuth2`, not OIDC.** GitHub user login has no discovery document, no ID
-/// token and no JWKS; the device flow yields an *access token* and identity
-/// comes from `GET /user`. (GitHub Actions workload identity *is* real OIDC —
-/// a different verifier, a different task.)
+/// token and no JWKS; both flows yield an *access token* and identity comes
+/// from `GET /user`. (GitHub Actions workload identity *is* real OIDC — a
+/// different verifier, a different task.)
 ///
-/// There is deliberately **no callback origin here**: the device flow has no
-/// `redirect_uri` at all (RFC 8628), so §10's unresolved "where does the hosted
-/// control plane run" question does not block login. The only hostname involved
-/// is this coordinator's own [`CoordinatorConfig::public_url`].
+/// Two front doors, one app: the CLI's device flow (RFC 8628, no `redirect_uri`
+/// at all) and the browser's authorization-code flow (`docs/web-ui.md` D1). The
+/// device flow needs no per-deployment registration; the browser one needs
+/// exactly one, which is what [`callback_registered`](Self::callback_registered)
+/// asserts. A deployment that skips it still has a working login — the web UI
+/// falls back to showing a device code — so the browser path is a nicety rather
+/// than a new requirement.
 ///
-/// The three endpoint URLs are configurable so the integration tests can point
-/// the flow at a loopback stub — the only way to exercise it without GitHub.
+/// The endpoint URLs are configurable so the integration tests can point the
+/// flows at a loopback stub — the only way to exercise them without GitHub.
 #[derive(Debug, Clone)]
 pub struct GithubConfig {
     /// The OAuth app's client id. Not a secret (it appears in the device-flow
-    /// request), but without it there is no flow.
+    /// request and in the browser redirect), but without it there is no flow.
     pub client_id: String,
     /// The OAuth app's client secret, when the app requires one.
     ///
     /// OAuth Apps do not need it for the device flow; some GitHub App
-    /// configurations do. It never leaves this process.
+    /// configurations do. It becomes **required** once
+    /// [`callback_registered`](Self::callback_registered) is true: GitHub's
+    /// token endpoint refuses the authorization-code exchange without it, and
+    /// GitHub implements no PKCE, so the secret is also what makes an
+    /// intercepted code unspendable. It never leaves this process.
     pub client_secret: Option<String>,
     /// The OAuth scope requested. Empty is correct for identity-only login:
     /// `GET /user` needs no scope, and asking for more than we use is a
@@ -65,10 +72,29 @@ pub struct GithubConfig {
     pub scope: String,
     /// `POST` endpoint that starts a device flow.
     pub device_code_url: String,
-    /// `POST` endpoint that redeems a device code for an access token.
+    /// `POST` endpoint that redeems a device code — or a browser authorization
+    /// code — for an access token.
     pub access_token_url: String,
     /// Base URL of the GitHub REST API (`GET {api_base}/user`).
     pub api_base: String,
+    /// Browser-facing endpoint the `/auth/github/start` redirect targets.
+    ///
+    /// Overridable exactly like the three URLs above, for GitHub Enterprise or
+    /// a loopback test stub; that overridability is what lets the integration
+    /// tests exercise the browser flow at all.
+    pub authorize_url: String,
+    /// The operator asserting that `<public_url>/auth/github/callback` is
+    /// registered as a callback URL in the OAuth app.
+    ///
+    /// Browser authorization-code login is offered **only** when this is true.
+    /// It is the one per-deployment setup step the device flow did not need,
+    /// and nothing the coordinator can discover for itself — GitHub does not
+    /// expose an app's registered callbacks to the app. Default `false`, so a
+    /// deployment that has not done the registration falls back to the in-page
+    /// device-code login rather than sending every user into a redirect that
+    /// dead-ends on GitHub's "`redirect_uri` is not associated with this
+    /// application" page.
+    pub callback_registered: bool,
 }
 
 /// The GitHub Actions OIDC issuer the coordinator accepts workload tokens
@@ -305,10 +331,29 @@ impl CoordinatorConfig {
                 ("github.device_code_url", &gh.device_code_url),
                 ("github.access_token_url", &gh.access_token_url),
                 ("github.api_base", &gh.api_base),
+                // Joined to the three above rather than checked separately:
+                // an empty authorize endpoint is the same class of mistake,
+                // and it would surface as a 302 to a bare query string.
+                ("github.authorize_url", &gh.authorize_url),
             ] {
                 if value.trim().is_empty() {
                     return Err(CoordinatorError::Config(format!("{label} must be non-empty")));
                 }
+            }
+            // Opting into browser login without a secret is a login that always
+            // fails at its last step: GitHub's token endpoint refuses the
+            // authorization-code exchange without `client_secret`, and GitHub
+            // implements no PKCE, so there is no verifier standing in for it.
+            // Refused here, where the operator can act on it, rather than at
+            // the callback, where every user sees an opaque error.
+            if gh.callback_registered && gh.client_secret.is_none() {
+                return Err(CoordinatorError::Config(
+                    "github.client_secret is required when github.callback_registered = true: \
+                     GitHub refuses the authorization-code exchange without it (and implements \
+                     no PKCE). Set the secret, or set callback_registered = false to fall back \
+                     to the device flow."
+                        .to_owned(),
+                ));
             }
         }
         if let Some(gha) = &self.github_actions {
@@ -500,6 +545,8 @@ mod tests {
             device_code_url: "https://github.com/login/device/code".to_owned(),
             access_token_url: "https://github.com/login/oauth/access_token".to_owned(),
             api_base: "https://api.github.com".to_owned(),
+            authorize_url: "https://github.com/login/oauth/authorize".to_owned(),
+            callback_registered: false,
         };
         let c = CoordinatorConfig {
             github: Some(good.clone()),
@@ -519,11 +566,71 @@ mod tests {
         let c = CoordinatorConfig {
             github: Some(GithubConfig {
                 api_base: String::new(),
+                ..good.clone()
+            }),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_err());
+
+        // The browser flow's endpoint is checked with the other three: an empty
+        // one would 302 the user at a bare query string.
+        let c = CoordinatorConfig {
+            github: Some(GithubConfig {
+                authorize_url: "  ".to_owned(),
                 ..good
             }),
             ..CoordinatorConfig::default()
         };
         assert!(c.validate().is_err());
+    }
+
+    /// `callback_registered = true` promises a browser login; without a client
+    /// secret that login always fails at its last step, because GitHub refuses
+    /// the authorization-code grant without one and implements no PKCE to stand
+    /// in for it. The failure is invisible until a real user tries to log in,
+    /// which is why it is a startup error.
+    #[test]
+    fn callback_registered_requires_a_client_secret() {
+        let base = GithubConfig {
+            client_id: "Iv1.abc".to_owned(),
+            client_secret: None,
+            scope: String::new(),
+            device_code_url: "https://github.com/login/device/code".to_owned(),
+            access_token_url: "https://github.com/login/oauth/access_token".to_owned(),
+            api_base: "https://api.github.com".to_owned(),
+            authorize_url: "https://github.com/login/oauth/authorize".to_owned(),
+            callback_registered: true,
+        };
+        let c = CoordinatorConfig {
+            github: Some(base.clone()),
+            ..CoordinatorConfig::default()
+        };
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("client_secret"), "{err}");
+        // The message has to carry the remediation, or an operator's only move
+        // is to guess which of the two knobs to turn.
+        assert!(err.contains("callback_registered = false"), "{err}");
+
+        // With a secret, the same table is valid.
+        let c = CoordinatorConfig {
+            github: Some(GithubConfig {
+                client_secret: Some("s3cret".to_owned()),
+                ..base.clone()
+            }),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_ok());
+
+        // And a deployment that has not registered the callback needs none:
+        // the device flow is the fallback, and it asks for no secret.
+        let c = CoordinatorConfig {
+            github: Some(GithubConfig {
+                callback_registered: false,
+                ..base
+            }),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_ok());
     }
 
     /// No `[github]` table is a supported deployment (air-gapped / dev), not an

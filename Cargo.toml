@@ -86,6 +86,11 @@ rustls-pemfile = "2"
 # self-hosted-TLS test).
 rcgen = { version = "0.13", default-features = false, features = ["x509-parser", "ring", "pem"] }
 sha2 = "0.10"
+# Cookie/CSRF machinery for the browser surface (docs/web-ui.md D1). Pure Rust,
+# no C toolchain: `docs/cross-compiling.md`'s constraint applies to every new
+# dependency, and these two were already in the lock file transitively.
+hmac = "0.12"
+subtle = "2"
 
 # storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }

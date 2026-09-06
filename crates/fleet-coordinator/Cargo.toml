@@ -37,6 +37,15 @@ serde_json.workspace = true
 sqlx.workspace = true
 
 sha2.workspace = true
+# The CSRF double-submit token is `HMAC-SHA256` over the session token hash,
+# keyed by a derivation of the coordinator's existing ed25519 signing seed
+# (docs/web-ui.md D1) — no cookie framework, no second secret to persist.
+# `subtle` gives the constant-time comparison that check needs; both are pure
+# Rust and already in the lock file, so `docs/cross-compiling.md`'s `ring`-only,
+# no-C-toolchain constraint is unaffected.
+hmac.workspace = true
+subtle.workspace = true
+base64.workspace = true
 
 ed25519-dalek.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }

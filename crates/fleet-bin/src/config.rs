@@ -35,7 +35,8 @@ struct TlsToml {
     key: PathBuf,
 }
 
-/// The `[github]` table: the OAuth app backing `probe-rs-fleet login`.
+/// The `[github]` table: the OAuth app backing `probe-rs-fleet login` and the
+/// web UI's browser login.
 ///
 /// Omit it entirely for an air-gapped or development fleet; the device-flow
 /// routes then answer a named `503` and `coordinator user-token` remains the
@@ -62,6 +63,17 @@ struct GithubToml {
     /// See [`GithubToml::device_code_url`].
     #[serde(default = "default_api_base")]
     api_base: String,
+    /// The browser endpoint `/auth/github/start` redirects to. Overridable for
+    /// the same reasons as [`GithubToml::device_code_url`].
+    #[serde(default = "default_authorize_url")]
+    authorize_url: String,
+    /// The operator asserting that `<public_url>/auth/github/callback` is
+    /// registered in the OAuth app — the one setup step the device flow did not
+    /// need. Browser login is offered only when this is true; `false` (the
+    /// default) falls back to the in-page device-code login. Requires
+    /// `client_secret`.
+    #[serde(default)]
+    callback_registered: bool,
 }
 
 fn default_device_code_url() -> String {
@@ -74,6 +86,10 @@ fn default_access_token_url() -> String {
 
 fn default_api_base() -> String {
     "https://api.github.com".to_owned()
+}
+
+fn default_authorize_url() -> String {
+    "https://github.com/login/oauth/authorize".to_owned()
 }
 
 /// The `[github_actions]` table: the OIDC issuer backing `probe-rs-fleet ci
@@ -272,6 +288,8 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
             device_code_url: g.device_code_url,
             access_token_url: g.access_token_url,
             api_base: g.api_base,
+            authorize_url: g.authorize_url,
+            callback_registered: g.callback_registered,
         }),
         github_actions: raw.github_actions.map(|g| GithubActionsConfig {
             issuer: g.issuer,

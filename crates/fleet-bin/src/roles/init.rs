@@ -124,8 +124,11 @@ listen_addr = "{DEFAULT_LISTEN_ADDR}"
 # Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
 # listens on loopback and the world reaches it at a name it never sees.
 #
-# This is NOT an OAuth callback origin: the GitHub device flow has no
-# redirect_uri, so nothing here is registered with GitHub.
+# For the CLI login this is NOT an OAuth callback origin: the GitHub device flow
+# has no redirect_uri. For the web UI's BROWSER login it is: the callback is
+# derived from this value as `<public_url>/auth/github/callback`, and never from
+# the request's Host / X-Forwarded-Host header — behind a proxy that header is
+# attacker-settable, and a redirect it controls is an account takeover.
 public_url = {public_url}
 
 # SQLite database file (created on first run).
@@ -171,7 +174,7 @@ signing_key_path = {signing_key_path}
 #   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
 # and pass it as `--server-cert-sha256` to `login` / `agent up`.
 
-# The GitHub OAuth app backing `probe-rs-fleet login`.
+# The GitHub OAuth app backing `probe-rs-fleet login` and the web UI.
 #
 # Omitting this block is a SUPPORTED deployment, not a broken one: an air-gapped
 # or development fleet bootstraps with `coordinator user-token` instead, and the
@@ -180,21 +183,38 @@ signing_key_path = {signing_key_path}
 #
 # To enable login: register an OAuth app at
 # https://github.com/settings/developers with "Enable Device Flow" TICKED.
-# There is NO callback URL to configure — the device flow has no redirect_uri.
+# There is NO callback URL to configure for the CLI — the device flow has no
+# redirect_uri.
 #
-# The coordinator brokers the flow, so the client id/secret never leave this
+# The web UI's BROWSER login needs exactly one extra step, the only
+# per-deployment setup the device flow did not need: add
+# `<public_url>/auth/github/callback` to the app's callback URLs, set a client
+# secret, and set `callback_registered = true`. Skipping it is supported — the
+# UI then falls back to the in-page device-code login.
+#
+# The coordinator brokers both flows, so the client id/secret never leave this
 # host and the user's GitHub access token never leaves this process.
 #
 # [github]
 # client_id = "Iv1.0123456789abcdef"
-# # Only if your app requires one (OAuth Apps do not, for the device flow):
+# # Only if your app requires one (OAuth Apps do not, for the device flow).
+# # REQUIRED once `callback_registered = true`: GitHub refuses the
+# # authorization-code exchange without it and implements no PKCE, so the
+# # secret is also what makes an intercepted code unspendable.
 # # client_secret = "…"
 # # Scope to request. Empty is correct for identity-only login: `GET /user`
 # # needs none, and asking for more than you use is hard for a user to undo.
 # # scope = ""
+# # You have added `<public_url>/auth/github/callback` to the OAuth app's
+# # callback URLs. Default: false — an assertion the coordinator cannot verify,
+# # and false means the web UI offers the device-code login rather than a
+# # redirect that dead-ends on GitHub's "redirect_uri is not associated with
+# # this application" page.
+# # callback_registered = false
 # # Endpoint overrides, for GitHub Enterprise. Defaults shown.
 # # device_code_url  = "https://github.com/login/device/code"
 # # access_token_url = "https://github.com/login/oauth/access_token"
+# # authorize_url    = "https://github.com/login/oauth/authorize"
 # # api_base         = "https://api.github.com"
 
 # Lease scheduling policy (defaults shown).
@@ -221,7 +241,11 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("Next steps:");
     println!("  1. Register a GitHub OAuth app with DEVICE FLOW ENABLED and put");
     println!("     its client id in the [github] block of the config above.");
-    println!("     (There is no callback URL to fill in.)");
+    println!("     (No callback URL is needed for the CLI login. For the web UI's");
+    println!("     browser login, additionally register");
+    println!("       {public_url}/auth/github/callback");
+    println!("     set a client secret, and set callback_registered = true;");
+    println!("     without that the web UI falls back to the device-code login.)");
     println!("  2. Start the coordinator (no --config needed):");
     println!("       probe-rs-fleet coordinator");
     println!("  3. Log in from your laptop:");

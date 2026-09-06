@@ -15,7 +15,7 @@
 # Deployment shape (architecture §3.5)
 # ---------------------------------------------------------------------------
 #
-# The coordinator is an HTTP server. Four routes:
+# The coordinator is an HTTP server. Its routes:
 #
 #   GET  /healthz      liveness, for the proxy
 #   GET  /agent        WebSocket upgrade — a node's persistent control plane
@@ -23,9 +23,12 @@
 #                      workload token (architecture §6.7)
 #   POST /auth/token   JSON credential exchange (node enrollment, session
 #                      refresh, CI workload identity)
+#   GET  /auth/github/start, /auth/github/callback
+#                      browser login for the web UI — offered only when the
+#                      [github] block sets callback_registered = true (below)
 #
-# Every principal presents `Authorization: Bearer …` on the upgrade. There are
-# no client certificates, no private CA, and no mTLS.
+# Every non-browser principal presents `Authorization: Bearer …` on the upgrade.
+# There are no client certificates, no private CA, and no mTLS.
 #
 # The expected deployment puts an HTTPS reverse proxy in front: it terminates
 # TLS and routes by path, which is exactly what the WebSocket transport bought
@@ -34,8 +37,10 @@
 # below only when you are self-hosting with no proxy.
 #
 # Bootstrap (the normal path):
-#   1. Register a GitHub OAuth app with DEVICE FLOW ENABLED. There is no
-#      callback URL to fill in: the device flow has no redirect_uri.
+#   1. Register a GitHub OAuth app with DEVICE FLOW ENABLED. The CLI login needs
+#      no callback URL to fill in: the device flow has no redirect_uri.
+#      Registering one is optional and buys only the BROWSER login — see the
+#      [github] block below.
 #   2. Put its client id in the [github] block below.
 #   3. coordinator init && coordinator
 #   4. On your laptop: probe-rs-fleet login --fleet-url <url>
@@ -73,8 +78,14 @@ listen_addr = "127.0.0.1:7000"
 # The externally reachable base URL agents and clients DIAL to reach this
 # coordinator — what you pass to `login --fleet-url` / `agent up --fleet-url`.
 #
-# NOT an OAuth callback origin: the device flow has no redirect_uri, so nothing
-# here needs to be registered with GitHub.
+# For the CLI device flow this is NOT an OAuth callback origin: that flow has no
+# redirect_uri and nothing here is registered with GitHub. For the BROWSER login
+# it is: the callback is derived from this value as
+# `<public_url>/auth/github/callback` — and never from the request's `Host` or
+# `X-Forwarded-Host`. That is deliberate: behind a proxy the coordinator does
+# not see its own public name, and a Host-derived callback would let anyone who
+# can set that header point a login at an origin they control, which is an
+# account takeover.
 #
 # Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
 # listens on loopback and the world reaches it at a name it never sees.
@@ -197,7 +208,7 @@ max_concurrent_per_subject = 2
 default_ttl_secs = 900
 
 # ---------------------------------------------------------------------------
-# GitHub OAuth app (optional): what backs `probe-rs-fleet login`
+# GitHub OAuth app (optional): what backs `probe-rs-fleet login` and the web UI
 # ---------------------------------------------------------------------------
 #
 # Omitting this whole block is a SUPPORTED deployment, not a broken one: an
@@ -208,19 +219,34 @@ default_ttl_secs = 900
 #
 # Register the app at https://github.com/settings/developers with
 #   "Enable Device Flow" TICKED.
-# There is NO callback URL to configure: the device flow has no redirect_uri.
 #
-# The coordinator brokers the flow; the CLI never talks to GitHub. So these
+# For the CLI login that is all: there is NO callback URL to configure, because
+# the device flow has no redirect_uri.
+#
+# For the web UI's BROWSER login there is exactly one extra step — the only
+# per-deployment setup the device flow did not need. Add
+#   <public_url>/auth/github/callback
+# (e.g. https://fleet.example/auth/github/callback) as the app's Authorization
+# callback URL, set a client secret, and set `callback_registered = true` below.
+# Skipping all of that is a SUPPORTED deployment: the web UI then falls back to
+# the in-page device-code login — the same code-and-link dance `login
+# --headless` prints — which is uglier but needs no registration at all.
+#
+# The coordinator brokers both flows; the CLI never talks to GitHub. So these
 # credentials stay on this host, and the user's GitHub access token never leaves
 # this process (it is spent on one `GET /user` and discarded).
 
 # [github]
 # # The OAuth app's client id. Not a secret — it travels in the device-flow
-# # request — but without it there is no flow.
+# # request and in the browser redirect — but without it there is no flow.
 # client_id = "Iv1.0123456789abcdef"
 #
 # # Only if your app requires one. OAuth Apps do not need a secret for the
-# # device flow; some GitHub App configurations do.
+# # device flow; some GitHub App configurations do. It becomes REQUIRED once
+# # `callback_registered = true`: GitHub refuses the authorization-code exchange
+# # without it, and GitHub implements no PKCE, so the secret is also what makes
+# # an intercepted code unspendable. The validator rejects that combination
+# # rather than letting every browser login fail at its last step.
 # # client_secret = "…"
 #
 # # Scope to request. Empty (the default) is correct for identity-only login:
@@ -228,9 +254,24 @@ default_ttl_secs = 900
 # # the user cannot easily take back.
 # # scope = ""
 #
+# # You have added <public_url>/auth/github/callback to the OAuth app's
+# # callback URLs. Default: false.
+# #
+# # An ASSERTION, not something the coordinator can verify: GitHub does not tell
+# # an app which callbacks it has registered. True, and the web UI offers the
+# # one-click browser login; false or omitted, and it offers the device-code
+# # fallback instead. That is why false is the default — a deployment that has
+# # not done the registration sends nobody into a redirect that dead-ends on
+# # GitHub's "redirect_uri is not associated with this application" page.
+# #
+# # The callback origin comes from `public_url` above, never from the request's
+# # Host / X-Forwarded-Host header — see the note there.
+# # callback_registered = false
+#
 # # Endpoint overrides, for GitHub Enterprise (or a test stub). Defaults shown.
 # # device_code_url  = "https://github.com/login/device/code"
 # # access_token_url = "https://github.com/login/oauth/access_token"
+# # authorize_url    = "https://github.com/login/oauth/authorize"
 # # api_base         = "https://api.github.com"
 
 # ---------------------------------------------------------------------------

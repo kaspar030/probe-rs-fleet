@@ -96,6 +96,8 @@ impl StubGithub {
             device_code_url: format!("{}/login/device/code", self.base_url),
             access_token_url: format!("{}/login/oauth/access_token", self.base_url),
             api_base: self.base_url.clone(),
+            authorize_url: format!("{}/login/oauth/authorize", self.base_url),
+            callback_registered: false,
         }
     }
 }

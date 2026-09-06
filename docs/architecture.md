@@ -140,7 +140,25 @@ Routes:
 | `POST /node/register/poll` | headless nodes | redeem an approved registration for a node token |
 | `POST /node/register/approve` | org members | inspect / approve / deny a pending registration |
 | `GET /node/approve` | anyone | static page: what to run to approve one |
+| `GET /auth/github/start` | a browser | 302 to GitHub's authorize endpoint (browser login, `docs/web-ui.md` D1) |
+| `GET /auth/github/callback` | a browser holding a valid `state` | exchange the code, set the session cookies, 302 `/ui` |
+| `GET /api/v1/*` | a browser session, or a bearer | the browser-facing JSON API (`docs/web-ui.md` §3) |
 | `GET /healthz` | proxy | liveness |
+
+The last three are the **browser surface**, added by `docs/web-ui.md` and
+designed there rather than here. Two properties of it belong in this table
+rather than only in that document:
+
+* `/api/v1/*` is the **only** prefix on which a session cookie is an accepted
+  credential. Every other route in this table requires an explicit
+  `Authorization: Bearer`, including `/agent`, `/client` and `/delegate` (a
+  browser must never drive a control-plane WebSocket by ambient authority) and
+  the CLI's `/auth/token` and `/auth/keys`.
+* Mutating `/api/v1` calls whose credential arrived in a cookie must also carry
+  an `X-Fleet-Csrf` header, and the coordinator emits **no CORS headers
+  anywhere**, which is what makes that header a second independent control.
+  Phase 1 ships exactly one mutating route (`POST /api/v1/session/logout`), so
+  the machinery is exercised before there is anything worth abusing through it.
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
 reaped on a timeout we do not control, so the node connection must run
@@ -676,6 +694,33 @@ The cost, stated honestly: bearer tokens are pure bearer credentials, so a leak
 is immediately usable. Short user sessions, rotating node tokens, and per-job CI
 tokens bound the window.
 
+**One extra carrier for the user token (`docs/web-ui.md` D1).** A browser
+cannot hold an `Authorization` header the way `ctl` does, so a user session
+token also travels in a `prfs_session` cookie — `HttpOnly`, `Secure`,
+`SameSite=Lax`, `Path=/`, with `Max-Age` tracking the `session` row's own
+expiry. This is a **second carrier of the same credential, not a second
+credential kind**: the same `prfs1_` string, resolved byte-for-byte by the same
+`fleet_auth::authenticate`, through the same single `Subject` construction site
+(`http::authenticate_request_with`). The table above is unchanged — same token,
+same lifetime, same "delete session" revocation.
+
+What the carrier changes is what else the caller must prove, and where it is
+accepted:
+
+* it is accepted **only under `/api/v1/*`** (§3.5), because a cookie is ambient
+  — the browser attaches it to every request to this origin, including ones
+  another site caused;
+* a mutating call carrying one must also carry `X-Fleet-Csrf`, a double-submit
+  token `HMAC`-derived from the coordinator's existing signing seed and the
+  session token's hash. Nothing is stored: no CSRF table, no second secret. A
+  **bearer**-authenticated `/api/v1` call needs no such header, because that
+  credential is not ambient.
+
+The trade recorded with it: `HttpOnly` costs the CSRF machinery, and buys that a
+single XSS cannot walk away with a credential that can power-cycle real
+hardware. `Authorization: Bearer` from JavaScript would need no CSRF at all and
+was rejected for exactly that reason (`docs/web-ui.md` §5).
+
 ### 6.3 Capability tokens (unchanged)
 
 The coordinator mints an ed25519-signed `CapabilityToken { lease, board,
@@ -701,10 +746,39 @@ probe-rs-fleet login
   → session token cached in the per-fleet config
 ```
 
-**No callback origin is involved.** The device flow (RFC 8628) has no
-`redirect_uri` at all, so §10's unresolved "where does the hosted control plane
-run" question does not gate login and nothing hardcodes a hostname. Register the
-OAuth app with **Device Flow enabled**; there is no callback URL to fill in.
+**No callback origin is involved *for the CLI*.** The device flow (RFC 8628)
+has no `redirect_uri` at all, so §10's unresolved "where does the hosted control
+plane run" question does not gate `probe-rs-fleet login` and nothing in the CLI
+path hardcodes a hostname. Register the OAuth app with **Device Flow enabled**;
+for the CLI there is no callback URL to fill in, and this is still the whole
+story for every deployed agent, sidecar and `ctl`.
+
+**A callback origin *is* involved for the browser (`docs/web-ui.md` D1).** The
+web UI cannot use the device flow as its primary login — a page that makes you
+type a code into another tab is a poor front door — so the coordinator also
+offers the GitHub **authorization-code** flow at `GET /auth/github/{start,
+callback}`. That reverses the sentence above for one surface, and it costs
+exactly one thing: a per-deployment setup step, registering
+`<public_url>/auth/github/callback` in the OAuth app. Three things bound it:
+
+* the step is **opt-in** (`github.callback_registered`). A deployment that skips
+  it falls back to an in-page device-code login, which is uglier and works, so
+  `[github]` stays optional and no existing deployment is broken by this;
+* `redirect_uri` is derived from `public_url`, **never** from `Host` or
+  `X-Forwarded-Host`. Behind the reverse proxy of §3.5 the coordinator does not
+  see its own public name, and a Host-derived callback is a host-header
+  injection into an attacker-chosen OAuth redirect — an account takeover. The
+  callback path is fixed and the origin is configuration;
+* GitHub does **not** implement PKCE (it ignores `code_challenge` /
+  `code_verifier`). The parameters are sent anyway, because they are harmless
+  and correct for a GHES or other-IdP future, but what actually protects the
+  callback is the `state` value bound to a short-lived `HttpOnly` cookie plus
+  the `client_secret` — which is therefore effectively **required** once
+  browser login is enabled, unlike the device flow. Please do not record this as
+  "PKCE-protected"; it is not.
+
+The device-flow paragraphs below are unchanged and describe the CLI path, which
+nothing here moves.
 
 **The coordinator brokers; the CLI never talks to GitHub.** The OAuth app's
 client id/secret stay server-side, the user's GitHub *access token* never leaves

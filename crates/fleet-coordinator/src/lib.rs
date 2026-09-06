@@ -40,10 +40,14 @@
 //! The lease/relay/auth decision logic lives in [`core::Coordinator`] and is
 //! unit-testable over in-memory channels; [`http`] is the route surface,
 //! [`server`] the per-connection I/O shell, and [`sweep`] the background expiry
-//! task.
+//! task. The browser surface (`docs/web-ui.md`) is split off rather than grown
+//! into `http`: [`browser_auth`] holds the cookie/CSRF machinery and the two
+//! login flows, [`api`] the `/api/v1` JSON handlers.
 
+pub mod api;
 pub mod auth;
 pub mod authz;
+pub mod browser_auth;
 pub mod clock;
 pub mod config;
 pub mod core;

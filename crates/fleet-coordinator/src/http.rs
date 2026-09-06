@@ -14,6 +14,14 @@
 //! | `POST /node/register/poll` | a pending node | redeem an approved registration for a node token |
 //! | `POST /node/register/approve` | org members | inspect / approve / deny one |
 //! | `GET /node/approve` | anyone | a static page saying what to run |
+//! | `GET /auth/github/start` | anyone | 302 to GitHub's authorize endpoint (browser login) |
+//! | `GET /auth/github/callback` | anyone with a valid `state` | exchange the code, set the session cookies |
+//! | `GET /api/v1/*` | browser sessions, or a bearer | the read-only JSON API ([`crate::api`]) |
+//!
+//! The last three are the browser surface (`docs/web-ui.md`); their handlers
+//! live in [`crate::browser_auth`] and [`crate::api`] and are merged into the
+//! router here. `/api/v1/*` is the **only** prefix on which a cookie is an
+//! accepted credential — see [`Carrier`].
 //!
 //! # Interactive node approval (architecture §4.2 rung 3, §6.4)
 //!
@@ -28,12 +36,49 @@
 //! *device* flow: deliberately no `redirect_uri`, no cookie session (§6.4). A
 //! page served here therefore cannot know who is looking at it, so approving
 //! from a browser would mean adding an OAuth redirect flow and cookies to the
-//! coordinator — which contradicts §6.4 and reopens §10 Q6. `GET /node/approve`
-//! is informational **because of that**, not by oversight. Please do not "fix"
-//! it by bolting a session onto the coordinator.
+//! coordinator. That was the right answer for a coordinator with no web UI, and
+//! this paragraph used to end "please do not 'fix' it by bolting a session onto
+//! the coordinator".
+//!
+//! **`docs/web-ui.md` D1 reverses that**, and the reversal is stated here
+//! rather than left as a silent contradiction. The coordinator now has an
+//! OAuth authorization-code flow and a cookie session, because a web UI needs a
+//! browser identity and there is no third option. What it costs is exactly what
+//! the old paragraph named:
+//!
+//! * **one per-deployment setup step** — registering
+//!   `<public_url>/auth/github/callback` in the OAuth app, which the device
+//!   flow did not need. `[github]` stays optional and a deployment that skips
+//!   the registration falls back to the device flow, so it is a nicety rather
+//!   than a new requirement (see [`crate::browser_auth::login_method`]);
+//! * **a callback origin to get right.** `redirect_uri` is derived from
+//!   `public_url`, never from `Host` or `X-Forwarded-Host`: behind a reverse
+//!   proxy the coordinator does not see its own public name, and a
+//!   Host-derived callback is an attacker-chosen OAuth redirect, i.e. an
+//!   account takeover;
+//! * **an ambient credential, and therefore CSRF machinery.** A cookie is
+//!   attached by the browser to every request to this origin, so the
+//!   double-submit token and the mandatory `X-Fleet-Csrf` header exist to
+//!   distinguish a call the page made from one another site made on its
+//!   behalf. That machinery is the price of `HttpOnly`, which is the price of
+//!   not handing a hardware-controlling credential to JavaScript.
+//!
+//! The blast radius is fenced: cookie authentication is accepted on
+//! `/api/v1/*` and **nowhere else** — not `/agent`, `/client` or `/delegate`
+//! (a browser must never drive a control-plane `WebSocket` by ambient
+//! authority), and not `/auth/token` or `/auth/keys`, which keep requiring an
+//! explicit bearer. [`Carrier`] is that fence, and `tests/browser_auth.rs`
+//! asserts each of those five routes refuses a cookie-only request.
+//!
+//! `GET /node/approve` is **still** informational: growing it a form is phase 2
+//! of `docs/web-ui.md` §6, not something this change did on the way past.
+//! Please do not "fix" that either — the page's *unauthenticated* rendering
+//! must stay byte-identical whatever the query string, which is what makes it
+//! reflect nothing.
 //!
 //! The design keeps a real browser flow open, and these three properties are
-//! commitments, not accidents:
+//! commitments, not accidents (the first is what phase 2 will cash in — a
+//! cookie-authenticated approval handler calls exactly [`decide_pending_node`]):
 //!
 //! 1. approval is keyed by `user_code` and is a pure function of `(code,
 //!    decision, authenticated user)` — [`decide_pending_node`] takes an
@@ -126,6 +171,23 @@
 //! and a second minting site in a crate with no membership knowledge is exactly
 //! how tenancy holes appear.
 //!
+//! ## One extra carrier, not a second credential
+//!
+//! The browser surface did **not** get a parallel cookie-authenticating
+//! function. [`authenticate_request_with`] takes a [`Carrier`] and, under
+//! [`Carrier::HeaderOrCookie`], reads the same credential out of the
+//! `prfs_session` cookie when there is no `Authorization` header: the same
+//! `prfs1_` token, byte for byte, resolved by the same
+//! [`fleet_auth::authenticate`], mapped to the same `Subject`, rejected and
+//! audited the same way. `authenticate_request` is now the
+//! [`Carrier::Header`] wrapper, so every pre-existing call site is unchanged.
+//!
+//! What the carrier *does* change is what the caller must additionally prove:
+//! a credential that arrived by cookie is ambient, so any mutating call
+//! carrying one must also carry `X-Fleet-Csrf`
+//! ([`crate::browser_auth::csrf_ok`]). That is why the function reports an
+//! [`Arrival`] rather than swallowing the distinction.
+//!
 //! ## `GET /delegate` constructs none, by design
 //!
 //! The one route that does not go through [`authenticate_request`], and the
@@ -202,6 +264,12 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         .route("/node/register/poll", post(node_register_poll))
         .route("/node/register/approve", post(node_register_approve))
         .route("/node/approve", get(node_approve_page))
+        // The browser surfaces (`docs/web-ui.md`). Kept in their own modules
+        // and merged here rather than listed above, so this file does not grow
+        // by ~1500 lines and so the `/api/v1` prefix — the only place a cookie
+        // is an accepted credential — stays greppable in one place.
+        .merge(crate::browser_auth::github_router())
+        .merge(crate::api::router())
         .with_state(coord)
 }
 
@@ -214,7 +282,11 @@ async fn healthz() -> &'static str {
 ///
 /// One shape for every authentication failure, so the response cannot be used to
 /// enumerate valid credentials or distinguish expiry from revocation.
-fn reject(status: StatusCode, code: &str) -> Response {
+///
+/// `pub(crate)` so [`crate::api`] and [`crate::browser_auth`] produce the same
+/// bodies: two rejection shapes on one coordinator is how a caller learns which
+/// module answered it.
+pub(crate) fn reject(status: StatusCode, code: &str) -> Response {
     (
         status,
         Json(ErrorResponse {
@@ -231,6 +303,39 @@ fn bearer_of(headers: &HeaderMap) -> Option<&str> {
     scheme.eq_ignore_ascii_case("bearer").then_some(credential.trim())
 }
 
+/// Which carriers a route accepts the credential in.
+///
+/// Not a second credential *kind*: both variants resolve **byte-for-byte the
+/// same** `prfs1_` session token through the same [`fleet_auth::authenticate`].
+/// The distinction exists because an ambient credential (a cookie the browser
+/// attaches to every request to this origin) is forgeable cross-site in a way
+/// an explicit header is not, so it needs the CSRF check
+/// ([`crate::browser_auth::csrf_ok`]) and it needs to be confined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Carrier {
+    /// `Authorization: Bearer` only. Every pre-existing route.
+    Header,
+    /// A bearer header, or the `prfs_session` cookie. **`/api/v1/*` only** —
+    /// that allowlist is the blast radius of the whole cookie design
+    /// (`docs/web-ui.md` D1), and `tests/browser_auth.rs` asserts each of
+    /// `/agent`, `/client`, `/delegate`, `/auth/token`, `/auth/keys` refuses a
+    /// cookie-only request.
+    HeaderOrCookie,
+}
+
+/// How the credential actually arrived.
+///
+/// The CSRF check keys off this rather than off [`Carrier`]: a browser page
+/// that sends an explicit `Authorization` header needs no CSRF token, because
+/// the credential it used is not ambient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// In an `Authorization: Bearer` header.
+    Header,
+    /// In the `prfs_session` cookie.
+    Cookie,
+}
+
 /// Authenticate a request and build the caller's [`Subject`].
 ///
 /// **The only place a `Subject` is constructed from wire input.** See the module
@@ -244,8 +349,42 @@ async fn authenticate_request(
     headers: &HeaderMap,
     allowed: &[TokenKind],
 ) -> Result<(Authenticated, Subject), Response> {
+    authenticate_request_with(coord, headers, allowed, Carrier::Header)
+        .await
+        .map(|(auth, subject, _)| (auth, subject))
+}
+
+/// [`authenticate_request`], with the carrier spelled out and reported back.
+///
+/// Every pre-existing call site goes through the [`Carrier::Header`] wrapper
+/// above and is unchanged; `/api/v1` calls this directly. There is deliberately
+/// **no** parallel cookie-authenticating function: a second `Subject` minting
+/// site in a file whose module doc promises there is only one is how a tenancy
+/// hole gets introduced by someone who never read the promise.
+///
+/// `allowed`, the rejection shapes, the `reject_authentication` /
+/// `audit_reject` behaviour and the `Subject` mapping are all shared — the only
+/// thing the carrier changes is where the credential string is read from.
+pub(crate) async fn authenticate_request_with(
+    coord: &Coordinator,
+    headers: &HeaderMap,
+    allowed: &[TokenKind],
+    carrier: Carrier,
+) -> Result<(Authenticated, Subject, Arrival), Response> {
     let now = coord.now();
-    let bearer = bearer_of(headers).unwrap_or("");
+    // The header wins when both are present. Not arbitrary: an explicit
+    // credential is a deliberate act by the caller, while a cookie is attached
+    // by the browser, so preferring the header means a page that opts into a
+    // bearer never has an ambient credential silently substituted for it.
+    let (bearer, arrival) = match bearer_of(headers) {
+        Some(bearer) => (bearer, Arrival::Header),
+        None if carrier == Carrier::HeaderOrCookie => (
+            crate::browser_auth::cookie_value(headers, crate::browser_auth::SESSION_COOKIE)
+                .unwrap_or(""),
+            Arrival::Cookie,
+        ),
+        None => ("", Arrival::Header),
+    };
 
     let auth = match fleet_auth::authenticate(coord.db(), bearer, now).await {
         Ok(auth) => auth,
@@ -279,7 +418,7 @@ async fn authenticate_request(
             return Err(reject(StatusCode::FORBIDDEN, "forbidden"));
         }
     };
-    Ok((auth, subject))
+    Ok((auth, subject, arrival))
 }
 
 /// Log or audit a failed authentication, then produce the uniform rejection.
@@ -1684,10 +1823,10 @@ pub async fn mint_session_for_user(
 /// call sites want to return it verbatim; it is built once per request on a path
 /// that is already making network calls, so its size is not worth a `Box`.
 #[allow(clippy::result_large_err)]
-fn github_app(coord: &Coordinator) -> Result<GithubApp, Response> {
+pub(crate) fn github_app(coord: &Coordinator) -> Result<GithubApp, Response> {
     let Some(cfg) = coord.config().github.as_ref() else {
         warn!(
-            "a device-flow request arrived but no [github] table is configured; \
+            "a GitHub login request arrived but no [github] table is configured; \
              `probe-rs-fleet login` cannot work against this coordinator"
         );
         return Err(reject(
@@ -1702,6 +1841,7 @@ fn github_app(coord: &Coordinator) -> Result<GithubApp, Response> {
         endpoints: GithubEndpoints {
             device_code_url: cfg.device_code_url.clone(),
             access_token_url: cfg.access_token_url.clone(),
+            authorize_url: cfg.authorize_url.clone(),
             api_base: cfg.api_base.clone(),
         },
     })
