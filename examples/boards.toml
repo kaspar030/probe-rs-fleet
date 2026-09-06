@@ -74,8 +74,9 @@ chip      = "nRF52840_xxAA"
 #                            nrf52840dk": any board of this type will do
 #   tags  = free-form convention (`lab`, `bluetooth`) — whatever you agree on
 #
-# The agent cannot infer the model, so omit the key (do NOT write `model = ""`,
-# which is rejected) and no `board=` selector will reach this board.
+# The agent cannot infer the model, so declare it here. If this board genuinely
+# has no model, omit the key entirely (do NOT write `model = ""`, which is
+# rejected) — accepting that no `board=` selector will then match it.
 model     = "nrf52840dk"
 
 # Free-form selection tags (matched by `ctl lease tag=<t>`).

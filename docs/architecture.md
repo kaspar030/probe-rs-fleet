@@ -1440,7 +1440,7 @@ The lease is **not** tied to a single `probe-rs run`. A workstation can **claim
 a specific board and hold it across many probe-rs invocations** — flash, attach,
 reset, gdb, re-flash — to support multi-step debugging sessions. Mechanics:
 
-- An explicit claim (`fleet ctl lease <board> [--duration]`, or first use under
+- An explicit claim (`fleet ctl lease id=<board> [--duration]`, or first use under
   a selector) holds the board for the principal with an **extendable timeout**.
 - Each subsequent vanilla `probe-rs …` from that workstation **reuses the
   existing lease** instead of re-queuing (sidecar caches `{board, lease, token}`
