@@ -22,12 +22,37 @@
 //!
 //! Queries use the runtime (`query`) API rather than the compile-time `query!`
 //! macro so the crate builds without a live database.
+//!
+//! ## What the `board` table means
+//!
+//! The `board` table is **what each node currently declares**, and the
+//! in-memory scheduler is **what can be leased right now**. They are
+//! deliberately not the same set:
+//!
+//! * A row exists iff the node's latest inventory report carries the board and
+//!   the coordinator admits it — a *declared* board with any presence, or an
+//!   *adopted* board the node's [`AdoptPolicy`] admits **online**.
+//! * A declared board reported `Offline` keeps its row (a J-Link unplugged for
+//!   an afternoon must not vanish from the UI, nor churn rows every
+//!   `discovery_secs`) but leaves the scheduler: it cannot be leased.
+//! * A board **absent** from the latest report — renamed, or deleted from
+//!   `boards.toml` — is no longer declared, so its row is deleted
+//!   ([`OrgDb::prune_boards`]) and its scheduler entry removed.
+//! * An adopted board reported `Offline` is a *tombstone*, not a declaration:
+//!   it is dropped from both stores whatever the policy says.
+//!
+//! The invariant that falls out: **the DB set is the scheduler set plus
+//! declared-but-offline boards, and nothing else.** So the Agents page (which
+//! counts rows) may legitimately show more boards than Devices (which lists
+//! the scheduler); any other divergence is a bug. The write side of this rule
+//! lives in [`crate::core::Coordinator::reconcile_inventory`].
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
 use fleet_core::access::GrantScope;
 use fleet_proto::adopt::AdoptPolicy;
+use fleet_proto::agent_api::BoardPresence;
 use fleet_proto::board::{Board, BoardState};
 use fleet_proto::ids::{AgentId, BoardRef, LeaseId, OrgId, Role, SubjectKey};
 use fleet_proto::token::AllowedOp;
@@ -1787,11 +1812,36 @@ impl OrgDb<'_> {
     /// The board's org must match this handle's org; a mismatch is refused
     /// rather than silently written into the wrong tenant.
     ///
+    /// `presence` is the presence the node reported. Every **admitted** board
+    /// is recorded, offline ones included: the table is the set of boards the
+    /// node declares (see the module docs), so a board that is declared but has
+    /// never been plugged in must still have a row — otherwise
+    /// [`OrgDb::prune_boards`]'s keep/delete rule would be incoherent and the
+    /// board would silently never appear on the Agents page. Which boards count
+    /// as admitted is decided by the caller
+    /// ([`crate::core::Coordinator::reconcile_inventory`]); an adopted board
+    /// reported offline is a tombstone and must not be recorded.
+    ///
+    /// # The `state` column mixes two axes, deliberately
+    ///
+    /// An offline board is written as `"offline"`, where every other value
+    /// (`idle`/`leased`/`faulted`/`disabled`) comes from `board_state_label`,
+    /// i.e. from [`BoardState`]. That conflates presence with lease state and
+    /// is safe only because the column is **write-only**: nothing in this
+    /// module — or anywhere else — selects it back. Treat it as a debugging
+    /// label; a future reader must not parse it as a [`BoardState`] without
+    /// first splitting the two axes into separate columns.
+    ///
     /// # Errors
     ///
     /// Returns a database error if the write fails, or
     /// [`crate::error::CoordinatorError::Protocol`] on an org mismatch.
-    pub async fn record_board(&self, board: &Board, now: i64) -> Result<()> {
+    pub async fn record_board(
+        &self,
+        board: &Board,
+        presence: BoardPresence,
+        now: i64,
+    ) -> Result<()> {
         if board.id.org != self.org {
             return Err(crate::error::CoordinatorError::Protocol(format!(
                 "board {} does not belong to org {}",
@@ -1800,7 +1850,10 @@ impl OrgDb<'_> {
         }
         // Tags are simple identifiers (no newlines); store newline-joined.
         let tags = board.tags.join("\n");
-        let state = board_state_label(&board.state);
+        let state = match presence {
+            BoardPresence::Offline => "offline",
+            BoardPresence::Online => board_state_label(&board.state),
+        };
         sqlx::query(
             "INSERT INTO board (org_id, node_id, name, chip, model, tags, exclusive, state, first_seen, last_seen)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
@@ -1824,6 +1877,51 @@ impl OrgDb<'_> {
         .execute(self.db.pool())
         .await?;
         Ok(())
+    }
+
+    /// Delete this node's `board` rows for boards it no longer declares.
+    ///
+    /// `keep` is the set of node-local board names the coordinator admitted
+    /// from the node's latest inventory report — *including* the ones it
+    /// reported `Offline`, because an offline **declared** board is still
+    /// declared (see the module docs). A board absent from `keep` is one the
+    /// node stopped declaring: renamed, or removed from `boards.toml`. No
+    /// tombstone ever arrives for such a board — the agent only reports what is
+    /// still in its config — so a set difference is the only thing that can
+    /// retire the row.
+    ///
+    /// An **empty** `keep` deletes every row for this node, deliberately: an
+    /// agent that reports an empty inventory declares nothing, and the rows
+    /// really are gone. The statement degenerates to a plain
+    /// `DELETE … WHERE org_id = ? AND node_id = ?` rather than to a
+    /// syntactically invalid `NOT IN ()`.
+    ///
+    /// Scoped by `org_id` **and** `node_id`: another node's boards, and another
+    /// tenant's, are not expressible from here.
+    ///
+    /// Returns the number of rows deleted (for the audit detail).
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the delete fails.
+    pub async fn prune_boards(&self, node: &AgentId, keep: &[String]) -> Result<u64> {
+        // sqlx has no list binding, so the placeholder list is built here; the
+        // names are still bound, never interpolated.
+        let mut qb =
+            sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM board WHERE org_id = ");
+        qb.push_bind(self.org.0.as_str());
+        qb.push(" AND node_id = ");
+        qb.push_bind(node.0.as_str());
+        if !keep.is_empty() {
+            qb.push(" AND name NOT IN (");
+            let mut sep = qb.separated(", ");
+            for name in keep {
+                sep.push_bind(name.as_str());
+            }
+            qb.push(")");
+        }
+        let deleted = qb.build().execute(self.db.pool()).await?.rows_affected();
+        Ok(deleted)
     }
 
     /// Count the boards recorded in this org.
@@ -2660,7 +2758,7 @@ mod tests {
         // accepted — this is what makes `ensure_node` load-bearing.
         let err = db
             .scoped(org(DEFAULT_ORG_ID))
-            .record_board(&board_in(DEFAULT_ORG_ID, "ghost", "b1"), 1000)
+            .record_board(&board_in(DEFAULT_ORG_ID, "ghost", "b1"), BoardPresence::Online, 1000)
             .await;
         assert!(err.is_err(), "FK must reject a board with no node row");
     }
@@ -2671,12 +2769,12 @@ mod tests {
         let o = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         let scoped = db.scoped(o);
         scoped
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "b1"), 1000)
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "b1"), BoardPresence::Online, 1000)
             .await
             .unwrap();
         // Upsert: same key again with a later timestamp.
         scoped
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "b1"), 2000)
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "b1"), BoardPresence::Online, 2000)
             .await
             .unwrap();
         assert_eq!(scoped.board_count().await.unwrap(), 1);
@@ -2694,6 +2792,69 @@ mod tests {
         assert_eq!(row.1, 2000);
     }
 
+    /// [`OrgDb::prune_boards`] is a set difference, and the set it applies to
+    /// is exactly one node of one org.
+    ///
+    /// Also pins the empty-`keep` path: an agent that reports an empty
+    /// inventory declares nothing, so all of *its* rows go — and the statement
+    /// must degenerate to a plain `DELETE` rather than an invalid `NOT IN ()`.
+    #[tokio::test]
+    async fn prune_boards_is_scoped_to_one_node_and_one_org() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
+        db.scoped(mine.clone())
+            .ensure_node(&AgentId("rpi-2".to_owned()), 1000)
+            .await
+            .unwrap();
+        let theirs = seeded(&db, "other", "rpi-9").await;
+        for (o, node, name) in [
+            (&mine, "rpi-1", "b1"),
+            (&mine, "rpi-1", "b2"),
+            (&mine, "rpi-2", "b1"),
+            (&theirs, "rpi-9", "b1"),
+        ] {
+            db.scoped(o.clone())
+                .record_board(&board_in(&o.0, node, name), BoardPresence::Online, 1000)
+                .await
+                .unwrap();
+        }
+
+        // A rename: `rpi-1` now declares only `b2`.
+        let deleted = db
+            .scoped(mine.clone())
+            .prune_boards(&AgentId("rpi-1".to_owned()), &["b2".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(!db
+            .scoped(mine.clone())
+            .has_board(&board_ref(DEFAULT_ORG_ID, "rpi-1", "b1"))
+            .await
+            .unwrap());
+        assert!(db
+            .scoped(mine.clone())
+            .has_board(&board_ref(DEFAULT_ORG_ID, "rpi-1", "b2"))
+            .await
+            .unwrap());
+        // The sibling node and the other tenant are untouched.
+        assert!(db
+            .scoped(mine.clone())
+            .has_board(&board_ref(DEFAULT_ORG_ID, "rpi-2", "b1"))
+            .await
+            .unwrap());
+        assert_eq!(db.scoped(theirs.clone()).board_count().await.unwrap(), 1);
+
+        // Empty keep-set: every row of that node goes, and only that node's.
+        let deleted = db
+            .scoped(mine.clone())
+            .prune_boards(&AgentId("rpi-1".to_owned()), &[])
+            .await
+            .unwrap();
+        assert_eq!(deleted, 1);
+        assert_eq!(db.scoped(mine).board_count().await.unwrap(), 1, "rpi-2's row survives");
+        assert_eq!(db.scoped(theirs).board_count().await.unwrap(), 1);
+    }
+
     #[tokio::test]
     async fn record_board_refuses_a_foreign_org_board() {
         let db = Db::connect_in_memory().await.unwrap();
@@ -2701,7 +2862,7 @@ mod tests {
         seeded(&db, "org-b", "rpi-2").await;
         let err = db
             .scoped(a)
-            .record_board(&board_in("org-b", "rpi-2", "b1"), 1000)
+            .record_board(&board_in("org-b", "rpi-2", "b1"), BoardPresence::Online, 1000)
             .await;
         assert!(err.is_err(), "cross-org board write must be refused");
     }
@@ -2715,10 +2876,10 @@ mod tests {
         let b = seeded(&db, "org-b", "node-b").await;
         let (da, db_) = (db.scoped(a.clone()), db.scoped(b.clone()));
 
-        da.record_board(&board_in("org-a", "node-a", "dk"), 1000)
+        da.record_board(&board_in("org-a", "node-a", "dk"), BoardPresence::Online, 1000)
             .await
             .unwrap();
-        db_.record_board(&board_in("org-b", "node-b", "dk"), 1000)
+        db_.record_board(&board_in("org-b", "node-b", "dk"), BoardPresence::Online, 1000)
             .await
             .unwrap();
         da.record_lease(
@@ -2781,7 +2942,7 @@ mod tests {
         let a = seeded(&db, "org-a", "node-a").await;
         let b = seeded(&db, "org-b", "node-b").await;
         db.scoped(a.clone())
-            .record_board(&board_in("org-a", "node-a", "dk"), 1000)
+            .record_board(&board_in("org-a", "node-a", "dk"), BoardPresence::Online, 1000)
             .await
             .unwrap();
         db.scoped(a.clone())
@@ -3056,7 +3217,7 @@ mod tests {
         let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
         let scoped = db.scoped(o);
         scoped
-            .record_board(&board_in(DEFAULT_ORG_ID, "agent-a", "b1"), 1000)
+            .record_board(&board_in(DEFAULT_ORG_ID, "agent-a", "b1"), BoardPresence::Online, 1000)
             .await
             .unwrap();
         let lease = LeaseId(1);
@@ -3589,15 +3750,15 @@ mod tests {
         let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         let theirs = seeded(&db, "other", "rpi-2").await;
         db.scoped(mine.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), 10)
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), BoardPresence::Online, 10)
             .await
             .unwrap();
         db.scoped(mine.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-2"), 10)
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-2"), BoardPresence::Online, 10)
             .await
             .unwrap();
         db.scoped(theirs)
-            .record_board(&board_in("other", "rpi-2", "dk-1"), 10)
+            .record_board(&board_in("other", "rpi-2", "dk-1"), BoardPresence::Online, 10)
             .await
             .unwrap();
 
@@ -3733,11 +3894,11 @@ mod tests {
         let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         let theirs = seeded(&db, "other", "rpi-2").await;
         db.scoped(mine.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), 10)
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), BoardPresence::Online, 10)
             .await
             .unwrap();
         db.scoped(theirs.clone())
-            .record_board(&board_in("other", "rpi-2", "dk-1"), 10)
+            .record_board(&board_in("other", "rpi-2", "dk-1"), BoardPresence::Online, 10)
             .await
             .unwrap();
 
@@ -3776,7 +3937,7 @@ mod tests {
         let db = Db::connect(path_str).await.unwrap();
         let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
         db.scoped(o.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "agent-a", "b1"), 1000)
+            .record_board(&board_in(DEFAULT_ORG_ID, "agent-a", "b1"), BoardPresence::Online, 1000)
             .await
             .unwrap();
         drop(db);

@@ -370,6 +370,15 @@ bundle, since D3 means there is no build to branch in.
 | `DELETE /api/v1/nodes/{name}` | — | `204` | `Coordinator::delete_node_core` → lease teardown + scheduler removal + `OrgDb::delete_node` + close the live connection | node owner, or admin |
 | `POST /api/v1/nodes/pending/{code}` | `{"decision":"inspect"\|"approve"\|"deny","replace":false}` | `NodeApprovalResponse` + a `warning` field | `http::decide_pending_node` (**unchanged**) | member |
 
+`boards` in a node row is the **declared** set, not the leasable one: the names
+in the coordinator's `board` table, i.e. every board the machine's latest
+inventory report carries, including ones whose probe is currently unplugged. A
+board the node stops declaring (renamed, or deleted from `boards.toml`) is
+pruned on its next report. `GET /api/v1/boards` reads the *scheduler* instead —
+what can be leased right now — so the Agents count is legitimately ≥ the Devices
+list, differing exactly by the declared-but-offline boards. The field carries no
+per-board presence; adding it would widen this payload for a display nicety.
+
 There is deliberately **no** `GET /api/v1/nodes/pending`. An earlier revision of
 this table had one; it is dropped, for the reason §4 now records:
 `pending_node.org_id` is `NULL` until an approval binds it, so there is no

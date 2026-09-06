@@ -531,7 +531,7 @@ impl TestCoordinator {
         };
         self.db()
             .scoped(org.clone())
-            .record_board(&board, now)
+            .record_board(&board, fleet_proto::agent_api::BoardPresence::Online, now)
             .await
             .unwrap();
         let id = board.id.clone();

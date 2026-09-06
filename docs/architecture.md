@@ -610,21 +610,48 @@ quiet. An enumeration failure keeps the previous inventory and does not drop the
 connection — a transient USB or `probe-rs` hiccup taking every board offline
 would be far worse than a stale snapshot.
 
-**Unplugging is a report, not an absence.** A board leaves the scheduler only
-via an explicit `Offline` status, never by going missing from a report — nothing
-on the coordinator prunes a board an inventory failed to mention. That falls out
-for a *declared* board (its `boards.toml` entry is still there to report as
-offline), but an adopted board has no declaration, so the agent remembers what
-the previous pass adopted and emits an offline tombstone for anything that has
-since gone. Without it an unplugged laptop board would sit in the scheduler as
-`Idle` forever: `ctl list` would show it, a lease against it would be *granted*
-and a capability token minted, and the agent would refuse at the last hop. A
-laptop is the machine where probes are unplugged several times a day, so this is
-the common path.
+**Unplugging is a report, not an absence.** A board leaves the scheduler either
+via an explicit `Offline` status or by disappearing from the report entirely
+(see the two-store rule below). The tombstone path exists because the second one
+is coarser: it falls out for a *declared* board (its `boards.toml` entry is
+still there to report as offline), but an adopted board has no declaration, so
+the agent remembers what the previous pass adopted and emits an offline
+tombstone for anything that has since gone. Without it an unplugged laptop board
+would sit in the scheduler as `Idle` forever: `ctl list` would show it, a lease
+against it would be *granted* and a capability token minted, and the agent would
+refuse at the last hop. A laptop is the machine where probes are unplugged
+several times a day, so this is the common path.
 
 The tombstone is honoured whatever the node's policy currently says — removing a
 board is never a tenancy risk, and a node whose policy was flipped `auto` →
 `declared` must still be able to retire what it adopted while it was `auto`.
+
+**Two stores, two meanings.** A `ProbeInventory` is a full snapshot, never a
+delta, so `Coordinator::reconcile_inventory` treats it as a **set**:
+
+- The **scheduler** is *what can be leased right now*. A board is present iff
+  the latest report declares it, reports it `Online`, and policy admits it.
+  `Offline`, or absent from the report → removed.
+- The **`board` table** is *what the node currently declares*. A row exists iff
+  the latest report carries the board and the coordinator admits it: a declared
+  board at any presence, or an adopted board the policy admits online. A
+  declared board reported `Offline` **keeps** its row — a probe unplugged for an
+  afternoon must not vanish from the browser UI, nor churn rows every
+  `discovery_secs` — but it is not leasable. A board **absent** from the report
+  (renamed, or deleted from `boards.toml`) is no longer declared, so its row is
+  deleted; an empty inventory clears the node's rows entirely, deliberately. An
+  adopted `Offline` status is a tombstone, not a declaration, and clears both
+  stores.
+- A **live lease pins the board in both stores** even when the report stops
+  declaring it: dropping it would strand an open lease nothing can release.
+  The stale entry is retired by a later report instead.
+
+The invariant: the DB set is the scheduler set plus declared-but-offline boards,
+and nothing else. The browser UI's Agents page counts rows and Devices lists the
+scheduler, so Agents ≥ Devices, and they differ *only* by unplugged declared
+boards. Before the set difference existed, board rows were only ever written and
+never deleted, so every rename leaked a row — and, within one coordinator
+lifetime, a leasable phantom.
 
 
 ### 4.3 `sidecar` (workstation / CI)

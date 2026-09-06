@@ -118,6 +118,21 @@ test('agents offers tags and adopt, never a rename', () => {
   assert.match(textOf(tree), /Renaming is not supported/);
 });
 
+// Agents counts *declared* boards (the `board` table) and Devices lists the
+// *leasable* ones (the scheduler), so the two legitimately differ by boards
+// whose probe is unplugged. The page has to say so, or the disagreement reads
+// as the bug it used to be.
+test('agents says its board count is the declared set, not the leasable one', () => {
+  const node = {
+    id: 'gh-1/rpi-1', name: 'rpi-1', tags: [], adopt: 'declared',
+    owner: 'gh-1', last_seen: 1700000000, created_at: 1600000000, online: true, boards: ['dk-3'],
+  };
+  const text = textOf(agents.render({ nodes: [node], session: MEMBER }));
+  assert.match(text, /declares/);
+  assert.match(text, /unplugged/);
+  assert.match(text, /Devices/);
+});
+
 test('approve renders the server warning verbatim, not a copy of the sentence', () => {
   // Deliberately not the production string: the page must render the *field*.
   const warning = 'SERVER-SUPPLIED WARNING TEXT, RENDERED VERBATIM.';

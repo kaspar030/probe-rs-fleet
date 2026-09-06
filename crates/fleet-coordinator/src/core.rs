@@ -66,6 +66,20 @@ pub struct Coordinator {
     jwks: std::sync::OnceLock<Arc<fleet_auth::oidc::JwksCache>>,
 }
 
+/// What one [`Coordinator::reconcile_inventory`] pass did.
+///
+/// Two numbers rather than one because a deletion is the operator-visible half:
+/// the audit detail is the only trace that a board row was retired, and
+/// "5 boards, 3 removed" is the line that explains a dropped board count on the
+/// Agents page.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReconcileOutcome {
+    /// Boards reported present and admitted — i.e. now leasable.
+    online: usize,
+    /// `board` rows deleted because the node stopped declaring them.
+    pruned: u64,
+}
+
 /// The transport-neutral failure of an operator verb.
 ///
 /// Every operator verb exists twice: as a `*_core` method returning
@@ -297,7 +311,8 @@ impl Coordinator {
                 // `boards.toml`, but never for the org. The scheduler preserves
                 // any live lease state on re-report (see
                 // `Scheduler::upsert_board`).
-                let online = self.reconcile_inventory(&org, agent_id, adopt, &inv).await;
+                let ReconcileOutcome { online, pruned } =
+                    self.reconcile_inventory(&org, agent_id, adopt, &inv).await;
                 self.audit(
                     &org,
                     "agent.inventory",
@@ -306,7 +321,7 @@ impl Coordinator {
                     None,
                     None,
                     Some(&format!(
-                        "{} boards ({online} online, adopt={adopt})",
+                        "{} boards ({online} online, {pruned} removed, adopt={adopt})",
                         inv.boards.len()
                     )),
                 )
@@ -374,12 +389,40 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Reconcile an agent inventory snapshot into the scheduler's board set.
+    /// Reconcile an agent inventory snapshot into the scheduler's board set and
+    /// the `board` table.
     ///
-    /// Online boards are upserted (and persisted to the board table) as
-    /// `Board`s owned by `agent_id` **in `org`**; offline boards are removed
-    /// from the scheduler unless they currently hold a live lease. Returns the
-    /// number of online boards.
+    /// A [`ProbeInventory`](fleet_proto::agent_api::ProbeInventory) is a full
+    /// snapshot, never a delta, so this is a **set** operation: what the report
+    /// omits is retired from both stores.
+    ///
+    /// # The two stores, and why they differ
+    ///
+    /// * **The scheduler is what can be leased right now.** A board is present
+    ///   iff the latest report declares it, reports it `Online`, and policy
+    ///   admits it. `Offline` → removed. Absent from the report → removed. A
+    ///   live lease pins the board in either case.
+    /// * **The `board` table is what the node currently declares.** A row
+    ///   exists iff the latest report carries the board and this function
+    ///   admits it: a *declared* board with any presence, or an *adopted* board
+    ///   the policy admits **online**. A declared board reported `Offline`
+    ///   keeps its row — a J-Link unplugged for an afternoon must not vanish
+    ///   from the UI, and must not churn rows every `discovery_secs`. Absent
+    ///   from the report → the declaration is gone → the row is deleted
+    ///   ([`crate::state::OrgDb::prune_boards`]).
+    ///
+    /// The invariant: **the DB set is the scheduler set plus declared-but-
+    /// offline boards, and nothing else.** "Agents shows 3, Devices shows 2"
+    /// is therefore a legitimate state (one declared board is unplugged), and
+    /// after this it is the *only* way the two pages can differ.
+    ///
+    /// A renamed board is the case that motivates the prune: it is not reported
+    /// offline, it simply stops appearing, so no tombstone ever arrives. Before
+    /// the set difference it lingered in *both* stores — leaving a leasable
+    /// phantom whose lease is granted, tokenised, and only refused at the last
+    /// hop with `UnknownBoard`.
+    ///
+    /// Returns the number of online boards and the number of rows pruned.
     ///
     /// This is the only place a [`BoardRef`] is minted from node input: the
     /// node supplies a node-local [`BoardName`] and the coordinator attaches the
@@ -405,8 +448,9 @@ impl Coordinator {
         agent_id: &AgentId,
         adopt: AdoptPolicy,
         inv: &fleet_proto::agent_api::ProbeInventory,
-    ) -> usize {
+    ) -> ReconcileOutcome {
         use fleet_proto::agent_api::BoardPresence;
+        use std::collections::HashSet;
 
         let now = self.now_i64();
         let scoped = self.db.scoped(org.clone());
@@ -414,56 +458,79 @@ impl Coordinator {
         // otherwise every board insert below fails the foreign key.
         if let Err(e) = scoped.ensure_node(agent_id, now).await {
             warn!(node = %agent_id, error = %e, "failed to record node; skipping inventory");
-            return 0;
+            // No prune in this path: without a node row we cannot tell an
+            // unknown node from one whose write failed, and deleting its boards
+            // on a transient DB error would be the worse answer.
+            return ReconcileOutcome::default();
         }
 
         let mut online = 0usize;
-        let mut boards_to_record: Vec<Board> = Vec::new();
+        // Boards to persist, paired with the presence to record them under.
+        let mut boards_to_record: Vec<(Board, BoardPresence)> = Vec::new();
+        // The node-local names whose rows survive this report.
+        let mut keep: HashSet<String> = HashSet::new();
+        // Names pinned by a live lease: they survive the prune even when the
+        // report stopped declaring them (see below).
+        let mut leased_keep: Vec<String> = Vec::new();
         {
             let mut sched = self.scheduler.lock().await;
             for status in &inv.boards {
-                // Enforcement, not decoration: a `declared` node that reports
-                // an adopted board as *online* has drifted from (or is
-                // contradicting) the policy its owner set, and the row here is
-                // what decides.
+                // Which boards the coordinator is willing to know about at all.
+                // One predicate for both stores, so the keep-set and the record
+                // set cannot drift apart:
                 //
-                // Scoped to online deliberately. An adopted board reported
-                // **offline** is a tombstone — "this probe is gone, drop it" —
-                // and must be honoured whatever the policy says, or a node
-                // whose policy was flipped `auto` → `declared` would strand
-                // every board it had adopted while it was `auto`. Removing a
-                // board is never a tenancy risk; refusing to is the one that
-                // leaves a phantom the scheduler will happily lease.
-                if status.adopted
-                    && adopt != AdoptPolicy::Auto
-                    && status.presence == BoardPresence::Online
-                {
-                    warn!(
-                        node = %agent_id,
-                        board = %status.board,
-                        "ignoring an adopted board from a node whose policy is `declared`"
-                    );
+                // * a *declared* board is admitted at any presence — offline
+                //   just means "unplugged", and the declaration stands;
+                // * an *adopted* board is admitted only when the node's policy
+                //   is `auto` **and** it is online.
+                //
+                // Both halves of the adopted case matter. Refusing an adopted
+                // board from a `declared` node is enforcement, not decoration:
+                // a node whose local config drifted (or which is simply lying)
+                // must not be able to widen its own policy, and the row here is
+                // what decides. Refusing an adopted board reported *offline* is
+                // the tombstone rule — "this probe is gone, drop it" — which
+                // must be honoured whatever the policy says, or a node whose
+                // policy was flipped `auto` → `declared` would strand every
+                // board it had adopted while it was `auto`. Removing a board is
+                // never a tenancy risk; refusing to is the one that leaves a
+                // phantom the scheduler will happily lease.
+                //
+                // Since a non-admitted board is also absent from `keep`, any row
+                // it left behind (from an earlier `auto` period, say) is pruned
+                // below rather than lingering.
+                let admitted = !status.adopted
+                    || (adopt == AdoptPolicy::Auto && status.presence == BoardPresence::Online);
+                if !admitted {
+                    if status.presence == BoardPresence::Online {
+                        warn!(
+                            node = %agent_id,
+                            board = %status.board,
+                            "ignoring an adopted board from a node whose policy is `declared`"
+                        );
+                    }
                     continue;
                 }
                 let board_ref =
                     BoardRef::new(org.clone(), agent_id.clone(), status.board.0.clone());
+                keep.insert(status.board.0.clone());
+                let board = Board {
+                    id: board_ref.clone(),
+                    agent: agent_id.clone(),
+                    chip: status.chip.clone(),
+                    model: status.model.clone(),
+                    tags: status.tags.clone(),
+                    exclusive: status.exclusive,
+                    power: status.power.clone(),
+                    state: BoardState::Idle,
+                };
                 if status.presence == BoardPresence::Online {
                     online += 1;
-                    let board = Board {
-                        id: board_ref,
-                        agent: agent_id.clone(),
-                        chip: status.chip.clone(),
-                        model: status.model.clone(),
-                        tags: status.tags.clone(),
-                        exclusive: status.exclusive,
-                        power: status.power.clone(),
-                        state: BoardState::Idle,
-                    };
                     sched.upsert_board(board.clone());
-                    boards_to_record.push(board);
                 } else {
                     // An offline board is dropped from the scheduler unless it
                     // is currently leased (an in-flight lease is preserved).
+                    // Its row stays: it is still declared.
                     let leased = matches!(
                         sched.board(&board_ref).map(|b| &b.state),
                         Some(BoardState::Leased { .. })
@@ -472,16 +539,61 @@ impl Coordinator {
                         sched.remove_board(&board_ref);
                     }
                 }
+                boards_to_record.push((board, status.presence));
+            }
+
+            // Boards this node no longer declares leave the scheduler. Decided
+            // and applied under the same lock as the upserts above, so no lease
+            // can be granted on a board between the decision and its removal —
+            // the reasoning `delete_node_core` documents.
+            //
+            // A live lease pins the board: dropping it here would strand an open
+            // `leases` row against a board nothing can release. Known hole,
+            // accepted for v1: the stale board is only re-pruned by the *next*
+            // inventory report, and `Agent::discovery_pass` suppresses reports
+            // whose inventory is unchanged — so a board renamed while leased
+            // survives the lease's release until something else about the
+            // inventory changes. Closing that needs a prune hooked into lease
+            // release, which is a separate change.
+            let stale: Vec<BoardRef> = sched
+                .boards()
+                .filter(|b| b.id.org == *org && b.id.node == *agent_id)
+                .filter(|b| !keep.contains(b.id.name.as_str()))
+                .filter_map(|b| {
+                    if matches!(b.state, BoardState::Leased { .. }) {
+                        leased_keep.push(b.id.name.clone());
+                        None
+                    } else {
+                        Some(b.id.clone())
+                    }
+                })
+                .collect();
+            for board_ref in &stale {
+                debug!(board = %board_ref, "pruning a board the node no longer declares");
+                sched.remove_board(board_ref);
             }
         }
         // Persist the board rows (best-effort; a DB error is logged, not fatal
         // — the scheduler is the source of truth for leasing).
-        for board in &boards_to_record {
-            if let Err(e) = scoped.record_board(board, now).await {
+        for (board, presence) in &boards_to_record {
+            if let Err(e) = scoped.record_board(board, *presence, now).await {
                 warn!(board = %board.id, error = %e, "failed to record board");
             }
         }
-        online
+        // …and retire the rows of boards the node stopped declaring. A board
+        // held by a live lease keeps its row for the same reason it keeps its
+        // scheduler entry: the Agents page must not contradict a lease that is
+        // being actively used.
+        let mut keep_names: Vec<String> = keep.into_iter().collect();
+        keep_names.extend(leased_keep);
+        let pruned = match scoped.prune_boards(agent_id, &keep_names).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(node = %agent_id, error = %e, "failed to prune stale board rows");
+                0
+            }
+        };
+        ReconcileOutcome { online, pruned }
     }
 
     /// Mark a board as faulted in the scheduler (best-effort).
@@ -3733,6 +3845,347 @@ mod tests {
             "an unplugged adopted board must not linger as a leasable phantom"
         );
     }
+
+    /// The regression test for this whole change: a **renamed** board leaves
+    /// nothing behind in either store.
+    ///
+    /// A rename produces no tombstone — the agent reports only what is still in
+    /// `boards.toml`, so `b1` simply stops appearing. Before the set-difference
+    /// pass it survived in the scheduler (a leasable phantom: `ctl list` showed
+    /// it, a lease was granted and tokenised, and the agent refused it at the
+    /// last hop with `UnknownBoard`) *and* in the `board` table, which is what
+    /// made the Agents page count two boards for a node that has one.
+    ///
+    /// Both assertions matter. Without the scheduler half the phantom lease
+    /// comes back; without the DB half the page count does.
+    #[tokio::test]
+    async fn a_renamed_board_leaves_no_stale_row() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let node = node_id(DEFAULT_ORG_ID, "agent-a");
+        coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .ensure_node(&node, 1000)
+            .await
+            .unwrap();
+
+        for name in ["b1", "b2"] {
+            coord
+                .handle_agent_report(
+                    &node,
+                    AgentReport::Inventory(ProbeInventory {
+                        boards: vec![status(name, "S1", BoardPresence::Online, "chip", false)],
+                        unknown: vec![],
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let sched_names: Vec<String> = coord
+            .scheduler()
+            .lock()
+            .await
+            .boards()
+            .map(|b| b.id.name.clone())
+            .collect();
+        assert_eq!(sched_names, vec!["b2".to_owned()], "the old name must not stay leasable");
+
+        let nodes = coord.db().scoped(org(DEFAULT_ORG_ID)).list_nodes().await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].boards,
+            vec!["b2".to_owned()],
+            "the renamed-away row must be pruned, or Agents disagrees with Devices"
+        );
+    }
+
+    /// A **declared** board reported `Offline` is unplugged, not undeclared: the
+    /// row stays (Agents keeps showing it) while the scheduler drops it (it
+    /// cannot be leased). Re-reporting must not churn the row — the agent
+    /// re-reports every `discovery_secs`.
+    #[tokio::test]
+    async fn an_offline_board_is_retained_in_the_db_but_not_in_the_scheduler() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let node = node_id(DEFAULT_ORG_ID, "agent-a");
+        let key = board_ref(DEFAULT_ORG_ID, "agent-a", "b1");
+        coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .ensure_node(&node, 1000)
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            coord
+                .handle_agent_report(
+                    &node,
+                    AgentReport::Inventory(ProbeInventory {
+                        boards: vec![status("b1", "S1", BoardPresence::Offline, "chip", false)],
+                        unknown: vec![],
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(
+                coord
+                    .db()
+                    .scoped(org(DEFAULT_ORG_ID))
+                    .has_board(&key)
+                    .await
+                    .unwrap(),
+                "a declared board must not vanish from the UI while its probe is unplugged"
+            );
+            assert!(
+                coord.scheduler().lock().await.board(&key).is_none(),
+                "…but it is not leasable either"
+            );
+        }
+    }
+
+    /// The DB half of `an_unplugged_adopted_board_leaves_the_scheduler`.
+    ///
+    /// An adopted board reported `Offline` is a *tombstone* synthesised from
+    /// `previously_adopted`, not a declaration — so unlike a declared offline
+    /// board it must lose its row too. A laptop with `adopt = "auto"` is where
+    /// probes get unplugged several times a day; retaining these rows would
+    /// inflate the Agents count for the most common case, which is the very
+    /// symptom this change exists to fix.
+    #[tokio::test]
+    async fn an_unplugged_adopted_board_leaves_the_db_too() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        coord
+            .db()
+            .register_node_full(
+                &org(DEFAULT_ORG_ID),
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Auto,
+                1000,
+            )
+            .await
+            .unwrap();
+        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
+        let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
+
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(scoped.has_board(&key).await.unwrap());
+
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Offline, "", true)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !scoped.has_board(&key).await.unwrap(),
+            "an adopted tombstone must clear the row, not just the scheduler entry"
+        );
+        assert!(coord.scheduler().lock().await.board(&key).is_none());
+    }
+
+    /// A `declared` node's adopted board is refused by policy — and refusing it
+    /// means leaving no row behind, including one written while the node's
+    /// policy was still `auto`.
+    #[tokio::test]
+    async fn a_policy_violating_adopted_board_gets_no_row() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let o = org(DEFAULT_ORG_ID);
+        coord
+            .db()
+            .register_node_full(&o, "laptop", "hash", &[], Some("op"), AdoptPolicy::Auto, 1000)
+            .await
+            .unwrap();
+        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let key = BoardRef::new(o.clone(), node.clone(), "j-link-zzz");
+        let inv = || ProbeInventory {
+            boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
+            unknown: vec![],
+        };
+
+        // While `auto`, the adopted board is admitted and gets a row.
+        coord
+            .handle_agent_report(&node, AgentReport::Inventory(inv()))
+            .await
+            .unwrap();
+        assert!(coord.db().scoped(o.clone()).has_board(&key).await.unwrap());
+
+        // The owner tightens the policy; the next report must retire the row.
+        coord
+            .db()
+            .register_node_full(
+                &o,
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Declared,
+                1001,
+            )
+            .await
+            .unwrap();
+        coord
+            .handle_agent_report(&node, AgentReport::Inventory(inv()))
+            .await
+            .unwrap();
+        assert!(
+            !coord.db().scoped(o).has_board(&key).await.unwrap(),
+            "a board the coordinator refuses to know about must not keep a row"
+        );
+        assert!(coord.scheduler().lock().await.board(&key).is_none());
+    }
+
+    /// A live lease pins the board in **both** stores even when the report stops
+    /// declaring it: dropping the scheduler entry would strand an open lease
+    /// nothing can release, and dropping the row would make Agents contradict a
+    /// lease that is in active use.
+    #[tokio::test]
+    async fn a_leased_board_that_vanishes_from_a_report_is_not_deleted() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "alice", Role::Member)]).await;
+        let node = node_id(DEFAULT_ORG_ID, "agent-a");
+        let key = board_ref(DEFAULT_ORG_ID, "agent-a", "b1");
+        coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .ensure_node(&node, 1000)
+            .await
+            .unwrap();
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("b1", "S1", BoardPresence::Online, "chip", false)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+        grant_lease(&coord, &user(DEFAULT_ORG_ID, "alice"), "b1").await;
+
+        // A rename while the lease is live.
+        coord
+            .handle_agent_report(
+                &node,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![status("b2", "S1", BoardPresence::Online, "chip", false)],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                coord.scheduler().lock().await.board(&key).map(|b| &b.state),
+                Some(BoardState::Leased { .. })
+            ),
+            "a live lease pins the board"
+        );
+        assert!(
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .has_board(&key)
+                .await
+                .unwrap(),
+            "the DB delete guard must match the scheduler's"
+        );
+    }
+
+    /// An **empty** inventory is a real statement — "I declare nothing" — so it
+    /// clears that node's rows and scheduler entries. Deliberately, and only
+    /// that node's: a sibling node in the same org, and another tenant
+    /// entirely, are untouched.
+    #[tokio::test]
+    async fn an_empty_inventory_clears_only_that_nodes_rows() {
+        use fleet_proto::agent_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[],
+            &[(DEFAULT_ORG_ID, "op", Role::Admin), ("other", "op", Role::Admin)],
+        )
+        .await;
+        let nodes = [
+            (org(DEFAULT_ORG_ID), node_id(DEFAULT_ORG_ID, "agent-a")),
+            (org(DEFAULT_ORG_ID), node_id(DEFAULT_ORG_ID, "agent-b")),
+            (org("other"), node_id("other", "agent-c")),
+        ];
+        for (o, node) in &nodes {
+            coord.db().ensure_org(o, "personal").await.unwrap();
+            coord.db().scoped(o.clone()).ensure_node(node, 1000).await.unwrap();
+            coord
+                .handle_agent_report(
+                    node,
+                    AgentReport::Inventory(ProbeInventory {
+                        boards: vec![status("b1", "S1", BoardPresence::Online, "chip", false)],
+                        unknown: vec![],
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(coord.db().scoped(org(DEFAULT_ORG_ID)).board_count().await.unwrap(), 2);
+
+        // Agent A's `boards.toml` was emptied.
+        coord
+            .handle_agent_report(
+                &nodes[0].1,
+                AgentReport::Inventory(ProbeInventory {
+                    boards: vec![],
+                    unknown: vec![],
+                }),
+            )
+            .await
+            .unwrap();
+
+        assert!(!coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .has_board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1"))
+            .await
+            .unwrap());
+        assert!(coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .has_board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1"))
+            .await
+            .unwrap());
+        assert_eq!(coord.db().scoped(org(DEFAULT_ORG_ID)).board_count().await.unwrap(), 1);
+        assert_eq!(coord.db().scoped(org("other")).board_count().await.unwrap(), 1);
+
+        let sched = coord.scheduler().lock().await;
+        assert!(sched.board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1")).is_none());
+        assert!(sched.board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1")).is_some());
+        assert!(sched.board(&board_ref("other", "agent-c", "b1")).is_some());
+    }
+
 
     /// The `declared`-policy guard must not swallow a **tombstone**. A node
     /// whose policy was flipped `auto` → `declared` still has to retire what it

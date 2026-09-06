@@ -11,6 +11,14 @@
 // Revoking is a revocation, not a tidy-up, and the confirm says the cascade out
 // loud: the node's token dies, its live leases are released, and its
 // control-plane connection is closed.
+//
+// The `Boards` column counts `node.boards`, which is the **declared** set (the
+// coordinator's `board` table): every board still in the machine's
+// `boards.toml`, whether or not its probe is plugged in right now. Devices
+// reads the scheduler instead — the boards that can actually be leased — so
+// Agents legitimately shows the larger number when a probe is unplugged. The
+// page says so in a hint rather than papering over it by widening
+// `GET /api/v1/nodes` with per-board presence.
 
 import { h, tags, ago, when, errorBox } from '../dom.mjs';
 
@@ -31,6 +39,12 @@ export function render(state) {
       { class: 'hint' },
       'Machines enrolled in this org. Renaming is not supported in v1 — a node id is embedded in ' +
         'its boards, its leases and the scheduler; the answer is to revoke the node and re-enroll it.',
+    ),
+    h(
+      'p',
+      { class: 'hint' },
+      'Boards counts what each machine declares, including any whose probe is currently unplugged. ' +
+        'Devices lists the boards that can be leased right now, so it may show fewer.',
     ),
   ];
   if (error) children.push(errorBox(error));
