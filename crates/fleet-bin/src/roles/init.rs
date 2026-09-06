@@ -239,8 +239,9 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("  public URL   {public_url}");
     println!();
     println!("Next steps:");
-    println!("  1. Register a GitHub OAuth app with DEVICE FLOW ENABLED and put");
-    println!("     its client id in the [github] block of the config above.");
+    println!("  1. Register a GitHub OAuth app with DEVICE FLOW ENABLED, then");
+    println!("     UNCOMMENT the [github] block and set client_id in");
+    println!("       {}", config_path.display());
     println!("     (No callback URL is needed for the CLI login. For the web UI's");
     println!("     browser login, additionally register");
     println!("       {public_url}/auth/github/callback");
@@ -335,6 +336,14 @@ mod tests {
         // default, and generating a certificate nobody asked for is how you end
         // up with a self-signed cert in production.
         assert!(cfg.tls.is_none());
+        // `[github]` is commented out for the same reason: an empty table with no
+        // client_id fails validation. The next-steps text therefore says to
+        // UNCOMMENT it — uncommenting it here means fixing that text too.
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.lines().any(|l| l.trim_start().starts_with("[github]")),
+            "[github] must stay commented out"
+        );
     }
 
     #[test]
