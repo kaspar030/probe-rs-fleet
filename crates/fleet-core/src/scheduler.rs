@@ -140,6 +140,11 @@ struct LeaseInfo {
     holder: Subject,
     priority: Priority,
     expires: u64,
+    /// The **granted** hold length in seconds (already `cap_duration`-clamped
+    /// at grant time). [`Scheduler::extend_lease`] renews by *this*, not by the
+    /// priority-class maximum, so a heartbeat cannot silently promote a short
+    /// lease into a cap-length one.
+    duration: u64,
 }
 
 /// A queued request waiting for a matching board to free up.
@@ -295,13 +300,19 @@ impl Scheduler {
 
     /// Mark `board` leased to `holder` and record the lease. Returns the value
     /// object describing the grant.
+    ///
+    /// `duration` is the already-clamped hold length (see
+    /// [`crate::policy::Policy::cap_duration`]); the expiry is `now + duration`
+    /// and the duration is remembered so renewals can re-apply it.
     fn grant(
         &mut self,
         board_id: &BoardRef,
         holder: Subject,
         priority: Priority,
-        expires: u64,
+        now: u64,
+        duration: u64,
     ) -> GrantedLease {
+        let expires = now + duration;
         let lease = self.alloc_lease();
         let board = self
             .boards
@@ -320,6 +331,7 @@ impl Scheduler {
                 holder: holder.clone(),
                 priority,
                 expires,
+                duration,
             },
         );
         GrantedLease {
@@ -365,7 +377,7 @@ impl Scheduler {
         if !at_cap {
             if let Some(board_id) = self.find_idle(access, &request.select, now) {
                 let dur = self.policy.cap_duration(request.priority, request.duration_secs);
-                let grant = self.grant(&board_id, subject, request.priority, now + dur);
+                let grant = self.grant(&board_id, subject, request.priority, now, dur);
                 return LeaseDecision::Granted(grant);
             }
         }
@@ -430,12 +442,29 @@ impl Scheduler {
         refreshed
     }
 
-    /// Extend an active lease's expiry to `now + max_duration_for(priority)`.
+    /// Extend an active lease's expiry to `now +` **the lease's own granted
+    /// duration** (still clamped by the priority-class cap).
     ///
-    /// The renewal re-applies the priority-class cap from `now`, so a lease may
-    /// be held indefinitely across many probe-rs invocations as long as it is
-    /// extended before it expires. Updates both the lease index and the board's
-    /// [`BoardState::Leased`] expiry.
+    /// The renewal re-derives the hold length from what was actually granted,
+    /// not from `max_duration_for(priority)`: a lease granted the 900s policy
+    /// default renews for another 900s, never for the 4h Interactive cap. The
+    /// cap is re-applied (`cap_duration` is idempotent on an already-capped
+    /// value) so tightening policy at runtime takes effect on the next renewal.
+    ///
+    /// Consequences, both deliberate:
+    ///
+    /// * A lease may be held indefinitely across many probe-rs invocations as
+    ///   long as it is extended before it expires. This is **not new** — the
+    ///   previous `now + cap` formula allowed exactly the same thing; the
+    ///   change strictly *shortens* each renewal window. Do not "fix" it by
+    ///   restoring the cap-based extend.
+    /// * A holder that stops heartbeating — killed, crashed, disconnected —
+    ///   loses the board after one granted TTL rather than after a full
+    ///   priority cap. That is the point (task 3595): a dead sidecar must not
+    ///   sit on a board for hours.
+    ///
+    /// Updates both the lease index and the board's [`BoardState::Leased`]
+    /// expiry.
     ///
     /// **Ownership is enforced here**: `by` must be the holder's
     /// [`SubjectKey`]. The "or an org admin" override of architecture §6.5 is
@@ -459,7 +488,7 @@ impl Scheduler {
         if info.holder.key() != *by {
             return Err(LeaseAuthError::NotHolder);
         }
-        let new_expires = now + self.policy.max_duration_for(info.priority);
+        let new_expires = now + self.policy.cap_duration(info.priority, info.duration);
         info.expires = new_expires;
         if let Some(board) = self.boards.get_mut(&info.board) {
             if let BoardState::Leased { expires, .. } = &mut board.state {
@@ -597,7 +626,7 @@ impl Scheduler {
         let dur = self
             .policy
             .cap_duration(waiter.request.priority, waiter.request.duration_secs);
-        let grant = self.grant(board_id, waiter.holder, waiter.request.priority, now + dur);
+        let grant = self.grant(board_id, waiter.holder, waiter.request.priority, now, dur);
         Some(grant)
     }
 }
@@ -838,21 +867,97 @@ mod tests {
             LeaseDecision::Queued { .. } => panic!(),
         };
         assert_eq!(g.expires, 100);
-        // Extend at now=50; new expiry = 50 + ci cap (3600).
+        // Extend at now=50; the new expiry re-applies the lease's *own* granted
+        // duration (100s), not the Ci class cap.
         let new = s
             .extend_lease(g.lease, &subject("p1").key(), 50)
             .expect("extended");
-        assert_eq!(new, 50 + 3600);
+        assert_eq!(new, 50 + 100);
         if let BoardState::Leased { expires, .. } = &s.board(&board_ref(ORG, "b1")).unwrap().state {
-            assert_eq!(*expires, 50 + 3600);
+            assert_eq!(*expires, 50 + 100);
         } else {
             panic!("still leased");
         }
         // An expire before the new expiry does nothing.
-        assert!(s.expire(150).freed.is_empty());
+        assert!(s.expire(100).freed.is_empty());
         assert_eq!(
             s.extend_lease(LeaseId(999), &subject("p1").key(), 0),
             Err(LeaseAuthError::Unknown)
+        );
+    }
+
+    /// Regression for task 3595: a heartbeat must renew a lease by the duration
+    /// it was *granted*, never by the priority-class maximum. Renewing by the
+    /// cap would turn the sidecar's 900s policy-default lease into a 4h hold on
+    /// its first heartbeat — strictly worse than the hardcoded 3600s the task
+    /// removes.
+    #[test]
+    fn extend_reapplies_the_granted_duration_not_the_cap() {
+        let mut s = sched();
+        s.upsert_board(board("b1", "nrf52", &[]));
+        let g = match request_as(
+            &mut s,
+            subject("p1"),
+            req(by_id("b1"), 900, Priority::Interactive),
+            0,
+        ) {
+            LeaseDecision::Granted(g) => g,
+            LeaseDecision::Queued { .. } => panic!(),
+        };
+        assert_eq!(g.expires, 900);
+        let new = s
+            .extend_lease(g.lease, &subject("p1").key(), 500)
+            .expect("extended");
+        assert_eq!(new, 500 + 900);
+        let cap = crate::policy::Policy::default().max_duration_interactive;
+        assert_ne!(new, 500 + cap, "renewal must not promote to the class cap");
+    }
+
+    /// The priority-class cap still bounds every renewal: a CI workload that
+    /// asks for four hours is clamped to `max_duration_ci` at grant time, and
+    /// the clamp survives extension.
+    #[test]
+    fn extend_stays_clamped_by_the_priority_cap() {
+        let mut s = sched();
+        s.upsert_board(board("b1", "nrf52", &[]));
+        let g = match request_as(
+            &mut s,
+            subject("p1"),
+            req(by_id("b1"), 4 * 60 * 60, Priority::Ci),
+            0,
+        ) {
+            LeaseDecision::Granted(g) => g,
+            LeaseDecision::Queued { .. } => panic!(),
+        };
+        let ci_cap = crate::policy::Policy::default().max_duration_ci;
+        assert_eq!(g.expires, ci_cap);
+        assert_eq!(
+            s.extend_lease(g.lease, &subject("p1").key(), 1_000),
+            Ok(1_000 + ci_cap)
+        );
+    }
+
+    /// `duration_secs: 0` means "whatever the operator's policy says" — the
+    /// shape the sidecar now requests. Both the grant and every renewal use
+    /// `default_ttl_secs`.
+    #[test]
+    fn a_policy_default_lease_extends_by_the_policy_default() {
+        let mut s = sched();
+        s.upsert_board(board("b1", "nrf52", &[]));
+        let g = match request_as(
+            &mut s,
+            subject("p1"),
+            req(by_id("b1"), 0, Priority::Interactive),
+            0,
+        ) {
+            LeaseDecision::Granted(g) => g,
+            LeaseDecision::Queued { .. } => panic!(),
+        };
+        let ttl = crate::policy::Policy::default().default_ttl_secs;
+        assert_eq!(g.expires, ttl);
+        assert_eq!(
+            s.extend_lease(g.lease, &subject("p1").key(), 700),
+            Ok(700 + ttl)
         );
     }
 
@@ -871,15 +976,12 @@ mod tests {
             Err(LeaseAuthError::NotHolder)
         );
         // Expiry unchanged, on both the lease index and the board.
-        assert_eq!(
-            s.extend_lease(g.lease, &subject("alice").key(), 0),
-            Ok(3600)
-        );
+        assert_eq!(s.extend_lease(g.lease, &subject("alice").key(), 0), Ok(100));
         let BoardState::Leased { expires, by, .. } = &s.board(&board_ref(ORG, "b1")).unwrap().state
         else {
             panic!("still leased");
         };
-        assert_eq!(*expires, 3600);
+        assert_eq!(*expires, 100);
         assert_eq!(by, &subject("alice"));
     }
 
@@ -948,7 +1050,7 @@ mod tests {
         let mut regrouped = subject("alice");
         regrouped.groups.push(Group("firmware".to_owned()));
         assert_ne!(regrouped, subject("alice"));
-        assert_eq!(s.extend_lease(g.lease, &regrouped.key(), 50), Ok(50 + 3600));
+        assert_eq!(s.extend_lease(g.lease, &regrouped.key(), 50), Ok(50 + 100));
     }
 
     #[test]

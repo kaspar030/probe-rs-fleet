@@ -38,6 +38,17 @@
 //!   `127.0.0.1:1337`) byte-spliced to the agent's `probe-rs gdb` stub over a
 //!   second relay channel (`probe-rs gdb` is not remote-capable in 0.32).
 //! * [`local`] — locate and exec the genuine probe-rs (local + remote env).
+//! * [`signal`] — SIGINT/SIGTERM handling for the fleet path, so Ctrl-C
+//!   releases the lease instead of stranding the board until it expires.
+//!
+//! ## Lease lifetime on the fleet path
+//!
+//! The sidecar asks for `duration_secs: 0`, i.e. the coordinator's own
+//! `Policy::default_ttl_secs`, and **heartbeats** (`Extend`) for the life of
+//! the invocation, so a long `attach` / `gdb` session is not cut short by a
+//! short policy TTL. On SIGINT/SIGTERM it releases before exiting. A sidecar
+//! that is killed outright releases nothing — nothing can — but the board comes
+//! back after one policy TTL rather than the hardcoded hour this replaced.
 
 pub mod cli;
 pub mod gdb;
@@ -45,6 +56,7 @@ pub mod lease_cache;
 pub mod local;
 pub mod proxy;
 pub mod selector;
+pub mod signal;
 pub mod transport;
 
 use std::ffi::OsString;
@@ -206,22 +218,133 @@ async fn run_fleet(
     let session = transport::CoordSession::connect(&cfg).await?;
     let request = LeaseRequest {
         select: cfg.select.clone(),
-        duration_secs: 3600,
+        // `0` means "the operator's `Policy::default_ttl_secs`". **Do not**
+        // reintroduce a constant here, not even as a "sensible fallback": the
+        // hardcoded 3600s this replaced meant a killed sidecar sat on a board
+        // for an hour, and a knob would just be a slower way back to it. The
+        // TTL is the coordinator's policy to set; we keep the lease alive for
+        // as long as we actually need it by heartbeating (see `keepalive`).
+        duration_secs: 0,
         priority: Priority::Interactive,
     };
     let grant = session.lease(&request).await?;
     tracing::info!(board = %grant.board, lease = ?grant.lease, "leased board");
 
-    let result = match &invocation {
-        cli::ProbeRsInvocation::Gdb {
-            connection_string, ..
-        } => run_fleet_gdb(&session, grant.lease, connection_string.as_deref()).await,
-        _ => run_fleet_data(&session, grant.lease, &original_argv).await,
+    let work = async {
+        match &invocation {
+            cli::ProbeRsInvocation::Gdb {
+                connection_string, ..
+            } => run_fleet_gdb(&session, grant.lease, connection_string.as_deref()).await,
+            _ => run_fleet_data(&session, grant.lease, &original_argv).await,
+        }
     };
 
-    // Always release the lease before returning (best-effort).
+    hold_and_run(&session, &grant, work, signal::shutdown_signal()).await
+}
+
+/// Hold `grant` for the duration of `work`: heartbeat it, abandon it on
+/// `shutdown`, and release it on the way out whichever arm wins.
+///
+/// Split out of [`run_fleet`] so the release-on-signal behaviour is testable
+/// without raising real signals at the test process: `shutdown` is a parameter,
+/// and `run_fleet` simply passes [`signal::shutdown_signal`]. It is `pub` for
+/// the same reason [`gdb::splice`] is — an integration test drives it against a
+/// mock coordinator peer (`tests/lease_lifecycle.rs`).
+///
+/// On shutdown the returned code is `128 + signum`, exactly what the shell sees
+/// from a signalled child; `work` is dropped, which kills the genuine probe-rs
+/// ([`transport::exec_remote_probe_rs`] sets `kill_on_drop`) *before* we give
+/// the lease away.
+///
+/// # Errors
+///
+/// Propagates whatever `work` returns.
+pub async fn hold_and_run<F>(
+    session: &transport::CoordSession,
+    grant: &fleet_proto::lease::LeaseGrant,
+    work: F,
+    shutdown: impl std::future::Future<Output = i32>,
+) -> Result<i32, RunError>
+where
+    F: std::future::Future<Output = Result<i32, RunError>>,
+{
+    tokio::pin!(work);
+    tokio::pin!(shutdown);
+
+    let result = tokio::select! {
+        r = &mut work => r,
+        never = keepalive(session, grant) => match never {},
+        signum = &mut shutdown => Ok(128 + signum),
+    };
+
+    // Always release the lease before returning (best-effort). Reached on every
+    // arm, including the shutdown one — that is the entire point of the signal
+    // handling: a Ctrl-C must not strand the board until the TTL expires.
     session.release(grant.lease).await;
     result
+}
+
+/// Renew `grant` for as long as this invocation runs. Never completes.
+///
+/// Without a heartbeat, a session outliving its TTL is not merely re-leasable:
+/// the coordinator's sweep closes the relay channels and power-cycles the board
+/// under a live `attach` / `gdb`. With the policy default at 900s that is a
+/// routine occurrence, so the keepalive is what makes dropping the hardcoded
+/// 3600s safe.
+///
+/// The heartbeat renews the **lease**, not the channel's capability token. The
+/// token's `expires` is stamped at `OpenChannel` time and checked exactly once,
+/// by the agent in `on_open_session`; thereafter it is an opaque shared secret
+/// handed to `probe-rs serve`. So an open channel outlives its token's nominal
+/// expiry, which is precisely what makes a short lease TTL workable.
+///
+/// A failing heartbeat is logged, not fatal — there is nothing better to do,
+/// and the user's real signal is the data plane going quiet when the sweep
+/// closes the channel. The interval gives three attempts per TTL.
+async fn keepalive(
+    session: &transport::CoordSession,
+    grant: &fleet_proto::lease::LeaseGrant,
+) -> std::convert::Infallible {
+    // The *local* clock is used only to pick an interval, never to judge
+    // whether the lease is still valid: our clock may skew from the
+    // coordinator's, and a slightly wrong interval is harmless where a wrong
+    // validity judgement would not be. An implausible remainder (clock skew, a
+    // grant already in the past) falls back to a conservative 60s.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let ttl = grant.expires.saturating_sub(now);
+    let interval = if ttl == 0 || ttl > 24 * 60 * 60 {
+        60
+    } else {
+        (ttl / 3).clamp(15, 300)
+    };
+    let interval = std::time::Duration::from_secs(interval);
+
+    let mut failures = 0u32;
+    loop {
+        tokio::time::sleep(interval).await;
+        match session.extend(grant.lease).await {
+            Ok(expires) => {
+                failures = 0;
+                tracing::debug!(lease = ?grant.lease, expires, "renewed lease");
+            }
+            Err(error) => {
+                failures += 1;
+                if failures >= 2 {
+                    // Two misses in a row means we are probably going to lose
+                    // the board mid-session, and the user will see the data
+                    // plane stop rather than an error. Say so loudly.
+                    tracing::error!(
+                        lease = ?grant.lease, %error, failures,
+                        "lease renewal keeps failing; the board may be reclaimed mid-session"
+                    );
+                } else {
+                    tracing::warn!(lease = ?grant.lease, %error, "lease renewal failed");
+                }
+            }
+        }
+    }
 }
 
 /// Drive the **delegated** path: a sandboxed agent using a board somebody else
@@ -235,7 +358,10 @@ async fn run_fleet(
 /// * **no `release`, and no extend** — the delegator owns the lease lifecycle.
 ///   The sandbox's only lease-affecting power is letting it expire. This is
 ///   enforced by the coordinator's `/delegate` allowlist, not by this
-///   politeness, but the politeness is what makes the intent readable;
+///   politeness, but the politeness is what makes the intent readable. Renewal
+///   is the delegator's job for the same reason: a sandbox that could heartbeat
+///   could hold the board indefinitely. There is likewise no shutdown arm —
+///   there is no lease of ours to release on Ctrl-C;
 /// * no fleet identity of any kind: the connection carries the capability token
 ///   and nothing else.
 async fn run_delegated(
@@ -457,6 +583,40 @@ mod tests {
             err,
             RunError::Transport(transport::TransportError::Connect(_))
         ));
+    }
+
+    /// A fleet selector plus a *no-board* subcommand (`list`) still goes to the
+    /// fleet: it must reach the transport, never silently enumerate local
+    /// probes.
+    ///
+    /// **Recorded decision (task 3595, option (a)): `list` keeps leasing.**
+    /// `list` parses to `Passthrough` and runs through the relay against the
+    /// agent's per-board `probe-rs serve`, so it prints the *remote* probe —
+    /// which is the answer the user asked for. That channel is lease-gated by
+    /// construction, so "don't lease for `list`" is not implementable without
+    /// synthesising probe-level output from board-level inventory (a different,
+    /// weaker answer; `ctl list` is the fleet-level path and needs no lease).
+    /// The mitigation for the cost of leasing is the shorter TTL this task
+    /// introduces, not a special case here. Please do not re-litigate without
+    /// re-reading that: making `list` fall back to *local* probes under a fleet
+    /// selector would be the same class of trap as the old local fallback.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fleet_selector_never_falls_back_to_local_probes() {
+        let env = MapEnv::new(&[
+            (selector::env::ID, "nrf52840-dk-3"),
+            (selector::env::COORDINATOR, "unresolvable.invalid:4443"),
+            (selector::env::TOKEN, "prfs1_t"),
+        ]);
+        let err = run_async(["probe-rs", "list"].map(String::from), &env)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RunError::Transport(transport::TransportError::Connect(_))
+            ),
+            "a no-board subcommand under a fleet selector must reach the relay, got {err:?}"
+        );
     }
 
     #[test]

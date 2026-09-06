@@ -667,6 +667,10 @@ as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
 5. Streams stdout/stderr back and **propagates the exit code** (critical for
    `run` = embedded-test pass/fail and for CI).
 6. Heartbeats to renew the lease for long-lived sessions (`attach`, `gdb`).
+   **Implemented**: the fleet path requests the coordinator's policy-default
+   TTL (`duration_secs: 0`) and heartbeats it for the whole invocation, so a
+   session longer than one TTL is not swept mid-flight. It also releases on
+   SIGINT/SIGTERM.
 
 #### Credentials (revision 2)
 
@@ -1333,8 +1337,10 @@ nightly CI > soak" and priority is a plain wire field, so without the clamp a CI
 job outbids a human at a desk by setting it. This is not an edge case: the
 sidecar sends `Priority::Interactive` unconditionally, so the clamp fires on
 *every* CI lease. `Policy::max_duration_ci` then applies to it, and extension
-inherits the clamp for free — `Scheduler::extend_lease` re-derives the duration
-from the **recorded** priority, so there is deliberately no second guard in
+inherits the clamp for free — `Scheduler::extend_lease` re-derives the renewal
+from the **recorded** priority *and* the **recorded granted duration**, both of
+which already carry the clamp (the duration was capped under the clamped
+priority at grant time), so there is deliberately no second guard in
 `extend_lease`.
 
 The clamp orders contention; it does not make contention painless. A workload
@@ -1437,6 +1443,23 @@ reset, gdb, re-flash — to support multi-step debugging sessions. Mechanics:
   TTL and the board returns to the pool (agent runs cleanup: power-cycle,
   optional erase).
 - Explicit `fleet ctl release` frees it immediately.
+
+**Status.** The *within-invocation* half is implemented: the sidecar requests
+`duration_secs: 0` — i.e. the operator's `Policy::default_ttl_secs`, never a
+TTL of its own — and heartbeats it (`Extend`) for the life of one probe-rs
+invocation, so `attach` / `gdb` sessions longer than the policy TTL are not
+swept. A renewal re-applies the lease's *granted* duration, so heartbeating
+extends the hold without promoting it to the priority-class cap. On SIGINT /
+SIGTERM the sidecar releases before exiting; a **SIGKILLed** sidecar releases
+nothing, but the board now returns to the pool after one policy TTL instead of
+the hardcoded hour the sidecar used to request.
+
+The *cross-invocation* half — reusing one lease across successive `probe-rs`
+commands, keyed by selector + subject key — is **not** implemented.
+`fleet_sidecar::lease_cache` holds the mechanism but is not wired up, and it
+needs a persistence layer (e.g. under `$XDG_RUNTIME_DIR`) for the cache to
+survive between processes at all. Until then each invocation leases and
+releases on its own.
 
 This is what makes remote DX feel local: you grab a board, iterate freely, then
 let it go — exactly like a board on your own desk.

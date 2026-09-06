@@ -1,0 +1,254 @@
+//! The sidecar's fleet-path lease lifecycle, driven against a mock coordinator
+//! peer: what TTL is requested, that a shutdown signal releases the lease, and
+//! that a long session is kept alive by heartbeats.
+//!
+//! Regression cover for task 3595, where the sidecar leased a hardcoded 3600s
+//! and released only on the happy path — so a Ctrl-C'd or killed invocation sat
+//! on an exclusive board for a full hour.
+//!
+//! Everything runs over `fleet_wire::mock::pair`: no coordinator, no TLS, no
+//! probe-rs binary. `hold_and_run` takes its shutdown future as a parameter
+//! precisely so this file can fire "a signal" without raising a real one at the
+//! test process.
+
+use std::sync::Arc;
+
+use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
+use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
+use fleet_proto::{LeaseId, PROTOCOL_VERSION};
+use fleet_sidecar::transport::CoordSession;
+use fleet_wire::{CoordToSidecar, SidecarToCoord, WireRx, WireTx};
+use tokio::sync::{mpsc, Mutex};
+
+/// The grant every peer in this file hands out.
+fn grant(expires: u64) -> LeaseGrant {
+    LeaseGrant {
+        lease: LeaseId(1),
+        board: BoardRef::new(OrgId("default".to_owned()), AgentId("a".to_owned()), "b1"),
+        agent: AgentId("a".to_owned()),
+        holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
+        expires,
+        token: vec![0xab],
+    }
+}
+
+fn lease_request() -> LeaseRequest {
+    LeaseRequest {
+        select: Constraint::Id(BoardName("b1".to_owned())),
+        // What `run_fleet` sends: the operator's policy default.
+        duration_secs: 0,
+        priority: Priority::Interactive,
+    }
+}
+
+/// Answer the Hello with a Welcome.
+async fn handshake(tx: &mut impl WireTx, rx: &mut impl WireRx) {
+    match fleet_wire::recv::<SidecarToCoord>(rx).await.unwrap() {
+        SidecarToCoord::Hello { .. } => {}
+        other => panic!("expected Hello, got {other:?}"),
+    }
+    fleet_wire::send(
+        tx,
+        &CoordToSidecar::Welcome {
+            protocol_version: PROTOCOL_VERSION,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// The lease request the fleet path sends carries **no** hardcoded duration:
+/// `duration_secs: 0` defers to the coordinator's `Policy::default_ttl_secs`,
+/// which is the whole point of task 3595. A sidecar that picks its own TTL is
+/// overriding the operator's policy with a constant nobody can configure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lease_request_carries_no_hardcoded_duration() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        let req = match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            SidecarToCoord::Lease(req) => req,
+            other => panic!("expected Lease, got {other:?}"),
+        };
+        assert_ne!(
+            req.duration_secs, 3600,
+            "the hardcoded hour must not come back"
+        );
+        assert_eq!(
+            req.duration_secs, 0,
+            "0 means the coordinator's policy default"
+        );
+        assert_eq!(req.priority, Priority::Interactive);
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+            .await
+            .unwrap();
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    session.lease(&lease_request()).await.unwrap();
+    peer.await.unwrap();
+}
+
+/// Ctrl-C (or SIGTERM) during a fleet invocation releases the lease before
+/// exiting, and reports the conventional `128 + signum` exit code.
+///
+/// Before this, the release was reached only on the happy path: an aborted
+/// `probe-rs run` left the board leased until the TTL expired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_signal_releases_the_lease() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let released = Arc::new(Mutex::new(false));
+    let released_peer = Arc::clone(&released);
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            SidecarToCoord::Lease(_) => {}
+            other => panic!("expected Lease, got {other:?}"),
+        }
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+            .await
+            .unwrap();
+        // The only other frame we expect is the release.
+        loop {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+                Ok(SidecarToCoord::Release { lease }) => {
+                    assert_eq!(lease, LeaseId(1));
+                    *released_peer.lock().await = true;
+                    fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease })
+                        .await
+                        .unwrap();
+                    break;
+                }
+                // A heartbeat may race in; ignore it.
+                Ok(SidecarToCoord::Extend { lease }) => {
+                    fleet_wire::send(
+                        &mut coord_tx,
+                        &CoordToSidecar::Extended {
+                            lease,
+                            expires: 19_999,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                Ok(other) => panic!("unexpected frame {other:?}"),
+                Err(_) => break,
+            }
+        }
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let granted = session.lease(&lease_request()).await.unwrap();
+
+    // Work that never finishes — an `attach` session, say — plus a shutdown
+    // future we fire by hand. `hold_and_run` must pick the shutdown arm,
+    // release, and report 128 + SIGINT.
+    let (fire_tx, mut fire_rx) = mpsc::channel::<i32>(1);
+    let work = async {
+        std::future::pending::<()>().await;
+        unreachable!()
+    };
+    let shutdown = async move { fire_rx.recv().await.unwrap_or(2) };
+
+    let held = fleet_sidecar::hold_and_run(&session, &granted, work, shutdown);
+    tokio::pin!(held);
+    tokio::select! {
+        code = &mut held => panic!("returned {code:?} before the signal"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+    fire_tx.send(2).await.unwrap();
+    let code = held.await.unwrap();
+
+    assert_eq!(code, 130, "SIGINT propagates as 128 + 2");
+    assert!(
+        *released.lock().await,
+        "the coordinator must have seen a Release"
+    );
+    peer.await.unwrap();
+}
+
+/// A session that outlives its TTL is heartbeat rather than swept.
+///
+/// With the hardcoded hour gone, a `attach` / `gdb` session routinely outlives
+/// the policy default (900s). An expired lease is not benign — the coordinator's
+/// sweep closes the relay channels and power-cycles the board — so the keepalive
+/// is what makes the short TTL safe. Time is paused, so this asserts on the
+/// heartbeat *sequence*, never on wall-clock.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_long_session_is_kept_alive() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (seen_tx, mut seen_rx) = mpsc::channel::<u64>(64);
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            SidecarToCoord::Lease(_) => {}
+            other => panic!("expected Lease, got {other:?}"),
+        }
+        // A grant far in the future: `keepalive` derives its interval from the
+        // remaining TTL against the *local* clock, and clamps it to 300s.
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 900;
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(expires)))
+            .await
+            .unwrap();
+
+        let mut n = 0u64;
+        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+            match msg {
+                SidecarToCoord::Extend { lease } => {
+                    n += 1;
+                    fleet_wire::send(
+                        &mut coord_tx,
+                        &CoordToSidecar::Extended {
+                            lease,
+                            expires: expires + n * 900,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    if seen_tx.send(n).await.is_err() {
+                        break;
+                    }
+                }
+                SidecarToCoord::Release { lease } => {
+                    let _ = fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease })
+                        .await;
+                    break;
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let granted = session.lease(&lease_request()).await.unwrap();
+
+    // Work that runs well past one heartbeat interval: a 900s TTL yields a
+    // 300s interval, so this sees two renewals before finishing.
+    let work = async {
+        tokio::time::sleep(std::time::Duration::from_secs(700)).await;
+        Ok(7)
+    };
+    let shutdown = std::future::pending::<i32>();
+    let code = fleet_sidecar::hold_and_run(&session, &granted, work, shutdown)
+        .await
+        .unwrap();
+
+    assert_eq!(code, 7, "the work's exit code is propagated");
+    let first = seen_rx.recv().await.expect("a first heartbeat");
+    let second = seen_rx.recv().await.expect("a second heartbeat");
+    assert_eq!((first, second), (1, 2), "the session is heartbeat repeatedly");
+    peer.await.unwrap();
+}

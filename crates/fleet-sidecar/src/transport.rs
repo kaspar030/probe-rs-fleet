@@ -57,8 +57,17 @@ type DataSink = Arc<Mutex<Option<(ChannelId, mpsc::Sender<DataFrame>)>>>;
 pub struct CoordSession {
     /// Funnels outbound `SidecarToCoord` frames to the writer task.
     out_tx: mpsc::Sender<SidecarToCoord>,
-    /// Control replies (everything that is not a `Data` frame).
+    /// Control replies (everything that is not a `Data` frame, and not an
+    /// `Extended` heartbeat reply).
     ctrl_rx: Mutex<mpsc::Receiver<CoordToSidecar>>,
+    /// Heartbeat replies (`Extended`), routed to their own slot.
+    ///
+    /// A keepalive runs concurrently with everything else, so its reply must
+    /// **not** land in `ctrl_rx`: whoever calls `next_ctrl` next (a `release`
+    /// ack drain, an `open_channel`) would consume it and then mis-read the
+    /// stream by one message. Load-dependent, intermittent, and very annoying
+    /// to debug — hence a dedicated slot.
+    extend_rx: Mutex<mpsc::Receiver<(fleet_proto::LeaseId, u64)>>,
     /// Set the active channel's data sink so the reader routes `Data` frames.
     data_sink: DataSink,
 }
@@ -156,6 +165,7 @@ impl CoordSession {
         }
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CoordToSidecar>(256);
+        let (extend_tx, extend_rx) = mpsc::channel::<(fleet_proto::LeaseId, u64)>(8);
         let data_sink: DataSink = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&data_sink);
         tokio::spawn(async move {
@@ -181,6 +191,12 @@ impl CoordSession {
                             let _ = tx.send(frame).await;
                         }
                     }
+                    Ok(CoordToSidecar::Extended { lease, expires }) => {
+                        // Heartbeat reply: its own slot, never `ctrl_rx`.
+                        // A full/closed slot is not fatal — a heartbeat is
+                        // best-effort and the next one carries the same news.
+                        let _ = extend_tx.try_send((lease, expires));
+                    }
                     Ok(other) => {
                         if ctrl_tx.send(other).await.is_err() {
                             break;
@@ -194,6 +210,7 @@ impl CoordSession {
         Ok(Self {
             out_tx,
             ctrl_rx: Mutex::new(ctrl_rx),
+            extend_rx: Mutex::new(extend_rx),
             data_sink,
         })
     }
@@ -248,6 +265,39 @@ impl CoordSession {
             ))),
             CoordToSidecar::Error { message } => Err(TransportError::Declined(message)),
             other => Err(TransportError::Wire(format!("expected Lease, got {other:?}"))),
+        }
+    }
+
+    /// Renew a held lease (heartbeat), returning the coordinator's new expiry.
+    ///
+    /// The sidecar requests the operator's policy-default TTL rather than a
+    /// hardcoded hour, so a session that outlives that TTL — `attach`, `gdb`,
+    /// a long soak `run` — must renew. The coordinator renews by the lease's
+    /// *granted* duration, so heartbeating extends the hold without ever
+    /// promoting it to the priority-class cap.
+    ///
+    /// **Best-effort by construction.** A coordinator that refuses replies with
+    /// `Error`, which lands in `ctrl_rx` (it is not an `Extended`), so a
+    /// refusal surfaces here as a timeout rather than a message. That is fine:
+    /// the authoritative signal that a lease is gone is the relay dying, not
+    /// this call. Callers log and keep going.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Connect`] if the connection is gone,
+    /// [`TransportError::Declined`] if no reply arrives in time.
+    pub async fn extend(&self, lease: fleet_proto::LeaseId) -> Result<u64, TransportError> {
+        self.send(SidecarToCoord::Extend { lease }).await?;
+        let mut slot = self.extend_rx.lock().await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), slot.recv()).await {
+            Ok(Some((got, expires))) if got == lease => Ok(expires),
+            Ok(Some((got, _))) => Err(TransportError::Wire(format!(
+                "Extended for {got:?}, expected {lease:?}"
+            ))),
+            Ok(None) => Err(TransportError::Connect("connection closed".to_owned())),
+            Err(_) => Err(TransportError::Declined(
+                "no Extended reply within 5s".to_owned(),
+            )),
         }
     }
 
@@ -389,6 +439,13 @@ pub async fn exec_remote_probe_rs(
     cmd.args(args);
     cmd.env(crate::local::remote_env::HOST, remote_host);
     cmd.env(crate::local::remote_env::TOKEN, token);
+    // Kill the child if this future is dropped. The fleet path drops the work
+    // future on SIGINT/SIGTERM and then *releases the lease*; without this the
+    // genuine probe-rs would keep driving a board somebody else may already
+    // hold. probe-rs does not receive our SIGTERM (it is not in a shared
+    // foreground process group in the SIGTERM case), so dropping is the only
+    // handle we have on it.
+    cmd.kill_on_drop(true);
     let status = cmd
         .status()
         .await
@@ -566,6 +623,119 @@ mod tests {
 
         drop(client);
         let _ = splice.await;
+        coord.abort();
+    }
+
+    /// Regression for the heartbeat-routing bug: an `Extended` reply must land
+    /// in its own slot, never in `ctrl_rx`.
+    ///
+    /// A keepalive runs concurrently with the session, so if `Extended` were
+    /// funnelled through the shared control channel the *next* `next_ctrl`
+    /// caller would consume it and read the stream off by one — here, `release`
+    /// would drain the `Extended` and never see its `Released` ack. This test
+    /// drives `lease -> extend -> release` and asserts the ack still arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extend_reply_does_not_steal_the_control_channel() {
+        use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
+        use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
+        use fleet_proto::LeaseId;
+
+        let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let saw_release = Arc::new(Mutex::new(false));
+        let saw_release_peer = Arc::clone(&saw_release);
+
+        let coord = tokio::spawn(async move {
+            // Hello -> Welcome.
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+                SidecarToCoord::Hello { .. } => {}
+                other => panic!("expected Hello, got {other:?}"),
+            }
+            fleet_wire::send(
+                &mut coord_tx,
+                &CoordToSidecar::Welcome {
+                    protocol_version: PROTOCOL_VERSION,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Lease -> grant.
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+                SidecarToCoord::Lease(req) => {
+                    // The sidecar must not smuggle a hardcoded TTL past the
+                    // operator's policy (task 3595).
+                    assert_ne!(req.duration_secs, 3600);
+                }
+                other => panic!("expected Lease, got {other:?}"),
+            }
+            fleet_wire::send(
+                &mut coord_tx,
+                &CoordToSidecar::Lease(LeaseGrant {
+                    lease: LeaseId(1),
+                    board: BoardRef::new(OrgId("default".to_owned()), AgentId("a".to_owned()), "b1"),
+                    agent: AgentId("a".to_owned()),
+                    holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
+                    expires: 9999,
+                    token: vec![0xab],
+                }),
+            )
+            .await
+            .unwrap();
+
+            // Extend -> Extended.
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+                SidecarToCoord::Extend { lease } => assert_eq!(lease, LeaseId(1)),
+                other => panic!("expected Extend, got {other:?}"),
+            }
+            fleet_wire::send(
+                &mut coord_tx,
+                &CoordToSidecar::Extended {
+                    lease: LeaseId(1),
+                    expires: 12_345,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Release -> Released.
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+                SidecarToCoord::Release { lease } => {
+                    assert_eq!(lease, LeaseId(1));
+                    *saw_release_peer.lock().await = true;
+                }
+                other => panic!("expected Release, got {other:?}"),
+            }
+            fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease: LeaseId(1) })
+                .await
+                .unwrap();
+            let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
+        });
+
+        let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+            .await
+            .unwrap();
+        let grant = session
+            .lease(&LeaseRequest {
+                select: Constraint::Id(BoardName("b1".to_owned())),
+                duration_secs: 0,
+                priority: Priority::Interactive,
+            })
+            .await
+            .unwrap();
+        assert_eq!(session.extend(grant.lease).await.unwrap(), 12_345);
+
+        // `release` drains its own ack. If `Extended` had gone through
+        // `ctrl_rx`, this would have consumed *that* instead — the bug.
+        session.release(grant.lease).await;
+        assert!(*saw_release.lock().await, "peer must have seen Release");
+        // The control channel is still empty and in sync: nothing stale left.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), session.next_ctrl())
+                .await
+                .is_err(),
+            "control channel should be drained, not holding a stale reply"
+        );
+
         coord.abort();
     }
 }

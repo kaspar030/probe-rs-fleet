@@ -2095,9 +2095,12 @@ impl Coordinator {
         // (`fleet-sidecar/src/lib.rs`), so the clamp fires on *every* CI lease.
         //
         // `Policy::max_duration_ci` then applies to it, and extension inherits
-        // the clamp for free: `Scheduler::extend_lease` re-derives the duration
-        // from the **recorded** priority, so there is deliberately no second
-        // guard in `extend_lease` — please do not add one.
+        // the clamp for free: `Scheduler::extend_lease` re-derives the renewal
+        // from the **recorded** priority *and* the **recorded granted
+        // duration** — both already carry the clamp, because the duration was
+        // capped under the clamped priority at grant time. So a workload stays
+        // clamped on every renewal and there is deliberately no second guard in
+        // `extend_lease` — please do not add one.
         if subject.kind == fleet_proto::ids::SubjectKind::Workload
             && req.priority != fleet_proto::lease::Priority::Ci
         {
@@ -2987,8 +2990,9 @@ mod tests {
         match rx.recv().await.unwrap() {
             CoordToSidecar::Extended { lease, expires } => {
                 assert_eq!(lease, grant.lease);
-                // Interactive cap is 4h; extend = now + cap.
-                assert_eq!(expires, 1000 + 4 * 60 * 60);
+                // The renewal re-applies the lease's own granted duration
+                // (600s here), not the 4h Interactive cap.
+                assert_eq!(expires, 1000 + 600);
             }
             other => panic!("expected Extended, got {other:?}"),
         }
