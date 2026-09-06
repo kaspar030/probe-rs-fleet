@@ -257,22 +257,34 @@ pub fn adopted_board_status(spec: &BoardSpec, presence: BoardPresence) -> BoardS
 /// derivation that produced the reported statuses, which is what keeps the two
 /// from drifting.
 ///
-/// # Why departed boards must be reported, not merely dropped
+/// # Why departed boards are reported, not merely dropped
 ///
 /// [`reconcile`] emits a status for every *declared* board, `Offline` when its
-/// probe is absent, and that is what lets the coordinator drop it from the
-/// scheduler. An adopted board has no declaration to emit a status from, so
-/// simply not synthesising it would make it **vanish from the report** — and
-/// nothing on the coordinator prunes a board a report failed to mention. The
-/// board would sit in the scheduler as `Idle` forever: `ctl list` shows it, a
-/// lease against it is granted, a capability token is minted, and the agent
-/// finally answers `UnknownBoard` at the last possible hop.
+/// probe is absent. An adopted board has no declaration to emit a status from,
+/// so simply not synthesising it would make it **vanish from the report**.
+///
+/// That used to be fatal on its own: nothing on the coordinator pruned a board
+/// a report failed to mention, so the board sat in the scheduler as `Idle`
+/// forever — `ctl list` showed it, a lease against it was granted, a capability
+/// token minted, and the agent finally answered `UnknownBoard` at the last
+/// possible hop. That hole is closed: the coordinator's `reconcile_inventory`
+/// now treats each report as a **set**, so a board absent from it is retired
+/// from the scheduler *and* from the coordinator's `board` table.
+///
+/// The tombstone is not thereby redundant, because the two removals do not mean
+/// the same thing. Absence is an *inference* — the coordinator can only read it
+/// as "this node no longer declares that board", which is the right reading for
+/// a rename or a `boards.toml` deletion. An adopted board's `Offline` status is
+/// a *declaration*: "this probe is gone". The coordinator acts on the
+/// difference — `adopted && Offline` is a tombstone, not a declared-but-
+/// unplugged board, so it clears the DB row as well, where a declared board
+/// reported `Offline` keeps its row and stays visible in the UI. Emitting the
+/// tombstone is also what makes the removal *prompt* and *legible*: it names
+/// the board in the report the operator can see, instead of leaving the
+/// coordinator to notice a gap.
 ///
 /// A laptop is precisely the machine where probes get unplugged several times
-/// a day, so this is the common case, not an edge one. `previously_adopted` is
-/// therefore not an optimisation: it is what keeps the invariant "a board
-/// leaves the scheduler only via an explicit `Offline` report" true for
-/// adopted boards as it already is for declared ones.
+/// a day, so this is the common case, not an edge one.
 ///
 /// The tombstones are emitted **whatever the policy**, so that a node whose
 /// policy flips `auto` → `declared` also cleans up after itself rather than

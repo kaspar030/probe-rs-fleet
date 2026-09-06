@@ -1832,6 +1832,14 @@ impl OrgDb<'_> {
     /// label; a future reader must not parse it as a [`BoardState`] without
     /// first splitting the two axes into separate columns.
     ///
+    /// `first_seen` / `last_seen` shifted with it, for the same reason:
+    /// recording offline boards makes them "first/last **reported**", not
+    /// "first/last seen online". A board declared but never plugged in now gets
+    /// a row with both set, and an unplugged board's `last_seen` keeps
+    /// advancing every `discovery_secs`. Nothing reads either column back today
+    /// either (only a test does), but a future "idle since" display must not
+    /// assume they mean presence.
+    ///
     /// # Errors
     ///
     /// Returns a database error if the write fails, or
@@ -1898,6 +1906,13 @@ impl OrgDb<'_> {
     ///
     /// Scoped by `org_id` **and** `node_id`: another node's boards, and another
     /// tenant's, are not expressible from here.
+    ///
+    /// Binds `keep.len() + 2` parameters, so a node declaring roughly a
+    /// thousand boards would exceed SQLite's default
+    /// `SQLITE_MAX_VARIABLE_NUMBER` and fail. The caller treats that as
+    /// best-effort and logs it — stale rows, never corruption — and a fleet
+    /// with a thousand probes on one machine has other problems first; chunk
+    /// the delete if that ever stops being true.
     ///
     /// Returns the number of rows deleted (for the audit detail).
     ///

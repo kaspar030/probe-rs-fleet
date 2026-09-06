@@ -3790,11 +3790,21 @@ mod tests {
     /// unplugged arrives as an `Offline` status, and the coordinator must drop
     /// it from the scheduler.
     ///
-    /// Without the agent's tombstone the board simply stopped appearing in the
-    /// report, and nothing here prunes a board a report failed to mention: it
-    /// stayed `Idle` forever, `ctl list` showed it, and a lease against it was
-    /// *granted* and then failed at the agent with `UnknownBoard`. On a laptop,
-    /// where probes are unplugged daily, that is the common case.
+    /// Note which code path delivers that today. `reconcile_inventory` excludes
+    /// an `adopted && Offline` status from the keep-set — it is a tombstone,
+    /// not a declared-but-unplugged board — so the removal happens in the
+    /// **stale-board prune**, not in the offline branch this test was written
+    /// against. The assertion is unchanged and still load-bearing; only the
+    /// mechanism moved. `an_unplugged_adopted_board_leaves_the_db_too` pins the
+    /// other half, which the prune added: the row goes as well.
+    ///
+    /// Historically this was the *only* thing that retired such a board:
+    /// nothing pruned a board a report failed to mention, so without the
+    /// agent's tombstone it stayed `Idle` forever, `ctl list` showed it, and a
+    /// lease against it was *granted* and then failed at the agent with
+    /// `UnknownBoard`. The set difference now catches that case too, but the
+    /// tombstone still carries the meaning — see `adopt_unknown`'s doc comment.
+    /// On a laptop, where probes are unplugged daily, this is the common case.
     #[tokio::test]
     async fn an_unplugged_adopted_board_leaves_the_scheduler() {
         use fleet_proto::agent_api::ProbeInventory;
@@ -4185,7 +4195,6 @@ mod tests {
         assert!(sched.board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1")).is_some());
         assert!(sched.board(&board_ref("other", "agent-c", "b1")).is_some());
     }
-
 
     /// The `declared`-policy guard must not swallow a **tombstone**. A node
     /// whose policy was flipped `auto` → `declared` still has to retire what it
