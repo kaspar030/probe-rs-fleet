@@ -259,7 +259,11 @@ on the coordinator host at all**: any org member mints one with
 `probe-rs-fleet auth-key create`, authenticated by their `[user]` session. The
 `coordinator auth-key` / `auth-keys` / `auth-key-revoke` verbs remain for the
 self-hosted operator, for the air-gapped case, and for the one thing the API
-refuses — a key that never expires.
+refuses — a key that never expires. `coordinator auth-key` takes the same
+`--purpose` / `--ops` as the API path, so a never-expiring **CI** key
+(`--purpose ci --ttl 0`) is mintable here and only here; the grant its
+redemption synthesises is still capped at 30 days and renewed on each
+redemption, so a perpetual key is a rolling share, not a perpetual one.
 
 #### Per-fleet config layout (revision 2)
 
@@ -373,6 +377,8 @@ probe-rs-fleet agent up --auth-key prffk1_…
 #     Self-hosted, or air-gapped, or for a key that never expires, the same
 #     thing from a shell on the coordinator host:
 probe-rs-fleet coordinator auth-key --org acme --tag lab --ttl 24h
+#     Same verb, same flags as the API path, for a CI key that never expires:
+probe-rs-fleet coordinator auth-key --org acme --tag lab --purpose ci --ttl 0
 
 # 6. Give a colleague access to some of your boards.
 probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31

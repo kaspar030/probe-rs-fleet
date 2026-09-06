@@ -8,7 +8,8 @@
 //! Since `probe-rs-fleet auth-key create` landed, that is true of the auth-key
 //! verbs too: a member with a login mints over the authenticated API, needing
 //! no shell here. These stay for the self-hosted operator, for the air-gapped
-//! case, and for the one thing the API refuses — a key that never expires.
+//! case, and for the one thing the API refuses — a key that never expires,
+//! including a never-expiring `--purpose ci` key, which no other path can mint.
 //!
 //! `auth-key` is joined here by `auth-keys` (list) and `auth-key-revoke`.
 //! Those are not conveniences: auth keys are the weak link in the credential
@@ -39,7 +40,7 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_coordinator::state::Db;
+use fleet_coordinator::state::{AUTH_KEY_PURPOSE_CI, AUTH_KEY_PURPOSE_NODE, Db};
 use fleet_proto::ids::{OrgId, Role};
 
 use crate::cli::{AuthKeyArgs, UserTokenArgs};
@@ -106,9 +107,48 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
          create`, and a machine with a login runs `probe-rs-fleet share`."
     );
 
-    let (db, default_org, _) = open_db(args.config_dir).await?;
+    // Everything that can be judged from the arguments alone is judged *before*
+    // `open_db`: `ensure_org` below has a permanent `kind` side effect, so a
+    // rejected invocation must not have created an org on its way out (nor need
+    // a reachable coordinator config to be told it was wrong).
+    let purpose = if args.purpose == AUTH_KEY_PURPOSE_CI {
+        AUTH_KEY_PURPOSE_CI
+    } else {
+        AUTH_KEY_PURPOSE_NODE
+    };
+    // A CI key's tags become the *selector* of the grant its redemption
+    // synthesises, so an empty set would share every board in the org. Refused
+    // here as well as at the coordinator (`exchange_workload_key`), because a
+    // key that could never redeem must not be mintable: the failure would
+    // otherwise be a bare `403` at redemption, long after the mint.
+    anyhow::ensure!(
+        purpose != AUTH_KEY_PURPOSE_CI || !args.tag.is_empty(),
+        "a `--purpose ci` key needs at least one `--tag`: the tags become the \
+         selector of the grant it creates, and an empty selector matches every \
+         board in the org"
+    );
+    let ops: Vec<String> = match &args.ops {
+        // Validated locally so a typo names the unknown op rather than being
+        // silently dropped and discovered at redemption. `normalize_ops`
+        // matches what the API path stores, so the same `--ops` produces the
+        // same row whichever verb minted it.
+        Some(spec) => fleet_proto::token::normalize_ops(crate::roles::grant::parse_ops_arg(spec)?)
+            .iter()
+            .map(|o| o.as_str().to_owned())
+            .collect(),
+        None => Vec::new(),
+    };
+    if !ops.is_empty() && purpose != AUTH_KEY_PURPOSE_CI {
+        // Stored either way (as the API path does), but a node key's redemption
+        // never reads them — say so now rather than let the flag look effective.
+        warn!(
+            "`--ops` only takes effect for a `--purpose ci` key; a node key confers no operations"
+        );
+    }
+
+    let (db, default_org, _) = open_db(args.config_dir.clone()).await?;
     let explicit_org = args.org.is_some();
-    let org = args.org.map_or(default_org, OrgId);
+    let org = args.org.clone().map_or(default_org, OrgId);
     db.ensure_org(&org, org_kind(explicit_org))
         .await
         .context("ensuring the org exists")?;
@@ -120,7 +160,7 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
         Some(now.saturating_add(i64::try_from(args.ttl).unwrap_or(i64::MAX)))
     };
     let token = OpaqueToken::mint(TokenKind::AuthKey);
-    db.insert_auth_key(
+    db.insert_auth_key_with_purpose(
         &org,
         token.hash().as_str(),
         &args.tag,
@@ -128,17 +168,36 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
         expires,
         None,
         now,
+        purpose,
+        &ops,
     )
     .await
     .context("recording the auth key")?;
 
+    print_auth_key(&org, &token.to_secret_string(), &args, purpose, expires);
+    Ok(())
+}
+
+/// Print a freshly minted key. **The only place the secret is printed.**
+///
+/// Split out of [`auth_key`] the way `roles::auth_key` splits work from
+/// printing: the epilogue now branches on purpose, and a `ci` key's is four
+/// times the size of a node key's.
+fn print_auth_key(
+    org: &OrgId,
+    secret: &str,
+    args: &AuthKeyArgs,
+    purpose: &str,
+    expires: Option<i64>,
+) {
     println!("Auth key for org '{org}':");
     println!();
     // The one place the secret is printed: it is not stored anywhere, only its
     // SHA-256, so this output is the only chance to capture it.
-    println!("  {}", token.to_secret_string());
+    println!("  {secret}");
     println!();
     println!("  single use : {}", !args.multi_use);
+    println!("  purpose    : {purpose}");
     match expires {
         Some(e) => println!("  expires    : {e} (epoch seconds)"),
         None => println!("  expires    : never"),
@@ -147,12 +206,30 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
         println!("  tags       : {}", args.tag.join(", "));
     }
     println!();
-    println!("Enroll a node with it:");
-    println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
-    println!();
-    println!("This key is a bearer credential and is not stored anywhere (only its");
-    println!("hash). Copy it now; anyone holding it can enroll a node into this org.");
-    Ok(())
+    if purpose == AUTH_KEY_PURPOSE_CI {
+        println!("Use it on a CI runner with no workload identity of its own:");
+        println!("  probe-rs-fleet ci login --fleet-url <url> --auth-key <key>");
+        println!();
+        println!("Redeeming it creates a GRANT in this org selecting the tagged boards,");
+        println!("so revoking the key also tears down whatever it is holding — not just");
+        println!("the credential. This is the weak CI path: prefer GitHub Actions");
+        println!("workload identity (`grant --repo owner/name`), which stores no secret");
+        println!("anywhere at all. See docs/ci-github-actions.md.");
+        if expires.is_none() {
+            println!();
+            println!("This key never expires, but the grant it creates is capped at 30 days");
+            println!("and renewed on each redemption — a rolling share, not a perpetual one.");
+        }
+        println!();
+        println!("This key is a bearer credential and is not stored anywhere (only its");
+        println!("hash). Copy it now; anyone holding it can use it.");
+    } else {
+        println!("Enroll a node with it:");
+        println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
+        println!();
+        println!("This key is a bearer credential and is not stored anywhere (only its");
+        println!("hash). Copy it now; anyone holding it can enroll a node into this org.");
+    }
 }
 
 /// Run `coordinator auth-keys`: list the org's outstanding auth keys.
@@ -329,6 +406,42 @@ mod tests {
     use super::*;
     use fleet_coordinator::state::DEFAULT_ORG_ID;
 
+    /// Build an `AuthKeyArgs` with the defaults clap would supply, so a test
+    /// names only the field it is about.
+    fn args_for(config_dir: Option<std::path::PathBuf>) -> AuthKeyArgs {
+        AuthKeyArgs {
+            org: None,
+            tag: Vec::new(),
+            ttl: 86_400,
+            multi_use: false,
+            purpose: AUTH_KEY_PURPOSE_NODE.to_owned(),
+            ops: None,
+            config_dir,
+        }
+    }
+
+    /// A coordinator config directory pointing at a fresh sqlite file inside
+    /// it. The path must be absolute: `load_coordinator_config` does not
+    /// resolve `sqlite_path` relative to the config file, so a bare name would
+    /// land in the test process's cwd and make these tests order-dependent.
+    fn coordinator_config_dir() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = dir.path().join("coord.sqlite");
+        let seed = "ab".repeat(32);
+        std::fs::write(
+            dir.path().join("coordinator.toml"),
+            format!(
+                "listen_addr = \"127.0.0.1:7000\"\n\
+                 public_url = \"https://fleet.example\"\n\
+                 sqlite_path = \"{}\"\n\
+                 signing_key_hex = \"{seed}\"\n",
+                sqlite.display()
+            ),
+        )
+        .unwrap();
+        (dir, sqlite)
+    }
+
     /// The membership provisioning that makes a session token *useful*: without
     /// the `member` row, `authz::require_role` denies everything and `ctl list`
     /// fails closed on a valid token.
@@ -423,5 +536,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.role_of(&acme, "alice").await.unwrap(), Some(Role::Admin));
+    }
+
+    /// The point of the verb: a CI-purpose key that never expires, which the
+    /// API path cannot mint (it caps the TTL) and this path could not express
+    /// (it hardcoded `node`).
+    #[tokio::test]
+    async fn mints_a_never_expiring_ci_key_with_ops() {
+        let (dir, sqlite) = coordinator_config_dir();
+        let args = AuthKeyArgs {
+            tag: vec!["desk".to_owned()],
+            ttl: 0,
+            purpose: AUTH_KEY_PURPOSE_CI.to_owned(),
+            ops: Some("flash,attach".to_owned()),
+            ..args_for(Some(dir.path().to_owned()))
+        };
+        auth_key(args).await.unwrap();
+
+        let db = Db::connect(sqlite.to_str().unwrap()).await.unwrap();
+        let org = OrgId(DEFAULT_ORG_ID.to_owned());
+        let keys = db.list_auth_keys(&org).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].purpose, AUTH_KEY_PURPOSE_CI);
+        assert_eq!(keys[0].tags, vec!["desk".to_owned()]);
+        assert_eq!(keys[0].expires, None, "--ttl 0 means no expiry");
+
+        let meta = db
+            .ci_auth_key_meta(&keys[0].key_hash)
+            .await
+            .unwrap()
+            .expect("the key is redeemable at the CI path");
+        assert_eq!(meta.purpose, AUTH_KEY_PURPOSE_CI);
+        let mut ops = meta.ops.clone();
+        ops.sort();
+        assert_eq!(ops, vec!["attach".to_owned(), "flash".to_owned()]);
+    }
+
+    /// The default is still a node-enrollment key with no ops, so the
+    /// coordinator's redemption behaviour for existing callers is unchanged.
+    #[tokio::test]
+    async fn defaults_to_a_node_key_with_no_ops() {
+        let (dir, sqlite) = coordinator_config_dir();
+        auth_key(args_for(Some(dir.path().to_owned())))
+            .await
+            .unwrap();
+
+        let db = Db::connect(sqlite.to_str().unwrap()).await.unwrap();
+        let org = OrgId(DEFAULT_ORG_ID.to_owned());
+        let keys = db.list_auth_keys(&org).await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].purpose, AUTH_KEY_PURPOSE_NODE);
+        let meta = db
+            .ci_auth_key_meta(&keys[0].key_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(meta.ops.is_empty(), "empty ops let DEFAULT_CI_KEY_OPS apply");
+    }
+
+    /// A tagless CI key could never redeem — and its empty tag set would be an
+    /// empty *selector*, i.e. every board in the org. Refused at mint time, and
+    /// refused before any config or database work, so a bad invocation leaves
+    /// no org behind.
+    #[tokio::test]
+    async fn a_tagless_ci_key_is_refused_before_touching_the_database() {
+        let args = AuthKeyArgs {
+            purpose: AUTH_KEY_PURPOSE_CI.to_owned(),
+            ..args_for(Some(std::path::PathBuf::from(
+                "/nonexistent/coordinator/config/dir",
+            )))
+        };
+        let err = auth_key(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("empty selector"),
+            "the refusal must say why, got: {err}"
+        );
+    }
+
+    /// A typo in `--ops` names the unknown op, rather than being dropped and
+    /// discovered as a missing capability at redemption — also before any
+    /// database work.
+    #[tokio::test]
+    async fn an_unknown_op_is_named_before_touching_the_database() {
+        let args = AuthKeyArgs {
+            tag: vec!["desk".to_owned()],
+            purpose: AUTH_KEY_PURPOSE_CI.to_owned(),
+            ops: Some("flash,bogus".to_owned()),
+            ..args_for(Some(std::path::PathBuf::from(
+                "/nonexistent/coordinator/config/dir",
+            )))
+        };
+        let err = auth_key(args).await.unwrap_err().to_string();
+        assert!(err.contains("bogus"), "the refusal must name the op: {err}");
     }
 }

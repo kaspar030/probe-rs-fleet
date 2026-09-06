@@ -164,7 +164,10 @@ pub struct InitArgs {
 /// with a key its owner minted using `probe-rs-fleet auth-key create`, and
 /// neither needs a shell on the coordinator host. What is still only available
 /// here: minting with no login at all, and `--ttl 0` (a key that never
-/// expires), which the API path refuses.
+/// expires), which the API path refuses. Since `--purpose` landed here too,
+/// this is also the only path to a never-expiring **CI** key
+/// (`--purpose ci --ttl 0`) — each half was supported, but only this verb
+/// composes them.
 ///
 /// Auth keys are the weak link in the model — long-lived credentials that end
 /// up in strangers' CI config and disk images — so they are org-scoped, TTL'd,
@@ -183,6 +186,11 @@ pub struct AuthKeyArgs {
     #[arg(long)]
     pub tag: Vec<String>,
     /// Time-to-live in seconds (default 24h). 0 means no expiry.
+    ///
+    /// A never-expiring `--purpose ci` key is still bounded where it matters:
+    /// its redemption synthesises a grant capped at 30 days, re-upserted
+    /// forward on each redemption, so a perpetual key yields a rolling 30-day
+    /// share of the tagged boards rather than an unbounded one.
     #[arg(long, default_value_t = 86_400)]
     pub ttl: u64,
     /// Allow the key to enroll more than one node.
@@ -190,6 +198,23 @@ pub struct AuthKeyArgs {
     /// Convenient for provisioning a rack; correspondingly worse if it leaks.
     #[arg(long)]
     pub multi_use: bool,
+    /// What the key is for: `node` (enroll a machine that *offers* probes — the
+    /// default) or `ci` (a runner that *leases* them, architecture §6.7).
+    ///
+    /// A `ci` key is the fallback for a runner with no workload identity, and
+    /// it is honestly the weak path: a long-lived bearer secret in somebody
+    /// else's CI config. It requires at least one `--tag`, because the tags
+    /// become the selector of the grant its redemption synthesises and an empty
+    /// selector matches every board in the org.
+    #[arg(long, default_value = "node", value_parser = ["node", "ci"])]
+    pub purpose: String,
+    /// For `--purpose ci`: the operations the key's grant confers,
+    /// comma-separated. Defaults to `flash,attach,reset,erase`.
+    ///
+    /// `power-cycle` is deliberately not in that default: an unattended runner
+    /// cutting power to a lab board should be an explicit choice.
+    #[arg(long)]
+    pub ops: Option<String>,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
     #[arg(long)]
@@ -1468,6 +1493,8 @@ mod tests {
                     assert_eq!(k.tag, vec!["nrf52".to_owned()]);
                     assert_eq!(k.ttl, 600);
                     assert!(k.multi_use);
+                    assert_eq!(k.purpose, "node");
+                    assert!(k.ops.is_none());
                 }
                 other => panic!("expected auth-key, got {other:?}"),
             },
@@ -1486,11 +1513,62 @@ mod tests {
                     assert!(!k.multi_use);
                     assert_eq!(k.ttl, 86_400);
                     assert!(k.org.is_none());
+                    assert_eq!(k.purpose, "node");
+                    assert!(k.ops.is_none());
                 }
                 other => panic!("expected auth-key, got {other:?}"),
             },
             other => panic!("expected coordinator, got {other:?}"),
         }
+    }
+
+    /// The parity fix: the shell verb speaks `--purpose`/`--ops` too, so the
+    /// one combination neither path could express before — a CI key that never
+    /// expires — is reachable.
+    #[test]
+    fn parses_coordinator_auth_key_ci_purpose_and_ops() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "coordinator",
+            "auth-key",
+            "--tag",
+            "desk",
+            "--purpose",
+            "ci",
+            "--ops",
+            "flash,attach",
+            "--ttl",
+            "0",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::AuthKey(k)) => {
+                    assert_eq!(k.purpose, "ci");
+                    assert_eq!(k.ops.as_deref(), Some("flash,attach"));
+                    assert_eq!(k.tag, vec!["desk".to_owned()]);
+                    assert_eq!(k.ttl, 0);
+                }
+                other => panic!("expected auth-key, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    /// A junk purpose is a parse error on this path too: the two minting verbs
+    /// must not disagree about what a purpose is.
+    #[test]
+    fn coordinator_auth_key_rejects_an_unknown_purpose() {
+        assert!(
+            Cli::try_parse_from(os(&[
+                "probe-rs-fleet",
+                "coordinator",
+                "auth-key",
+                "--purpose",
+                "wat",
+            ]))
+            .is_err(),
+            "an unrecognised purpose must be a parse error, never a silent default"
+        );
     }
 
     /// The interim bootstrap verb defaults to `admin`: the first token minted
