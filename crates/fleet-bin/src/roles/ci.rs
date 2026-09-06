@@ -42,6 +42,7 @@
 //! The variables are exactly the two the sidecar already reads
 //! (`fleet_sidecar::selector`), so nothing in the sidecar changes.
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -100,7 +101,7 @@ pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
             .map_err(|e| describe(&e, "exchanging this job's GitHub workload identity"))
     }?;
 
-    emit(&args, &url, &response)?;
+    emit(&args, &url, &response, github_env_destination().as_deref())?;
     print_summary(&response);
     Ok(ExitCode::SUCCESS)
 }
@@ -139,12 +140,36 @@ async fn request_github_oidc_token(audience: &str) -> Result<String> {
         .context("requesting an OIDC token from GitHub's own token service")
 }
 
-/// Export the credential, to `$GITHUB_ENV` or to stdout.
+/// Where GitHub Actions wants environment variables appended, if anywhere.
+///
+/// Resolved once, at the CLI entry point, and passed *into* [`emit`] — the
+/// process environment is global mutable state, and reading it inside the code
+/// under test is what made two unit tests race on it.
+///
+/// An empty value counts as unset: a runner that exports `GITHUB_ENV=` has no
+/// file to append to.
+fn github_env_destination() -> Option<PathBuf> {
+    std::env::var_os(ENV_GITHUB_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Export the credential, to `github_env` or to stdout.
+///
+/// The destination is a parameter, resolved by the caller
+/// ([`github_env_destination`]), not read from the environment here: that keeps
+/// this function pure with respect to process-global state and lets the tests
+/// below exercise both branches without racing each other.
 ///
 /// **The token is never printed when `$GITHUB_ENV` is written.** stdout is the
 /// job log on every CI system worth naming, and a credential in a log is a
 /// credential in whatever archives that log.
-fn emit(args: &CiLoginArgs, url: &str, response: &TokenResponse) -> Result<()> {
+fn emit(
+    args: &CiLoginArgs,
+    url: &str,
+    response: &TokenResponse,
+    github_env: Option<&Path>,
+) -> Result<()> {
     let mut vars = vec![
         ("PROBE_RS_FLEET_COORDINATOR", url.to_owned()),
         ("PROBE_RS_FLEET_TOKEN", response.token.clone()),
@@ -154,13 +179,12 @@ fn emit(args: &CiLoginArgs, url: &str, response: &TokenResponse) -> Result<()> {
         vars.push(("PROBE_RS_FLEET_SERVER_CERT_SHA256", pin.clone()));
     }
 
-    let github_env = std::env::var_os(ENV_GITHUB_ENV).filter(|v| !v.is_empty());
     if let Some(path) = github_env {
         use std::io::Write as _;
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
+            .open(path)
             .with_context(|| {
                 format!("appending to ${ENV_GITHUB_ENV} ({})", path.to_string_lossy())
             })?;
@@ -282,9 +306,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("github.env");
         std::fs::write(&path, "PRE=existing\n").unwrap();
-        temp_env_set(ENV_GITHUB_ENV, path.to_str().unwrap(), || {
-            emit(&args(), "https://fleet.example", &response()).unwrap();
-        });
+        emit(
+            &args(),
+            "https://fleet.example",
+            &response(),
+            Some(path.as_path()),
+        )
+        .unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         // Appended, never truncated: the runner and other steps write here too.
         assert!(written.starts_with("PRE=existing\n"));
@@ -299,9 +327,7 @@ mod tests {
     fn without_github_env_the_export_form_is_used() {
         // `emit` prints, which a unit test cannot capture; what is asserted is
         // that it does not fail and writes no file.
-        temp_env_unset(ENV_GITHUB_ENV, || {
-            emit(&args(), "https://fleet.example", &response()).unwrap();
-        });
+        emit(&args(), "https://fleet.example", &response(), None).unwrap();
     }
 
     /// A malformed audience is refused before any request leaves the process.
@@ -359,32 +385,25 @@ mod tests {
         assert!(text.contains("audience"), "{text}");
     }
 
-    // --- tiny env helpers -------------------------------------------------
+    // --- tiny env helper --------------------------------------------------
     //
-    // `std::env::set_var` is process-global; these tests do not run
-    // concurrently with anything that reads the same variables, and the
-    // env-mutating integration tests take `ENV_LOCK` instead.
-
-    fn temp_env_set<T>(key: &str, value: &str, f: impl FnOnce() -> T) -> T {
-        let old = std::env::var_os(key);
-        std::env::set_var(key, value);
-        let out = f();
-        match old {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        out
-    }
-
-    fn temp_env_unset<T>(key: &str, f: impl FnOnce() -> T) -> T {
-        let old = std::env::var_os(key);
-        std::env::remove_var(key);
-        let out = f();
-        if let Some(v) = old {
-            std::env::set_var(key, v);
-        }
-        out
-    }
+    // `emit` takes its `$GITHUB_ENV` destination as a parameter precisely so
+    // that the tests above need no environment at all: libtest runs tests as
+    // parallel threads in one process, so a test that sets a variable another
+    // test reads is a race, not a fixture. That is exactly the flake the
+    // set/unset helpers that used to live here caused.
+    //
+    // What is left mutates only `ACTIONS_ID_TOKEN_REQUEST_URL`, and only ever
+    // *removes* it: nothing else in this test binary reads or writes that key
+    // (`tests/ci_e2e.rs` is a separate binary with its own `ENV_LOCK`), so the
+    // concurrent removes are idempotent. It is still process-global state — if
+    // a future test needs that variable *set*, take
+    // `crate::test_support::ENV_LOCK` rather than extending this helper.
+    //
+    // Note `std::env::set_var`/`remove_var` are `unsafe` as of edition 2024 for
+    // exactly this reason. The workspace is on 2021 and forbids `unsafe_code`,
+    // so this compiles today, but an edition bump turns it into a build problem
+    // and the fix is to remove the mutation, not to wrap it.
 
     async fn temp_env_unset_async<F: std::future::Future>(key: &str, f: F) -> F::Output {
         let old = std::env::var_os(key);
