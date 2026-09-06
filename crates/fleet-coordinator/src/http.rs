@@ -17,6 +17,7 @@
 //! | `GET /auth/github/start` | anyone | 302 to GitHub's authorize endpoint (browser login) |
 //! | `GET /auth/github/callback` | anyone with a valid `state` | exchange the code, set the session cookies |
 //! | `GET /api/v1/*` | browser sessions, or a bearer | the read-only JSON API ([`crate::api`]) |
+//! | `POST`/`PATCH`/`DELETE /api/v1/*` | browser sessions (+ `X-Fleet-Csrf`), or a bearer | the management verbs ([`crate::api`]) |
 //!
 //! The last three are the browser surface (`docs/web-ui.md`); their handlers
 //! live in [`crate::browser_auth`] and [`crate::api`] and are merged into the
@@ -1374,7 +1375,18 @@ async fn refresh_session(coord: &Coordinator, session_token: &str) -> Response {
 /// (`coordinator auth-key --ttl 0` still allows it); a hosted org member's is
 /// not, so this path refuses `ttl_secs = 0` and caps the rest. A config knob is
 /// a trivial follow-up; a documented constant keeps the config surface flat.
-const MAX_API_AUTH_KEY_TTL_SECS: u64 = 30 * 24 * 3600;
+///
+/// `pub(crate)` so [`crate::api`] can *report* the bound rather than duplicate
+/// it: the browser has to constrain a TTL input, and a frontend that hardcoded
+/// `30` would be silently wrong the day this constant moves.
+pub(crate) const MAX_API_AUTH_KEY_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// The shortest revocation prefix `POST /auth/keys` accepts, in hex characters.
+///
+/// Reported by [`crate::api`] for the same reason as the TTL cap above; the
+/// enforcement stays in [`revoke_auth_key`], which is the only place that may
+/// decide it.
+pub(crate) const MIN_AUTH_KEY_PREFIX_LEN: usize = 8;
 
 /// `POST /auth/keys` — mint, list and revoke the caller's org's auth keys
 /// (architecture §6.4).
@@ -1401,31 +1413,8 @@ async fn auth_keys(
     let org = OrgId(auth.org_id.clone());
     let now_i64 = i64::try_from(coord.now()).unwrap_or(i64::MAX);
 
-    // Membership, mirroring `self_register`: a valid session whose membership
-    // was revoked must not keep minting enrollment credentials.
-    match coord.db().role_of(&org, &auth.id).await {
-        Ok(Some(_role)) => {}
-        Ok(None) => {
-            let _ = coord
-                .db()
-                .scoped(org.clone())
-                .append_audit(&AuditEntry {
-                    ts: now_i64,
-                    subject: Some(auth.id.as_str()),
-                    action: "auth_key.denied",
-                    node: None,
-                    board: None,
-                    lease: None,
-                    detail: Some("not a member of the org the session belongs to"),
-                })
-                .await;
-            warn!(org = %org, subject = %auth.id, "auth-key request by a non-member");
-            return reject(StatusCode::FORBIDDEN, "forbidden");
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to resolve membership");
-            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
-        }
+    if let Err(response) = require_membership_for_auth_keys(&coord, &org, &auth.id, now_i64).await {
+        return response;
     }
 
     match request {
@@ -1456,16 +1445,70 @@ async fn auth_keys(
     }
 }
 
+/// Membership is required to touch the org's auth keys — and the refusal is
+/// audited.
+///
+/// Factored out of [`auth_keys`] so the browser surface ([`crate::api`]'s
+/// `/api/v1/auth-keys`) applies the *same* rule and writes the *same*
+/// `auth_key.denied` row, exactly as [`require_membership_to_approve`] does for
+/// node approval. Two surfaces onto one credential must not disagree about who
+/// may mint it, and an audit log with two differently-named refusal actions is
+/// one nobody can query.
+///
+/// Mirrors `self_register`: a valid session whose membership was revoked must
+/// not keep minting enrollment credentials.
+///
+/// # Errors
+///
+/// The `403` / `500` [`Response`] to return, on refusal or a database failure.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn require_membership_for_auth_keys(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    now: i64,
+) -> Result<(), Response> {
+    match coord.db().role_of(org, user_id).await {
+        Ok(Some(_role)) => Ok(()),
+        Ok(None) => {
+            let _ = coord
+                .db()
+                .scoped(org.clone())
+                .append_audit(&AuditEntry {
+                    ts: now,
+                    subject: Some(user_id),
+                    action: "auth_key.denied",
+                    node: None,
+                    board: None,
+                    lease: None,
+                    detail: Some("not a member of the org the session belongs to"),
+                })
+                .await;
+            warn!(org = %org, subject = %user_id, "auth-key request by a non-member");
+            Err(reject(StatusCode::FORBIDDEN, "forbidden"))
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to resolve membership");
+            Err(reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))
+        }
+    }
+}
+
 /// Mint an auth key for `org` on behalf of `user_id`.
 ///
 /// The secret exists exactly once, in this response: only its SHA-256 is
 /// stored. `created_by` is finally populated on this path, which is what lets
 /// the creator revoke their own key later.
+///
+/// `pub(crate)` for [`crate::api`], which **calls** it rather than forking the
+/// validation: `ttl_secs = 0`, the TTL cap, the `purpose` allowlist, the
+/// tagless-`ci` refusal and the op normalisation are one implementation or they
+/// are two that will disagree.
 // One argument per column, as `insert_auth_key` has: the columns are the key's
 // whole definition and bundling them would only move the same list down a
 // level.
 #[allow(clippy::too_many_arguments)]
-async fn create_auth_key(
+pub(crate) async fn create_auth_key(
     coord: &Coordinator,
     org: &OrgId,
     user_id: &str,
@@ -1581,7 +1624,9 @@ async fn create_auth_key(
 }
 
 /// List `org`'s auth keys. Hash-only, so the listing is never a credential.
-async fn list_auth_keys(coord: &Coordinator, org: &OrgId) -> Response {
+///
+/// `pub(crate)` for [`crate::api`]; see [`create_auth_key`].
+pub(crate) async fn list_auth_keys(coord: &Coordinator, org: &OrgId) -> Response {
     let keys = match coord.db().list_auth_keys(org).await {
         Ok(keys) => keys,
         Err(e) => {
@@ -1614,7 +1659,12 @@ async fn list_auth_keys(coord: &Coordinator, org: &OrgId) -> Response {
 /// their own key, an **org admin** may revoke any of the org's keys — including
 /// the shell-minted ones whose `created_by` is `NULL`, which would otherwise be
 /// unrevokable from here.
-async fn revoke_auth_key(
+///
+/// `pub(crate)` for [`crate::api`]; see [`create_auth_key`]. The CI-grant
+/// revocation cascade below is the reason forking this would be worse than it
+/// looks — a second implementation that forgot it would leave a runner relaying
+/// bytes on a board whose key the operator believes is dead.
+pub(crate) async fn revoke_auth_key(
     coord: &Coordinator,
     org: &OrgId,
     user_id: &str,
@@ -1626,7 +1676,7 @@ async fn revoke_auth_key(
     // Load-bearing, not hygiene: `delete_auth_keys_by_prefix` with an empty
     // prefix is `LIKE '%'`, i.e. every key in the org. A short or non-hex
     // prefix cannot address a key on purpose, so it is refused outright.
-    if prefix.len() < 8 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+    if prefix.len() < MIN_AUTH_KEY_PREFIX_LEN || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     }
 

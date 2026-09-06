@@ -572,4 +572,28 @@ impl AgentStub {
             other => panic!("expected OpenSession, got {other:?}"),
         }
     }
+
+    /// Await the next `PowerCycle` command, returning the board name it names.
+    ///
+    /// The point of asserting on the *command* rather than on the handler's
+    /// `200` is that power-cycle is the one op the coordinator enforces: an
+    /// implementation that authorized correctly and then sent nothing, or sent
+    /// the wrong board, would pass a status-code-only test.
+    pub async fn expect_power_cycle(&mut self) -> fleet_proto::ids::BoardName {
+        match self.rx.recv().await.expect("agent connection closed") {
+            fleet_coordinator::registry::AgentMessage::Command(
+                fleet_proto::CoordinatorCommand::PowerCycle { board },
+            ) => board,
+            other => panic!("expected PowerCycle, got {other:?}"),
+        }
+    }
+
+    /// Whether any command is queued for this stub, without waiting.
+    ///
+    /// For the negative half of a power-cycle test: a *refused* request must
+    /// have left the agent with nothing to do, which "the response was a 403"
+    /// alone does not show.
+    pub fn is_idle(&mut self) -> bool {
+        self.rx.try_recv().is_err()
+    }
 }

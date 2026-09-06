@@ -349,20 +349,34 @@ deliberate follow-up that moves all three.
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/boards` | — | `[BoardSummary]` | `Coordinator::list_boards` | anyone with non-empty `Access` |
-| `POST /api/v1/boards/power-cycle` | `{"board":"<name or qualified>"}` | `{"board":"…"}` | `Coordinator::operator_power_cycle` | `board_access` + `AllowedOp::PowerCycle` for a grantee |
-| `GET /api/v1/leases` | — | `[LeaseHolderSummary]` | `Coordinator::who` | anyone with non-empty `Access` |
-| `DELETE /api/v1/leases/{lease_id}` | — | `{"lease":N}` | `Coordinator::release_lease` | lease holder, or org admin |
+| `GET /api/v1/boards` | — | `[BoardSummary]` | `Coordinator::list_boards_core` | anyone with non-empty `Access` |
+| `POST /api/v1/boards/power-cycle` | `{"board":"<name or qualified>"}` | `{"board":"…"}` | `Coordinator::operator_power_cycle_core` | `board_access` + `AllowedOp::PowerCycle` for a grantee |
+| `GET /api/v1/leases` | — | `[LeaseHolderSummary]` | `Coordinator::who_core` | anyone with non-empty `Access` |
+| `DELETE /api/v1/leases/{lease_id}` | — | `{"lease":N}` | `Coordinator::release_lease_core` | lease holder, or org admin |
 
 There is no `POST /api/v1/leases` (D4).
+
+A `lease_id` is a `u64`, which is why it is the one identifier on this surface
+that may live in a path at all: unlike a `BoardRef` or a node id it contains no
+slash. A non-numeric segment is a `400 invalid_request` rather than a `404` — it
+is a malformed request, not an answer about whether a lease exists. "Org admin"
+means the **board org's** admin, so reclaiming your own hardware from somebody
+you shared it with works; `authz::require_lease_control` already says so, and a
+stranger gets the answer they would get for a lease that does not exist.
 
 ### Grants
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/grants` | — | `[GrantSummary]` | `Coordinator::grant_list` | member |
-| `POST /api/v1/grants` | `{"subject","selector","ops":[…],"expires":N}` | `GrantSummary` | `Coordinator::grant_create` | **admin** |
-| `DELETE /api/v1/grants/{id_prefix}` | — | `{"revoked":["…"]}` | `Coordinator::grant_revoke` | grant creator, or admin |
+| `GET /api/v1/grants` | — | `[GrantSummary]` | `Coordinator::grant_list_core` | member |
+| `GET /api/v1/grants/limits` | — | `{"max_ttl_secs","expires_optional","now","ops":[…],"min_revoke_prefix","auth_key_max_ttl_secs"}` | config only | member |
+| `POST /api/v1/grants` | `{"subject","selector","ops":[…],"expires":N}` | `GrantSummary` | `Coordinator::grant_create_core` | **admin** |
+| `DELETE /api/v1/grants/{id_prefix}` | — | `{"revoked":["…"]}` | `Coordinator::grant_revoke_core` | grant creator, or admin |
+
+Note the deliberate divergence from auth keys: grant **create** is admin-only
+while grant **list** needs only membership. An auth key cannot exceed the
+caller's own org (it enrolls a node *into* it); a grant points outward, handing
+the org's hardware to somebody who is not in it at all.
 
 `selector` is the **canonical selector string** and is canonicalised
 server-side: `board=<name>`, `chip=<c>`, `tag=<t>`, and `a && b` conjunctions,
@@ -379,26 +393,50 @@ enforcement**. The UI must say so where ops are picked, or it will read as a
 permission system it is not. A data-plane op implies `attach`, and that
 implication must be shown, as the CLI shows it.
 
-`expires` is required: the API refuses an unbounded grant.
+**That op table ships as data, not as prose.** `GET /api/v1/grants/limits`
+returns, per op, its label, `enforced_by` (`agent` / `coordinator` / `nobody`)
+and `implies_attach`, read from `AllowedOp::is_enforced` and
+`AllowedOp::needs_data_channel`. A frontend that re-derived the table from this
+document would drift from the enum the first time an op moved.
+
+`expires` is **required and capped on both ends**: it must be in the future and
+no more than `Coordinator::MAX_GRANT_TTL_SECS` (365 days) away — `core.rs`
+refuses `expires <= now` as well as an over-long TTL, and refuses an absent one
+outright. Both bounds, plus the server's own `now`, come back from
+`GET /api/v1/grants/limits`, so the date picker constrains itself from the
+contract rather than from a hardcoded `365` that goes stale silently (and from
+the *coordinator's* clock, not the browser's — that difference is exactly what
+turns "one minute from now" into a `400`).
 
 ### Auth keys
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/auth-keys` | — | `AuthKeyList` (hashes only) | `http::list_auth_keys` | member |
-| `POST /api/v1/auth-keys` | `{"tags":[…],"ttl_secs":N,"multi_use":false,"purpose":"node"\|"ci","ops":[…]}` | `AuthKeyCreated` — **the only time the secret exists** | `http::create_auth_key` | member |
-| `DELETE /api/v1/auth-keys/{hash_prefix}` | — | `AuthKeyRevoked` | `http::revoke_auth_key` | key creator, or admin |
+| `GET /api/v1/auth-keys` | — | `AuthKeyList` (hashes only) | `http::list_auth_keys` (**unchanged**) | member |
+| `POST /api/v1/auth-keys` | `{"tags":[…],"ttl_secs":N,"multi_use":false,"purpose":"node"\|"ci","ops":[…]}` | `AuthKeyCreated` — **the only time the secret exists** | `http::create_auth_key` (**unchanged**) | member |
+| `DELETE /api/v1/auth-keys/{hash_prefix}` | — | `AuthKeyRevoked` | `http::revoke_auth_key` (**unchanged**) | key creator, or admin |
 
 `ttl_secs = 0` is a `400` and the TTL is capped at 30 days
-(`MAX_API_AUTH_KEY_TTL_SECS`), exactly as on `POST /auth/keys`. The prefix must
-be at least 8 hex characters. The UI shows the key once, in a panel that says it
-will not be shown again, and never stores it anywhere.
+(`MAX_API_AUTH_KEY_TTL_SECS`), exactly as on `POST /auth/keys` — the same
+function is called, so `purpose` outside `node` / `ci` is a `400`, a `ci` key
+with no tags is a `400`, and revoking a `ci` key cascades into the grant its
+redemption synthesised. The prefix must be at least 8 hex characters. Both
+numbers are also reported by `GET /api/v1/grants/limits`. The UI shows the key
+once, in a panel that says it will not be shown again, and never stores it
+anywhere.
+
+`POST /api/v1/auth-keys` is the **one** place this surface returns a long-lived
+bearer secret, and it is not a counter-example to "no capability token ever
+reaches the browser" (§5, D4): an auth key is org-scoped, expiring, listable,
+revocable and confers only the right to *enroll*, where a capability token is
+offline-verifiable, unrevokable short of tearing down its lease, and confers
+control of a leased board.
 
 ### Audit log
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/audit?board=<name>` | — | `[LogLine]`, newest first, **at most 200** | `Coordinator::logs` | **admin** |
+| `GET /api/v1/audit?board=<name>` | — | `[LogLine]`, newest first, **at most 200** | `Coordinator::logs_core` | **admin** |
 
 **v1 has no paging and no filtering beyond `board`.** `logs()` calls
 `OrgDb::recent_audit` with a hardcoded limit of 200 and this endpoint keeps that
@@ -429,14 +467,14 @@ against the *target object's* org through the existing evaluator —
 | Endpoint group | Rule | Where it already lives |
 |---|---|---|
 | boards list, leases list | non-empty `Access` (own-org membership, or a live grant) | `authz::board_access` |
-| power-cycle | `Access` + `AllowedOp::PowerCycle` for a grantee | `Coordinator::operator_power_cycle` |
-| lease release | **holder, or org admin** | `authz::require_lease_control` |
+| power-cycle | `Access` + `AllowedOp::PowerCycle` for a grantee | `Coordinator::operator_power_cycle_core` |
+| lease release | **holder, or the board org's admin** | `authz::require_lease_control` |
 | grant create | **admin** | `require_role(Admin)` |
 | grant list | membership | `require_role(Member)` |
-| grant revoke | **creator, or admin** | `Coordinator::grant_revoke` |
-| auth-key mint / list | membership | `http::auth_keys` |
+| grant revoke | **creator, or admin** | `Coordinator::grant_revoke_core` |
+| auth-key mint / list | membership | `http::require_membership_for_auth_keys` |
 | auth-key revoke | **creator, or admin** | `http::revoke_auth_key` |
-| audit log | **admin** | `Coordinator::logs` (+ `OrgDb` scoping, a second independent fence) |
+| audit log | **admin** | `Coordinator::logs_core` (+ `OrgDb` scoping, a second independent fence) |
 | org / member list | membership | new, `require_role(Member)` |
 | pending-node approve / deny | membership | §6.4, `decide_pending_node` (there is no listing; see §3/§4) |
 | node list | membership | new |
@@ -508,6 +546,12 @@ short of tearing down the lease (§6.5) — it is exactly the wrong thing to put
 where an XSS can read it. So: no `delegate` endpoint, no lease acquisition, no
 `ChannelOpened::token`, no `LeaseGrant::token`. Enforce it with a test over the
 API's response types rather than by remembering.
+
+The one long-lived secret this surface *does* return —
+`POST /api/v1/auth-keys`'s `AuthKeyCreated.key` — is not one of these, and the
+enforcing test knows the difference by name rather than by prefix class: an auth
+key is org-scoped, expiring, listable, revocable (cascading into any grant it
+synthesised) and confers only the right to enroll. D4 accepts it explicitly.
 
 **CSRF, both options stated.** With `Authorization: Bearer` from JS there is no
 CSRF at all — the credential is not ambient — but see the first note. With a

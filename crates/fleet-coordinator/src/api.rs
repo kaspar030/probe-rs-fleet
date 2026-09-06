@@ -2,7 +2,8 @@
 //!
 //! One `Router`, every JSON handler, and the view structs that shape the
 //! responses. Phase 1a was read-only apart from `POST /api/v1/session/logout`;
-//! phase 1b adds the node-management verbs — see
+//! phase 1b adds the node-management verbs and phase 1c the outward-pointing
+//! ones — see
 //! [§ Which routes mutate, and why](#which-routes-mutate-and-why).
 //!
 //! # The no-drift guarantee is structural
@@ -40,6 +41,13 @@
 //! that might grow one, and `tests/api_readonly.rs` asserts no response body
 //! contains a token prefix.
 //!
+//! `POST /api/v1/auth-keys` is the one deliberate exception and it is **not** a
+//! counter-example: an auth key is a revocable, org-scoped, expiring
+//! *enrollment* credential, not an offline-verifiable capability over a leased
+//! board. `docs/web-ui.md` D4 accepts the cost explicitly, because the
+//! alternative is a UI whose most-asked-for enrollment path is the one thing
+//! you must leave the browser for. See [`create_auth_key`].
+//!
 //! # Which routes mutate, and why
 //!
 //! `docs/web-ui.md` §6's phase fence put phase 1a's cookie, CSP and CSRF
@@ -55,6 +63,28 @@
 //!   node registration, cashing in `docs/architecture.md` §4.2's promise that a
 //!   cookie-authenticated handler would call the *same*
 //!   [`crate::http::decide_pending_node`]; see [`decide_pending`].
+//!
+//! Phase **1c** adds the outward-pointing verbs — the two surfaces where a
+//! mistake hands hardware to somebody else, which is why the doc's phase fence
+//! put them last:
+//!
+//! * `POST /api/v1/grants` / `DELETE /api/v1/grants/{id_prefix}` — sharing this
+//!   org's hardware with a subject who is not in it, and taking it back. Create
+//!   is **admin**-gated while list is member-gated; that divergence is
+//!   deliberate and lives in the cores. See [`create_grant`].
+//! * `POST /api/v1/auth-keys` / `DELETE /api/v1/auth-keys/{hash_prefix}` —
+//!   minting and revoking enrollment credentials, by **calling**
+//!   [`crate::http::create_auth_key`] / [`crate::http::revoke_auth_key`]
+//!   unchanged. See [`create_auth_key`].
+//! * `POST /api/v1/boards/power-cycle` — the one [`fleet_proto::token::AllowedOp`]
+//!   the *coordinator* enforces; see [`power_cycle`].
+//! * `DELETE /api/v1/leases/{lease_id}` — holder-or-admin lease release,
+//!   including a board org's admin reclaiming their own hardware from someone
+//!   they shared it with; see [`release_lease`].
+//!
+//! There is deliberately **no** `POST /api/v1/leases` and no `/delegate`
+//! equivalent (`docs/web-ui.md` D4): a lease taken in a browser has no sidecar
+//! to use it, and delegation hands out a capability token.
 //!
 //! Every one of them calls [`csrf_ok`] before touching anything, and the check
 //! is a single shared helper rather than a per-handler line of code precisely
@@ -84,17 +114,20 @@ use std::sync::Arc;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use fleet_auth::api::NodeApprovalDecision;
 use fleet_auth::TokenKind;
-use fleet_proto::admin::{BoardAvailability, BoardSummary, LeaseHolderSummary, LogLine};
+use fleet_proto::admin::{
+    BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine,
+};
 use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::board::PowerKind;
-use fleet_proto::ids::{BoardName, BoardRef, Role, Subject, SubjectKey};
+use fleet_proto::ids::{BoardName, BoardRef, LeaseId, Role, Subject, SubjectKey};
+use fleet_proto::token::AllowedOp;
 
 use crate::browser_auth::{cleared_session_cookies, csrf_ok};
 use crate::core::{Coordinator, NodeStatus, OpError};
@@ -120,7 +153,14 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
         )
         .route("/api/v1/nodes/pending/{code}", post(decide_pending))
         .route("/api/v1/boards", get(boards))
+        .route("/api/v1/boards/power-cycle", post(power_cycle))
         .route("/api/v1/leases", get(leases))
+        .route("/api/v1/leases/{lease_id}", delete(release_lease))
+        .route("/api/v1/grants", get(grants).post(create_grant))
+        .route("/api/v1/grants/{id_prefix}", delete(revoke_grant))
+        .route("/api/v1/grants/limits", get(grant_limits))
+        .route("/api/v1/auth-keys", get(auth_keys).post(create_auth_key))
+        .route("/api/v1/auth-keys/{hash_prefix}", delete(revoke_auth_key))
         .route("/api/v1/audit", get(audit))
         .merge(crate::browser_auth::api_routes())
 }
@@ -493,6 +533,123 @@ struct MemberView {
     user_id: String,
     login: Option<String>,
     role: &'static str,
+}
+
+/// One `AllowedOp`, with where it is actually enforced.
+///
+/// `docs/web-ui.md` §6.5 is honest about this and §3 requires the UI to be too:
+/// only three of the six labels are enforced anywhere, and a picker that
+/// rendered all six identically would read as a permission system it is not.
+/// Shipping the fact as a **field** rather than as prose in this doc comment is
+/// deliberate: a frontend that re-derived the table would drift from
+/// [`AllowedOp::is_enforced`] the first time an op moved.
+#[derive(Debug, Serialize)]
+struct OpView {
+    /// The wire label, as `POST /api/v1/grants` accepts it.
+    op: &'static str,
+    /// `agent`, `coordinator`, or `nobody` — who checks it at use time.
+    ///
+    /// `nobody` is not a euphemism: `flash` / `erase` / `reset` travel in band
+    /// inside an open data channel that the fleet relays without parsing, so
+    /// recording them is intent and audit, never a control.
+    enforced_by: &'static str,
+    /// Whether granting this op implies [`AllowedOp::Attach`], because it is
+    /// unusable without a data channel. `normalize_ops` adds it server-side;
+    /// the UI shows the implication, as the CLI does.
+    implies_attach: bool,
+}
+
+impl From<AllowedOp> for OpView {
+    fn from(op: AllowedOp) -> Self {
+        Self {
+            op: op.as_str(),
+            enforced_by: match op {
+                AllowedOp::Attach | AllowedOp::Gdb => "agent",
+                AllowedOp::PowerCycle => "coordinator",
+                AllowedOp::Flash | AllowedOp::Erase | AllowedOp::Reset => "nobody",
+            },
+            implies_attach: op.needs_data_channel(),
+        }
+    }
+}
+
+/// `GET /api/v1/grants/limits`' body — the endpoint contract, as data.
+///
+/// Every bound `POST /api/v1/grants` enforces, plus the op semantics, in a
+/// shape the frontend reads instead of duplicating. `docs/web-ui.md` §3 asks
+/// for exactly this: #3540 has to constrain a date picker to
+/// [`Coordinator::MAX_GRANT_TTL_SECS`] and refuse a past date, and a hardcoded
+/// `365` in JavaScript is a number that goes stale silently — the picker keeps
+/// offering a year while the server starts refusing it, and the operator sees
+/// an unexplained `400`.
+///
+/// Unauthenticated?  No: it is member-gated like the listing it describes.
+/// These are not secrets, but an anonymous endpoint that reports a
+/// deployment's policy constants is a fingerprinting surface for nothing in
+/// return.
+#[derive(Debug, Serialize)]
+struct GrantLimitsView {
+    /// Maximum lifetime, in seconds, of a grant created over this API.
+    max_ttl_secs: u64,
+    /// Whether `expires` may be omitted. Always `false`; present so the
+    /// frontend expresses the rule as a check against the contract rather than
+    /// as an assumption.
+    expires_optional: bool,
+    /// The earliest acceptable `expires`, as epoch seconds: the server's *now*.
+    ///
+    /// An expiry at or before this is refused (`core.rs`'s `expires <= now`).
+    /// Sent because a browser's clock is not the coordinator's, and the
+    /// difference is exactly what turns "one minute from now" into a `400`.
+    now: u64,
+    /// The op vocabulary, with each op's enforcement reality.
+    ops: Vec<OpView>,
+    /// The minimum revocation-prefix length shared by grants and auth keys.
+    min_revoke_prefix: usize,
+    /// Maximum auth-key TTL, in seconds — the same contract for
+    /// `POST /api/v1/auth-keys`, whose `ttl_secs = 0` is a `400`.
+    auth_key_max_ttl_secs: u64,
+}
+
+/// One row of `GET /api/v1/grants`, and the body of `POST /api/v1/grants`.
+///
+/// [`GrantSummary`] serializes acceptably already, but is re-shaped here for
+/// the reason every other view struct is: it is a **wire** DTO, and a field
+/// added for the CLI's benefit must not silently appear in a browser response.
+/// `subject` is flattened through [`SubjectView`] so the frontend has one
+/// opaque key plus the parts, exactly as elsewhere.
+#[derive(Debug, Serialize)]
+struct GrantView {
+    id: String,
+    org: String,
+    /// Who the hardware is shared with.
+    subject: SubjectView,
+    /// The **canonical** selector string, as `Constraint`'s `Display` renders
+    /// it — not the string the caller sent.
+    selector: String,
+    /// The stored op set, after `normalize_ops`: sorted, deduplicated, and with
+    /// `attach` added if a data-plane op needed it.
+    ops: Vec<&'static str>,
+    expires: Option<u64>,
+    /// The creating user, or `null` for a row created outside the API. Only an
+    /// org admin can revoke one of those, and the frontend needs to know which
+    /// rows those are to render the difference.
+    created_by: Option<String>,
+    created_at: u64,
+}
+
+impl From<GrantSummary> for GrantView {
+    fn from(g: GrantSummary) -> Self {
+        Self {
+            id: g.id,
+            org: g.org.0,
+            subject: SubjectView::from(&g.subject),
+            selector: g.selector,
+            ops: g.ops.iter().map(|o| o.as_str()).collect(),
+            expires: g.expires,
+            created_by: g.created_by,
+            created_at: g.created_at,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +1070,397 @@ async fn leases(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Re
         Ok(rows) => Json(rows.into_iter().map(LeaseView::from).collect::<Vec<_>>()).into_response(),
         Err(e) => op_error(&e),
     }
+}
+
+/// `POST /api/v1/boards/power-cycle` — cut and restore a board's power.
+///
+/// The board travels **in the body**, not in the path: a [`BoardRef`] is four
+/// slash-separated segments (`docs/web-ui.md` §3), so board-targeting endpoints
+/// take the node-local name (or a qualified one, per §6.5's
+/// `BoardRef::answers_to` grammar) exactly as the wire verbs do.
+///
+/// [`Coordinator::operator_power_cycle_core`] resolves it within the caller's
+/// [`fleet_core::access::Access`] through the tiered `resolve_board` — own org
+/// wins, then granted orgs — and re-checks [`AllowedOp::PowerCycle`] for a
+/// grantee. That second check is not redundant: resolution proves the caller may
+/// *see* the board, not that they may cut its power, and this is the one op the
+/// **coordinator** enforces rather than the agent (the agent's power-cycle
+/// command carries no capability token to check).
+///
+/// A board in another tenant is a `404`, identical to one that does not exist.
+async fn power_cycle(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Ok(request) = serde_json::from_slice::<PowerCycleRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    if request.board.trim().is_empty() {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let board = BoardName(request.board.trim().to_owned());
+    match coord.operator_power_cycle_core(&subject, &board).await {
+        Ok(board) => Json(PowerCycledView { board: board.0 }).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// The body of `POST /api/v1/boards/power-cycle`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PowerCycleRequest {
+    /// A node-local board name, or a qualified one.
+    board: String,
+}
+
+/// `POST /api/v1/boards/power-cycle`'s body.
+#[derive(Debug, Serialize)]
+struct PowerCycledView {
+    /// The node-local name the request resolved to, echoed back — which is how
+    /// a caller who sent a bare name learns *which* board was cycled.
+    board: String,
+}
+
+/// `DELETE /api/v1/leases/{lease_id}` — release a lease.
+///
+/// [`Coordinator::release_lease_core`]'s `require_lease_control` gives
+/// holder-or-admin, and "admin" here means the **board org's** admin: reclaiming
+/// your own hardware from somebody you shared it with is the case this exists
+/// for.
+///
+/// A stranger gets exactly the answer they would get for a lease that does not
+/// exist (`AuthzError::lease_message`, mapped to `404 not_found`). Telling the
+/// two apart would let anyone probe which lease ids are live and, across orgs,
+/// enumerate other tenants' leases.
+///
+/// The id is a `u64` in the path — the one identifier on this surface that is
+/// not a name, and the only reason it may be there at all is that it contains
+/// no slash. A non-numeric segment is a `400`, not a `404`: it is a malformed
+/// request rather than an answer about whether a lease exists.
+async fn release_lease(
+    State(coord): State<Arc<Coordinator>>,
+    Path(lease_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Ok(lease) = lease_id.parse::<u64>() else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    match coord.release_lease_core(&subject, LeaseId(lease)).await {
+        Ok(lease) => Json(ReleasedView { lease: lease.0 }).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/leases/{lease_id}`'s body.
+#[derive(Debug, Serialize)]
+struct ReleasedView {
+    lease: u64,
+}
+
+/// `GET /api/v1/grants` — the grants this org has issued.
+///
+/// **Member**-gated, unlike creation. That divergence from auth keys (where
+/// membership suffices for both) is deliberate and lives in the cores: a
+/// listing names only grants the org itself issued, which any member can
+/// already infer from `ctl list` / `ctl who`.
+///
+/// This is the outbound view. There is deliberately no "what am I granted?"
+/// endpoint; `GET /api/v1/boards` is the grantee-facing one.
+async fn grants(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
+    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    match coord.grant_list_core(&subject).await {
+        Ok(rows) => Json(rows.into_iter().map(GrantView::from).collect::<Vec<_>>()).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// `GET /api/v1/grants/limits` — the bounds `POST /api/v1/grants` enforces.
+///
+/// See [`GrantLimitsView`] for why this is a route rather than prose in
+/// `docs/web-ui.md`. Member-gated, like the listing it describes.
+async fn grant_limits(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
+    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let org = subject.org.clone();
+    let Ok(()) = crate::authz::require_role(coord.db(), &subject, &org, Role::Member).await else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    Json(GrantLimitsView {
+        max_ttl_secs: Coordinator::MAX_GRANT_TTL_SECS,
+        expires_optional: false,
+        now: coord.now(),
+        ops: AllowedOp::all().into_iter().map(OpView::from).collect(),
+        min_revoke_prefix: crate::http::MIN_AUTH_KEY_PREFIX_LEN,
+        auth_key_max_ttl_secs: crate::http::MAX_API_AUTH_KEY_TTL_SECS,
+    })
+    .into_response()
+}
+
+/// The body of `POST /api/v1/grants`.
+///
+/// `deny_unknown_fields`, as everywhere on this surface: a typo'd field that
+/// silently created a *different* grant than the caller described is the worst
+/// possible failure mode for the one verb that hands hardware outward.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRequest {
+    /// The grantee, in one of `grant_create`'s four spellings
+    /// (`repo:<owner>/<name>`, a rendered `SubjectKey`, a bare `gh-<id>`, or a
+    /// GitHub login). Resolved server-side to an **immutable user id**.
+    subject: String,
+    /// The canonical selector string — the same one a CLI would send.
+    selector: String,
+    /// `AllowedOp` labels; see [`OpView`].
+    ops: Vec<String>,
+    /// Expiry, as epoch seconds. Required, and bounded on both ends; see
+    /// [`GrantLimitsView`].
+    expires: Option<u64>,
+}
+
+/// `POST /api/v1/grants` — share this org's hardware with another subject.
+///
+/// **Admin**-gated inside [`Coordinator::grant_create_core`], which also holds
+/// every rule this handler deliberately does not pre-empt:
+///
+/// * the **selector** is parsed by `fleet_proto::lease::parse_constraint` with
+///   `BareTerm::Tag` and stored as `Constraint`'s `Display`, so a grant's
+///   meaning never depends on which surface wrote it. The UI sends the same
+///   string a CLI would and must **not** build a structured selector of its
+///   own. An empty expression is refused, which is what stops an empty tag set
+///   — a match-everything — from reaching the table;
+/// * the **ops** go through `fleet_proto::token::normalize_ops`, so a
+///   data-plane op implies `attach` in the stored row;
+/// * the **expiry** is required, must be in the future, and is capped at
+///   [`Coordinator::MAX_GRANT_TTL_SECS`];
+/// * the **grantee** is resolved now, to an immutable id, so §6.4's
+///   rename/reuse takeover is not a hole.
+///
+/// This handler parses op *labels* only — the one thing the core cannot do,
+/// because its signature takes [`AllowedOp`]s. An unrecognised label is a `400`
+/// rather than a silently dropped op.
+async fn create_grant(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Ok(request) = serde_json::from_slice::<GrantRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let Some(ops) = request
+        .ops
+        .iter()
+        .map(|o| AllowedOp::from_label(o))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    match coord
+        .grant_create_core(
+            &subject,
+            &request.subject,
+            &request.selector,
+            ops,
+            request.expires,
+        )
+        .await
+    {
+        Ok(grant) => Json(GrantView::from(grant)).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/grants/{id_prefix}` — revoke a grant, for real.
+///
+/// Creator-or-admin, including the `created_by = NULL` rows only an admin can
+/// reach; the policy is [`Coordinator::grant_revoke_core`]'s, along with the
+/// part that matters more than the row deletion: the **cascade**. Revoking
+/// recomputes the grantee's access and tears down, through the whole release
+/// path, every lease they hold on a board they may no longer use. Deleting the
+/// row alone would leave them relaying bytes until the lease TTL ran out while
+/// the operator believed the grant was gone.
+///
+/// A grant id is hex (or `ci-` + hex), so it is safe in a path; the core still
+/// refuses a prefix shorter than 8 characters of entropy, because
+/// `delete_grants_by_prefix("")` is `LIKE '%'`.
+async fn revoke_grant(
+    State(coord): State<Arc<Coordinator>>,
+    Path(id_prefix): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    match coord.grant_revoke_core(&subject, &id_prefix).await {
+        Ok(ids) => Json(RevokedGrantsView { revoked: ids }).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/grants/{id_prefix}`'s body.
+#[derive(Debug, Serialize)]
+struct RevokedGrantsView {
+    /// The ids actually deleted — what the operator is shown, since a prefix
+    /// that matched one grant still deletes only that grant.
+    revoked: Vec<String>,
+}
+
+/// `GET /api/v1/auth-keys` — the org's enrollment keys, **hashes only**.
+///
+/// Membership suffices, exactly as on `POST /auth/keys`: the check is
+/// [`crate::http::require_membership_for_auth_keys`], shared with that route so
+/// the two surfaces cannot disagree about who may look, nor leave two
+/// differently-named refusals in the audit log. The listing carries no secret —
+/// only a key's SHA-256 is stored at all.
+async fn auth_keys(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
+    let (auth, subject, _) = match api_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let org = subject.org.clone();
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    if let Err(response) =
+        crate::http::require_membership_for_auth_keys(&coord, &org, &auth.id, now).await
+    {
+        return response;
+    }
+    crate::http::list_auth_keys(&coord, &org).await
+}
+
+/// The body of `POST /api/v1/auth-keys`, mirroring `AuthKeyRequest::Create`.
+///
+/// A local struct rather than the wire enum because the action is in the method
+/// here, not in an `action` tag. Every field means what it means on
+/// `POST /auth/keys`, and the validation is that route's — see
+/// [`create_auth_key`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthKeyCreateRequest {
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Seconds. `0` is a `400` (no forever-keys over the API) and the value is
+    /// capped at [`crate::http::MAX_API_AUTH_KEY_TTL_SECS`].
+    ttl_secs: u64,
+    #[serde(default)]
+    multi_use: bool,
+    /// `node` (the default) or `ci`. An unrecognised value is a `400`, never a
+    /// silent default: they are different credentials.
+    #[serde(default)]
+    purpose: Option<String>,
+    /// For a `ci` key: the ops its synthesised grant confers.
+    #[serde(default)]
+    ops: Vec<String>,
+}
+
+/// `POST /api/v1/auth-keys` — mint an enrollment key.
+///
+/// # This response contains a long-lived secret, exactly once
+///
+/// [`fleet_auth::api::AuthKeyCreated`] carries the key itself; only its SHA-256
+/// is stored, so it exists in this body and nowhere else, ever. That is the
+/// single place the browser surface creates a long-lived bearer secret, and it
+/// is a **deliberate, accepted cost** recorded in `docs/web-ui.md` D4: the
+/// alternative is a UI in which the most-asked-for enrollment path is the one
+/// thing you must leave the browser for. The UI shows it in a panel that says
+/// it will not be shown again and stores it nowhere.
+///
+/// **This is not a capability token, so it does not violate the
+/// no-capability-token rule**, and this paragraph exists so a later reader does
+/// not "fix" it. A capability token is offline-verifiable, unrevokable short of
+/// tearing down its lease, and confers control of a *leased board*. An auth key
+/// is org-scoped, expiring (30 days maximum here), listable, revocable — with
+/// the revocation cascading through any grant it synthesised — and confers only
+/// the right to *enroll*: a `node` key adds a machine that offers probes, a `ci`
+/// key redeems into a workload token bounded by its own tag selector.
+///
+/// # The validation is `POST /auth/keys`'s, because it is the same function
+///
+/// [`crate::http::create_auth_key`] is called unchanged. Forking it would mean
+/// two opinions about `ttl_secs = 0`, the TTL cap, the `purpose` allowlist and
+/// the tagless-`ci` refusal — and the tagless-`ci` rule is the one that stops a
+/// key from synthesising a grant over the whole fleet.
+async fn create_auth_key(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Ok(request) = serde_json::from_slice::<AuthKeyCreateRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let org = subject.org.clone();
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    if let Err(response) =
+        crate::http::require_membership_for_auth_keys(&coord, &org, &auth.id, now).await
+    {
+        return response;
+    }
+    crate::http::create_auth_key(
+        &coord,
+        &org,
+        &auth.id,
+        request.tags,
+        request.ttl_secs,
+        request.multi_use,
+        request.purpose.as_deref(),
+        request.ops,
+        now,
+    )
+    .await
+}
+
+/// `DELETE /api/v1/auth-keys/{hash_prefix}` — revoke enrollment keys.
+///
+/// Creator-or-admin, mirroring lease ownership and grant revocation: the key's
+/// creator may revoke it, an org admin may revoke any of the org's — including
+/// the shell-minted rows whose `created_by` is `NULL`, which would otherwise be
+/// unrevokable from a browser at all.
+///
+/// [`crate::http::revoke_auth_key`] is called unchanged, so the `≥ 8` hex-digit
+/// prefix floor (an empty prefix is `LIKE '%'`, i.e. every key in the org) and
+/// the **CI-grant cascade** come along: revoking a `ci` key also revokes the
+/// grant its redemption synthesised, through the whole release path, rather
+/// than leaving a runner on a board until its lease TTL ran out.
+///
+/// A hash prefix is hex, so it is safe in a path.
+async fn revoke_auth_key(
+    State(coord): State<Arc<Coordinator>>,
+    Path(hash_prefix): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let org = subject.org.clone();
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    if let Err(response) =
+        crate::http::require_membership_for_auth_keys(&coord, &org, &auth.id, now).await
+    {
+        return response;
+    }
+    crate::http::revoke_auth_key(&coord, &org, &auth.id, &subject, &hash_prefix, now).await
 }
 
 /// `GET /api/v1/audit?board=<name>` — the org's audit log, admin-only.
