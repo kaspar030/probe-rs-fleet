@@ -358,3 +358,39 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
     // The promoted token is still the live one — no later cycle superseded it.
     assert_eq!(fleet.upgrade_status("/agent", Some(&new_token)).await, 101);
 }
+
+/// A node flooding inbound frames must not keep the keepalive/rotation arm
+/// from being polled. With a `biased;` select! whose read arm outranks the
+/// tick, `rx.recv()` is continuously ready and the tick arm never runs: no ping
+/// goes out and a due rotation is deferred for as long as the flood lasts.
+///
+/// The rotation push is the observable proxy for "the tick arm was polled":
+/// the coordinator's own ping is invisible to the client, because tungstenite
+/// answers inbound pings itself and `fleet_wire` does not surface them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flooding_node_does_not_starve_the_rotation_tick() {
+    let fleet = eager_rotation_fleet().await;
+    // A *fresh* token: rotation is not due at connect, only ~1s later — so a
+    // push can only come from the tick arm being polled mid-flood.
+    let (token, _node) = fleet
+        .seed_node_at("default", "rpi-1", fleet.coord.now())
+        .await;
+
+    let (mut tx, mut rx) = fleet.dial("/agent", &token).await.unwrap();
+    let flood = tokio::spawn(async move {
+        while fleet_wire::send(
+            &mut tx,
+            &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+        )
+        .await
+        .is_ok()
+        {}
+    });
+
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), expect_push(&mut rx)).await;
+    flood.abort();
+    assert!(
+        got.is_ok(),
+        "the rotation tick was starved by the inbound flood"
+    );
+}

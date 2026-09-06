@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use futures_util::FutureExt as _;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -175,10 +176,29 @@ async fn agent_read_loop(
             }
         }
 
+        // Revocation wins over anything else already pending: the node row is
+        // already gone, so there is nothing left worth reading from it. This is
+        // checked *here*, outside the `select!`, rather than as a `biased;`
+        // first arm — a biased arm also made `rx.recv()` out-poll
+        // `ping.tick()`, so a node flooding frames could starve its own
+        // keepalive and defer a due token rotation for as long as the flood
+        // lasted.
+        //
+        // `now_or_never` polls with a noop waker, which is sound only because
+        // `closed` is pinned and never dropped: on `None` the future survives
+        // and the `select!` poll just below re-registers the real waker, and a
+        // `notify_one` landing in that window sets the future's own notified
+        // state, so no permit is consumed or lost.
+        if closed.as_mut().now_or_never().is_some() {
+            warn!(%agent_id, "closing the connection: the node was deleted");
+            break Err(CoordinatorError::Protocol("node deleted".to_owned()));
+        }
+
         tokio::select! {
-            // Revocation wins over anything else pending: the node row is
-            // already gone, so there is nothing left worth reading from it.
-            biased;
+            // Still an arm as well as a pre-check: the pre-check only observes
+            // a signal that has *already* arrived, and a connection parked in
+            // this `select!` would otherwise not learn of its deletion until
+            // the next ping tick woke the loop — a whole ping interval late.
             () = &mut closed => {
                 warn!(%agent_id, "closing the connection: the node was deleted");
                 break Err(CoordinatorError::Protocol("node deleted".to_owned()));
