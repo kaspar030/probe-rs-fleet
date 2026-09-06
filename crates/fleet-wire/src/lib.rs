@@ -329,7 +329,12 @@ pub enum SidecarToCoord {
     ///
     /// Deliberately **not** a grant: it creates no principal and no fleet
     /// identity. Replies with the ordinary [`CoordToSidecar::Lease`] /
-    /// [`CoordToSidecar::Queued`] / [`CoordToSidecar::Error`].
+    /// [`CoordToSidecar::Queued`] / [`CoordToSidecar::NoCandidate`] /
+    /// [`CoordToSidecar::AtCap`] / [`CoordToSidecar::Error`].
+    ///
+    /// A `Queued` reply here means "the board is busy", and **nothing was
+    /// enqueued**: this verb hands a token to a sandbox and returns, so a
+    /// waiter it left behind could be promoted onto a board nobody is holding.
     Delegate {
         /// Which board to lease.
         select: Constraint,
@@ -351,7 +356,11 @@ pub enum CoordToSidecar {
     },
     /// The outcome of a [`SidecarToCoord::Lease`] request.
     Lease(LeaseGrant),
-    /// The request was queued; position is 0-based.
+    /// Matching boards exist in the caller's reach but all are busy: the
+    /// request was queued, and the caller will be sent a
+    /// [`CoordToSidecar::Lease`] if it is promoted before it gives up.
+    ///
+    /// Position is 0-based, among waiters for the same constraint.
     Queued {
         /// 0-based position among waiters for the same constraint.
         position: u32,
@@ -421,6 +430,30 @@ pub enum CoordToSidecar {
     GrantRevoked {
         /// The ids deleted.
         ids: Vec<String>,
+    },
+    /// Nothing the caller may reach matches the selector at all — whatever its
+    /// state. Distinct from [`CoordToSidecar::Queued`]: waiting cannot help,
+    /// and nothing was queued.
+    ///
+    /// Appended at the **end** of the enum rather than placed next to `Queued`
+    /// where it belongs semantically: postcard is positional, so inserting a
+    /// variant renumbers every later one. Appending is the cheap edit; the
+    /// protocol bump this pair costs is the same either way.
+    NoCandidate {
+        /// The selector as the coordinator parsed it, in `Constraint`'s
+        /// canonical `Display` form, so the client can echo back exactly what
+        /// was asked for.
+        selector: String,
+        /// How many boards the caller can reach at all.
+        reachable: u32,
+    },
+    /// The caller is already at its `max_concurrent_per_subject` budget, so
+    /// the selector was never evaluated. Nothing was queued.
+    AtCap {
+        /// Leases the caller currently holds.
+        held: u32,
+        /// The configured cap.
+        cap: u32,
     },
 }
 

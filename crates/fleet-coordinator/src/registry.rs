@@ -1,22 +1,28 @@
-//! Connection registries: agents and relay channels.
+//! Connection registries: agents, sidecars, and relay channels.
 //!
-//! Two shared tables, both behind `tokio::sync` locks:
+//! Three shared tables, all behind `tokio::sync` locks:
 //!
 //! * [`AgentRegistry`] maps an [`AgentId`] to a handle for sending
 //!   [`CoordinatorCommand`]s (and [`DataFrame`]s) down that agent's persistent
 //!   dial-out connection. The per-connection writer task drains the channel, so
 //!   the relay and the expiry sweep can push without sharing the TLS stream.
+//! * [`SidecarRegistry`] maps a [`RequesterId`] — one per *connection*, not per
+//!   subject — to that connection's [`SidecarHandle`], so the coordinator can
+//!   push an unsolicited message (today: a queue promotion) to the client that
+//!   asked for it.
 //! * [`ChannelTable`] maps a [`ChannelId`] to the routing endpoints of an open
 //!   relay channel, so a [`DataFrame`] arriving from either side can be
 //!   forwarded to the other.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
+use fleet_core::scheduler::RequesterId;
 use fleet_proto::agent_api::CoordinatorCommand;
 use fleet_proto::ids::{AgentId, LeaseId};
 use fleet_proto::{ChannelId, DataFrame};
@@ -105,6 +111,73 @@ impl AgentHandle {
 
 /// A message bound for a sidecar connection's writer task.
 pub type SidecarHandle = mpsc::Sender<CoordToSidecar>;
+
+/// Registry of connected sidecar/ctl connections, keyed by [`RequesterId`].
+///
+/// Exists so the coordinator can push a message a client did not ask for on
+/// this round trip. v1 has exactly one such push: a queued lease request that
+/// gets promoted when a board frees up, which is the difference between a CI
+/// leg waiting its turn and a CI leg failing.
+///
+/// Keyed per **connection**, not per subject: one subject may hold several
+/// connections at once and a promotion belongs to the one that queued. That is
+/// also what lets [`Scheduler::remove_waiters`] drop exactly the right waiters
+/// when a socket closes.
+///
+/// [`Scheduler::remove_waiters`]: fleet_core::scheduler::Scheduler::remove_waiters
+#[derive(Debug, Clone, Default)]
+pub struct SidecarRegistry {
+    inner: Arc<Mutex<HashMap<RequesterId, SidecarHandle>>>,
+    next: Arc<AtomicU64>,
+}
+
+impl SidecarRegistry {
+    /// A new, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a fresh [`RequesterId`], never reused for the life of the process.
+    ///
+    /// Starts at 1: [`RequesterId::DETACHED`] is 0 and must never collide with
+    /// a real connection, or a detached call path would inherit somebody's
+    /// promotion channel.
+    pub fn mint(&self) -> RequesterId {
+        RequesterId(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    /// Register a connection's handle.
+    pub async fn insert(&self, id: RequesterId, handle: SidecarHandle) {
+        self.inner.lock().await.insert(id, handle);
+    }
+
+    /// Remove a connection (on disconnect).
+    ///
+    /// **Does not close the connection**, and cannot: the connection task holds
+    /// its own sender clone, so dropping the registry's changes nothing — the
+    /// same property [`AgentRegistry::remove`] documents. This is the right
+    /// call from the connection's own teardown, where the socket is already
+    /// going away.
+    pub async fn remove(&self, id: RequesterId) {
+        self.inner.lock().await.remove(&id);
+    }
+
+    /// Get a clone of a connection's handle, if it is still registered.
+    pub async fn get(&self, id: RequesterId) -> Option<SidecarHandle> {
+        self.inner.lock().await.get(&id).cloned()
+    }
+
+    /// Number of connected sidecars.
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    /// Whether no sidecars are connected.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
+    }
+}
 
 /// Registry of connected agents, keyed by [`AgentId`]. Cloneable handle over a
 /// shared map.
@@ -271,6 +344,34 @@ mod tests {
         reg.remove(&agent).await;
         assert!(reg.is_empty().await);
         assert!(reg.get(&agent).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn sidecar_registry_mints_unique_ids_and_never_the_detached_one() {
+        let reg = SidecarRegistry::new();
+        let a = reg.mint();
+        let b = reg.mint();
+        assert_ne!(a, b);
+        assert_ne!(a, RequesterId::DETACHED);
+        assert_ne!(b, RequesterId::DETACHED);
+
+        let (tx, mut rx) = mpsc::channel(4);
+        reg.insert(a, tx).await;
+        assert_eq!(reg.len().await, 1);
+        reg.get(a)
+            .await
+            .unwrap()
+            .send(CoordToSidecar::Queued { position: 0 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoordToSidecar::Queued { position: 0 }
+        ));
+
+        reg.remove(a).await;
+        assert!(reg.is_empty().await);
+        assert!(reg.get(a).await.is_none());
     }
 
     #[tokio::test]

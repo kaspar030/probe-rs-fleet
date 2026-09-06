@@ -162,6 +162,11 @@ impl CtlClient {
             // requests), so the selector is a placeholder the session ignores.
             select: Constraint::Tags(Vec::new()),
             server_cert_sha256: self.conn.server_cert_sha256.clone(),
+            // Likewise: `ctl` never calls `CoordSession::lease`, so it never
+            // waits on a queue slip. `ctl lease` prints its position and exits
+            // (see `CtlClient::lease`); the bounded wait belongs to the sidecar
+            // path, and the two are deliberately kept apart.
+            queue_wait_secs: 0,
         };
         CoordSession::connect(&cfg)
             .await

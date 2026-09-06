@@ -15,6 +15,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
@@ -265,20 +266,114 @@ impl CoordSession {
         self.next_ctrl().await
     }
 
-    /// Request a lease for `request`, returning the grant.
+    /// Request a lease for `request`, waiting up to `queue_wait` for promotion
+    /// if the board is contended.
+    ///
+    /// The three non-grant outcomes are deliberately not the same failure:
+    ///
+    /// * **queued** — matching boards exist but are busy. Waiting can fix this,
+    ///   so it waits: the position is logged once and the call parks on the
+    ///   control connection for the coordinator's promotion push. This is what
+    ///   lets a CI matrix wider than the fleet run to completion instead of
+    ///   failing legs.
+    /// * **no candidate** — nothing the caller can reach matches the selector.
+    ///   No release will ever change that, so it fails immediately.
+    /// * **at cap** — the caller's own concurrency budget is full. Also not
+    ///   something a wait can fix, and blaming contention for it is how the old
+    ///   single `Queued` reply misled people.
+    ///
+    /// # Waiting, in detail
+    ///
+    /// `queue_wait` is a **client-side** patience bound (`queue_wait_secs` in
+    /// [`FleetConfig`]); `Duration::ZERO` restores the old fail-fast
+    /// behaviour. On expiry the call returns [`TransportError::Declined`]
+    /// naming the wait.
+    ///
+    /// **The waiter's cleanup happens by connection teardown, and that is
+    /// load-bearing.** There is no cancel message on the wire: when this call
+    /// gives up, the caller drops the session, the socket closes, and the
+    /// coordinator's `drop_sidecar` removes the queued request. Anything that
+    /// keeps this session alive after a timeout leaves an orphaned waiter
+    /// behind — the exact defect the wait was added alongside fixing.
+    ///
+    /// Parking here is safe against both ends' keepalives: the reader task goes
+    /// on looping (answering pings, routing `Extended` heartbeat replies into
+    /// their own slot so a heartbeat can never be mistaken for a promotion),
+    /// so the transport is never idle even while this call is.
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::Declined`] if the request is queued or refused.
-    pub async fn lease(&self, request: &LeaseRequest) -> Result<LeaseGrant, TransportError> {
+    /// Returns [`TransportError::Declined`] if the request is refused, or if
+    /// the wait expires while still queued.
+    pub async fn lease(
+        &self,
+        request: &LeaseRequest,
+        queue_wait: Duration,
+    ) -> Result<LeaseGrant, TransportError> {
         self.send(SidecarToCoord::Lease(request.clone())).await?;
-        match self.next_ctrl().await? {
-            CoordToSidecar::Lease(grant) => Ok(grant),
-            CoordToSidecar::Queued { position } => Err(TransportError::Declined(format!(
-                "board contended; queued at position {position}"
-            ))),
-            CoordToSidecar::Error { message } => Err(TransportError::Declined(message)),
-            other => Err(TransportError::Wire(format!("expected Lease, got {other:?}"))),
+        let mut queued_at: Option<u32> = None;
+        let deadline = tokio::time::Instant::now() + queue_wait;
+        loop {
+            let next = if queued_at.is_some() {
+                match tokio::time::timeout_at(deadline, self.next_ctrl()).await {
+                    Ok(next) => next?,
+                    Err(_) => {
+                        let position = queued_at.unwrap_or(0);
+                        return Err(TransportError::Declined(format!(
+                            "still queued at position {position} after {}s; giving up",
+                            queue_wait.as_secs()
+                        )));
+                    }
+                }
+            } else {
+                self.next_ctrl().await?
+            };
+            match next {
+                CoordToSidecar::Lease(grant) => return Ok(grant),
+                CoordToSidecar::Queued { position } => {
+                    if queue_wait.is_zero() {
+                        return Err(TransportError::Declined(format!(
+                            "board contended; queued at position {position}"
+                        )));
+                    }
+                    // Logged once, not per loop iteration: the wait is quiet by
+                    // design, and a queued CI leg should not narrate.
+                    if queued_at.is_none() {
+                        tracing::info!(
+                            position,
+                            wait_secs = queue_wait.as_secs(),
+                            "board contended; waiting for a turn"
+                        );
+                    }
+                    queued_at = Some(position);
+                }
+                CoordToSidecar::NoCandidate {
+                    selector,
+                    reachable,
+                } => {
+                    return Err(TransportError::Declined(format!(
+                        "no board matches `{selector}`; ctl list shows {reachable} boards you can reach"
+                    )))
+                }
+                CoordToSidecar::AtCap { held, cap } => {
+                    return Err(TransportError::Declined(format!(
+                        "you already hold {held} leases (cap max_concurrent_per_subject = {cap}); release one or raise the cap"
+                    )))
+                }
+                CoordToSidecar::Error { message } => {
+                    return Err(TransportError::Declined(message))
+                }
+                // While waiting, an unrelated control message is not a reason to
+                // abort a queue slip we may still win.
+                other if queued_at.is_some() => {
+                    tracing::debug!(?other, "ignoring a control message while queued");
+                }
+                other => {
+                    return Err(TransportError::Wire(format!(
+                        "expected Lease, got {other:?}"
+                    )))
+                }
+            }
         }
     }
 
@@ -579,6 +674,7 @@ mod tests {
                 "b".to_owned(),
             )),
             server_cert_sha256: Some("cd".repeat(32)),
+            queue_wait_secs: 0,
         };
         assert_eq!(cfg.server_pin(), Some([0xcdu8; 32]));
 
@@ -688,11 +784,14 @@ mod tests {
             .await
             .unwrap();
         let grant = session
-            .lease(&LeaseRequest {
-                select: Constraint::Id(BoardName("b1".to_owned())),
-                duration_secs: 600,
-                priority: Priority::Interactive,
-            })
+            .lease(
+                &LeaseRequest {
+                    select: Constraint::Id(BoardName("b1".to_owned())),
+                    duration_secs: 600,
+                    priority: Priority::Interactive,
+                },
+                Duration::ZERO,
+            )
             .await
             .unwrap();
         assert_eq!(grant.board, board_ref);
@@ -811,11 +910,14 @@ mod tests {
             .await
             .unwrap();
         let grant = session
-            .lease(&LeaseRequest {
-                select: Constraint::Id(BoardName("b1".to_owned())),
-                duration_secs: 0,
-                priority: Priority::Interactive,
-            })
+            .lease(
+                &LeaseRequest {
+                    select: Constraint::Id(BoardName("b1".to_owned())),
+                    duration_secs: 0,
+                    priority: Priority::Interactive,
+                },
+                Duration::ZERO,
+            )
             .await
             .unwrap();
         assert_eq!(session.extend(grant.lease).await.unwrap(), 12_345);

@@ -194,7 +194,7 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
             select: Constraint::Id(board_name.clone()),
             duration_secs: 600,
             priority: Priority::Interactive,
-        })
+        }, std::time::Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);

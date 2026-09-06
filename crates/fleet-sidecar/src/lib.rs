@@ -482,7 +482,12 @@ pub async fn acquire_lease(
         duration_secs: 0,
         priority: Priority::Interactive,
     };
-    let grant = session.lease(&request).await?;
+    let grant = session
+        .lease(
+            &request,
+            std::time::Duration::from_secs(cfg.queue_wait_secs),
+        )
+        .await?;
     tracing::info!(board = %grant.board, lease = ?grant.lease, "leased board");
 
     // Shareable only if we hold the cache slot *and* the store accepts the

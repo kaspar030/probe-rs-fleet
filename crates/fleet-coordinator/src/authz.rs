@@ -296,7 +296,7 @@ mod tests {
             }
         };
         let fleet_core::scheduler::LeaseDecision::Granted(g) =
-            s.request_lease(holder.clone(), &access, lease_req("b1"), 1000)
+            s.request_lease(holder.clone(), fleet_core::scheduler::RequesterId::DETACHED, &access, lease_req("b1"), 1000)
         else {
             panic!("expected grant");
         };

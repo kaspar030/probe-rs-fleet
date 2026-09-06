@@ -22,7 +22,7 @@ use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
 use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
+use fleet_core::scheduler::{RequesterId, Scheduler};
 use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Role, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
@@ -250,7 +250,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
             select: Constraint::Id(board_name.clone()),
             duration_secs: 600,
             priority: Priority::Interactive,
-        })
+        }, std::time::Duration::ZERO)
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);
@@ -288,7 +288,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // The board shows up as leased in the operator inventory.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CoordToSidecar>(8);
     coord
-        .handle_sidecar_message(&dev, SidecarToCoord::ListBoards, &tx)
+        .handle_sidecar_message(&dev, SidecarToCoord::ListBoards, &tx, RequesterId::DETACHED)
         .await
         .unwrap();
     match rx.recv().await.unwrap() {

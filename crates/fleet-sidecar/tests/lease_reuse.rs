@@ -54,6 +54,7 @@ fn cfg() -> FleetConfig {
         token: TOKEN.to_owned(),
         select: Constraint::Id(BoardName("b1".to_owned())),
         server_cert_sha256: None,
+        queue_wait_secs: 0,
     }
 }
 

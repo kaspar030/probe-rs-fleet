@@ -18,5 +18,6 @@ pub mod scheduler;
 pub use access::{Access, GrantScope};
 pub use policy::Policy;
 pub use scheduler::{
-    ExpireResult, ExpiredLease, GrantedLease, LeaseAuthError, LeaseDecision, Scheduler,
+    ExpireResult, ExpiredLease, GrantedLease, LeaseAuthError, LeaseDecision, Promotion,
+    RequesterId, Scheduler,
 };

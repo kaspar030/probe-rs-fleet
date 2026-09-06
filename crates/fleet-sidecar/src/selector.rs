@@ -81,7 +81,30 @@ pub mod env {
     /// held between two `probe-rs` commands. The escape hatch for a shared
     /// workstation, or for debugging the cache itself.
     pub const NO_LEASE_CACHE: &str = "PROBE_RS_FLEET_NO_LEASE_CACHE";
+    /// How long, in seconds, to wait for a queued lease request to be promoted
+    /// before giving up. Default [`super::DEFAULT_QUEUE_WAIT_SECS`].
+    ///
+    /// A **client-side** bound, not a coordinator policy knob: how long *this*
+    /// invocation is willing to sit in the queue is the caller's business, and
+    /// a CI leg, an interactive `probe-rs run` and a script have different
+    /// answers. `0` disables waiting, restoring the fail-fast behaviour.
+    pub const QUEUE_WAIT: &str = "PROBE_RS_FLEET_QUEUE_WAIT";
 }
+
+/// How long a queued lease request waits for promotion by default: 5 minutes.
+///
+/// "Low minutes" is the target: long enough that a matrix leg wider than the
+/// fleet gets its turn once the legs ahead of it finish a flash-and-test cycle,
+/// short enough that a genuinely stuck job fails inside a typical CI step
+/// timeout instead of burning the whole budget.
+///
+/// Safe against both ends' liveness checks: the coordinator pings every 20s
+/// with a 60s pong timeout, tungstenite answers inbound pings automatically,
+/// and the sidecar's reader task keeps looping throughout the wait — so the
+/// *transport* is never idle for more than 20s even though the *application*
+/// is idle for minutes. If this default is ever raised past a proxy's idle
+/// timeout, that is the reasoning to re-check.
+pub const DEFAULT_QUEUE_WAIT_SECS: u64 = 300;
 
 /// A source of environment variables. Implemented for the real process
 /// environment and for test-only maps.
@@ -129,6 +152,12 @@ pub struct FleetConfig {
     /// Optional pinned coordinator server-certificate SHA-256, as 64 lowercase
     /// hex characters.
     pub server_cert_sha256: Option<String>,
+    /// How long to wait for a queued lease request to be promoted, in seconds;
+    /// `0` means do not wait.
+    ///
+    /// From [`env::QUEUE_WAIT`], defaulting to
+    /// [`DEFAULT_QUEUE_WAIT_SECS`].
+    pub queue_wait_secs: u64,
 }
 
 impl FleetConfig {
@@ -294,6 +323,14 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     let pin = env
         .get(env::SERVER_CERT_SHA256)
         .filter(|s| !s.is_empty());
+    // A malformed value falls back to the default rather than failing the
+    // invocation: this tunes patience, and refusing to run over it would be a
+    // worse outcome than waiting the default five minutes.
+    let queue_wait_secs = env
+        .get(env::QUEUE_WAIT)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_QUEUE_WAIT_SECS);
 
     let any_fleet = board.is_some()
         || id.is_some()
@@ -352,6 +389,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
         token,
         select: constraint,
         server_cert_sha256: pin,
+        queue_wait_secs,
     }))
 }
 

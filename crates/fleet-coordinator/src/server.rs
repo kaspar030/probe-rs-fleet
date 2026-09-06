@@ -415,16 +415,28 @@ async fn complete_rotation(
 pub async fn handle_sidecar(coord: Arc<Coordinator>, tx: BoxTx, rx: BoxRx, subject: Subject) -> Result<()> {
     let (out_tx, ping_tx, writer_task) = spawn_sidecar_writer(tx);
 
+    // One `RequesterId` per connection, not per subject: it tags this
+    // connection's queued lease requests so they can be dropped when it closes,
+    // and routes a promotion back to this socket. A second connection from the
+    // same user (say `ctl list` while `probe-rs run` waits) gets its own.
+    let requester = coord.sidecars().mint();
+    coord.sidecars().insert(requester, out_tx.clone()).await;
+
     let result = sidecar_pump(&coord, rx, &out_tx, &ping_tx, |msg| {
         let coord = &coord;
         let subject = &subject;
         let out_tx = &out_tx;
-        async move { coord.handle_sidecar_message(subject, msg, out_tx).await }
+        async move {
+            coord
+                .handle_sidecar_message(subject, msg, out_tx, requester)
+                .await
+        }
     })
     .await;
 
-    // Release any leases this sidecar still held, then drop its channels.
-    coord.drop_sidecar(&subject);
+    // Drop this connection's queued requests (its held leases survive to TTL),
+    // then drop its channels.
+    coord.drop_sidecar(&subject, requester).await;
     writer_task.abort();
     result
 }
@@ -444,6 +456,12 @@ pub async fn handle_sidecar(coord: Arc<Coordinator>, tx: BoxTx, rx: BoxRx, subje
 /// `Release` (the delegator owns the lease lifecycle; the sandbox's only
 /// lease-affecting power is letting it expire), no `ListBoards`/`Who`/`Logs`
 /// (the sandbox cannot enumerate the fleet) and no grant verbs.
+///
+/// It follows that this route mints **no `RequesterId`** and registers nothing
+/// in the sidecar registry: with no `Lease` verb it can never create a waiter,
+/// so there is nothing to drop on disconnect and no promotion to route back.
+/// Stated here rather than left to inference, because the absence of a
+/// registration otherwise looks like an oversight.
 ///
 /// **No [`Subject`] is constructed anywhere on this path.** That is the design
 /// point, not an implementation detail: delegation creates no principal, so

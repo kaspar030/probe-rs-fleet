@@ -18,6 +18,7 @@
 //! test process.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
@@ -95,7 +96,7 @@ async fn the_lease_request_carries_no_hardcoded_duration() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    session.lease(&lease_request()).await.unwrap();
+    session.lease(&lease_request(), Duration::ZERO).await.unwrap();
     peer.await.unwrap();
 }
 
@@ -151,7 +152,7 @@ async fn a_shutdown_signal_releases_the_lease() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let granted = session.lease(&lease_request()).await.unwrap();
+    let granted = session.lease(&lease_request(), Duration::ZERO).await.unwrap();
 
     // Work that never finishes — an `attach` session, say — plus a shutdown
     // future we fire by hand. `hold_and_run` must pick the shutdown arm,
@@ -235,7 +236,7 @@ async fn a_shutdown_signal_keeps_a_shareable_lease() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let granted = session.lease(&lease_request()).await.unwrap();
+    let granted = session.lease(&lease_request(), Duration::ZERO).await.unwrap();
 
     let (fire_tx, mut fire_rx) = mpsc::channel::<i32>(1);
     let work = async {
@@ -332,7 +333,7 @@ async fn a_long_session_is_kept_alive() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let granted = session.lease(&lease_request()).await.unwrap();
+    let granted = session.lease(&lease_request(), Duration::ZERO).await.unwrap();
 
     // Work that runs well past one heartbeat interval: a 900s TTL yields a
     // 300s interval, so this sees two renewals before finishing.

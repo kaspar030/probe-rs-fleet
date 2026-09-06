@@ -29,7 +29,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use fleet_core::access::Access;
-use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Scheduler};
+use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Promotion, RequesterId, Scheduler};
 use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::agent_api::AgentReport;
 use fleet_proto::board::{Board, BoardState};
@@ -44,7 +44,7 @@ use crate::clock::SharedClock;
 use crate::config::CoordinatorConfig;
 use crate::error::Result;
 use crate::proto::{CoordToSidecar, SidecarToCoord};
-use crate::registry::{AgentRegistry, ChannelTable};
+use crate::registry::{AgentRegistry, ChannelTable, SidecarRegistry};
 use crate::relay;
 use crate::state::{AuditEntry, Db};
 
@@ -55,6 +55,9 @@ pub struct Coordinator {
     db: Db,
     signer: Ed25519Signer,
     agents: AgentRegistry,
+    /// Live sidecar/ctl connections, so a promotion can be pushed to the
+    /// connection that queued for it.
+    sidecars: SidecarRegistry,
     channels: ChannelTable,
     clock: SharedClock,
     /// The GitHub Actions JWKS cache, built lazily from `config` on first use.
@@ -161,6 +164,7 @@ impl Coordinator {
             db,
             signer,
             agents: AgentRegistry::new(),
+            sidecars: SidecarRegistry::new(),
             channels: ChannelTable::new(),
             clock,
             jwks: std::sync::OnceLock::new(),
@@ -194,6 +198,12 @@ impl Coordinator {
     #[must_use]
     pub fn agents(&self) -> &AgentRegistry {
         &self.agents
+    }
+
+    /// The registry of live sidecar/ctl connections.
+    #[must_use]
+    pub fn sidecars(&self) -> &SidecarRegistry {
+        &self.sidecars
     }
 
     /// The relay channel table.
@@ -612,6 +622,11 @@ impl Coordinator {
 
     /// Handle one [`SidecarToCoord`] message, replying via `tx`.
     ///
+    /// `requester` identifies the calling *connection*. It is what a queued
+    /// lease request is tagged with, so the waiter can be dropped when this
+    /// connection closes and a promotion can be pushed back down `tx`. Call
+    /// paths that cannot create a waiter pass [`RequesterId::DETACHED`].
+    ///
     /// # Errors
     ///
     /// Returns a [`crate::error::CoordinatorError`] only on a fatal error (DB /
@@ -623,6 +638,7 @@ impl Coordinator {
         subject: &Subject,
         msg: SidecarToCoord,
         tx: &mpsc::Sender<CoordToSidecar>,
+        requester: RequesterId,
     ) -> Result<()> {
         match msg {
             SidecarToCoord::Hello { .. } => {
@@ -634,7 +650,7 @@ impl Coordinator {
                     .await;
             }
             SidecarToCoord::Lease(req) => {
-                let reply = self.request_lease(subject, req).await?;
+                let reply = self.request_lease(subject, req, requester).await?;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::Extend { lease } => {
@@ -1942,7 +1958,9 @@ impl Coordinator {
     /// Revocation is releasing the lease. Mechanically this is exactly
     /// [`Coordinator::request_lease`] with the token attenuated further, to the
     /// intersection of what the caller may do and what they asked to hand over
-    /// — you can never delegate more than you hold.
+    /// — you can never delegate more than you hold — **minus the queueing**: it
+    /// goes through [`fleet_core::scheduler::Scheduler::try_lease`], so a
+    /// contended board is reported and no waiter is left behind (#452).
     ///
     /// # A CI workload may not delegate
     ///
@@ -1983,6 +2001,7 @@ impl Coordinator {
             return Ok(Self::denied());
         }
 
+        let select_display = select.to_string();
         let req = LeaseRequest {
             select,
             duration_secs,
@@ -1990,14 +2009,30 @@ impl Coordinator {
         };
         let decision = {
             let mut sched = self.scheduler.lock().await;
-            sched.request_lease(subject.clone(), &access, req, now)
+            // `try_lease`, not `request_lease`: this verb must not leave a
+            // waiter behind. It hands a token to a sandbox and returns, so a
+            // queued request would stay eligible for promotion and a board
+            // freed minutes later would be handed to a delegator that walked
+            // away — held by nobody until TTL (#452). A separate entry point
+            // rather than a flag, so the property is visible at the call site.
+            sched.try_lease(subject.clone(), &access, req, now)
         };
         let granted = match decision {
             LeaseDecision::Granted(g) => g,
             // The caller decides what to do with a queue slip; `ctl delegate`
-            // fails fast rather than blocking a sandbox handoff on it.
+            // fails fast rather than blocking a sandbox handoff on it, and now
+            // leaves nothing queued behind it.
             LeaseDecision::Queued { position } => {
                 return Ok(CoordToSidecar::Queued { position })
+            }
+            LeaseDecision::NoCandidate { reachable } => {
+                return Ok(CoordToSidecar::NoCandidate {
+                    selector: select_display,
+                    reachable,
+                })
+            }
+            LeaseDecision::AtCap { held, cap } => {
+                return Ok(CoordToSidecar::AtCap { held, cap })
             }
         };
 
@@ -2080,6 +2115,7 @@ impl Coordinator {
         &self,
         subject: &Subject,
         mut req: LeaseRequest,
+        requester: RequesterId,
     ) -> Result<CoordToSidecar> {
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
@@ -2110,9 +2146,10 @@ impl Coordinator {
             );
             req.priority = fleet_proto::lease::Priority::Ci;
         }
+        let select_display = req.select.to_string();
         let decision = {
             let mut sched = self.scheduler.lock().await;
-            sched.request_lease(subject.clone(), &access, req, now)
+            sched.request_lease(subject.clone(), requester, &access, req, now)
         };
         match decision {
             LeaseDecision::Granted(granted) => {
@@ -2156,6 +2193,15 @@ impl Coordinator {
                 Ok(CoordToSidecar::Lease(grant))
             }
             LeaseDecision::Queued { position } => Ok(CoordToSidecar::Queued { position }),
+            // Neither of these queued anything, and both say what is actually
+            // wrong rather than blaming contention: a selector that matches
+            // nothing can never be satisfied by waiting, and a cap is the
+            // caller's own budget, not the fleet's state.
+            LeaseDecision::NoCandidate { reachable } => Ok(CoordToSidecar::NoCandidate {
+                selector: select_display,
+                reachable,
+            }),
+            LeaseDecision::AtCap { held, cap } => Ok(CoordToSidecar::AtCap { held, cap }),
         }
     }
 
@@ -2257,8 +2303,9 @@ impl Coordinator {
     }
 
     /// The whole tail of releasing a lease: close its relay channels, release
-    /// it in the scheduler, persist the close, audit it, and persist whatever
-    /// waiter was promoted onto the freed board.
+    /// it in the scheduler, persist the close, audit it, and settle whatever
+    /// waiter was promoted onto the freed board (persist, notify, and — if the
+    /// promoted holder is unreachable — pass the board on again).
     ///
     /// Factored out so the **revocation cascade** goes through exactly this
     /// path rather than a reimplementation of it: forgetting `close_lease` or
@@ -2308,32 +2355,10 @@ impl Coordinator {
         )
         .await?;
 
-        // If a waiter was promoted onto the freed board, persist its grant. The
-        // promoted holder is notified out-of-band when it next polls/re-requests
-        // (v1 limitation: no push to a disconnected sidecar).
-        if let Some(granted) = promoted {
-            let promoted_org = granted.board.org.clone();
-            self.db
-                .scoped(promoted_org.clone())
-                .record_lease(
-                    granted.lease,
-                    &granted.board,
-                    &granted.holder.key(),
-                    self.now_i64(),
-                    i64::try_from(granted.expires).unwrap_or(i64::MAX),
-                )
-                .await?;
-            self.audit(
-                &promoted_org,
-                "lease.promote",
-                Some(&granted.holder.key().to_string()),
-                Some(&granted.board.node.0),
-                Some(&granted.board.name),
-                Some(granted.lease),
-                None,
-            )
-            .await?;
-        }
+        // If a waiter was promoted onto the freed board, persist its grant and
+        // push it to the holder — or, if the holder cannot be reached, hand the
+        // board on to the next waiter. All of that is `settle_promotion`.
+        self.settle_promotion(promoted, None).await?;
 
         Ok(true)
     }
@@ -2651,14 +2676,208 @@ impl Coordinator {
         }
     }
 
-    /// Note a disconnecting sidecar subject.
+    /// Handle a sidecar/ctl connection going away.
     ///
-    /// v1 deliberately does **not** force-release the subject's leases here:
-    /// a lease outlives a single connection and expires via the sweep
-    /// (architecture §6). Any relay channels the sidecar had open are torn down
-    /// when its writer task drops and the agent reports `SessionClosed`.
-    pub fn drop_sidecar(&self, subject: &Subject) {
-        debug!(%subject, "sidecar disconnected");
+    /// A disconnect drops that connection's **queued requests** but not its
+    /// **held leases**, and the split is deliberate:
+    ///
+    /// * a queued request has nobody left to hand a board to. Promoting it
+    ///   would mark a board `Leased` to a caller that has exited, held by
+    ///   nobody until TTL, and skipped over every waiter that is still there
+    ///   (#381). So the waiters tagged with this `requester` are dropped.
+    /// * a lease outlives a single connection: a sidecar may reconnect, `ctl`
+    ///   opens one connection per command, and a `probe-rs` run legitimately
+    ///   holds hardware across reconnects. Leases are reclaimed by the expiry
+    ///   sweep, not by a socket closing (architecture §6).
+    ///
+    /// This is also the **only** cleanup for a sidecar that gave up waiting:
+    /// there is no cancel message on the wire, so a client whose bounded queue
+    /// wait expires simply closes its connection and *this* method removes its
+    /// waiter. That indirection is load-bearing — if this is ever refactored,
+    /// the wait-deadline path in `fleet-sidecar`'s `CoordSession::lease` loses
+    /// its cleanup with it.
+    ///
+    /// Any relay channels the sidecar had open are torn down when its writer
+    /// task drops and the agent reports `SessionClosed`.
+    pub async fn drop_sidecar(&self, subject: &Subject, requester: RequesterId) {
+        let dropped = {
+            let mut sched = self.scheduler.lock().await;
+            sched.remove_waiters(requester)
+        };
+        self.sidecars.remove(requester).await;
+        debug!(
+            %subject,
+            dropped_waiters = dropped,
+            "sidecar disconnected"
+        );
+    }
+
+    /// Push a promoted grant to the connection that queued for it.
+    ///
+    /// Returns whether the holder was actually reached. `false` means the
+    /// promotion is undeliverable and the lease must not be left standing —
+    /// see [`Coordinator::settle_promotion`], which is the only caller.
+    ///
+    /// Two ways to fail, and both are real:
+    ///
+    /// * the connection is gone (it disconnected between being queued and being
+    ///   promoted, or in the window between a client's wait deadline firing and
+    ///   its socket closing), or its writer task has stopped draining;
+    /// * the holder's effective ops on the promoted board are empty — its
+    ///   access evaporated between queueing and promotion. No token is minted
+    ///   in that case, mirroring the identical check in
+    ///   [`Coordinator::open_channel`]: a capability token conferring nothing
+    ///   is worse than an error, because the holder cannot tell it apart from
+    ///   a working one until it tries to use it.
+    async fn notify_promotion(
+        &self,
+        requester: RequesterId,
+        granted: &fleet_core::scheduler::GrantedLease,
+    ) -> bool {
+        let Some(handle) = self.sidecars.get(requester).await else {
+            debug!(
+                lease = ?granted.lease,
+                board = %granted.board,
+                "promoted holder is not connected"
+            );
+            return false;
+        };
+        let now = self.now();
+        let access = authz::board_access(&self.db, &granted.holder, now).await;
+        let ops = {
+            let sched = self.scheduler.lock().await;
+            match sched.board(&granted.board) {
+                Some(board) => access.effective_ops(board, now),
+                None => Vec::new(),
+            }
+        };
+        if ops.is_empty() {
+            debug!(
+                lease = ?granted.lease,
+                board = %granted.board,
+                "promoted holder may no longer use the board; not minting a token"
+            );
+            return false;
+        }
+        let Ok(grant) = self.signer.grant_to_wire(granted, ops) else {
+            warn!(lease = ?granted.lease, "failed to mint a promoted lease token");
+            return false;
+        };
+        handle.send(CoordToSidecar::Lease(grant)).await.is_ok()
+    }
+
+    /// Persist, audit and deliver a promotion — and, when it cannot be
+    /// delivered, release the board again and repeat for the next waiter.
+    ///
+    /// The whole tail of "a board came free and the scheduler handed it to
+    /// somebody", shared by [`Coordinator::tear_down_lease`] and the expiry
+    /// sweep so the two cannot drift.
+    ///
+    /// Each iteration writes the database **before** notifying anyone: the
+    /// lease row and the `lease.promote` audit must be right whether or not the
+    /// holder is listening. Only then is the push attempted, and its outcome
+    /// recorded in the audit detail — a stranded promotion and a live one look
+    /// identical in the lease table otherwise.
+    ///
+    /// An undeliverable promotion is **closed out**, not left standing. Leaving
+    /// it would move the very defect this exists to fix ("a board held by
+    /// nobody until TTL") out of the queue and into the lease table. The
+    /// precedent is `delegate`'s "undo the lease rather than hand back a token
+    /// that does nothing".
+    ///
+    /// # Why a loop and not recursion
+    ///
+    /// Releasing again may itself promote the next waiter, so this is a cycle:
+    /// notify → fail → release → promote → notify. It is written iteratively,
+    /// and it terminates for the same reason `delete_node_core`'s loop does:
+    /// each round consumes at least one waiter (`promote_one` removes it from
+    /// the queue), so it runs at most `queue.len()` times. A defensive bound
+    /// with a `warn!` guards against a future change breaking that argument
+    /// silently.
+    ///
+    /// Note what this path deliberately **skips**: it does not tear down relay
+    /// channels. A just-promoted lease has never had a channel opened on it —
+    /// the holder was never told the lease exists — so
+    /// `teardown_lease_channels` would be a no-op. Calling
+    /// [`Coordinator::tear_down_lease`] here to "be safe" would re-enter the
+    /// cycle above; don't.
+    pub(crate) async fn settle_promotion(
+        &self,
+        promoted: Option<Promotion>,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        /// At most this many undeliverable promotions are chased in one
+        /// release. The queue length bounds it in theory; this catches a future
+        /// change that breaks that argument.
+        const MAX_ROUNDS: usize = 64;
+
+        let mut promoted = promoted;
+        for _ in 0..MAX_ROUNDS {
+            let Some(promotion) = promoted.take() else {
+                return Ok(());
+            };
+            let granted = promotion.grant;
+            let org = granted.board.org.clone();
+            self.db
+                .scoped(org.clone())
+                .record_lease(
+                    granted.lease,
+                    &granted.board,
+                    &granted.holder.key(),
+                    self.now_i64(),
+                    i64::try_from(granted.expires).unwrap_or(i64::MAX),
+                )
+                .await?;
+            let notified = self.notify_promotion(promotion.requester, &granted).await;
+            let notified_detail = match (detail, notified) {
+                (Some(d), true) => format!("{d}; holder notified"),
+                (Some(d), false) => format!("{d}; holder unreachable"),
+                (None, true) => "holder notified".to_owned(),
+                (None, false) => "holder unreachable".to_owned(),
+            };
+            self.audit(
+                &org,
+                "lease.promote",
+                Some(&granted.holder.key().to_string()),
+                Some(&granted.board.node.0),
+                Some(&granted.board.name),
+                Some(granted.lease),
+                Some(&notified_detail),
+            )
+            .await?;
+            if notified {
+                return Ok(());
+            }
+
+            // Undeliverable: give the board back and try the next waiter.
+            let now = self.now();
+            let next = {
+                let mut sched = self.scheduler.lock().await;
+                match sched.release_lease(granted.lease, &granted.holder.key(), now) {
+                    Ok(next) => next,
+                    // The lease vanished under us (a sweep, a node deletion).
+                    // Nothing left to undo, and nothing was promoted here.
+                    Err(_) => return Ok(()),
+                }
+            };
+            self.db
+                .scoped(org.clone())
+                .close_lease(granted.lease, self.now_i64(), "promotion undeliverable")
+                .await?;
+            self.audit(
+                &org,
+                "lease.release",
+                Some(&granted.holder.key().to_string()),
+                Some(&granted.board.node.0),
+                Some(&granted.board.name),
+                Some(granted.lease),
+                Some("promotion undeliverable"),
+            )
+            .await?;
+            promoted = next;
+        }
+        warn!("gave up chasing undeliverable promotions after {MAX_ROUNDS} rounds");
+        Ok(())
     }
 
     /// Append an audit row at the current time, in `org`.
@@ -2859,7 +3078,7 @@ mod tests {
     ) -> fleet_proto::lease::LeaseGrant {
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
-            .handle_sidecar_message(subject, SidecarToCoord::Lease(lease_req(board)), &tx)
+            .handle_sidecar_message(subject, SidecarToCoord::Lease(lease_req(board)), &tx, RequesterId::DETACHED)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -2901,8 +3120,7 @@ mod tests {
                 SidecarToCoord::Extend {
                     lease: grant.lease,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -2917,8 +3135,7 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         let CoordToSidecar::ChannelOpened { token: to_sidecar, .. } = rx.recv().await.unwrap()
@@ -2954,7 +3171,7 @@ mod tests {
 
         // Request -> Granted.
         coord
-            .handle_sidecar_message(&alice, SidecarToCoord::Lease(lease_req("b1")), &tx)
+            .handle_sidecar_message(&alice, SidecarToCoord::Lease(lease_req("b1")), &tx, RequesterId::DETACHED)
             .await
             .unwrap();
         let grant = match rx.recv().await.unwrap() {
@@ -2983,8 +3200,7 @@ mod tests {
             .handle_sidecar_message(
                 &alice,
                 SidecarToCoord::Extend { lease: grant.lease },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3002,8 +3218,7 @@ mod tests {
             .handle_sidecar_message(
                 &alice,
                 SidecarToCoord::Release { lease: grant.lease },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3027,8 +3242,7 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "alice"),
                 SidecarToCoord::Lease(lease_req("b1")),
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
@@ -3038,8 +3252,7 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "bob"),
                 SidecarToCoord::Lease(lease_req("b1")),
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3057,8 +3270,7 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "alice"),
                 SidecarToCoord::Extend { lease: LeaseId(99) },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -3096,8 +3308,7 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3119,8 +3330,7 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -3156,8 +3366,7 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -3183,7 +3392,7 @@ mod tests {
             SidecarToCoord::Extend { lease: grant.lease },
             SidecarToCoord::Release { lease: grant.lease },
         ] {
-            coord.handle_sidecar_message(&bob, msg, &tx).await.unwrap();
+            coord.handle_sidecar_message(&bob, msg, &tx, RequesterId::DETACHED).await.unwrap();
             match rx.recv().await.unwrap() {
                 CoordToSidecar::Error { message } => assert_eq!(message, "no such lease"),
                 other => panic!("expected Error, got {other:?}"),
@@ -3237,16 +3446,19 @@ mod tests {
                     duration_secs: 600,
                     priority: Priority::Interactive,
                 }),
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
-            CoordToSidecar::Queued { .. } => {}
+            // `NoCandidate`, not `Queued`: org-B's subject can reach none of the
+            // fleet, so no release will ever satisfy this. The board count it
+            // reports is 0 for the same reason — the tenancy fence stated as a
+            // number, and it leaks nothing about org-A's hardware.
+            CoordToSidecar::NoCandidate { reachable, .. } => assert_eq!(reachable, 0),
             CoordToSidecar::Lease(g) => {
                 panic!("cross-org lease granted on {} — tenancy breach", g.board)
             }
-            other => panic!("expected Queued, got {other:?}"),
+            other => panic!("expected NoCandidate, got {other:?}"),
         }
 
         // Nothing persisted, in either tenant.
@@ -3307,7 +3519,7 @@ mod tests {
 
         // `ctl list` shows only org B's board to org B's alice.
         coord
-            .handle_sidecar_message(&alice_b, SidecarToCoord::ListBoards, &tx)
+            .handle_sidecar_message(&alice_b, SidecarToCoord::ListBoards, &tx, RequesterId::DETACHED)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3320,7 +3532,7 @@ mod tests {
 
         // `ctl who` shows org A's lease to org A only.
         coord
-            .handle_sidecar_message(&alice_b, SidecarToCoord::Who, &tx)
+            .handle_sidecar_message(&alice_b, SidecarToCoord::Who, &tx, RequesterId::DETACHED)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3328,7 +3540,7 @@ mod tests {
             other => panic!("expected LeaseTable, got {other:?}"),
         }
         coord
-            .handle_sidecar_message(&alice_a, SidecarToCoord::Who, &tx)
+            .handle_sidecar_message(&alice_a, SidecarToCoord::Who, &tx, RequesterId::DETACHED)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3347,7 +3559,7 @@ mod tests {
             },
         ] {
             coord
-                .handle_sidecar_message(&alice_b, msg, &tx)
+                .handle_sidecar_message(&alice_b, msg, &tx, RequesterId::DETACHED)
                 .await
                 .unwrap();
             match rx.recv().await.unwrap() {
@@ -3364,8 +3576,7 @@ mod tests {
                     board: None,
                     follow: false,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3388,8 +3599,7 @@ mod tests {
                     board: None,
                     follow: false,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3404,8 +3614,7 @@ mod tests {
                     board: None,
                     follow: false,
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -3435,7 +3644,7 @@ mod tests {
                     board: BoardName("b1".to_owned()),
                 },
             ] {
-                coord.handle_sidecar_message(&s, msg, &tx).await.unwrap();
+                coord.handle_sidecar_message(&s, msg, &tx, RequesterId::DETACHED).await.unwrap();
                 match rx.recv().await.unwrap() {
                     CoordToSidecar::Error { message } => assert_eq!(message, "not authorized"),
                     other => panic!("expected Error for {s}, got {other:?}"),
@@ -3508,8 +3717,7 @@ mod tests {
                 SidecarToCoord::PowerCycle {
                     board: BoardName("dk".to_owned()),
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3550,8 +3758,7 @@ mod tests {
                 SidecarToCoord::PowerCycle {
                     board: BoardName("b1".to_owned()),
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3570,8 +3777,7 @@ mod tests {
                 SidecarToCoord::PowerCycle {
                     board: BoardName("b1".to_owned()),
                 },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -3650,8 +3856,7 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "op"),
                 SidecarToCoord::ListBoards,
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -4534,8 +4739,7 @@ mod tests {
                     duration_secs: 600,
                     priority: Priority::Interactive,
                 }),
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(
@@ -4548,8 +4752,7 @@ mod tests {
             .handle_sidecar_message(
                 &alice,
                 SidecarToCoord::GrantRevoke { id: id[..8].to_owned() },
-                &tx,
-            )
+                &tx, RequesterId::DETACHED,)
             .await
             .unwrap();
         assert!(matches!(

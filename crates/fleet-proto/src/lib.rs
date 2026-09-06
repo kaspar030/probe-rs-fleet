@@ -104,4 +104,12 @@ pub struct ChannelId(pub u64);
 ///   must be deployed together, and a coordinator DB whose stored grant
 ///   selectors say `board=<instance>` must be wiped: those rows now parse as
 ///   a *model* selector and match nothing.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// * 8 → 9: the lease decision split. `CoordToSidecar` gained `NoCandidate`
+///   and `AtCap`, so "queued" now means only what it says — matching boards
+///   exist but are busy — instead of also covering "no such board for you" and
+///   "you are at your own concurrency cap". Both variants are **appended** to
+///   the enum, which leaves every existing discriminant where it was, but
+///   postcard peers still reject an unknown one, so an old sidecar cannot
+///   decode either. A `Queued` reply now also implies a promotion push may
+///   follow on the same connection.
+pub const PROTOCOL_VERSION: u32 = 9;

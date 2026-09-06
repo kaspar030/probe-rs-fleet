@@ -64,9 +64,9 @@ async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
     assert!(
         matches!(
             bob.request(lease_by_tag("nrf52")).await.unwrap(),
-            CoordToSidecar::Queued { .. }
+            CoordToSidecar::NoCandidate { reachable: 0, .. }
         ),
-        "with no access the request queues rather than granting"
+        "with no access the request is refused outright rather than granting"
     );
 
     // Alice grants.
@@ -241,9 +241,11 @@ async fn an_expired_grant_is_denied() {
         }
         other => panic!("expected BoardList, got {other:?}"),
     }
+    // An expired grant leaves bob reaching nothing, so the request is
+    // `NoCandidate` rather than a queue slip that could never be satisfied.
     assert!(matches!(
         bob.request(lease_by_tag("nrf52")).await.unwrap(),
-        CoordToSidecar::Queued { .. }
+        CoordToSidecar::NoCandidate { reachable: 0, .. }
     ));
 }
 

@@ -4,9 +4,12 @@
 //! leases whose deadline has passed. For each freed lease the coordinator:
 //! closes any relay channels on the board, instructs the owning agent to clean
 //! up (`ReleaseLease` → power-cycle, optional erase), persists the close, and
-//! audits it. Waiters promoted onto a just-freed board are persisted; notifying
-//! a *disconnected* sidecar of its promotion is best-effort/deferred for v1 —
-//! such a sidecar re-requests on reconnect (architecture §6).
+//! audits it. A waiter promoted onto a just-freed board is persisted **and
+//! pushed** its grant on its own connection; if that connection has gone away
+//! the promotion is undeliverable and the board is released again for the next
+//! waiter. A *disconnected* sidecar no longer has a waiter to promote in the
+//! first place — its queued requests are dropped when its connection closes
+//! (architecture §6).
 //!
 //! **No authorization check happens here, deliberately**: the sweep is
 //! system-initiated, not caller-initiated, so there is no subject to check.
@@ -89,32 +92,16 @@ pub async fn sweep_once(coord: &Coordinator) {
             .await;
     }
 
-    // Persist any promotions made during the sweep.
-    for granted in &result.granted {
-        let scoped = coord.db().scoped(granted.board.org.clone());
-        if let Err(e) = scoped
-            .record_lease(
-                granted.lease,
-                &granted.board,
-                &granted.holder.key(),
-                now_i64,
-                i64::try_from(granted.expires).unwrap_or(i64::MAX),
-            )
+    // Settle any promotions made during the sweep: persist, push the grant to
+    // the promoted holder, and — if that holder is unreachable — release the
+    // board again for the next waiter, rather than leaving it held by nobody.
+    for promotion in result.granted {
+        if let Err(e) = coord
+            .settle_promotion(Some(promotion), Some("via expiry sweep"))
             .await
         {
-            warn!(error = %e, "failed to persist promoted lease");
+            warn!(error = %e, "failed to settle a promoted lease");
         }
-        let _ = scoped
-            .append_audit(&AuditEntry {
-                ts: now_i64,
-                subject: Some(&granted.holder.key().to_string()),
-                action: "lease.promote",
-                node: Some(granted.board.node.0.as_str()),
-                board: Some(granted.board.name.as_str()),
-                lease: Some(granted.lease),
-                detail: Some("via expiry sweep"),
-            })
-            .await;
     }
 
     // Expired user sessions are dead credentials; deleting them keeps the table
@@ -167,7 +154,7 @@ mod tests {
     use crate::registry::{AgentHandle, AgentMessage};
     use crate::state::DEFAULT_ORG_ID;
     use fleet_core::policy::Policy;
-    use fleet_core::scheduler::Scheduler;
+    use fleet_core::scheduler::{RequesterId, Scheduler};
     use fleet_proto::board::{Board, BoardState, PowerKind};
     use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Role, Subject, SubjectKind};
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
@@ -246,7 +233,7 @@ mod tests {
         };
         let alice = Subject::new(org(), SubjectKind::User, "alice");
         coord
-            .handle_sidecar_message(&alice, SidecarToCoord::Lease(req), &tx)
+            .handle_sidecar_message(&alice, SidecarToCoord::Lease(req), &tx, RequesterId::DETACHED)
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
