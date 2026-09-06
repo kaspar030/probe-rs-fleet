@@ -57,6 +57,8 @@
 
 # Path to this node's board inventory (see examples/boards.toml).
 # Default: ~/.config/probe-rs-fleet/node/boards.toml
+# A leading `~/` in this value is expanded to your home directory; `~user` is
+# not, and is left as a literal path component.
 # boards_path = "/etc/probe-rs-fleet/boards.toml"
 
 # How often (seconds) the agent heartbeats to the coordinator. Default: 15.

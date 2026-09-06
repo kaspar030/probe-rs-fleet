@@ -551,6 +551,7 @@ pub struct NodeBoardAddArgs {
     #[arg(long)]
     pub no_interactive: bool,
     /// Write to this `boards.toml` instead of the one `node.toml` resolves.
+    /// A leading `~/` is expanded.
     #[arg(long)]
     pub boards_path: Option<std::path::PathBuf>,
     /// Override the config directory (default: XDG config dir). Test and
@@ -583,6 +584,7 @@ impl NodeBoardAddArgs {
 #[derive(Debug, Args)]
 pub struct NodeBoardListArgs {
     /// Read this `boards.toml` instead of the one `node.toml` resolves.
+    /// A leading `~/` is expanded.
     #[arg(long)]
     pub boards_path: Option<std::path::PathBuf>,
     /// Override the config directory (default: XDG config dir). Test and

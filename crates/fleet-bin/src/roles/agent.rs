@@ -91,8 +91,11 @@ pub fn load_node_settings(path: &std::path::Path) -> Result<NodeSettings> {
 /// One function rather than one copy per caller: [`run`] and
 /// [`crate::roles::node_board`] must agree about which file the agent will
 /// read, or `node board add` writes a declaration into a file nobody loads.
-/// No `~` expansion is applied — nothing in this tree does that, and inventing
-/// it here would make the two disagree in the other direction.
+/// A leading `~/` is expanded for **both** the flag and the `node.toml` value,
+/// so the two spellings agree and the file the agent reads is the file
+/// `node board add` writes — the scaffolded `node.toml` advertises a `~/` path,
+/// so without this it would write a config it could not itself read. `~user`
+/// and a bare `~` are left literal (see [`crate::paths::expand_tilde`]).
 ///
 /// # Errors
 ///
@@ -102,12 +105,14 @@ pub fn resolve_boards_path(
     explicit: Option<&std::path::Path>,
 ) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        return Ok(path.to_path_buf());
+        return crate::paths::expand_tilde(path);
     }
     let settings = load_node_settings(&node_dir.join("node.toml"))?;
-    Ok(settings
-        .boards_path
-        .unwrap_or_else(|| node_dir.join("boards.toml")))
+    match settings.boards_path {
+        Some(path) => crate::paths::expand_tilde(&path),
+        // Absolute by construction; nothing to expand.
+        None => Ok(node_dir.join("boards.toml")),
+    }
 }
 
 /// Persists a rotated node token into the fleet file's `[node]` table.

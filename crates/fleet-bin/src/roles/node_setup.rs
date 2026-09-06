@@ -200,7 +200,8 @@ pub fn starter_node_toml(adopt: AdoptPolicy) -> String {
 # <policy>`) for that.
 adopt = "{adopt}"
 
-# Path to this node's board inventory.
+# Path to this node's board inventory. A leading `~/` is expanded to your home
+# directory; `~user` is not.
 # boards_path = "~/.config/probe-rs-fleet/node/boards.toml"
 
 # Heartbeat interval, seconds (default 15).
@@ -362,6 +363,54 @@ mod tests {
             assert!(settings.boards_path.is_none());
             assert_eq!(settings.adopt, Some(adopt));
         }
+    }
+
+    /// The config the tool *writes* must be a config the tool can *read*:
+    /// uncommenting the scaffold's own `boards_path` line has to yield a path
+    /// under the home directory, not a literal `./~` under the cwd.
+    #[test]
+    fn the_scaffolds_advertised_boards_path_expands() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let uncommented: String = starter_node_toml(AdoptPolicy::Auto)
+            .lines()
+            .map(|line| {
+                if line.contains("boards_path") {
+                    line.trim_start_matches("# ").to_owned()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let settings: crate::roles::agent::NodeSettings = toml::from_str(&uncommented).unwrap();
+        let declared = settings
+            .boards_path
+            .expect("the scaffold must advertise a boards_path to uncomment");
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("HOME", "/tmp/fleet-scaffold-home");
+        let expanded = crate::paths::expand_tilde(&declared);
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let expanded = expanded.unwrap();
+        assert!(
+            expanded.starts_with("/tmp/fleet-scaffold-home"),
+            "expected the scaffold's path under HOME, got {}",
+            expanded.display()
+        );
+        assert!(
+            !expanded.components().any(|c| c.as_os_str() == "~"),
+            "no literal `~` component may survive: {}",
+            expanded.display()
+        );
     }
 
     /// The scaffold has to name the command that fills it in: this file is

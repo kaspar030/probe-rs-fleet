@@ -36,10 +36,10 @@
 //! Base Directory environment variables on Linux and falls back to the
 //! platform conventions elsewhere.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 
 /// The fleet selected when neither `--fleet` nor `PROBE_RS_FLEET` is set.
 pub const DEFAULT_FLEET: &str = "default";
@@ -208,6 +208,63 @@ pub fn list_fleets() -> Result<Vec<String>> {
     Ok(names)
 }
 
+// --- tilde expansion --------------------------------------------------------
+
+/// The part of `path` after a leading `~/`, with any further leading separators
+/// stripped, or `None` when `path` does not start with `~/`.
+///
+/// Matches on the *string* prefix rather than [`Path::components`] on purpose:
+/// `components()` normalises (`~//x` → `~/x`, `./x` → `x`), and a path that does
+/// not start with `~/` must come back byte-identical to what the operator wrote.
+/// Trailing separators are trimmed so `~//x` joins under the home directory
+/// instead of `Path::join` treating `/x` as absolute and discarding the base.
+fn tilde_rest(path: &Path) -> Option<&str> {
+    let s = path.to_str()?;
+    let rest = s.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            s.strip_prefix("~\\")
+        } else {
+            None
+        }
+    })?;
+    Some(rest.trim_start_matches(std::path::is_separator))
+}
+
+/// [`expand_tilde`] against an explicit home directory — the pure core, so the
+/// table-driven tests need no environment mutation.
+fn expand_tilde_with(path: &Path, home: &Path) -> PathBuf {
+    match tilde_rest(path) {
+        // `~/` (and `~//`) name the home directory itself.
+        Some(rest) if rest.is_empty() => home.to_path_buf(),
+        Some(rest) => home.join(rest),
+        None => path.to_path_buf(),
+    }
+}
+
+/// Expand a leading `~/` to the user's home directory.
+///
+/// Deliberately minimal: only a leading `~/` (`~\` on Windows) is expanded. A
+/// bare `~`, `~user/...`, `./~/...` and every path with no tilde are returned
+/// unchanged — `~user` expansion needs a passwd lookup, and silently resolving
+/// it to the *wrong* home would be worse than leaving it literal. A non-UTF-8
+/// path is also returned unchanged.
+///
+/// This exists because the scaffolded `node.toml` advertises a `~/`-prefixed
+/// `boards_path`: without expansion the tool would write a config it cannot
+/// itself read, resolving it to a literal `./~` under the process cwd.
+///
+/// # Errors
+///
+/// Returns an error only when the path *does* start with `~/` and no home
+/// directory can be determined.
+pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
+    if tilde_rest(path).is_none() {
+        return Ok(path.to_path_buf());
+    }
+    let base = BaseDirs::new().context("could not determine a home directory to expand `~/`")?;
+    Ok(expand_tilde_with(path, base.home_dir()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +350,73 @@ mod tests {
                 "expected {good:?} to be accepted"
             );
         }
+    }
+
+    /// Only a leading `~/` expands; everything else must come back
+    /// byte-identical to what the operator wrote.
+    #[test]
+    fn expand_tilde_only_touches_a_leading_tilde_slash() {
+        let home = Path::new("/home/tester");
+
+        assert_eq!(
+            expand_tilde_with(Path::new("~/x/boards.toml"), home),
+            PathBuf::from("/home/tester/x/boards.toml")
+        );
+        // `~/` names the home directory itself.
+        assert_eq!(expand_tilde_with(Path::new("~/"), home), home);
+        // Extra separators must not make `Path::join` drop the base.
+        assert_eq!(
+            expand_tilde_with(Path::new("~//x"), home),
+            PathBuf::from("/home/tester/x")
+        );
+        assert_eq!(
+            expand_tilde_with(Path::new("~///x"), home),
+            PathBuf::from("/home/tester/x")
+        );
+
+        for unchanged in [
+            "~",
+            "~user/x",
+            "~foo",
+            "relative/x",
+            "/abs/x",
+            "",
+            "./~/x",
+            "a/~/b",
+        ] {
+            assert_eq!(
+                expand_tilde_with(Path::new(unchanged), home),
+                PathBuf::from(unchanged),
+                "expected {unchanged:?} to be left untouched"
+            );
+        }
+    }
+
+    /// The pure core is tested above; this asserts the wiring to the real home
+    /// directory lookup, which is the half a fake home cannot cover.
+    #[test]
+    fn expand_tilde_resolves_against_the_environment_home() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("HOME", "/tmp/fleet-tilde-home");
+
+        let expanded = expand_tilde(Path::new("~/x/boards.toml"));
+        let untouched = expand_tilde(Path::new("relative/x"));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            expanded.unwrap(),
+            PathBuf::from("/tmp/fleet-tilde-home/x/boards.toml")
+        );
+        assert_eq!(untouched.unwrap(), PathBuf::from("relative/x"));
     }
 
     #[test]

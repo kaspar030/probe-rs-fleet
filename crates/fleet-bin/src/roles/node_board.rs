@@ -700,6 +700,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    use crate::test_support::ENV_LOCK;
+
     /// The stub `fleet-agent`'s own one is `#[cfg(test)]`-private, so it cannot
     /// be borrowed from here.
     struct StubLister(Vec<DiscoveredProbe>);
@@ -1060,6 +1062,65 @@ mod tests {
         assert_eq!(
             resolve_boards_path(&bare, None).unwrap(),
             bare.join("boards.toml")
+        );
+    }
+
+    /// The scaffolded `node.toml` advertises a `~/` path, so both spellings of
+    /// the setting — the file value and the `--boards-path` flag — must expand
+    /// it, or `node board add` writes into a literal `./~` the agent never
+    /// reads.
+    #[test]
+    fn a_leading_tilde_is_expanded_for_both_spellings() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(
+            node_dir.join("node.toml"),
+            "boards_path = \"~/x/boards.toml\"\n",
+        )
+        .unwrap();
+
+        let home = tmp.path().join("home");
+        let prev_home = std::env::var_os("HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("HOME", &home);
+
+        let from_file = resolve_boards_path(&node_dir, None);
+        let from_flag = resolve_boards_path(&node_dir, Some(Path::new("~/y/boards.toml")));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(from_file.unwrap(), home.join("x/boards.toml"));
+        assert_eq!(from_flag.unwrap(), home.join("y/boards.toml"));
+    }
+
+    /// Expansion must be confined to a leading `~/`: a relative path stays
+    /// relative to the cwd, exactly as it resolved before.
+    #[test]
+    fn a_relative_boards_path_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let node_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&node_dir).unwrap();
+        std::fs::write(
+            node_dir.join("node.toml"),
+            "boards_path = \"rel/boards.toml\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_boards_path(&node_dir, None).unwrap(),
+            PathBuf::from("rel/boards.toml")
+        );
+        assert_eq!(
+            resolve_boards_path(&node_dir, Some(Path::new("other/boards.toml"))).unwrap(),
+            PathBuf::from("other/boards.toml")
         );
     }
 
