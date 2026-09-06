@@ -77,9 +77,18 @@ export function create(vnode) {
   return el;
 }
 
-/** Replace `target`'s contents with `vnode`. */
+/**
+ * Replace `target`'s contents with `vnode`.
+ *
+ * `vnode` may be an array of roots, in which case each becomes a child of
+ * `target` (and `[]` empties it). That is part of the contract, not an
+ * accident: a flex container's `gap` only spaces *sibling* items, so a nav or
+ * toolbar whose children must be spaced by CSS has to mount its items as a
+ * list rather than wrapped in a single element.
+ */
 export function mount(target, vnode) {
-  target.replaceChildren(create(vnode));
+  const roots = Array.isArray(vnode) ? vnode : [vnode];
+  target.replaceChildren(...roots.map(create));
   return target;
 }
 

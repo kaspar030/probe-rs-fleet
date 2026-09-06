@@ -80,25 +80,24 @@ function renderChrome(current) {
   const nav = document.getElementById('nav');
   const who = document.getElementById('whoami');
   if (!session) {
-    mount(nav, h('span', {}));
+    mount(nav, []);
     mount(who, h('span', {}));
     return;
   }
+  // Mounted as a list, not wrapped in a single element: `nav` is a flex
+  // container and its `gap` only spaces sibling items, so a wrapper would
+  // leave one flex item and run the labels together. Do not reintroduce one.
   mount(
     nav,
-    h(
-      'span',
-      {},
-      NAV.map((entry) =>
-        h(
-          'a',
-          {
-            href: entry.path,
-            class: entry.page === current ? 'active' : '',
-            on: { click: (e) => { e.preventDefault(); navigate(entry.path); } },
-          },
-          entry.label,
-        ),
+    NAV.map((entry) =>
+      h(
+        'a',
+        {
+          href: entry.path,
+          class: entry.page === current ? 'active' : '',
+          on: { click: (e) => { e.preventDefault(); navigate(entry.path); } },
+        },
+        entry.label,
       ),
     ),
   );
