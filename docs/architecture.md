@@ -1144,7 +1144,12 @@ and promotion re-decides per board. Refreshing rather than dropping matters:
 cancelling all of a subject's pending requests would silently kill ones for
 boards in *their own org*, collateral damage across a tenancy boundary suffered
 by someone who did nothing wrong, and would also be wrong for a subject still
-covered by a second overlapping grant. The honest limit: an already-minted
+covered by a second overlapping grant. **Note the contrast with §6.6's
+drop-on-disconnect rule**, which drops a connection's queued requests outright:
+there the caller is provably gone and no promotion could reach it; here the
+caller is present and only its reach changed. Same queue, opposite answers, and
+neither reason generalises to the other case. The honest limit: an
+already-minted
 capability token stays cryptographically valid until it expires; tearing down
 the relay is what makes it useless, since there is no path to the board without
 the coordinator. Delegation has exactly the same bound, which is why lease TTLs
@@ -1190,7 +1195,10 @@ what the delegator may actually do — you can never delegate more than you hold
 — and it is re-intersected with the delegator's *current* access at every
 channel open, so revoking the delegator's grant also narrows the sandbox. A
 contended `ctl delegate` prints no token and exits non-zero: a handoff script
-must not mistake a queue slip for a board.
+must not mistake a queue slip for a board. It also leaves **no waiter** behind —
+it goes through the scheduler's non-enqueueing `try_lease`, because a waiter
+left by a verb that returns immediately could later be promoted onto a board
+nobody is holding.
 
 **One data-plane token, carried explicitly.** `CoordToSidecar::ChannelOpened`
 now carries the exact capability-token bytes the coordinator sent the node, and
@@ -1201,11 +1209,36 @@ coincidence — same fields, deterministic ed25519 — a coincidence that an
 attenuation breaks by construction. The wire field removes the whole class of
 "two mints must be byte-identical" bugs. Protocol 6 → 7.
 
-### 6.6 Lease lifecycle (unchanged)
+### 6.6 Lease lifecycle
 
-- `request{constraints, duration, priority}` → `Leased{board, node, channel,
-  token, expires}` or `Queued`. Heartbeat renews; missed heartbeats free the
-  board and trigger node cleanup.
+- `request{constraints, duration, priority}` → one of **four** outcomes, not two:
+  - `Leased{board, node, channel, token, expires}`;
+  - `Queued{position}` — matching boards exist in the caller's reach but all are
+    busy. **The only outcome that enqueues.** A sidecar waits for the promotion
+    push; `ctl lease` prints the position and exits 0;
+  - `NoCandidate{selector, reachable}` — nothing the caller may reach matches
+    the selector, in *any* state. Waiting cannot help, so nothing is queued;
+  - `AtCap{held, cap}` — the caller is at `max_concurrent_per_subject`, so the
+    selector was never evaluated. Also not queued.
+
+  The split exists because one `Queued` for all of these blamed the fleet for a
+  selector typo and for the caller's own budget alike, and `position: 0` was not
+  a usable tell (it counts only waiters with an identical selector). Deciding
+  the cap *before* candidacy is what keeps the `AtCap` message honest.
+  Protocol 8 → 9.
+- Heartbeat renews; missed heartbeats free the board and trigger node cleanup.
+- **Promotion is pushed.** When a board frees up, the promoted waiter is sent
+  its grant on the connection that queued for it (`RequesterId`, minted per
+  connection). If that connection has gone, the promotion is *undeliverable*:
+  the lease is closed again and the board handed to the next waiter, rather than
+  left marked `Leased` to somebody who has exited.
+- **A disconnect drops queued requests, not held leases.** Closing a connection
+  removes that connection's waiters — nobody is left to receive a promotion —
+  while a lease it holds survives to its TTL, because a lease outlives one
+  connection (a sidecar reconnects; `ctl` dials once per command). This is
+  deliberately *not* the same question as the revocation cascade's
+  refresh-not-drop rule in §6.5: there the subject is present and blameless and
+  only its reach changed; here the caller is gone.
 - **Fairness v1:** FIFO queue + per-subject concurrency cap + priority classes
   (interactive dev > nightly CI > soak).
 - Leases are now **org-scoped**, and the per-principal concurrency cap is keyed
@@ -1351,12 +1384,17 @@ priority at grant time), so there is deliberately no second guard in
 `extend_lease`.
 
 The clamp orders contention; it does not make contention painless. A workload
-whose request finds no free board is `Queued` like anybody else, and the sidecar
-turns that into a hard error rather than waiting — a build step cannot sit on a
-queue slip the way a human at `ctl lease` can. Since every job in a repo is the
-*same* subject, `max_concurrent_per_subject` is effectively a per-repo cap and a
-wide CI matrix hits it. `docs/ci-github-actions.md` says so in the operator's
-vocabulary.
+whose request finds every matching board busy is `Queued` like anybody else, and
+the sidecar now **waits** for its turn rather than failing: it parks on the
+control connection for the coordinator's promotion push, bounded by
+`PROBE_RS_FLEET_QUEUE_WAIT` (client-side, default 300s; `0` restores the old
+fail-fast behaviour). Only a wait that expires is an error. That is what lets a
+matrix wider than the fleet run to completion instead of failing legs, so
+`max-parallel` is now a throughput knob rather than a correctness requirement.
+Since every job in a repo is the *same* subject, `max_concurrent_per_subject`
+is still effectively a per-repo cap and a wide CI matrix still hits it — but it
+now says so (`AtCap`) instead of reporting contention.
+`docs/ci-github-actions.md` says all of this in the operator's vocabulary.
 
 #### The verb surface behind `/client`, walked
 
@@ -1499,7 +1537,9 @@ caching. The decisions worth knowing:
   board — the coordinator caps neither channels per lease nor sessions per
   board, and its `Queued` reply was what prevented this. A hit is only taken if
   the record's use-lock is free; otherwise the invocation falls through to a
-  fresh `Lease` and gets today's "board contended" answer. The kernel releases
+  fresh `Lease` and takes the ordinary contention path — which since the queue
+  split means it *waits* for a turn (bounded by `PROBE_RS_FLEET_QUEUE_WAIT`)
+  rather than erroring immediately. The kernel releases
   the lock when the holder dies, SIGKILL included, so no staleness heuristic is
   needed.
 - **A reused lease id is cross-checked against the board.** Lease ids restart at

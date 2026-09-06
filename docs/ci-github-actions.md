@@ -148,43 +148,56 @@ past the expiry must re-run `ci login`; put it before the long step, or split th
 job. `ci login` prints the expiry and says this in one line, so it is not
 something to discover as a flake at 3am.
 
-### A wide matrix contends, and contention is a job failure — not a wait
+### A wide matrix contends — and a contended leg now *waits*
 
-Read this before widening a matrix; the intuitive reading is wrong.
+Read this before widening a matrix; the intuitive reading is wrong in a
+different way than it used to be.
 
 `max_concurrent_per_subject` (default 2) is keyed by the **subject**, and every
 job in the repo authenticates as the *same* subject (`gha/workload:owner/repo`)
 — so the cap is effectively **per repo**, not per job, per matrix leg or per
 workflow. Ten legs against a two-board pool are ten requests from one subject.
 
-When no board it may use is free, or the subject is at its cap, the coordinator
-**queues** the request and answers `Queued { position }` rather than refusing it.
-But the sidecar does not wait on that: `probe-rs run` turns `Queued` into a hard
-error and exits non-zero.
+The coordinator now answers three different situations differently, and only
+one of them is a wait:
 
-```
-coordinator declined: board contended; queued at position 1
-```
+- **every matching board is busy** — the request is queued, and `probe-rs run`
+  **waits** for its turn, up to `PROBE_RS_FLEET_QUEUE_WAIT` (default 300s). If a
+  leg ahead of it finishes inside that window, the coordinator pushes the grant
+  down the same connection and the leg proceeds as if it had never queued. Only
+  when the wait expires does the step fail:
 
-So the practical rule is: **a contended leg fails; it does not block.** Two
-consequences to plan for:
+  ```
+  coordinator declined: still queued at position 1 after 300s; giving up
+  ```
 
-- **Bound the concurrency yourself.** Set the matrix's `max-parallel` to no more
-  than `max_concurrent_per_subject`, or ask the fleet admin to raise the cap for
-  your subject. Retrying the step is the other option, but retry with a delay —
-  an immediate retry re-contends.
-- **A failed leg still leaves a queue entry.** Nothing removes a waiter when its
-  sidecar disconnects, so an abandoned request can later be promoted onto a
-  board that no one is listening for, holding it until the lease TTL expires.
-  With a wide matrix that is a real way to idle a small pool. This is v1
-  behaviour, recorded in `sweep.rs` ("notifying a *disconnected* sidecar of its
-  promotion is best-effort/deferred for v1") and filed as issue #384, not
-  something to work around in the workflow — keeping concurrency under the cap
-  is what avoids it.
+- **the selector matches nothing you can reach** — no amount of waiting helps,
+  so it fails immediately and says how much fleet you can actually see;
+- **you are at the cap** — likewise immediate, and it names the knob rather than
+  blaming contention.
+
+So the practical rules are:
+
+- **`max-parallel` is a throughput knob, not a correctness requirement.** Bounding
+  a matrix to `max_concurrent_per_subject` still avoids paying the queue wait on
+  every leg, and is worth doing for a long matrix. It is no longer the thing
+  standing between you and spurious failures.
+- **Size the wait to the job, not to the fleet.** A leg whose flash-and-test
+  cycle is two minutes wants a wait comfortably longer than the legs ahead of
+  it; a smoke test that should never queue can set
+  `PROBE_RS_FLEET_QUEUE_WAIT=0` and fail fast, which is exactly the old
+  behaviour.
+- **An abandoned leg leaves nothing behind.** When a leg gives up (or is
+  cancelled, or the runner dies), its connection closes and the coordinator
+  drops its queued request — so it can never later be promoted onto a board
+  nobody is listening for. A lease it was actually *holding* still survives to
+  its TTL, deliberately: that is what lets a sidecar reconnect.
 
 `ctl lease` behaves differently on purpose: it prints `queued at position N` and
-exits **zero**, because a human can come back to it. A build step cannot, which
-is why the sidecar fails fast rather than blocking a CI job on a queue slip.
+exits **zero** without waiting, because an operator wants to know the state of
+the queue rather than to be parked in it. Note that its slip lasts only while
+the command runs — `ctl` opens one connection per command, and the same
+drop-on-disconnect rule applies.
 
 One thing you never have to plan for: **a CI lease is clamped to CI priority**
 whatever it asks for, so a CI run can never outbid a developer sitting at a
@@ -204,7 +217,9 @@ changes that: the fleet relays bytes, it does not interpret them.
 
 | what you see | what happened | what to do |
 |---|---|---|
-| `coordinator declined: board contended; queued at position N` | every board matching your selector is busy, or the repo is at `max_concurrent_per_subject` | narrow the matrix (`max-parallel`), or retry with a delay. The sidecar fails fast rather than blocking a build step on a queue slip |
+| `coordinator declined: still queued at position N after 300s; giving up` | every board matching your selector was busy for the whole wait | raise `PROBE_RS_FLEET_QUEUE_WAIT`, narrow the matrix (`max-parallel`) so fewer legs compete, or ask for a bigger pool. Nothing is left queued behind the failure |
+| `coordinator declined: no board matches \`<selector>\`; ctl list shows N boards you can reach` | the selector matches nothing you have access to — a typo, or a grant you do not have | run `ctl list` and select from what it shows. Waiting cannot fix this, which is why it fails immediately |
+| `coordinator declined: you already hold N leases (cap max_concurrent_per_subject = N); release one or raise the cap` | your **repo** is at its concurrency cap; the fleet may well be idle | bound the matrix with `max-parallel`, release a lease, or ask the fleet admin to raise the cap for your subject |
 | `403 no_grant` | the token verified fine; this **repo** has no grant | the fleet admin runs `grant --repo <owner>/<name> …`. Being under a granted owner is deliberately not enough |
 | `401 invalid_grant` | the coordinator refused the credential and will not say why | check `--audience` against the coordinator's configured one, then the runner's clock; the real reason is in the **coordinator's** log |
 | `503 workload_oidc_unconfigured` | that coordinator has no `[github_actions]` block | the operator adds one, or use `ci login --auth-key` |

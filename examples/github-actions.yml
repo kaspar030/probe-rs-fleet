@@ -153,11 +153,16 @@ jobs:
       #    every job in this repository authenticates as the same subject
       #    (gha/workload:<owner>/<repo>). So the cap is effectively per repo:
       #    ten legs against a two-board pool are ten requests from ONE subject.
-      #  * a contended leg FAILS; it does not wait. The coordinator queues the
-      #    request, but the sidecar turns `Queued` into a hard error and exits
-      #    non-zero ("board contended; queued at position N") — a build step
-      #    cannot sit on a queue slip the way a human at `ctl lease` can. Set
-      #    `max-parallel` to no more than the cap, or retry with a delay.
+      #  * a contended leg WAITS, up to PROBE_RS_FLEET_QUEUE_WAIT (default
+      #    300s). The coordinator queues the request and pushes the grant down
+      #    the same connection when a board frees up, so a leg that gets its
+      #    turn inside the window proceeds as if it had never queued. Only an
+      #    expired wait fails ("still queued at position N after 300s"). Set
+      #    `max-parallel` to bound throughput, not to avoid failures; set
+      #    PROBE_RS_FLEET_QUEUE_WAIT=0 if you would rather fail fast.
+      #  * being at the cap, or naming a board you cannot reach, fails
+      #    immediately and says which of the two it was — neither is something
+      #    waiting can fix.
       #  * the workload token's TTL is one hour by default and there is no
       #    refresh path. Re-run `ci login` immediately before a long step
       #    rather than once at the top of a slow job.
@@ -166,7 +171,7 @@ jobs:
       # matrix can never outbid a developer at a desk.
       #
       # strategy:
-      #   max-parallel: 2          # <= max_concurrent_per_subject
+      #   max-parallel: 2          # keeps legs from queueing at all
       #   matrix:
       #     chip: [nRF52840_xxAA, nRF5340_xxAA]
       # ---------------------------------------------------------------------
