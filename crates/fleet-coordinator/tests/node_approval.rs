@@ -472,6 +472,10 @@ async fn the_approval_page_is_static_and_reflects_nothing() {
     assert_eq!(status, 200);
     assert!(plain.contains("probe-rs-fleet node approve"), "{plain}");
     assert!(plain.contains("cannot see it from here"), "{plain}");
+    // The one thing phase 2 added: a static link into the web UI, for the
+    // human who would rather click than install the CLI. Still no form, still
+    // no query parameter read.
+    assert!(plain.contains("/ui/approve"), "{plain}");
 
     for query in [
         "?code=ABCD-1234",

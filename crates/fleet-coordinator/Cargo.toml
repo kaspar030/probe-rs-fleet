@@ -47,6 +47,10 @@ hmac.workspace = true
 subtle.workspace = true
 base64.workspace = true
 
+# The web UI's asset tree, embedded at compile time (docs/web-ui.md D3); see
+# `src/assets.rs` for the serving side and for why there is no build step.
+include_dir.workspace = true
+
 ed25519-dalek.workspace = true
 rand_core = { workspace = true, features = ["getrandom"] }
 

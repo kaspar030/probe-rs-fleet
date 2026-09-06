@@ -92,6 +92,12 @@ sha2 = "0.10"
 hmac = "0.12"
 subtle = "2"
 
+# The web UI's asset tree, embedded in the binary (docs/web-ui.md D3). A proc
+# macro that expands to `include_bytes!` per file: pure Rust, no C toolchain, no
+# build step, nothing generated — which is what keeps `cargo build` working on a
+# machine with no node/npm installed, structurally rather than as a fallback.
+include_dir = "0.7"
+
 # storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 

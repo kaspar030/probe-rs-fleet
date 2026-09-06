@@ -42,9 +42,13 @@
 //! [`server`] the per-connection I/O shell, and [`sweep`] the background expiry
 //! task. The browser surface (`docs/web-ui.md`) is split off rather than grown
 //! into `http`: [`browser_auth`] holds the cookie/CSRF machinery and the two
-//! login flows, [`api`] the `/api/v1` JSON handlers.
+//! login flows, [`api`] the `/api/v1` JSON handlers, and [`assets`] the
+//! hand-written UI itself — embedded in this binary with `include_dir!`, so
+//! there is no build step and `cargo build` never needs node (`docs/web-ui.md`
+//! D3).
 
 pub mod api;
+pub mod assets;
 pub mod auth;
 pub mod authz;
 pub mod browser_auth;

@@ -1,0 +1,236 @@
+//! Hiding a button is UX; the server does not care that it was hidden.
+//!
+//! `docs/web-ui.md` §4 and the task's "no new authorization logic in the
+//! frontend" both reduce to one claim: **every action the UI hides from a
+//! caller is refused server-side for that caller, over the exact carrier the UI
+//! uses.** The per-endpoint matrix already lives in `api_grants.rs` /
+//! `api_readonly.rs` / `api_nodes.rs`; this file asserts the frontend-relevant
+//! claim in one place, so a reviewer of the UI has one file to read.
+//!
+//! The carrier matters and is not incidental: these calls go over the session
+//! **cookie plus `X-Fleet-Csrf`**, which is what `web/api.mjs` sends. A test
+//! that used `Authorization: Bearer` would exercise a path the browser never
+//! takes and would skip the CSRF gate entirely.
+//!
+//! What is deliberately *not* here: any assertion about the frontend's own
+//! rendering. Whether a member's devices page shows a Release button is a
+//! question for `web-tests/pages.test.mjs`; whether pressing it would work is
+//! this file's, and the answer must be no regardless of what the page drew.
+
+mod common;
+
+use common::TestCoordinator;
+
+use fleet_proto::adopt::AdoptPolicy;
+use fleet_proto::ids::{OrgId, Role};
+
+/// Call a route the way the UI does: session cookie + CSRF header.
+async fn as_browser(
+    fleet: &TestCoordinator,
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&str>,
+) -> (u16, String) {
+    let (cookie, csrf) = fleet.browser_session(token);
+    let (status, _, body) = fleet
+        .http_full(
+            method,
+            path,
+            &[("cookie", &cookie), ("x-fleet-csrf", &csrf)],
+            body.map(str::to_owned),
+        )
+        .await;
+    (status, body)
+}
+
+/// Every action the access page hides from a member is refused for a member.
+///
+/// The page renders "creating a grant is admin-only" instead of the form, and
+/// hides the audit nav for a non-admin. Neither is a control.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_is_refused_every_admin_action_the_ui_hides() {
+    let fleet = TestCoordinator::start().await;
+    // Both in **one** org: the question is what a member of an org may do in
+    // it, not what a stranger may do to it. A pair of personal orgs would make
+    // every refusal below true for the wrong reason.
+    fleet.seed_session("acme", "alice", Role::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+
+    // Grant creation: admin-only, because a grant points *outward*.
+    let body = serde_json::json!({
+        "subject": "alice",
+        "selector": "tag=nrf52",
+        "ops": ["attach"],
+        "expires": fleet.coord.now() + 3_600,
+    })
+    .to_string();
+    let (status, response) = as_browser(&fleet, "POST", "/api/v1/grants", &bob, Some(&body)).await;
+    assert_eq!(status, 403, "a member created a grant: {response}");
+    assert!(response.contains("forbidden"), "{response}");
+
+    // The audit log: admin-only. The UI renders "your role cannot read the
+    // audit log"; the server is what makes that true.
+    let (status, response) = as_browser(&fleet, "GET", "/api/v1/audit", &bob, None).await;
+    assert_eq!(status, 403, "a member read the audit log: {response}");
+}
+
+/// A member may not touch a node they do not own, whatever the page drew.
+///
+/// The agents page shows Edit/Revoke only for `owner == me` or an admin; the
+/// rule itself is `Coordinator::update_node_core`'s, and it holds for a caller
+/// who never saw the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_cannot_mutate_a_node_it_does_not_own() {
+    let fleet = TestCoordinator::start().await;
+    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+    // Owned by alice, in the org bob is a member of — so the refusal below is
+    // about ownership, not about tenancy (which `api_nodes.rs` covers).
+    fleet
+        .seed_owned_node("acme", "rpi-1", "alice", AdoptPolicy::Declared)
+        .await;
+
+    let (status, response) = as_browser(
+        &fleet,
+        "PATCH",
+        "/api/v1/nodes/rpi-1",
+        &bob,
+        Some(r#"{"tags":["mine-now"]}"#),
+    )
+    .await;
+    assert_eq!(status, 403, "a non-owner retagged a node: {response}");
+
+    let (status, response) = as_browser(&fleet, "DELETE", "/api/v1/nodes/rpi-1", &bob, None).await;
+    assert_eq!(status, 403, "a non-owner revoked a node: {response}");
+
+    // And a rename is refused for the *owner* too — the agents page offers
+    // tags and adopt only, and says why, because the server 400s a `name`.
+    let (status, response) = as_browser(
+        &fleet,
+        "PATCH",
+        "/api/v1/nodes/rpi-1",
+        &alice,
+        Some(r#"{"name":"rpi-2"}"#),
+    )
+    .await;
+    assert_eq!(status, 400, "a rename was accepted: {response}");
+    assert!(response.contains("invalid_request"), "{response}");
+}
+
+/// A stranger cannot release somebody else's lease, and gets the answer a
+/// nonexistent lease would produce.
+///
+/// The devices page shows Release for the holder or an org admin. A member who
+/// is neither gets `404` — deliberately *not* `403`, or the API would be an
+/// oracle for which lease ids are live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
+    let fleet = TestCoordinator::start().await;
+    let org = OrgId("acme".to_owned());
+    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+
+    // Alice takes a lease through the real sidecar path.
+    let session = fleet.client_session(&alice).await;
+    let lease = {
+        use fleet_proto::ids::BoardName;
+        use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+        use fleet_wire::{CoordToSidecar, SidecarToCoord};
+        match session
+            .request(SidecarToCoord::Lease(LeaseRequest {
+                select: Constraint::Board(BoardName("dk-3".to_owned())),
+                duration_secs: 600,
+                priority: Priority::Interactive,
+            }))
+            .await
+            .unwrap()
+        {
+            CoordToSidecar::Lease(g) => g.lease,
+            other => panic!("expected a lease, got {other:?}"),
+        }
+    };
+
+    let (status, held) = as_browser(
+        &fleet,
+        "DELETE",
+        &format!("/api/v1/leases/{}", lease.0),
+        &bob,
+        None,
+    )
+    .await;
+    assert_eq!(status, 404, "a stranger released a lease: {held}");
+
+    // Byte-identical to the answer for a lease that never existed: that is
+    // what stops the endpoint enumerating live leases across tenants.
+    let (absent_status, absent) =
+        as_browser(&fleet, "DELETE", "/api/v1/leases/999999", &bob, None).await;
+    assert_eq!(absent_status, status);
+    assert_eq!(absent, held);
+}
+
+/// Power-cycling a board in another org is a `404`, exactly as an absent one
+/// is — the devices page simply never lists it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_board_in_another_org_is_indistinguishable_from_one_that_does_not_exist() {
+    let fleet = TestCoordinator::start().await;
+    let other = OrgId("other".to_owned());
+    fleet.seed_board(&other, "rpi-9", "secret-dk", &["nrf52"]).await;
+    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+
+    let (cross, cross_body) = as_browser(
+        &fleet,
+        "POST",
+        "/api/v1/boards/power-cycle",
+        &alice,
+        Some(r#"{"board":"other/other/rpi-9/secret-dk"}"#),
+    )
+    .await;
+    let (absent, absent_body) = as_browser(
+        &fleet,
+        "POST",
+        "/api/v1/boards/power-cycle",
+        &alice,
+        Some(r#"{"board":"no-such-board"}"#),
+    )
+    .await;
+    assert_eq!(cross, 404, "{cross_body}");
+    assert_eq!(cross, absent);
+    assert_eq!(cross_body, absent_body);
+}
+
+/// The UI's carrier is refused without its CSRF header, on every action the
+/// pages perform.
+///
+/// This is the property that makes "the UI is same-origin by construction"
+/// true: `web/api.mjs` attaches `X-Fleet-Csrf` to every non-GET, and a request
+/// that arrived without it did not come from the UI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_action_the_ui_performs_needs_the_csrf_header() {
+    let fleet = TestCoordinator::start().await;
+    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    fleet
+        .seed_owned_node("acme", "rpi-1", "alice", AdoptPolicy::Declared)
+        .await;
+    let (cookie, _csrf) = fleet.browser_session(&alice);
+
+    for (method, path, body) in [
+        ("POST", "/api/v1/boards/power-cycle", r#"{"board":"dk-3"}"#),
+        ("DELETE", "/api/v1/leases/1", "{}"),
+        ("PATCH", "/api/v1/nodes/rpi-1", r#"{"tags":[]}"#),
+        ("DELETE", "/api/v1/nodes/rpi-1", "{}"),
+        ("POST", "/api/v1/nodes/pending/ABCD-1234", r#"{"decision":"inspect"}"#),
+        ("POST", "/api/v1/grants", "{}"),
+        ("DELETE", "/api/v1/grants/abcdef0123456789", "{}"),
+        ("POST", "/api/v1/auth-keys", r#"{"ttl_secs":3600}"#),
+        ("DELETE", "/api/v1/auth-keys/abcdef0123456789", "{}"),
+        ("POST", "/api/v1/session/logout", "{}"),
+    ] {
+        let (status, _, response) = fleet
+            .http_full(method, path, &[("cookie", &cookie)], Some(body.to_owned()))
+            .await;
+        assert_eq!(status, 403, "{method} {path} without CSRF: {response}");
+        assert!(response.contains("forbidden"), "{method} {path}: {response}");
+    }
+}

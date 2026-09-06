@@ -18,11 +18,24 @@
 //! | `GET /auth/github/callback` | anyone with a valid `state` | exchange the code, set the session cookies |
 //! | `GET /api/v1/*` | browser sessions, or a bearer | the read-only JSON API ([`crate::api`]) |
 //! | `POST`/`PATCH`/`DELETE /api/v1/*` | browser sessions (+ `X-Fleet-Csrf`), or a bearer | the management verbs ([`crate::api`]) |
+//! | `GET /` , `GET /ui` | anyone | `302` to `/ui/` |
+//! | `GET /ui/` and each client-side route | anyone | the UI shell ([`crate::assets`]) |
+//! | `GET /ui/a/{hash}/*` | anyone | an embedded, immutably-cacheable asset |
 //!
-//! The last three are the browser surface (`docs/web-ui.md`); their handlers
-//! live in [`crate::browser_auth`] and [`crate::api`] and are merged into the
-//! router here. `/api/v1/*` is the **only** prefix on which a cookie is an
-//! accepted credential — see [`Carrier`].
+//! `/auth/github/*`, `/api/v1/*` and `/ui*` are the browser surface
+//! (`docs/web-ui.md`) — named by prefix rather than by position, so the next row
+//! anyone adds does not silently make this sentence wrong. Their handlers live
+//! in [`crate::browser_auth`], [`crate::api`] and [`crate::assets`] and are
+//! merged into the router here. `/api/v1/*` is the **only** prefix on which a
+//! cookie is an accepted credential — see [`Carrier`]; the asset routes
+//! authenticate nothing at all, because the shell has to load before a session
+//! exists.
+//!
+//! **This router has no global fallback and must not grow one.** Every
+//! catch-all is scoped under `/ui/`, which is what makes "the SPA shell cannot
+//! swallow `/api/*`, `/agent`, `/client`, `/delegate` or `/healthz`" a property
+//! of the router's shape rather than of a test that samples it. See
+//! [`crate::assets`].
 //!
 //! # Interactive node approval (architecture §4.2 rung 3, §6.4)
 //!
@@ -77,6 +90,13 @@
 //! page a form. Please do not "fix" that: the page's *unauthenticated*
 //! rendering must stay byte-identical whatever the query string, which is what
 //! makes it reflect nothing, and it is the URL every deployed agent prints.
+//!
+//! Phase 2 (the UI itself) added **one static paragraph** linking to
+//! `/ui/approve`, where the same JSON endpoint is driven from a real form. That
+//! is the whole change: no query parameter is read, nothing is echoed, and the
+//! rendering is still byte-identical whatever the query string, so
+//! `tests/node_approval.rs`'s reflection test keeps holding. A link is the
+//! largest thing this page can grow without becoming the form it must not be.
 //!
 //! The design kept a real browser flow open, and these three properties were
 //! commitments rather than accidents. Phase 1b cashed in the first, exactly as
@@ -274,6 +294,9 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         // is an accepted credential — stays greppable in one place.
         .merge(crate::browser_auth::github_router())
         .merge(crate::api::router())
+        // The UI itself: `/`, `/ui`, the client-side routes and the hashed
+        // asset URLs. No `.fallback()` — see the module documentation.
+        .merge(crate::assets::router())
         .with_state(coord)
 }
 
@@ -2625,6 +2648,7 @@ const NODE_APPROVE_PAGE: &str = concat!(
     "and you cannot see it from here.</p>\n",
     "<p>Not logged in yet?</p>\n",
     "<pre>probe-rs-fleet login</pre>\n",
+    "<p>Or approve it in the web UI: <a href=\"/ui/approve\">/ui/approve</a></p>\n",
     "<p>This page is informational: nothing you do here approves anything.</p>\n",
     "</body>\n</html>\n",
 );
