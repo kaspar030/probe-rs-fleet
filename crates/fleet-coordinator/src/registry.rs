@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 
 use fleet_proto::agent_api::CoordinatorCommand;
 use fleet_proto::ids::{AgentId, LeaseId};
@@ -32,16 +33,49 @@ pub enum AgentMessage {
 }
 
 /// A handle to push messages to a connected agent's writer task.
+///
+/// Carries a **shutdown signal** alongside the message channel. That is not
+/// redundant with dropping the handle: [`crate::server::handle_agent`] keeps its
+/// own `out_tx` alive for the life of the read loop (rotation pushes go through
+/// it), so the registry holds a *clone* and removing the entry closes nothing.
+/// A caller that needs the socket actually torn down — node deletion, which is
+/// a revocation — must say so explicitly.
 #[derive(Debug, Clone)]
 pub struct AgentHandle {
     tx: mpsc::Sender<AgentMessage>,
+    shutdown: Arc<Notify>,
 }
 
 impl AgentHandle {
     /// Wrap a sender into the agent writer task.
     #[must_use]
     pub fn new(tx: mpsc::Sender<AgentMessage>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            shutdown: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Ask the owning connection task to close this agent's connection.
+    ///
+    /// Uses `notify_one` rather than `notify_waiters` deliberately: it stores a
+    /// permit when nobody is waiting yet, which closes the race between
+    /// [`AgentRegistry::insert`] and the read loop reaching its `select!`. A
+    /// signal delivered in that window must not be dropped on the floor — the
+    /// caller has already deleted the node row.
+    pub fn shutdown(&self) {
+        self.shutdown.notify_one();
+    }
+
+    /// The signal the owning connection task waits on.
+    ///
+    /// The waiter must create its [`Notify::notified`] future **once** and hold
+    /// it across `select!` iterations (see [`crate::server::handle_agent`]): a
+    /// future that is polled and then dropped each time round can consume the
+    /// stored permit and lose it.
+    #[must_use]
+    pub fn shutdown_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.shutdown)
     }
 
     /// Send a control command to the agent.
@@ -92,8 +126,30 @@ impl AgentRegistry {
     }
 
     /// Remove an agent (on disconnect).
+    ///
+    /// **Does not close the connection**, and cannot: the connection task holds
+    /// its own sender clone, so dropping the registry's changes nothing. This
+    /// is the right call from `handle_agent`'s own teardown, where the socket
+    /// is already going away. A caller that is *revoking* a node wants
+    /// [`AgentRegistry::remove_and_close`].
     pub async fn remove(&self, agent: &AgentId) {
         self.inner.lock().await.remove(agent);
+    }
+
+    /// Remove an agent **and** tear its connection down.
+    ///
+    /// The revocation path (node deletion): unrouting the node is not enough,
+    /// because an already-open socket would otherwise linger until it dropped
+    /// of its own accord — an operator who deleted a node would still have the
+    /// machine attached to the fleet. Returns whether an entry was present.
+    pub async fn remove_and_close(&self, agent: &AgentId) -> bool {
+        let handle = self.inner.lock().await.remove(agent);
+        if let Some(handle) = handle {
+            handle.shutdown();
+            true
+        } else {
+            false
+        }
     }
 
     /// Get a clone of an agent's handle, if connected.

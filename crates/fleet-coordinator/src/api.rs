@@ -658,7 +658,14 @@ async fn nodes(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Res
 /// `Option`s buy.
 ///
 /// `name` is present **so that it can be refused**. See [`update_node`].
+///
+/// `deny_unknown_fields` so the refusal is uniform: without it `{"name":…}` is
+/// a `400` while a typo'd `{"nmae":…}` is a silent success that changes
+/// nothing, which is the worse half of both answers. A caller who misspells a
+/// field learns it, and a caller who spells `name` correctly still learns that
+/// renaming is refused rather than unsupported.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NodePatch {
     #[serde(default)]
     name: Option<String>,
@@ -734,7 +741,8 @@ async fn update_node(
 /// A **revocation**, not a tidy-up: deleting the `node` row invalidates the
 /// node's token (architecture §4.2), and the cascade that makes that real —
 /// live leases through the whole release path, boards out of the scheduler and
-/// the `board` table, the connection dropped — lives in
+/// the `board` table, and the node's control-plane `WebSocket` actually closed
+/// (not merely unrouted) — lives in
 /// [`Coordinator::delete_node_core`], which is where a reader looking for "what
 /// else does this touch?" should go.
 ///

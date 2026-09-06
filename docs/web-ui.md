@@ -309,7 +309,7 @@ bundle, since D3 means there is no build to branch in.
 |---|---|---|---|---|
 | `GET /api/v1/nodes` | — | `[{"id","name","tags","adopt","owner","last_seen","online","boards"}]` | **new** `Coordinator::list_nodes` → **new** `OrgDb::list_nodes` (+ `AgentRegistry` for `online`) | member |
 | `PATCH /api/v1/nodes/{name}` | `{"tags"?,"adopt"?}` | the updated node row | `Coordinator::update_node_core` → `OrgDb::update_node` | node owner, or admin |
-| `DELETE /api/v1/nodes/{name}` | — | `204` | `Coordinator::delete_node_core` → lease teardown + scheduler removal + `OrgDb::delete_node` + drop the live connection | node owner, or admin |
+| `DELETE /api/v1/nodes/{name}` | — | `204` | `Coordinator::delete_node_core` → lease teardown + scheduler removal + `OrgDb::delete_node` + close the live connection | node owner, or admin |
 | `POST /api/v1/nodes/pending/{code}` | `{"decision":"inspect"\|"approve"\|"deny","replace":false}` | `NodeApprovalResponse` + a `warning` field | `http::decide_pending_node` (**unchanged**) | member |
 
 There is deliberately **no** `GET /api/v1/nodes/pending`. An earlier revision of
@@ -326,7 +326,11 @@ and drop its connection, or the machine keeps relaying until its lease TTL runs
 out — the same trap `grant_revoke` already solves by going through the whole
 release path. It also has to remove the node's `board` rows: `board.node_id
 REFERENCES node(id)` is enforced, so a bare `DELETE FROM node` fails for any
-node that has ever reported a board.
+node that has ever reported a board. And it must *close* the node's
+control-plane socket, not merely drop its registry entry: the connection task
+holds its own sender, so removing the entry makes the node unroutable while the
+socket lives on — an operator who deleted a node would still have the machine
+attached. `AgentRegistry::remove_and_close` is the revocation-side call.
 
 **`PATCH` does not rename, and says so.** The node id is `{org}/{name}`; it is a
 primary key referenced by `board.node_id` under `PRAGMA foreign_keys = ON`, it

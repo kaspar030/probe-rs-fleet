@@ -938,14 +938,26 @@ impl Coordinator {
     ///    this and the machine keeps relaying bytes until the lease TTL runs
     ///    out, while the operator believes it is gone;
     /// 2. the boards leave the **scheduler**, so nothing new can be leased onto
-    ///    hardware that is no longer part of the fleet;
+    ///    hardware that is no longer part of the fleet. The final "nothing is
+    ///    leased" check and the removal happen under **one** lock acquisition:
+    ///    a lease granted between a check and a later removal would be
+    ///    persisted and then dropped from the scheduler, which is the same
+    ///    stranded-row failure (1) guards against, reached by a different
+    ///    route;
     /// 3. the `board` and `node` rows are deleted in one transaction
     ///    ([`crate::state::OrgDb::delete_node`]); the board rows *must* go
     ///    first, since `board.node_id` is an enforced foreign key;
-    /// 4. the node is dropped from the [`crate::registry::AgentRegistry`],
-    ///    which closes its control-plane `WebSocket`: the connection task's
-    ///    writer drains an `mpsc` whose receiver dies with the handle, and the
-    ///    node's reconnect then fails authentication because its row is gone.
+    /// 4. the node is dropped from the [`crate::registry::AgentRegistry`] **and
+    ///    its control-plane `WebSocket` is closed**
+    ///    ([`crate::registry::AgentRegistry::remove_and_close`]). Both halves
+    ///    are needed and neither implies the other: removing the entry only
+    ///    makes the node unroutable, because
+    ///    [`crate::server::handle_agent`] keeps its own sender alive for the
+    ///    life of the read loop and the registry therefore holds a *clone*. An
+    ///    already-open socket would linger until it dropped of its own accord,
+    ///    leaving an operator who deleted a node with the machine still
+    ///    attached. The node's next reconnect then fails authentication,
+    ///    because its row is gone.
     ///
     /// The database write sits at (3) rather than first on purpose: if it
     /// fails, the leases are already down (safe, if inconvenient — the machine
@@ -975,20 +987,31 @@ impl Coordinator {
             .await?;
         let node_id = row.id.clone();
 
-        // (1) Live leases on this node's boards, through the whole release path.
+        // (1) + (2), interleaved on purpose: live leases go down through the
+        // whole shared release path, then the boards leave the scheduler — and
+        // the *last* teardown check and the `remove_board` calls happen under a
+        // single lock.
         //
-        // Looped, and that is not defensive coding: `tear_down_lease` promotes
-        // a queued waiter onto the board it just freed **and persists the
-        // promotion**, so a single pass can leave a brand-new open `leases` row
-        // against a node that is about to vanish — which step (2)'s
-        // `remove_board` would then drop from the scheduler silently, leaving
-        // the row open forever and the promoted holder believing it has a
-        // lease. Each pass consumes at least one waiter from the queue, so this
-        // terminates.
-        loop {
+        // Looped, and that is not defensive coding. Two distinct routes produce
+        // the same failure — an open `leases` row against a board the scheduler
+        // no longer has, which nothing will ever close and whose holder
+        // believes it has a lease:
+        //
+        // * `tear_down_lease` promotes a queued waiter onto the board it just
+        //   freed **and persists the promotion**, so a single pass can leave a
+        //   brand-new lease behind; and
+        // * a lease request arriving between the check and `remove_board` is
+        //   granted and persisted in that window.
+        //
+        // The second is why the exit is not "loop until empty, then take the
+        // lock again": the guard has to be re-tested and acted on without ever
+        // releasing the lock in between. Each iteration consumes at least one
+        // waiter or grant, and `tear_down_lease` needs the lock itself, so the
+        // teardown cannot happen inside the scope that removes the boards.
+        let board_refs: Vec<BoardRef> = loop {
             let held: Vec<(LeaseId, BoardRef, SubjectKey)> = {
-                let sched = self.scheduler.lock().await;
-                sched
+                let mut sched = self.scheduler.lock().await;
+                let held: Vec<_> = sched
                     .boards()
                     .filter(|b| b.agent == node_id)
                     .filter_map(|b| match &b.state {
@@ -997,11 +1020,22 @@ impl Coordinator {
                         }
                         _ => None,
                     })
-                    .collect()
+                    .collect();
+                if held.is_empty() {
+                    // Nothing leased *and* still holding the lock: remove the
+                    // boards now, before anything can be granted on them.
+                    let refs: Vec<BoardRef> = sched
+                        .boards()
+                        .filter(|b| b.agent == node_id)
+                        .map(|b| b.id.clone())
+                        .collect();
+                    for board_ref in &refs {
+                        sched.remove_board(board_ref);
+                    }
+                    break refs;
+                }
+                held
             };
-            if held.is_empty() {
-                break;
-            }
             for (lease, board_ref, holder) in held {
                 warn!(
                     %board_ref, ?lease, node = %node_id,
@@ -1011,23 +1045,7 @@ impl Coordinator {
                     .await
                     .map_err(OpError::Internal)?;
             }
-        }
-
-        // (2) The boards leave the scheduler.
-        let board_refs: Vec<BoardRef> = {
-            let sched = self.scheduler.lock().await;
-            sched
-                .boards()
-                .filter(|b| b.agent == node_id)
-                .map(|b| b.id.clone())
-                .collect()
         };
-        {
-            let mut sched = self.scheduler.lock().await;
-            for board_ref in &board_refs {
-                sched.remove_board(board_ref);
-            }
-        }
 
         // (3) The rows, board-first, in one transaction.
         let deleted = self
@@ -1041,7 +1059,7 @@ impl Coordinator {
         }
 
         // (4) The live connection.
-        self.agents.remove(&node_id).await;
+        self.agents.remove_and_close(&node_id).await;
 
         self.audit(
             &org,

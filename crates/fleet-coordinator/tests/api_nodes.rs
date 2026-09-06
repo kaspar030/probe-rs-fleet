@@ -294,6 +294,11 @@ async fn patch_validates_tags_and_adopt_the_way_enrollment_does() {
         // Not an object at all.
         r#"["tags"]"#,
         r#"{"tags":"lab"}"#,
+        // An unknown field, including the near-miss of the one field that is
+        // refused by name: a misspelling must not be a silent success while the
+        // correct spelling is a 400.
+        r#"{"nmae":"rpi-2"}"#,
+        r#"{"tags":["lab"],"owner":"mallory"}"#,
     ] {
         let (status, body) =
             as_browser(&fleet, "PATCH", "/api/v1/nodes/rpi-1", &alice, Some(bad)).await;
@@ -450,35 +455,22 @@ async fn a_non_member_cannot_probe_which_nodes_exist() {
 // DELETE — the cascade
 // ---------------------------------------------------------------------------
 
-/// **`DELETE` is a revocation.** A node holding a live lease loses it through
-/// the whole release path, and the assertion is against the *scheduler*, not
-/// merely the row: an implementation that deletes the row alone leaves the
-/// machine relaying bytes until the lease TTL expires while the operator
-/// believes it is gone.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
+/// Take a lease on `board_name` through the real wire surface, so the
+/// scheduler, the `leases` table and the audit log all agree it exists.
+///
+/// Factored out of the delete tests because seeding a lease by hand would not
+/// exercise the path whose teardown is under test.
+async fn take_lease(
+    session: &fleet_sidecar::transport::CoordSession,
+    board_name: &str,
+) -> fleet_proto::ids::LeaseId {
     use fleet_proto::ids::BoardName;
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
     use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
-    let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
-    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
-    // The node has to be *owned* by the caller for the owner path, and the
-    // board seeding above created the row through `ensure_node`, which writes
-    // the full id into `name` and no owner at all.
-    sqlx::query("UPDATE node SET owner_user_id = 'alice', name = 'rpi-1' WHERE id = 'acme/rpi-1'")
-        .execute(fleet.db().pool_for_test())
-        .await
-        .unwrap();
-
-    // Take a real lease through the wire surface, so the scheduler, the
-    // `leases` table and the audit log all agree it exists.
-    let session = fleet.client_session(&alice).await;
-    let lease = match session
+    match session
         .request(SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardName("dk-3".to_owned())),
+            select: Constraint::Board(BoardName(board_name.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         }))
@@ -487,7 +479,36 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
     {
         CoordToSidecar::Lease(g) => g.lease,
         other => panic!("expected a lease, got {other:?}"),
-    };
+    }
+}
+
+/// **`DELETE` is a revocation.** A node holding a live lease loses it through
+/// the whole release path, and the assertion is against the *scheduler*, not
+/// merely the row: an implementation that deletes the row alone leaves the
+/// machine relaying bytes until the lease TTL expires while the operator
+/// believes it is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
+    use fleet_wire::WireRx as _;
+
+    let fleet = TestCoordinator::start().await;
+    let org = OrgId("acme".to_owned());
+    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    // A real node credential for the same row, so the connection below is a
+    // genuine authenticated `/agent` upgrade rather than a stub handle.
+    // `seed_node` re-registers `acme/rpi-1` (`register_node` is an upsert on
+    // the id), which is what a machine reconnecting after enrollment does.
+    let (node_token, _) = fleet.seed_node("acme", "rpi-1").await;
+    // The node has to be *owned* by the caller for the owner path; neither
+    // `ensure_node` nor `register_node` records an owner.
+    sqlx::query("UPDATE node SET owner_user_id = 'alice', name = 'rpi-1' WHERE id = 'acme/rpi-1'")
+        .execute(fleet.db().pool_for_test())
+        .await
+        .unwrap();
+
+    let session = fleet.client_session(&alice).await;
+    let lease = take_lease(&session, "dk-3").await;
     assert!(
         fleet
             .coord
@@ -498,9 +519,19 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
             .is_some(),
         "the lease must be live before the delete"
     );
-    // ... and a live control-plane connection to drop.
-    let stub = common::AgentStub::attach(&fleet, &board.node).await;
-    assert!(fleet.coord.agents().get(&board.node).await.is_some());
+    // ... and a **real** `/agent` connection to drop. Deliberately not an
+    // `AgentStub`: a stub is a bare `mpsc` handle with nobody serving the far
+    // end, so it can only ever show that the registry entry went away — which
+    // is exactly the weaker claim that let the connection-close bug hide here.
+    let (node_tx, mut node_rx) = fleet.dial("/agent", &node_token).await.unwrap();
+    // Wait for the server to register the connection before deleting, or the
+    // test races the upgrade and passes for the wrong reason.
+    loop {
+        if fleet.coord.agents().get(&board.node).await.is_some() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     let (status, body) = as_browser(&fleet, "DELETE", "/api/v1/nodes/rpi-1", &alice, None).await;
     assert_eq!(status, 204, "{body}");
@@ -530,12 +561,29 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
         "the lease row is still open: {closed:?}"
     );
 
-    // The connection is dropped: nothing can route to the node any more.
+    // The connection is really gone, not merely unrouted. The node's socket
+    // must close: an operator who deleted a node expects the machine off the
+    // fleet, and `AgentRegistry::remove` alone cannot deliver that (the
+    // connection task holds its own sender clone, so the registry's is only a
+    // clone). This is the assertion that fails against a bare `remove`.
     assert!(
         fleet.coord.agents().get(&board.node).await.is_none(),
         "the node kept its registry entry"
     );
-    drop(stub);
+    let closed_within = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match node_rx.recv().await {
+                Ok(fleet_wire::WireEvent::Closed) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed_within.is_ok(),
+        "the deleted node's control-plane connection stayed open"
+    );
+    drop(node_tx);
 
     // The rows are gone — node **and** the boards that reference it, which is
     // the cascade `Db::delete_node` alone cannot do under enforced foreign keys.

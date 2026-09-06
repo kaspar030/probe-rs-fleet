@@ -76,10 +76,15 @@ pub async fn handle_agent(
     auth: fleet_auth::Authenticated,
 ) -> Result<()> {
     let (out_tx, mut out_rx) = mpsc::channel::<AgentMessage>(64);
-    coord
-        .agents()
-        .insert(agent_id.clone(), AgentHandle::new(out_tx.clone()))
-        .await;
+    // The handle is built first and *then* registered, so this task holds the
+    // same shutdown signal the registry hands out: `remove_and_close` fires it,
+    // and the read loop below selects on it. Removing the registry entry alone
+    // would close nothing — `out_tx` lives in this frame for the whole life of
+    // the read loop (rotation pushes go through it), so the registry only ever
+    // holds a clone.
+    let handle = AgentHandle::new(out_tx.clone());
+    let shutdown = handle.shutdown_signal();
+    coord.agents().insert(agent_id.clone(), handle).await;
 
     // One task owns the write half; every producer (the relay, the sweep, the
     // keepalive, rotation) funnels through the mpsc.
@@ -108,7 +113,7 @@ pub async fn handle_agent(
         let _ = tx.close().await;
     });
 
-    let result = agent_read_loop(&coord, rx, &agent_id, &auth, &out_tx, &ping_tx).await;
+    let result = agent_read_loop(&coord, rx, &agent_id, &auth, &out_tx, &ping_tx, &shutdown).await;
 
     coord.agents().remove(&agent_id).await;
     writer_task.abort();
@@ -123,6 +128,7 @@ async fn agent_read_loop(
     auth: &fleet_auth::Authenticated,
     out_tx: &mpsc::Sender<AgentMessage>,
     ping_tx: &mpsc::Sender<()>,
+    shutdown: &tokio::sync::Notify,
 ) -> Result<()> {
     let policy = coord.config().rotation_policy();
     let mut ping = tokio::time::interval(coord.config().ping_interval());
@@ -147,6 +153,14 @@ async fn agent_read_loop(
     // reconnects after a long outage should not have to wait a full interval.
     let mut rotation_due = fleet_auth::should_rotate(token_issued_at, coord.now(), policy);
 
+    // Created **once**, outside the loop, and pinned so `select!` can poll it
+    // repeatedly. A `notified()` future built inside the loop would be polled
+    // and then dropped every time another branch won, and a permit stored by
+    // `notify_one` in that window would be consumed and lost — leaving a
+    // deleted node connected. See `AgentHandle::shutdown_signal`.
+    let closed = shutdown.notified();
+    tokio::pin!(closed);
+
     loop {
         if rotation_due && pending.is_none() {
             rotation_due = false;
@@ -162,7 +176,15 @@ async fn agent_read_loop(
         }
 
         tokio::select! {
+            // Revocation wins over anything else pending: the node row is
+            // already gone, so there is nothing left worth reading from it.
+            biased;
+            () = &mut closed => {
+                warn!(%agent_id, "closing the connection: the node was deleted");
+                break Err(CoordinatorError::Protocol("node deleted".to_owned()));
+            }
             event = rx.recv() => {
+
                 let event = event?;
                 last_seen = Instant::now();
                 match event {
