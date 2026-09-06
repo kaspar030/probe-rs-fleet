@@ -242,6 +242,15 @@ fn is_cookie_byte(b: u8) -> bool {
 ///
 /// `Secure` is unconditional; see the module documentation. Please do not make
 /// it conditional on the scheme.
+///
+/// **Invariant: `value` must already be in the [`is_cookie_byte`] charset.**
+/// Nothing is escaped here, and a `;` in a cookie value does not escape the
+/// header — it *ends the value and starts an attribute*, which is how a value
+/// would come to set its own `Path` or clear its own `HttpOnly`. Every value
+/// this module writes but one is minted in this process (a `prfs1_` token, a
+/// hex HMAC, base64url randomness), so the invariant holds by construction.
+/// The exception is `prfs_device`, which carries GitHub's `device_code`
+/// verbatim; [`device_start`] checks it before calling this.
 fn set_cookie(name: &str, value: &str, max_age: i64, http_only: bool) -> String {
     let mut out = format!("{name}={value}; Secure; SameSite=Lax; Path=/; Max-Age={max_age}");
     if http_only {
@@ -666,6 +675,23 @@ async fn device_start(State(coord): State<Arc<Coordinator>>) -> Response {
     };
     match github::start_device_flow(&app).await {
         Ok(grant) => {
+            // The one cookie value this module does not mint itself. A `;` in
+            // it would not escape the header — it would end the value and
+            // start an *attribute*, which is how an upstream string could come
+            // to set its own `Path` or clear its own `HttpOnly`. GitHub's
+            // device codes are already in this charset, so refusing is the
+            // conservative direction: a code outside it means GitHub changed
+            // its wire format, and the operator should hear that as a failed
+            // login rather than as a cookie behaving strangely.
+            if grant.device_code.is_empty()
+                || !grant.device_code.bytes().all(is_cookie_byte)
+            {
+                warn!(
+                    "GitHub returned a device code outside the cookie token charset; \
+                     refusing to broker it"
+                );
+                return reject(StatusCode::BAD_GATEWAY, "upstream_error");
+            }
             let ttl = i64::try_from(grant.expires_in).unwrap_or(LOGIN_FLOW_TTL_SECS);
             let body = Json(BrokeredDeviceStart {
                 user_code: grant.user_code,
@@ -789,6 +815,32 @@ mod tests {
         let c = set_cookie(CSRF_COOKIE, "abc", 42, false);
         assert!(!c.contains("HttpOnly"), "{c}");
         assert!(c.contains("Secure"), "{c}");
+    }
+
+    /// `set_cookie` escapes nothing, so the values it is handed must already be
+    /// in the charset. Every value this module mints satisfies that by
+    /// construction; this pins the charset predicate itself, which is what
+    /// [`device_start`] screens GitHub's `device_code` with. A `;` is the one
+    /// that matters: in a cookie value it ends the value and begins an
+    /// *attribute*.
+    #[test]
+    fn the_cookie_charset_rejects_attribute_injection() {
+        for bad in ["a;Path=/evil", "a b", "a\"b", "a,b", "a\\b"] {
+            assert!(
+                !bad.bytes().all(is_cookie_byte),
+                "{bad} must not pass the cookie charset"
+            );
+        }
+        // The shapes we actually emit, and GitHub's device codes, do pass.
+        for good in [
+            "prfs1_bTVhY2hpbmU",
+            "deadbeef00",
+            "dc-abc123",
+            "3584d83530557fdd1f46af8289938c8ef79f9dc5",
+            "c0FSTUpBRlJ",
+        ] {
+            assert!(good.bytes().all(is_cookie_byte), "{good} must pass");
+        }
     }
 
     #[test]

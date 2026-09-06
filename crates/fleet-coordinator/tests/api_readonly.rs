@@ -129,6 +129,19 @@ async fn org_and_members_are_member_gated_and_org_scoped() {
     let org = parse(&body);
     assert_eq!(org["id"], "acme");
     assert_eq!(org["role"], "admin");
+    // `kind` reports the `org` row's own column, not a constant: every
+    // production path writes `personal` today, so a hardcoded value would be
+    // currently right and silently wrong the first time a team org exists.
+    assert_eq!(org["kind"], "personal");
+    assert!(org["slug"].is_string(), "{body}");
+
+    // Prove it is read rather than assumed.
+    sqlx::query("UPDATE org SET kind = 'team' WHERE id = 'acme'")
+        .execute(fleet.db().pool_for_test())
+        .await
+        .unwrap();
+    let (_, body) = get_as(&fleet, "/api/v1/org", &alice).await;
+    assert_eq!(parse(&body)["kind"], "team", "{body}");
 
     let (status, body) = get_as(&fleet, "/api/v1/org/members", &alice).await;
     assert_eq!(status, 200, "{body}");
@@ -286,6 +299,41 @@ async fn audit_is_admin_only_and_filters_by_board() {
     let (status, body) = get_as(&fleet, "/api/v1/audit?board=absent", &admin).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(parse(&body).as_array().unwrap().len(), 0, "{body}");
+}
+
+/// A malformed query string must be an ordinary answer, not a dropped
+/// connection.
+///
+/// The query is parsed **before** the endpoint's admin check runs, so a
+/// decoder that panicked would be reachable by any authenticated session — and
+/// `http`'s scanner passes high bytes through, so `%€` really does arrive here.
+/// The unit tests pin the decoder; this pins that the route survives the real
+/// path, which is the part a reader of either alone would have to assume.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_query_is_answered_not_a_dropped_connection() {
+    let fleet = TestCoordinator::start().await;
+    let admin = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let member = fleet.seed_session("acme", "bob", Role::Member).await;
+
+    for query in [
+        "?board=%\u{20ac}x",   // `%` before a multi-byte char: the panic case
+        "?%\u{20ac}x=1",       // the same shape in a key, which is decoded too
+        "?board=%",
+        "?board=%4",
+        "?board=%zz",
+        "?board=%ff",          // decodes to invalid UTF-8, repaired not refused
+        "?board=",
+        "?",
+    ] {
+        let (status, body) = get_as(&fleet, &format!("/api/v1/audit{query}"), &admin).await;
+        assert_eq!(status, 200, "{query}: {body}");
+
+        // And a non-admin still gets the role refusal rather than a panic:
+        // the parse happens first, so this is the case that would have been
+        // reachable without any privilege at all.
+        let (status, body) = get_as(&fleet, &format!("/api/v1/audit{query}"), &member).await;
+        assert_eq!(status, 403, "{query}: {body}");
+    }
 }
 
 /// **Cross-tenancy.** Org A's session must see nothing of org B through any

@@ -161,18 +161,41 @@ pub(crate) fn query_value(query: &str, key: &str) -> Option<String> {
 }
 
 /// Decode `%xx` escapes and `+` in one query-string component.
+///
+/// **Operates on bytes, never on `&str` slices.** A percent-decoder that
+/// indexed the `&str` (`&s[i + 1..i + 3]`) would panic on a `%` immediately
+/// before a multi-byte character, and that is reachable input: `http`'s query
+/// scanner accepts any `0x80..=0xFF` byte, so `?board=%€x` arrives here intact
+/// and would take down the handler — before any authorization check, since
+/// this runs on the way to [`Coordinator::logs_core`] rather than after it.
+/// Decoding byte-wise and letting [`String::from_utf8_lossy`] repair the
+/// result at the end keeps every input a value rather than a crash.
 fn percent_decode(s: &str) -> String {
+    /// One hex digit, or `None`.
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            // `i + 2 < len` is the right bound: `%41` at the very end has its
+            // last digit at `len - 1`, so it still decodes.
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                    out.push(b);
+                if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    out.push(hi * 16 + lo);
                     i += 3;
                     continue;
                 }
+                // Not an escape after all — a literal `%`, which is malformed
+                // but not worth refusing a whole request over.
                 out.push(bytes[i]);
                 i += 1;
             }
@@ -402,7 +425,13 @@ struct SessionView {
 struct OrgView {
     id: String,
     slug: Option<String>,
-    kind: &'static str,
+    /// `personal` | `team` | `system`, read from the `org` row's own column.
+    ///
+    /// Read rather than assumed: every production creation path writes
+    /// `personal` today, so a constant would be *currently* correct — and
+    /// silently wrong the first time a team org exists, in a field whose name
+    /// promises it reports the column.
+    kind: Option<String>,
     role: &'static str,
 }
 
@@ -520,8 +549,13 @@ async fn org(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Respo
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
-    let slug = match coord.db().org_slug(&org).await {
-        Ok(slug) => slug,
+    let (slug, kind) = match coord.db().org_slug_and_kind(&org).await {
+        // An org a live session names but no `org` row backs is not a
+        // condition to paper over with defaults; it cannot happen (`session`
+        // carries a foreign key onto `org`), and if it ever does the honest
+        // answer is nulls rather than an invented `personal`.
+        Ok(Some((slug, kind))) => (Some(slug), Some(kind)),
+        Ok(None) => (None, None),
         Err(e) => {
             warn!(error = %e, "failed to resolve an org slug");
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
@@ -530,10 +564,7 @@ async fn org(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Respo
     Json(OrgView {
         id: org.0.clone(),
         slug,
-        // Every org a session can name is a tenant org; the one `system` org
-        // (the reserved `gha` workload namespace) has no members and no
-        // sessions, so it is unreachable here.
-        kind: "personal",
+        kind,
         role: role.as_str(),
     })
     .into_response()
@@ -647,6 +678,30 @@ mod tests {
         assert_eq!(query_value("", "board"), None);
         // A repeated key resolves to the first, never the last.
         assert_eq!(query_value("board=a&board=b", "board").as_deref(), Some("a"));
+    }
+
+    /// A percent-decoder that sliced the `&str` by byte index would panic here,
+    /// on input any authenticated session can send and *before* the endpoint's
+    /// admin check runs. Pinned rather than left to be re-derived.
+    #[test]
+    fn a_malformed_escape_decodes_rather_than_panicking() {
+        // `%` immediately before a multi-byte character: bytes `i+1`/`i+2` land
+        // inside it, which is the char-boundary panic.
+        assert_eq!(query_value("board=%\u{20ac}x", "board").as_deref(), Some("%\u{20ac}x"));
+        // The same shape in the *key*, which is decoded for every pair.
+        assert_eq!(query_value("%\u{20ac}x=1&board=ok", "board").as_deref(), Some("ok"));
+        // Stray `%`s, truncated escapes and non-hex digits are literals.
+        assert_eq!(query_value("board=%", "board").as_deref(), Some("%"));
+        assert_eq!(query_value("board=%4", "board").as_deref(), Some("%4"));
+        assert_eq!(query_value("board=%zz", "board").as_deref(), Some("%zz"));
+        assert_eq!(query_value("board=a%", "board").as_deref(), Some("a%"));
+        // A complete escape at the very end still decodes: the bound is
+        // `i + 2 < len`, and `%41`'s last digit sits at `len - 1`.
+        assert_eq!(query_value("board=dk%41", "board").as_deref(), Some("dkA"));
+        // A percent-escaped byte sequence that is not valid UTF-8 is repaired,
+        // not rejected: this is a board name that will match nothing, which is
+        // the right outcome for a lookup.
+        assert_eq!(query_value("board=%ff", "board").as_deref(), Some("\u{fffd}"));
     }
 
     /// A `BoardRef` is four segments, so the flattened key is what a body field

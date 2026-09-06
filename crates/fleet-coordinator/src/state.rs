@@ -1607,6 +1607,31 @@ impl Db {
         Ok((user_id, org, true))
     }
 
+    /// The slug **and kind** of an org, for display.
+    ///
+    /// One query because the browser's `GET /api/v1/org` wants both and they
+    /// live in the same row; [`Db::org_slug`] stays for the callers that want
+    /// only the slug.
+    ///
+    /// `kind` is `personal` | `team` | `system` as written by
+    /// [`Db::ensure_org`]. It is returned as the stored string rather than
+    /// parsed into an enum: nothing branches on it, it is a display label, and
+    /// an unrecognised value should surface as itself rather than be collapsed
+    /// into a guess — the same discipline `adopt_policy` takes, minus the
+    /// loudness, because nothing here is a security decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn org_slug_and_kind(&self, org: &OrgId) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT slug, kind FROM org WHERE id = ?1")
+                .bind(org.0.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
     /// The slug of an org, for display.
     ///
     /// # Errors
