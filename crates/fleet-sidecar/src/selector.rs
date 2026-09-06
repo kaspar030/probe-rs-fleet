@@ -6,7 +6,8 @@
 //!
 //! | variable                          | meaning                                              |
 //! |-----------------------------------|------------------------------------------------------|
-//! | `PROBE_RS_FLEET_BOARD`            | explicit board id (e.g. `nrf52840-dk-3`)             |
+//! | `PROBE_RS_FLEET_BOARD`            | board **model** (e.g. `nrf52840dk`) — any board of that type |
+//! | `PROBE_RS_FLEET_ID`               | one specific board, by node-local id (e.g. `nrf52840-dk-3`) |
 //! | `PROBE_RS_FLEET_SELECT`           | constraint expression (e.g. `tag=nrf52 && bluetooth`)|
 //! | `PROBE_RS_FLEET_COORDINATOR`      | coordinator URL (`https://fleet.example`, or `host:port`) |
 //! | `PROBE_RS_FLEET_TOKEN`            | the bearer session token                             |
@@ -16,10 +17,11 @@
 //!
 //! * If **no** fleet variable is set ⇒ [`Resolution::Local`]: invoke the real
 //!   local `probe-rs` transparently. Local developer experience is unchanged.
-//! * If a board/select selector is set ⇒ [`Resolution::Fleet`], provided the
+//! * If a board/id/select selector is set ⇒ [`Resolution::Fleet`], provided the
 //!   coordinator URL and a token are both present. A partial configuration
 //!   (selector but no coordinator, or coordinator but no token) is a hard
-//!   [`SelectorError`] — we refuse to guess.
+//!   [`SelectorError`] — we refuse to guess. At most **one** of the three
+//!   selector variables may be set.
 //!
 //! # What is deliberately *not* here any more
 //!
@@ -33,8 +35,9 @@
 //!
 //! That injectability is also how the CLI selector flags work: this crate still
 //! resolves purely from an `EnvSource`, but `probe-rs-fleet sidecar --board` /
-//! `--select` layers the flag over the process environment in `fleet-bin`
-//! (`roles::sidecar::SelectorFlags`). The flag wins and *replaces both*
+//! `--id` / `--select` layers the flag over the process environment in
+//! `fleet-bin`
+//! (`roles::sidecar::SelectorFlags`). The flag wins and *replaces all three*
 //! selector variables, so it never produces [`SelectorError::AmbiguousSelector`]
 //! against a stale one; `PROBE_RS_FLEET_CAPABILITY` is not intercepted, so a
 //! capability token plus a flag is still
@@ -47,8 +50,12 @@ use fleet_proto::lease::Constraint;
 
 /// Environment variable names the sidecar consults.
 pub mod env {
-    /// Explicit board id selector.
+    /// Board **model** selector: any board of this board type, e.g.
+    /// `nrf52840dk`. The word "board" means the model on every surface — this
+    /// variable, the `board=` selector term and `sidecar --board`.
     pub const BOARD: &str = "PROBE_RS_FLEET_BOARD";
+    /// Explicit board **instance** selector: one board, by node-local id.
+    pub const ID: &str = "PROBE_RS_FLEET_ID";
     /// Constraint-expression selector.
     pub const SELECT: &str = "PROBE_RS_FLEET_SELECT";
     /// Coordinator base URL (`https://host[:port]`, or a bare `host:port`).
@@ -204,17 +211,20 @@ pub enum SelectorError {
     /// A coordinator/selector is configured but no bearer token was provided.
     #[error("no coordinator credential: set {}", env::TOKEN)]
     MissingAuth,
-    /// Both `PROBE_RS_FLEET_BOARD` and `PROBE_RS_FLEET_SELECT` were set.
+    /// More than one of `PROBE_RS_FLEET_BOARD`, `PROBE_RS_FLEET_ID` and
+    /// `PROBE_RS_FLEET_SELECT` was set.
     #[error(
-        "both {} and {} are set — pick one selector",
+        "more than one of {}, {} and {} is set — pick one selector",
         env::BOARD,
+        env::ID,
         env::SELECT
     )]
     AmbiguousSelector,
-    /// A coordinator and/or auth was configured but neither board selector was.
+    /// A coordinator and/or auth was configured but no board selector was.
     #[error(
-        "coordinator/auth is configured but no board selector ({} or {}) is set",
+        "coordinator/auth is configured but no board selector ({}, {} or {}) is set",
         env::BOARD,
+        env::ID,
         env::SELECT
     )]
     MissingSelector,
@@ -233,9 +243,10 @@ pub enum SelectorError {
     /// only ever disagree with it, and honouring either one silently would make
     /// which board you got depend on a guess.
     #[error(
-        "{} selects a board already leased for you — do not also set {} or {}",
+        "{} selects a board already leased for you — do not also set {}, {} or {}",
         env::CAPABILITY,
         env::BOARD,
+        env::ID,
         env::SELECT
     )]
     CapabilityWithSelector,
@@ -267,6 +278,7 @@ pub enum SelectorError {
 /// [`Resolution::Local`].
 pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     let board = env.get(env::BOARD).filter(|s| !s.is_empty());
+    let id = env.get(env::ID).filter(|s| !s.is_empty());
     let select = env.get(env::SELECT).filter(|s| !s.is_empty());
     let coordinator = env.get(env::COORDINATOR).filter(|s| !s.is_empty());
     let token = env.get(env::TOKEN).filter(|s| !s.is_empty());
@@ -276,6 +288,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
         .filter(|s| !s.is_empty());
 
     let any_fleet = board.is_some()
+        || id.is_some()
         || select.is_some()
         || coordinator.is_some()
         || token.is_some()
@@ -297,7 +310,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     // or a session token alongside it is a contradiction rather than extra
     // information.
     if let Some(capability) = capability {
-        if board.is_some() || select.is_some() {
+        if board.is_some() || id.is_some() || select.is_some() {
             return Err(SelectorError::CapabilityWithSelector);
         }
         if token.is_some() {
@@ -311,12 +324,16 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
         }));
     }
 
-    // Resolve the board selector.
-    let constraint = match (board, select) {
-        (Some(_), Some(_)) => return Err(SelectorError::AmbiguousSelector),
-        (Some(b), None) => Constraint::Board(BoardName(b)),
-        (None, Some(expr)) => parse_select(&expr)?,
-        (None, None) => return Err(SelectorError::MissingSelector),
+    // Resolve the board selector: exactly one of the three variables, never
+    // two — `board=` (model), `id=` (instance) and a full expression are
+    // different questions, and guessing which one the operator meant is how a
+    // job silently lands on the wrong board.
+    let constraint = match (board, id, select) {
+        (Some(model), None, None) => Constraint::Model(model),
+        (None, Some(name), None) => Constraint::Id(BoardName(name)),
+        (None, None, Some(expr)) => parse_select(&expr)?,
+        (None, None, None) => return Err(SelectorError::MissingSelector),
+        _ => return Err(SelectorError::AmbiguousSelector),
     };
 
     let coordinator = coordinator.ok_or(SelectorError::MissingCoordinator)?;
@@ -334,12 +351,13 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
 /// [`Constraint`].
 ///
 /// A thin delegate to [`fleet_proto::lease::parse_constraint`], the fleet's one
-/// selector grammar (architecture §6.5), with a bare term meaning a **tag** —
+/// selector grammar (architecture §6.5), where a bare term is a **tag** —
 /// `PROBE_RS_FLEET_SELECT=nrf52 && bluetooth` describes a set of boards.
-/// `PROBE_RS_FLEET_BOARD` remains the way to name one board; `board=<name>`
-/// works here too.
+/// `board=<model>` selects any board of a model and `id=<name>` one specific
+/// board; `PROBE_RS_FLEET_BOARD` / `PROBE_RS_FLEET_ID` are the shorthands for
+/// those two.
 fn parse_select(expr: &str) -> Result<Constraint, SelectorError> {
-    fleet_proto::lease::parse_constraint(expr, fleet_proto::lease::BareTerm::Tag).map_err(|e| {
+    fleet_proto::lease::parse_constraint(expr).map_err(|e| {
         SelectorError::InvalidSelect {
             reason: e.to_string(),
         }
@@ -385,9 +403,9 @@ mod tests {
     }
 
     #[test]
-    fn board_id_with_token() {
+    fn board_var_selects_a_model() {
         let env = MapEnv::new(&[
-            (env::BOARD, "nrf52840-dk-3"),
+            (env::BOARD, "nrf52840dk"),
             (env::COORDINATOR, "coord.example:4443"),
             (env::TOKEN, "secret"),
         ]);
@@ -395,9 +413,25 @@ mod tests {
             panic!("expected Fleet");
         };
         assert_eq!(cfg.coordinator, "coord.example:4443");
-        assert_eq!(cfg.select, Constraint::Board(BoardName("nrf52840-dk-3".to_owned())));
+        assert_eq!(cfg.select, Constraint::Model("nrf52840dk".to_owned()));
         assert_eq!(cfg.token, "secret");
         assert!(cfg.server_pin().is_none());
+    }
+
+    #[test]
+    fn id_var_selects_one_board() {
+        let env = MapEnv::new(&[
+            (env::ID, "nrf52840-dk-3"),
+            (env::COORDINATOR, "coord.example:4443"),
+            (env::TOKEN, "secret"),
+        ]);
+        let Resolution::Fleet(cfg) = resolve(&env).unwrap() else {
+            panic!("expected Fleet");
+        };
+        assert_eq!(
+            cfg.select,
+            Constraint::Id(BoardName("nrf52840-dk-3".to_owned()))
+        );
     }
 
     #[test]
@@ -458,10 +492,34 @@ mod tests {
         assert_eq!(resolve(&env), Err(SelectorError::MissingAuth));
     }
 
+    /// Any two of the three selector variables is a refusal, never a
+    /// precedence rule: which board you got must not depend on a guess.
     #[test]
     fn ambiguous_selector_is_error() {
+        let pairs = [
+            [(env::BOARD, "nrf52840dk"), (env::SELECT, "tag=x")],
+            [(env::BOARD, "nrf52840dk"), (env::ID, "b1")],
+            [(env::ID, "b1"), (env::SELECT, "tag=x")],
+        ];
+        for pair in pairs {
+            let env = MapEnv::new(&[
+                pair[0],
+                pair[1],
+                (env::COORDINATOR, "c:1"),
+                (env::TOKEN, "t"),
+            ]);
+            assert_eq!(
+                resolve(&env),
+                Err(SelectorError::AmbiguousSelector),
+                "{} + {} must be ambiguous",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+        // All three at once, too.
         let env = MapEnv::new(&[
-            (env::BOARD, "b"),
+            (env::BOARD, "nrf52840dk"),
+            (env::ID, "b1"),
             (env::SELECT, "tag=x"),
             (env::COORDINATOR, "c:1"),
             (env::TOKEN, "t"),
@@ -476,6 +534,20 @@ mod tests {
         assert_eq!(resolve(&env), Err(SelectorError::MissingSelector));
     }
 
+    /// The two shorthand variables mean exactly what the corresponding
+    /// expression terms mean; `PROBE_RS_FLEET_SELECT` can spell either.
+    #[test]
+    fn the_shorthand_vars_match_the_expression_terms() {
+        assert_eq!(
+            parse_select("board=nrf52840dk").unwrap(),
+            Constraint::Model("nrf52840dk".to_owned())
+        );
+        assert_eq!(
+            parse_select("id=nrf52840-dk-3").unwrap(),
+            Constraint::Id(BoardName("nrf52840-dk-3".to_owned()))
+        );
+    }
+
     /// The deleted `PROBE_RS_FLEET_SUBJECT_ID` let a client assert its own
     /// identity. Setting it now must have no effect whatsoever — in particular
     /// it must not trip fleet mode on its own, which would be a confusing way to
@@ -486,7 +558,7 @@ mod tests {
         assert_eq!(resolve(&env).unwrap(), Resolution::Local);
 
         let env = MapEnv::new(&[
-            (env::BOARD, "b"),
+            (env::BOARD, "nrf52840dk"),
             (env::COORDINATOR, "c:1"),
             (env::TOKEN, "t"),
             ("PROBE_RS_FLEET_SUBJECT_ID", "root"),
@@ -502,7 +574,7 @@ mod tests {
     fn empty_values_treated_as_unset() {
         // Empty strings must not count as "set" — otherwise an exported-but-
         // empty var would wrongly trip fleet mode.
-        let env = MapEnv::new(&[(env::BOARD, ""), (env::COORDINATOR, "")]);
+        let env = MapEnv::new(&[(env::BOARD, ""), (env::ID, ""), (env::COORDINATOR, "")]);
         assert_eq!(resolve(&env).unwrap(), Resolution::Local);
     }
 
@@ -553,7 +625,11 @@ mod tests {
     /// got depend on a guess.
     #[test]
     fn a_capability_token_refuses_a_selector() {
-        for (key, value) in [(env::BOARD, "b1"), (env::SELECT, "tag=nrf52")] {
+        for (key, value) in [
+            (env::BOARD, "nrf52840dk"),
+            (env::ID, "b1"),
+            (env::SELECT, "tag=nrf52"),
+        ] {
             let env = MapEnv::new(&[
                 (env::CAPABILITY, "deadbeef"),
                 (env::COORDINATOR, "https://coord.example"),

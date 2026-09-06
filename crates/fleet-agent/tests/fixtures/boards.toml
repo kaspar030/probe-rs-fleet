@@ -2,6 +2,7 @@
 id        = "nrf52840-dk-3"
 serial    = "001050257890"
 chip      = "nRF52840_xxAA"
+model     = "nrf52840dk"
 tags      = ["nrf52", "bluetooth"]
 exclusive = true
 

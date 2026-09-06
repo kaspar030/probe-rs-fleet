@@ -13,6 +13,11 @@ pub struct Board {
     /// probe-rs target name (informational; the `--chip` the caller passes
     /// still flows through untouched).
     pub chip: String,
+    /// Board *model* (board type), e.g. `nrf52840dk` — what `board=<model>`
+    /// matches. Declared by the operator in `boards.toml`; `None` for a board
+    /// that did not declare one (in particular every auto-adopted board), and
+    /// a board with no model is never matched by `board=`.
+    pub model: Option<String>,
     /// Free-form selection tags, e.g. `["nrf52", "bluetooth"]`.
     pub tags: Vec<String>,
     /// Most boards are exclusive (one lease at a time).

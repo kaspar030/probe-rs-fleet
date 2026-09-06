@@ -115,20 +115,23 @@ impl CtlConnection {
 /// Parse a `lease`/board selector into a [`Constraint`].
 ///
 /// A thin delegate to [`fleet_proto::lease::parse_constraint`], the fleet's one
-/// selector grammar (architecture §6.5), with a bare term meaning a **board**:
-/// `ctl lease nrf52840-dk-3` names a board, unlike the sidecar's
-/// `PROBE_RS_FLEET_SELECT`, where a bare word is a tag. That difference is a
-/// real property of the two surfaces, not an accident — hence the parameter.
+/// selector grammar (architecture §6.5). There is no per-surface dialect: the
+/// same expression means the same thing here, in the sidecar's
+/// `PROBE_RS_FLEET_SELECT` and in `grant --select`.
 ///
-/// The explicit forms (`board=`, `chip=`, `tag=`, and `a && b` tag
-/// conjunctions) mean the same thing on both.
+/// * `id=<name>` — one specific board;
+/// * `board=<model>` — any board of that model, e.g. `board=nrf52840dk`;
+/// * `chip=<name>` — any board with that probe-rs chip;
+/// * `tag=<t>` or a bare word, conjoinable with `&&`.
+///
+/// A **bare word is a tag**, everywhere: `ctl lease nrf52840-dk-3` is a tag
+/// selector, and the board is named with `ctl lease id=nrf52840-dk-3`.
 ///
 /// # Errors
 ///
 /// Returns the parse error's message for a malformed expression.
 pub fn parse_selector(selector: &str) -> Result<Constraint, String> {
-    fleet_proto::lease::parse_constraint(selector, fleet_proto::lease::BareTerm::Board)
-        .map_err(|e| e.to_string())
+    fleet_proto::lease::parse_constraint(selector).map_err(|e| e.to_string())
 }
 
 /// A thin client of the coordinator's admin/operator surface.
@@ -174,18 +177,22 @@ impl CtlClient {
                     println!("no boards in the fleet");
                 } else {
                     // BOARD is the fleet key "<org>/<node>/<name>", so it is
-                    // wider than revision 1's bare id.
+                    // wider than revision 1's bare id. MODEL is what
+                    // `board=<model>` matches; `-` means the board declared
+                    // none (every adopted board), so no `board=` selector can
+                    // reach it.
                     println!(
-                        "{:<32} {:<16} {:<16} {:<12} HOLDER",
-                        "BOARD", "AGENT", "CHIP", "STATE"
+                        "{:<32} {:<16} {:<14} {:<16} {:<12} HOLDER",
+                        "BOARD", "AGENT", "MODEL", "CHIP", "STATE"
                     );
                     for b in boards {
                         let state = format!("{:?}", b.availability);
                         // Render the holder as its stable key ("<org>/<kind>:<id>").
                         let holder = b.holder.map_or_else(String::new, |h| h.key().to_string());
+                        let model = b.model.unwrap_or_else(|| "-".to_owned());
                         println!(
-                            "{:<32} {:<16} {:<16} {:<12} {}",
-                            b.board, b.agent.0, b.chip, state, holder
+                            "{:<32} {:<16} {:<14} {:<16} {:<12} {}",
+                            b.board, b.agent.0, model, b.chip, state, holder
                         );
                     }
                 }
@@ -438,21 +445,27 @@ mod tests {
         }
     }
 
+    /// One reading of a bare word everywhere: it is a **tag**. `ctl lease
+    /// nrf52840-dk-3` used to name a board; the board form is now spelled
+    /// `id=`, which is fail-closed rather than ambiguous.
     #[test]
-    fn bare_id_is_a_board_constraint() {
+    fn a_bare_word_is_a_tag() {
         assert_eq!(
             parse_selector("nrf52840-dk-3").unwrap(),
-            Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
+            Constraint::Tags(vec!["nrf52840-dk-3".to_owned()])
         );
     }
 
-    /// The explicit `board=` form is the one grants use, and means the same
-    /// thing here.
+    /// `id=` names one board; `board=` is the board **model**.
     #[test]
-    fn explicit_board_prefix_is_a_board_constraint() {
+    fn id_is_the_instance_and_board_is_the_model() {
         assert_eq!(
-            parse_selector("board=nrf52840-dk-3").unwrap(),
-            Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
+            parse_selector("id=nrf52840-dk-3").unwrap(),
+            Constraint::Id(BoardName("nrf52840-dk-3".to_owned()))
+        );
+        assert_eq!(
+            parse_selector("board=nrf52840dk").unwrap(),
+            Constraint::Model("nrf52840dk".to_owned())
         );
     }
 
@@ -480,6 +493,7 @@ mod tests {
         assert!(parse_selector("tag=").is_err());
         assert!(parse_selector("chip=").is_err());
         assert!(parse_selector("board=").is_err());
+        assert!(parse_selector("id=").is_err());
         assert!(parse_selector("").is_err());
     }
 

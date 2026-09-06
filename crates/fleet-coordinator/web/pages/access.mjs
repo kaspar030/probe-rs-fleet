@@ -21,7 +21,10 @@
 
 import { h, when, errorBox, findAll } from '../dom.mjs';
 
-const TERM_KINDS = ['board', 'chip', 'tag'];
+// `board` is first: it is the model selector (`board=nrf52840dk` — any board of
+// that type), which is what people actually want to grant. `id` is the single
+// board.
+const TERM_KINDS = ['board', 'id', 'chip', 'tag'];
 
 /** Join selector rows into the canonical `a && b` string. */
 export function selectorString(rows) {

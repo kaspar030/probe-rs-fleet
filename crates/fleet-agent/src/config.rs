@@ -8,6 +8,7 @@
 //! id        = "nrf52840-dk-3"
 //! serial    = "001050257890"
 //! chip      = "nRF52840_xxAA"
+//! model     = "nrf52840dk"
 //! tags      = ["nrf52", "bluetooth"]
 //! exclusive = true
 //!
@@ -117,6 +118,21 @@ pub struct BoardSpec {
     /// probe-rs target/chip name (informational; the caller still passes
     /// `--chip` in-band).
     pub chip: String,
+    /// The board *model* (board type), e.g. `nrf52840dk` — what the
+    /// `board=<model>` selector matches.
+    ///
+    /// Distinct from `chip` (the MCU: a Nordic DK and a custom nRF52840 board
+    /// share `nRF52840_xxAA` and are not interchangeable) and from `tags`
+    /// (free-form convention). The agent **cannot infer it**: `probe-rs list`
+    /// reports the probe, never the board it is wired to, so an adopted board
+    /// has no model and `board=` will never match it.
+    ///
+    /// Omit the key rather than writing `model = ""`: an empty model is
+    /// rejected by [`BoardsConfig::validate`], because a board whose model is
+    /// the empty string could never be selected (`board=` with an empty value
+    /// is a parse error) and would render indistinguishably from "none".
+    #[serde(default)]
+    pub model: Option<String>,
     /// Free-form selection tags.
     #[serde(default)]
     pub tags: Vec<String>,
@@ -178,7 +194,7 @@ impl BoardsConfig {
     }
 
     /// Validate semantic invariants: non-empty ids/serials, unique ids, unique
-    /// serials.
+    /// serials, non-empty declared models.
     ///
     /// # Errors
     ///
@@ -193,6 +209,12 @@ impl BoardsConfig {
             if board.serial.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
                     "board {:?} has an empty serial",
+                    board.id
+                )));
+            }
+            if board.model.as_ref().is_some_and(|m| m.trim().is_empty()) {
+                return Err(ConfigError::Invalid(format!(
+                    "board {:?} declares an empty model (omit the key instead)",
                     board.id
                 )));
             }

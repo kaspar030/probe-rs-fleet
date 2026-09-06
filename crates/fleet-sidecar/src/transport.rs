@@ -422,7 +422,7 @@ mod tests {
         let cfg = FleetConfig {
             coordinator: "https://c:1".to_owned(),
             token: "prfs1_t".to_owned(),
-            select: fleet_proto::lease::Constraint::Board(fleet_proto::ids::BoardName(
+            select: fleet_proto::lease::Constraint::Id(fleet_proto::ids::BoardName(
                 "b".to_owned(),
             )),
             server_cert_sha256: Some("cd".repeat(32)),
@@ -536,7 +536,7 @@ mod tests {
             .unwrap();
         let grant = session
             .lease(&LeaseRequest {
-                select: Constraint::Board(BoardName("b1".to_owned())),
+                select: Constraint::Id(BoardName("b1".to_owned())),
                 duration_secs: 600,
                 priority: Priority::Interactive,
             })

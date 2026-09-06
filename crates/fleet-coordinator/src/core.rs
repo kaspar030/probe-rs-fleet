@@ -453,6 +453,7 @@ impl Coordinator {
                         id: board_ref,
                         agent: agent_id.clone(),
                         chip: status.chip.clone(),
+                        model: status.model.clone(),
                         tags: status.tags.clone(),
                         exclusive: status.exclusive,
                         power: status.power.clone(),
@@ -623,7 +624,7 @@ impl Coordinator {
 
     /// Resolve a node-local board name to a [`BoardRef`] the caller may reach.
     ///
-    /// The request wire stays node-local (so `PROBE_RS_FLEET_BOARD=nrf52840-dk-3`
+    /// The request wire stays node-local (so `PROBE_RS_FLEET_ID=nrf52840-dk-3`
     /// keeps working); the coordinator is the only thing that turns a name into
     /// a fleet key.
     ///
@@ -724,6 +725,7 @@ impl Coordinator {
                     board: b.id.clone(),
                     agent: b.agent.clone(),
                     chip: b.chip.clone(),
+                    model: b.model.clone(),
                     tags: b.tags.clone(),
                     exclusive: b.exclusive,
                     power: b.power.clone(),
@@ -1363,7 +1365,7 @@ impl Coordinator {
         ops: Vec<fleet_proto::token::AllowedOp>,
         expires: Option<u64>,
     ) -> std::result::Result<fleet_proto::GrantSummary, OpError> {
-        use fleet_proto::lease::{parse_constraint, BareTerm};
+        use fleet_proto::lease::parse_constraint;
 
         let org = subject.org.clone();
         if authz::require_role(&self.db, subject, &org, Role::Admin)
@@ -1378,7 +1380,7 @@ impl Coordinator {
         // so a grant's meaning never depends on which CLI wrote it. An empty
         // expression is refused by the parser, which is what stops
         // `Tags([])` — a match-everything — from ever reaching the table.
-        let selector = match parse_constraint(selector, BareTerm::Tag) {
+        let selector = match parse_constraint(selector) {
             Ok(c) => c.to_string(),
             Err(e) => return Err(OpError::Invalid(format!("invalid selector: {e}"))),
         };
@@ -2675,6 +2677,7 @@ mod tests {
             id: board_ref(org_name, agent, id),
             agent: node_id(org_name, agent),
             chip: "nRF52840_xxAA".to_owned(),
+            model: None,
             tags: vec!["nrf52".to_owned()],
             exclusive: true,
             power: PowerKind::None,
@@ -2727,7 +2730,7 @@ mod tests {
 
     fn lease_req(board: &str) -> LeaseRequest {
         LeaseRequest {
-            select: Constraint::Board(BoardName(board.to_owned())),
+            select: Constraint::Id(BoardName(board.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         }
@@ -3564,6 +3567,7 @@ mod tests {
             serial: serial.to_owned(),
             presence,
             chip: chip.to_owned(),
+            model: None,
             tags: vec![],
             exclusive: true,
             power: PowerKind::None,

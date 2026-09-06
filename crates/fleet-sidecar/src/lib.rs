@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn resolve_fleet_when_selector_set() {
         let env = MapEnv::new(&[
-            (selector::env::BOARD, "nrf52840-dk-3"),
+            (selector::env::ID, "nrf52840-dk-3"),
             (selector::env::COORDINATOR, "c:4443"),
             (selector::env::TOKEN, "t"),
         ]);
@@ -401,7 +401,7 @@ mod tests {
         // the unresolvable host (proving we reached the relay code, not a
         // panic).
         let env = MapEnv::new(&[
-            (selector::env::BOARD, "nrf52840-dk-3"),
+            (selector::env::ID, "nrf52840-dk-3"),
             (selector::env::COORDINATOR, "c:4443"),
             (selector::env::TOKEN, "t"),
         ]);
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn run_fleet_path_dials_with_the_bearer_token() {
         let env = MapEnv::new(&[
-            (selector::env::BOARD, "nrf52840-dk-3"),
+            (selector::env::ID, "nrf52840-dk-3"),
             (selector::env::COORDINATOR, "c:4443"),
             (selector::env::TOKEN, "prfs1_t"),
         ]);

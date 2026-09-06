@@ -256,6 +256,12 @@ fn boards_example_parses_and_validates() {
     let boards = fleet_agent::config::BoardsConfig::from_str(&text).unwrap();
     boards.validate().unwrap();
     assert!(!boards.boards.is_empty());
+    // The worked board must declare a `model`: it is the field a reader is
+    // most likely to omit, and without it `board=<model>` matches nothing.
+    assert!(
+        boards.boards.iter().any(|b| b.model.is_some()),
+        "the boards example must show a declared board model"
+    );
 }
 
 /// The `boards.toml` example's prose is load-bearing: revision 2 demoted the

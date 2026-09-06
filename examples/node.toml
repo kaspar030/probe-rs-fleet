@@ -30,9 +30,11 @@
 #                tags (the probe type, plus `auto`), and make it leasable.
 #                `share` sets this, because someone deliberately offering their
 #                machine wants a board they plug in to just work. The adopted
-#                board has NO `chip`, because `probe-rs list` reports the probe
-#                and not the target attached to it — so `ctl lease --select
-#                'chip=…'` will not match it until boards.toml annotates it.
+#                board has NO `chip` and NO `model`, because `probe-rs list`
+#                reports the probe and neither the target attached to it nor
+#                the board it is wired to — so neither `ctl lease chip=…` nor
+#                `ctl lease board=<model>` will match it until boards.toml
+#                annotates it.
 #   "declared" — report it, but keep it unleasable until it is declared in
 #                boards.toml. `agent up --auth-key` sets this: CI and lab nodes
 #                want stable ids and no surprises.

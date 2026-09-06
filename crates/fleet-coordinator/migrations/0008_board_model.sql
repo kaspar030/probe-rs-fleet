@@ -1,0 +1,15 @@
+-- Board *model* (board type), e.g. `nrf52840dk` — what the `board=<model>`
+-- selector matches (architecture §6.5).
+--
+-- Nullable, because a model is something an operator *declares* in the node's
+-- `boards.toml`: the agent cannot infer it (`probe-rs list` reports the probe,
+-- never the board it is wired to), so a board that never declared one — every
+-- auto-adopted board — legitimately has none. A board with no model is never
+-- matched by `board=`, exactly like `chip`.
+--
+-- Like `chip`, this column is **write-only**: `state::OrgDb::record_board` is
+-- its only writer and nothing reconstructs a `Board` from this table. The
+-- scheduler's board view is rebuilt from agent inventory reports on every
+-- reconnect; the row is an audit/debug snapshot. Do not go looking for the
+-- query that reads it back — there is none, and that is deliberate.
+ALTER TABLE board ADD COLUMN model TEXT;

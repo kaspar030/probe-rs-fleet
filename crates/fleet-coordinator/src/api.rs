@@ -375,6 +375,9 @@ struct BoardView {
     board: BoardKeyView,
     node: String,
     chip: String,
+    /// Board model (board type), e.g. `nrf52840dk` — what `board=<model>`
+    /// selects. `null` for a board that declared none (every adopted board).
+    model: Option<String>,
     tags: Vec<String>,
     exclusive: bool,
     /// `uhubctl` / `gpio` / `none`. The wiring detail (hub, port, gpio line) is
@@ -394,6 +397,7 @@ impl From<BoardSummary> for BoardView {
             board: BoardKeyView::from(&b.board),
             node: b.agent.0,
             chip: b.chip,
+            model: b.model,
             tags: b.tags,
             exclusive: b.exclusive,
             power: match b.power {
@@ -1236,8 +1240,9 @@ struct GrantRequest {
 /// **Admin**-gated inside [`Coordinator::grant_create_core`], which also holds
 /// every rule this handler deliberately does not pre-empt:
 ///
-/// * the **selector** is parsed by `fleet_proto::lease::parse_constraint` with
-///   `BareTerm::Tag` and stored as `Constraint`'s `Display`, so a grant's
+/// * the **selector** is parsed by `fleet_proto::lease::parse_constraint`
+///   (where a bare term is a tag) and stored as `Constraint`'s `Display`, so a
+///   grant's
 ///   meaning never depends on which surface wrote it. The UI sends the same
 ///   string a CLI would and must **not** build a structured selector of its
 ///   own. An empty expression is refused, which is what stops an empty tag set
@@ -1564,6 +1569,7 @@ mod tests {
             ),
             agent: fleet_proto::ids::AgentId("o/n".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
+            model: None,
             tags: vec![],
             exclusive: true,
             power: PowerKind::Uhubctl {

@@ -10,9 +10,10 @@
 //! # Selecting the board
 //!
 //! The board selector normally comes from the environment
-//! (`PROBE_RS_FLEET_BOARD` / `_SELECT`), which is what laze and CI use. The
-//! explicit subcommand additionally accepts `--board <ID>` / `--select <EXPR>`;
-//! a flag **beats** the environment and replaces *both* selector variables (see
+//! (`PROBE_RS_FLEET_BOARD` / `_ID` / `_SELECT`), which is what laze and CI use.
+//! The explicit subcommand additionally accepts `--board <MODEL>` /
+//! `--id <NAME>` / `--select <EXPR>`; a flag **beats** the environment and
+//! replaces *all three* selector variables (see
 //! [`SelectorFlags`]). The argv0 `probe-rs` path has no flags — it forwards
 //! every argument verbatim to stay transparent to laze — so there the
 //! environment remains the only mechanism.
@@ -24,32 +25,35 @@ use anyhow::{Context, Result};
 
 use fleet_sidecar::selector::{env, EnvSource, ProcessEnv};
 
-/// The sidecar's CLI selector flags: `--board` / `--select`.
+/// The sidecar's CLI selector flags: `--board` (a board **model**), `--id` (one
+/// board instance) and `--select` (a full expression).
 ///
-/// Clap makes the two mutually exclusive, so at most one is ever set. An empty
-/// string is normalised to `None` at construction: `--select ''` is a typo, not
-/// a request to select nothing, and letting it through would mask the
+/// Clap makes the three mutually exclusive, so at most one is ever set. An
+/// empty string is normalised to `None` at construction: `--select ''` is a
+/// typo, not a request to select nothing, and letting it through would mask the
 /// environment and fail later with the less helpful `MissingSelector`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectorFlags {
     board: Option<String>,
+    id: Option<String>,
     select: Option<String>,
 }
 
 impl SelectorFlags {
     /// Build from the parsed flags, dropping empty values.
     #[must_use]
-    pub fn new(board: Option<String>, select: Option<String>) -> Self {
+    pub fn new(board: Option<String>, id: Option<String>, select: Option<String>) -> Self {
         let non_empty = |s: Option<String>| s.filter(|v| !v.is_empty());
         Self {
             board: non_empty(board),
+            id: non_empty(id),
             select: non_empty(select),
         }
     }
 
     /// Whether any flag was given (and so overrides the environment).
     fn is_set(&self) -> bool {
-        self.board.is_some() || self.select.is_some()
+        self.board.is_some() || self.id.is_some() || self.select.is_some()
     }
 
     /// Validate a `--select` expression eagerly, so a typo names the *flag*.
@@ -59,7 +63,7 @@ impl SelectorFlags {
     /// came from the command line.
     fn validate(&self) -> Result<()> {
         if let Some(expr) = &self.select {
-            fleet_proto::lease::parse_constraint(expr, fleet_proto::lease::BareTerm::Tag)
+            fleet_proto::lease::parse_constraint(expr)
                 .with_context(|| format!("invalid --select {expr:?}"))?;
         }
         Ok(())
@@ -73,8 +77,8 @@ impl SelectorFlags {
 
 /// A CLI selector flag layered over an [`EnvSource`].
 ///
-/// An explicit flag beats the environment, and *replaces both* selector
-/// variables rather than adding a second one — so `--select` alongside a stale
+/// An explicit flag beats the environment, and *replaces all three* selector
+/// variables rather than adding another one — so `--select` alongside a stale
 /// `PROBE_RS_FLEET_BOARD` is not `AmbiguousSelector`, it is just the flag.
 /// Every other key (including `PROBE_RS_FLEET_CAPABILITY`) falls through
 /// untouched, so `resolve` still refuses a selector next to a capability token
@@ -93,6 +97,7 @@ impl<E: EnvSource> EnvSource for SelectorOverride<E> {
         if self.flags.is_set() {
             match key {
                 env::BOARD => return self.flags.board.clone(),
+                env::ID => return self.flags.id.clone(),
                 env::SELECT => return self.flags.select.clone(),
                 _ => {}
             }
@@ -130,7 +135,8 @@ pub async fn run(
     //
     // Credentials keep that precedence deliberately (env > file). The board
     // *selector* is the other way round: it defaults to the environment
-    // (`_BOARD` / `_SELECT`), but an explicit `--board` / `--select` flag wins
+    // (`_BOARD` / `_ID` / `_SELECT`), but an explicit `--board` / `--id` /
+    // `--select` flag wins
     // — an argument typed on this command line is more specific than an
     // exported variable. The flag is layered on with `SelectorOverride` rather
     // than written into the environment.
@@ -285,33 +291,73 @@ mod tests {
 
     #[test]
     fn select_flag_beats_select_env() {
-        let flags = SelectorFlags::new(None, Some("tag=from-flag".to_owned()));
+        let flags = SelectorFlags::new(None, None, Some("tag=from-flag".to_owned()));
         let overlay = flags.over(map_env(&ENV_WITH_SELECT));
         assert_eq!(constraint_of(resolve(&overlay).unwrap()), tags("from-flag"));
     }
 
     #[test]
     fn select_flag_replaces_board_env_rather_than_clashing() {
-        // The point of replacing *both* selector vars: no AmbiguousSelector.
-        const ENV_WITH_BOARD: [(&str, &str); 3] = [
+        // The point of replacing *all* selector vars: no AmbiguousSelector.
+        const ENV_WITH_BOARD: [(&str, &str); 4] = [
             (env::COORDINATOR, "https://fleet.example"),
             (env::TOKEN, "tok"),
-            (env::BOARD, "nrf52840-dk-9"),
+            (env::BOARD, "nrf52840dk"),
+            (env::ID, "nrf52840-dk-9"),
         ];
-        let flags = SelectorFlags::new(None, Some("tag=from-flag".to_owned()));
+        let flags = SelectorFlags::new(None, None, Some("tag=from-flag".to_owned()));
         let overlay = flags.over(map_env(&ENV_WITH_BOARD));
         assert_eq!(overlay.get(env::BOARD), None);
+        assert_eq!(overlay.get(env::ID), None);
         assert_eq!(constraint_of(resolve(&overlay).unwrap()), tags("from-flag"));
     }
 
+    /// `--board` is the **model** selector, matching the `board=` term and
+    /// `PROBE_RS_FLEET_BOARD`.
     #[test]
-    fn board_flag_replaces_select_env() {
-        let flags = SelectorFlags::new(Some("nrf52840-dk-1".to_owned()), None);
+    fn board_flag_selects_a_model() {
+        let flags = SelectorFlags::new(Some("nrf52840dk".to_owned()), None, None);
         let overlay = flags.over(map_env(&ENV_WITH_SELECT));
         assert_eq!(overlay.get(env::SELECT), None);
         assert_eq!(
             constraint_of(resolve(&overlay).unwrap()),
-            Constraint::Board(BoardName("nrf52840-dk-1".to_owned()))
+            Constraint::Model("nrf52840dk".to_owned())
+        );
+    }
+
+    /// `--id` is the instance selector, and beats a stale `PROBE_RS_FLEET_ID`.
+    #[test]
+    fn id_flag_selects_one_board_and_beats_the_env() {
+        const ENV_WITH_ID: [(&str, &str); 3] = [
+            (env::COORDINATOR, "https://fleet.example"),
+            (env::TOKEN, "tok"),
+            (env::ID, "stale-board"),
+        ];
+        let flags = SelectorFlags::new(None, Some("nrf52840-dk-1".to_owned()), None);
+        let overlay = flags.over(map_env(&ENV_WITH_ID));
+        assert_eq!(
+            constraint_of(resolve(&overlay).unwrap()),
+            Constraint::Id(BoardName("nrf52840-dk-1".to_owned()))
+        );
+    }
+
+    /// A flag replaces every selector variable, so a stale `_BOARD`/`_SELECT`
+    /// beside `--id` is silently dropped rather than clashing.
+    #[test]
+    fn id_flag_replaces_the_other_selector_vars() {
+        const ENV_ALL_SELECTORS: [(&str, &str); 4] = [
+            (env::COORDINATOR, "https://fleet.example"),
+            (env::TOKEN, "tok"),
+            (env::BOARD, "nrf52840dk"),
+            (env::SELECT, "tag=from-env"),
+        ];
+        let flags = SelectorFlags::new(None, Some("nrf52840-dk-1".to_owned()), None);
+        let overlay = flags.over(map_env(&ENV_ALL_SELECTORS));
+        assert_eq!(overlay.get(env::BOARD), None);
+        assert_eq!(overlay.get(env::SELECT), None);
+        assert_eq!(
+            constraint_of(resolve(&overlay).unwrap()),
+            Constraint::Id(BoardName("nrf52840-dk-1".to_owned()))
         );
     }
 
@@ -321,7 +367,21 @@ mod tests {
             (env::COORDINATOR, "https://fleet.example"),
             (env::CAPABILITY, "deadbeef"),
         ];
-        let flags = SelectorFlags::new(None, Some("tag=from-flag".to_owned()));
+        let flags = SelectorFlags::new(None, None, Some("tag=from-flag".to_owned()));
+        assert!(matches!(
+            resolve(&flags.over(map_env(&ENV_CAP))),
+            Err(SelectorError::CapabilityWithSelector)
+        ));
+    }
+
+    /// The capability check must cover the new `--id` flag too.
+    #[test]
+    fn capability_plus_id_flag_is_refused() {
+        const ENV_CAP: [(&str, &str); 2] = [
+            (env::COORDINATOR, "https://fleet.example"),
+            (env::CAPABILITY, "deadbeef"),
+        ];
+        let flags = SelectorFlags::new(None, Some("nrf52840-dk-1".to_owned()), None);
         assert!(matches!(
             resolve(&flags.over(map_env(&ENV_CAP))),
             Err(SelectorError::CapabilityWithSelector)
@@ -335,7 +395,7 @@ mod tests {
             (env::TOKEN, "tok"),
             (env::CAPABILITY, "cap"),
         ];
-        let overlay = SelectorFlags::new(Some("b".to_owned()), None).over(map_env(&ENV_ALL));
+        let overlay = SelectorFlags::new(Some("b".to_owned()), None, None).over(map_env(&ENV_ALL));
         assert_eq!(overlay.get(env::TOKEN).as_deref(), Some("tok"));
         assert_eq!(overlay.get(env::CAPABILITY).as_deref(), Some("cap"));
         assert_eq!(
@@ -346,7 +406,7 @@ mod tests {
 
     #[test]
     fn empty_flag_value_is_ignored_and_env_still_applies() {
-        let flags = SelectorFlags::new(None, Some(String::new()));
+        let flags = SelectorFlags::new(None, None, Some(String::new()));
         assert_eq!(flags, SelectorFlags::default());
         let overlay = flags.over(map_env(&ENV_WITH_SELECT));
         assert_eq!(constraint_of(resolve(&overlay).unwrap()), tags("from-env"));
@@ -354,7 +414,7 @@ mod tests {
 
     #[test]
     fn invalid_select_expression_names_the_flag() {
-        let err = SelectorFlags::new(None, Some("chip=a && tag=b".to_owned()))
+        let err = SelectorFlags::new(None, None, Some("chip=a && tag=b".to_owned()))
             .validate()
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -364,9 +424,11 @@ mod tests {
 
     #[test]
     fn valid_select_expression_passes_validation() {
-        let expr = SelectorFlags::new(None, Some("tag=nrf52 && bluetooth".to_owned()));
+        let expr = SelectorFlags::new(None, None, Some("tag=nrf52 && bluetooth".to_owned()));
         assert!(expr.validate().is_ok());
-        let board = SelectorFlags::new(Some("nrf52840-dk-1".to_owned()), None);
+        let board = SelectorFlags::new(Some("nrf52840dk".to_owned()), None, None);
         assert!(board.validate().is_ok());
+        let id = SelectorFlags::new(None, Some("nrf52840-dk-1".to_owned()), None);
+        assert!(id.validate().is_ok());
     }
 }

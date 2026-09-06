@@ -285,6 +285,61 @@ async fn a_grant_does_not_reach_a_third_orgs_same_tagged_board() {
     }
 }
 
+/// The requirement `board=<model>` exists for: a grant written against a board
+/// **type** covers every board of that model in the granting org — and nothing
+/// of another model, and nothing in another org.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_model_grant_covers_every_board_of_that_model_in_the_org() {
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (_carol_token, carol_org, _) = fleet.seed_github_user(3, "carol", Role::Admin).await;
+
+    let dk1 = fleet
+        .seed_board_with_model(&alice_org, "rpi-1", "dk-1", &[], Some("nrf52840dk"))
+        .await;
+    let dk2 = fleet
+        .seed_board_with_model(&alice_org, "rpi-1", "dk-2", &[], Some("nrf52840dk"))
+        .await;
+    // Another model in the same org, a board with no declared model at all
+    // (the adopted-board shape), and the same model in another org.
+    fleet
+        .seed_board_with_model(&alice_org, "rpi-1", "pico-1", &[], Some("rpi-pico"))
+        .await;
+    fleet
+        .seed_board_with_model(&alice_org, "rpi-1", "adopted-1", &[], None)
+        .await;
+    fleet
+        .seed_board_with_model(&carol_org, "rpi-9", "dk-9", &[], Some("nrf52840dk"))
+        .await;
+
+    let alice = fleet.client_session(&alice_token).await;
+    let _ = alice
+        .request(SidecarToCoord::GrantCreate {
+            subject: "bob".to_owned(),
+            selector: "board=nrf52840dk".to_owned(),
+            ops: vec![AllowedOp::Attach],
+            expires: Some(soon(&fleet)),
+        })
+        .await
+        .unwrap();
+
+    let bob = fleet.client_session(&bob_token).await;
+    match bob.request(SidecarToCoord::ListBoards).await.unwrap() {
+        CoordToSidecar::BoardList(boards) => {
+            let mut visible: Vec<String> = boards.iter().map(|b| b.board.name.clone()).collect();
+            visible.sort();
+            let mut expected = vec![dk1.name.clone(), dk2.name.clone()];
+            expected.sort();
+            assert_eq!(
+                visible, expected,
+                "a model grant covers exactly the boards of that model in the granting org"
+            );
+        }
+        other => panic!("expected BoardList, got {other:?}"),
+    }
+}
+
 /// Creating a grant is admin-only — deliberately stricter than minting an auth
 /// key, because a grant points outward at a non-member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

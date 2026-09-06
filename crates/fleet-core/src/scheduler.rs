@@ -626,6 +626,7 @@ mod tests {
             id: board_ref(ORG, id),
             agent: AgentId("agent-1".to_string()),
             chip: chip.to_string(),
+            model: None,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
             exclusive: true,
             power: PowerKind::None,
@@ -666,15 +667,83 @@ mod tests {
         s.request_lease(subject, &access, request, now)
     }
 
-    fn by_board(id: &str) -> Constraint {
-        Constraint::Board(BoardName(id.to_string()))
+    fn by_id(id: &str) -> Constraint {
+        Constraint::Id(BoardName(id.to_string()))
+    }
+
+    /// A board of a declared model.
+    fn modelled_board(id: &str, model: &str) -> Board {
+        Board {
+            model: Some(model.to_string()),
+            ..board(id, "nRF52840_xxAA", &[])
+        }
+    }
+
+    /// The point of `board=<model>`: a *generic* selector beats contention.
+    /// Two boards of the same model, one already leased — the model selector
+    /// hands out the other, where `id=` would have queued.
+    #[test]
+    fn a_model_selector_routes_around_a_leased_board() {
+        let mut s = sched();
+        s.upsert_board(modelled_board("dk-1", "nrf52840dk"));
+        s.upsert_board(modelled_board("dk-2", "nrf52840dk"));
+        s.upsert_board(modelled_board("pico-1", "rpi-pico"));
+
+        let model = Constraint::Model("nrf52840dk".to_owned());
+        let first = match request_as(&mut s, subject("p1"), req(model.clone(), 100, Priority::Ci), 0)
+        {
+            LeaseDecision::Granted(g) => g,
+            LeaseDecision::Queued { position } => panic!("expected a grant, queued at {position}"),
+        };
+        let second =
+            match request_as(&mut s, subject("p2"), req(model.clone(), 100, Priority::Ci), 0) {
+                LeaseDecision::Granted(g) => g,
+                LeaseDecision::Queued { position } => panic!(
+                    "the second board of the model must be granted, queued at {position}"
+                ),
+            };
+        assert_ne!(first.board, second.board, "two requests, two boards");
+        for b in [&first.board, &second.board] {
+            assert_ne!(b.name, "pico-1", "another model must never be granted");
+        }
+
+        // Both boards of the model are now held: the third request queues
+        // rather than spilling onto the other model.
+        match request_as(&mut s, subject("p3"), req(model, 100, Priority::Ci), 0) {
+            LeaseDecision::Queued { .. } => {}
+            LeaseDecision::Granted(g) => {
+                panic!("both boards of the model are held; got a grant on {}", g.board)
+            }
+        }
+    }
+
+    /// A board that declares no model (every adopted board) is unreachable by
+    /// `board=` — the documented trade, identical to `chip=`.
+    #[test]
+    fn a_board_without_a_model_is_never_granted_by_a_model_selector() {
+        let mut s = sched();
+        s.upsert_board(board("adopted-1", "", &["auto"]));
+        let d = request_as(
+            &mut s,
+            subject("p1"),
+            req(
+                Constraint::Model("nrf52840dk".to_owned()),
+                100,
+                Priority::Ci,
+            ),
+            0,
+        );
+        assert!(
+            matches!(d, LeaseDecision::Queued { .. }),
+            "a modelless board must not satisfy board=, got {d:?}"
+        );
     }
 
     #[test]
     fn grants_when_idle() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &["a"]));
-        let d = request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 1000);
+        let d = request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 1000);
         match d {
             LeaseDecision::Granted(g) => {
                 assert_eq!(g.board, board_ref(ORG, "b1"));
@@ -694,9 +763,9 @@ mod tests {
     fn queues_when_contended() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let _ = request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0);
-        let d2 = request_as(&mut s, subject("p2"), req(by_board("b1"), 100, Priority::Ci), 0);
-        let d3 = request_as(&mut s, subject("p3"), req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0);
+        let d2 = request_as(&mut s, subject("p2"), req(by_id("b1"), 100, Priority::Ci), 0);
+        let d3 = request_as(&mut s, subject("p3"), req(by_id("b1"), 100, Priority::Ci), 0);
         assert_eq!(d2, LeaseDecision::Queued { position: 0 });
         assert_eq!(d3, LeaseDecision::Queued { position: 1 });
     }
@@ -705,15 +774,15 @@ mod tests {
     fn release_hands_to_highest_priority_waiter() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
         // Soak queued first, then Interactive.
-        let _ = request_as(&mut s, subject("soak"), req(by_board("b1"), 100, Priority::Soak), 0);
+        let _ = request_as(&mut s, subject("soak"), req(by_id("b1"), 100, Priority::Soak), 0);
         let _ = request_as(&mut s, 
             subject("inter"),
-            req(by_board("b1"), 100, Priority::Interactive),
+            req(by_id("b1"), 100, Priority::Interactive),
             0,
         );
         let promoted = s
@@ -727,12 +796,12 @@ mod tests {
     fn fifo_within_class() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
-        let _ = request_as(&mut s, subject("first"), req(by_board("b1"), 100, Priority::Ci), 0);
-        let _ = request_as(&mut s, subject("second"), req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, subject("first"), req(by_id("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, subject("second"), req(by_id("b1"), 100, Priority::Ci), 0);
         let promoted = s
             .release_lease(g.lease, &subject("p1").key(), 10)
             .expect("holder may release")
@@ -744,11 +813,11 @@ mod tests {
     fn expiry_frees_and_drains_queue() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
-        let _ = request_as(&mut s, subject("p2"), req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, subject("p2"), req(by_id("b1"), 100, Priority::Ci), 0);
         // Before expiry: nothing happens.
         assert!(s.expire(50).freed.is_empty());
         // After expiry: board freed, then re-granted to the waiter.
@@ -764,7 +833,7 @@ mod tests {
     fn extend_pushes_expiry() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -793,7 +862,7 @@ mod tests {
     fn other_subject_cannot_extend() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("alice"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("alice"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -820,7 +889,7 @@ mod tests {
     fn other_subject_cannot_release() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("alice"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("alice"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -848,7 +917,7 @@ mod tests {
         s.upsert_board(b);
         let g = match request_as(&mut s, 
             subject_in("org-b", "alice"),
-            req(by_board("b1"), 100, Priority::Ci),
+            req(by_id("b1"), 100, Priority::Ci),
             0,
         ) {
             LeaseDecision::Granted(g) => g,
@@ -872,7 +941,7 @@ mod tests {
     fn groups_do_not_affect_holder_identity() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("alice"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("alice"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -935,7 +1004,7 @@ mod tests {
         // Request way over the Ci cap (3600).
         let g = match request_as(&mut s, 
             subject("p1"),
-            req(by_board("b1"), 1_000_000, Priority::Ci),
+            req(by_id("b1"), 1_000_000, Priority::Ci),
             100,
         ) {
             LeaseDecision::Granted(g) => g,
@@ -945,7 +1014,7 @@ mod tests {
 
         // duration 0 => default ttl (900).
         s.upsert_board(board("b2", "nrf52", &[]));
-        let g2 = match request_as(&mut s, subject("p2"), req(by_board("b2"), 0, Priority::Ci), 100) {
+        let g2 = match request_as(&mut s, subject("p2"), req(by_id("b2"), 0, Priority::Ci), 100) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -958,12 +1027,12 @@ mod tests {
         s.upsert_board(board("b1", "nrf52", &[]));
         // Exact match grants.
         assert!(matches!(
-            request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0),
+            request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0),
             LeaseDecision::Granted(_)
         ));
         // Wrong id queues.
         assert!(matches!(
-            request_as(&mut s, subject("p2"), req(by_board("nope"), 100, Priority::Ci), 0),
+            request_as(&mut s, subject("p2"), req(by_id("nope"), 100, Priority::Ci), 0),
             LeaseDecision::Queued { .. }
         ));
     }
@@ -1030,7 +1099,7 @@ mod tests {
     fn remove_board_while_leased_drops_lease() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -1047,7 +1116,7 @@ mod tests {
     fn upsert_preserves_live_lease_state() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &["a"]));
-        let _ = request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0);
         // Agent re-reports the board as Idle with updated tags.
         let mut reported = board("b1", "nrf52", &["a", "b"]);
         reported.state = BoardState::Idle;
@@ -1077,7 +1146,7 @@ mod tests {
     fn lease_target_resolves_board_and_agent() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(&mut s, subject("p1"), req(by_board("b1"), 100, Priority::Ci), 0) {
+        let g = match request_as(&mut s, subject("p1"), req(by_id("b1"), 100, Priority::Ci), 0) {
             LeaseDecision::Granted(g) => g,
             LeaseDecision::Queued { .. } => panic!(),
         };
@@ -1121,7 +1190,7 @@ mod tests {
 
         let d = request_as(&mut s, 
             subject_in("org-b", "mallory"),
-            req(by_board("b1"), 100, Priority::Ci),
+            req(by_id("b1"), 100, Priority::Ci),
             0,
         );
         assert_eq!(d, LeaseDecision::Queued { position: 0 });
@@ -1142,7 +1211,7 @@ mod tests {
 
         let alice = subject_in("org-a", "alice");
         let LeaseDecision::Granted(g) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
@@ -1150,7 +1219,7 @@ mod tests {
         // fair contest that did not consider the org.
         let d = request_as(&mut s, 
             subject_in("org-b", "mallory"),
-            req(by_board("b1"), 100, Priority::Interactive),
+            req(by_id("b1"), 100, Priority::Interactive),
             0,
         );
         assert_eq!(d, LeaseDecision::Queued { position: 0 });
@@ -1170,7 +1239,7 @@ mod tests {
 
         // Expiry takes the same path; re-lease then let it lapse.
         let LeaseDecision::Granted(g2) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 20)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 20)
         else {
             panic!("expected grant");
         };
@@ -1197,11 +1266,11 @@ mod tests {
         let alice = subject_in("org-a", "alice");
         let bob = subject_in("org-a", "bob");
         let LeaseDecision::Granted(g) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
-        let _ = request_as(&mut s, bob.clone(), req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, bob.clone(), req(by_id("b1"), 100, Priority::Ci), 0);
         let promoted = s
             .release_lease(g.lease, &alice.key(), 10)
             .expect("holder may release")
@@ -1282,7 +1351,7 @@ mod tests {
         let bob = subject_in("org-b", "bob");
 
         let LeaseDecision::Granted(g) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
@@ -1311,7 +1380,7 @@ mod tests {
         let alice = subject_in("org-a", "alice");
 
         let LeaseDecision::Granted(g) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
@@ -1343,12 +1412,12 @@ mod tests {
         let bob = subject_in("org-b", "bob");
 
         let LeaseDecision::Granted(g) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
         let carol = subject_in("org-a", "carol");
-        let _ = request_as(&mut s, carol.clone(), req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = request_as(&mut s, carol.clone(), req(by_id("b1"), 100, Priority::Ci), 0);
         // Bob queues at the highest priority, so he would win any fair contest
         // his access still admitted.
         let access = granted("org-b", "org-a", "nrf52", None);
@@ -1392,19 +1461,19 @@ mod tests {
 
         // Both boards are busy, so bob queues for each.
         let LeaseDecision::Granted(shared) =
-            request_as(&mut s, alice.clone(), req(by_board("shared"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("shared"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
         let LeaseDecision::Granted(mine) =
-            request_as(&mut s, bob_boss.clone(), req(by_board("mine"), 100, Priority::Ci), 0)
+            request_as(&mut s, bob_boss.clone(), req(by_id("mine"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
 
         let access = granted("org-b", "org-a", "nrf52", None);
-        let _ = s.request_lease(bob.clone(), &access, req(by_board("shared"), 100, Priority::Ci), 0);
-        let _ = s.request_lease(bob.clone(), &access, req(by_board("mine"), 100, Priority::Ci), 0);
+        let _ = s.request_lease(bob.clone(), &access, req(by_id("shared"), 100, Priority::Ci), 0);
+        let _ = s.request_lease(bob.clone(), &access, req(by_id("mine"), 100, Priority::Ci), 0);
 
         // Alice revokes her grant. Bob keeps his own org's membership.
         assert_eq!(
@@ -1441,7 +1510,7 @@ mod tests {
         let bob = subject_in("org-b", "bob");
 
         let LeaseDecision::Granted(g) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
@@ -1458,13 +1527,13 @@ mod tests {
                 GrantScope {
                     id: "g2".to_owned(),
                     org: org("org-a"),
-                    selector: Constraint::Board(BoardName("b1".to_owned())),
+                    selector: Constraint::Id(BoardName("b1".to_owned())),
                     ops: vec![AllowedOp::Gdb],
                     expires: None,
                 },
             ],
         };
-        let _ = s.request_lease(bob.clone(), &both, req(by_board("b1"), 100, Priority::Ci), 0);
+        let _ = s.request_lease(bob.clone(), &both, req(by_id("b1"), 100, Priority::Ci), 0);
 
         // g1 is revoked; g2 still covers the board.
         let mut remaining = both.clone();
@@ -1487,7 +1556,7 @@ mod tests {
         let bob = subject_in("org-b", "bob");
 
         let LeaseDecision::Granted(ga) =
-            request_as(&mut s, alice.clone(), req(by_board("b1"), 100, Priority::Ci), 0)
+            request_as(&mut s, alice.clone(), req(by_id("b1"), 100, Priority::Ci), 0)
         else {
             panic!("expected grant");
         };
@@ -1495,7 +1564,7 @@ mod tests {
         let LeaseDecision::Granted(gb) = s.request_lease(
             bob.clone(),
             &access,
-            req(by_board("b2"), 100, Priority::Ci),
+            req(by_id("b2"), 100, Priority::Ci),
             0,
         ) else {
             panic!("expected grant");
@@ -1521,7 +1590,7 @@ mod tests {
         let d = s.request_lease(
             subject_in("org-a", "ghost"),
             &Access::none(),
-            req(by_board("b1"), 100, Priority::Ci),
+            req(by_id("b1"), 100, Priority::Ci),
             0,
         );
         assert_eq!(d, LeaseDecision::Queued { position: 0 });

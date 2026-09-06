@@ -53,7 +53,7 @@ async fn delegate(
 }
 
 fn by_board(name: &str) -> fleet_proto::lease::Constraint {
-    fleet_proto::lease::Constraint::Board(BoardName(name.to_owned()))
+    fleet_proto::lease::Constraint::Id(BoardName(name.to_owned()))
 }
 
 /// Open a `/delegate` session with a capability token.

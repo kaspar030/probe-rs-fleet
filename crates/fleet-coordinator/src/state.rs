@@ -184,7 +184,7 @@ impl GrantRow {
     #[must_use]
     pub fn to_scope(&self) -> Option<GrantScope> {
         let selector =
-            fleet_proto::lease::parse_constraint(&self.selector, fleet_proto::lease::BareTerm::Tag)
+            fleet_proto::lease::parse_constraint(&self.selector)
                 .ok()?;
         let ops = self.parsed_ops();
         if ops.is_empty() {
@@ -1802,10 +1802,11 @@ impl OrgDb<'_> {
         let tags = board.tags.join("\n");
         let state = board_state_label(&board.state);
         sqlx::query(
-            "INSERT INTO board (org_id, node_id, name, chip, tags, exclusive, state, first_seen, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)
+            "INSERT INTO board (org_id, node_id, name, chip, model, tags, exclusive, state, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
              ON CONFLICT(org_id, node_id, name) DO UPDATE SET
                 chip = excluded.chip,
+                model = excluded.model,
                 tags = excluded.tags,
                 exclusive = excluded.exclusive,
                 state = excluded.state,
@@ -1815,6 +1816,7 @@ impl OrgDb<'_> {
         .bind(board.id.node.0.as_str())
         .bind(board.id.name.as_str())
         .bind(board.chip.as_str())
+        .bind(board.model.as_deref())
         .bind(tags)
         .bind(i64::from(board.exclusive))
         .bind(state)
@@ -2598,6 +2600,7 @@ mod tests {
             id: board_ref(org_name, node, name),
             agent: AgentId(node.to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
+            model: None,
             tags: vec!["nrf52".to_owned(), "ble".to_owned()],
             exclusive: true,
             power: PowerKind::None,

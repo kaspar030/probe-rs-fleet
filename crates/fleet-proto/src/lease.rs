@@ -26,33 +26,22 @@ pub enum Constraint {
     ///
     /// A bare name is only unique within one node of one org, so the
     /// coordinator resolves it to a [`BoardRef`] **within the caller's org**
-    /// (erroring on ambiguity). Keeping the request side node-local is what
-    /// lets `PROBE_RS_FLEET_BOARD=nrf52840-dk-3` keep working unchanged.
-    Board(BoardName),
+    /// (erroring on ambiguity). This is the instance selector: `id=<name>`,
+    /// `--id`, `PROBE_RS_FLEET_ID`.
+    Id(BoardName),
+    /// Any idle board of this board *model* (board type), e.g. `nrf52840dk`.
+    ///
+    /// The model is declared by the operator in `boards.toml`; the agent
+    /// cannot infer it (`probe-rs list` reports the probe, never the board it
+    /// is wired to), so an auto-adopted board has no model and is never
+    /// matched by `board=`.
+    Model(String),
     /// Any idle board matching all of these tags.
     Tags(Vec<String>),
     /// Any idle board with this probe-rs chip name.
     Chip(String),
 }
 
-/// What a bare (unprefixed) term in a selector expression means.
-///
-/// Two callers disagree, and the disagreement is real rather than accidental,
-/// so it is a parameter instead of being silently unified:
-///
-/// * `PROBE_RS_FLEET_SELECT=nrf52 && bluetooth` is a *tag* conjunction — the
-///   sidecar's selector is a fleet-wide "any board like this";
-/// * `ctl lease nrf52840-dk-3` names a *board* — the operator verb takes an id.
-///
-/// Grants use [`BareTerm::Tag`]: a grant's whole point is to describe a set,
-/// and an individual-board grant is spelled `board=<name>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BareTerm {
-    /// A bare word is a tag.
-    Tag,
-    /// A bare word is a node-local board name.
-    Board,
-}
 
 /// Why a selector expression could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,15 +52,15 @@ pub enum ConstraintParseError {
     /// **every** board, which is the last thing a grant should silently mean.
     #[error("selector expression is empty")]
     Empty,
-    /// A `board=`/`chip=`/`tag=` term had an empty value.
+    /// An `id=`/`board=`/`chip=`/`tag=` term had an empty value.
     #[error("empty value for `{term}`")]
     EmptyValue {
-        /// The offending term key (`board`, `chip` or `tag`).
+        /// The offending term key (`id`, `board`, `chip` or `tag`).
         term: &'static str,
     },
-    /// `board=`/`chip=` cannot be conjoined — the wire [`Constraint`] has no
-    /// representation for it.
-    #[error("`{term}=` selects exactly one board and cannot be combined with other terms")]
+    /// `id=`/`board=`/`chip=` cannot be conjoined — the wire [`Constraint`]
+    /// has no representation for it.
+    #[error("`{term}=` cannot be combined with other terms")]
     NotConjoinable {
         /// The offending term key.
         term: &'static str,
@@ -85,24 +74,30 @@ pub enum ConstraintParseError {
 ///
 /// This is the fleet's **one** selector grammar (architecture §6.5); the
 /// sidecar's `PROBE_RS_FLEET_SELECT`, `ctl lease`, `grant --select` and
-/// `ctl delegate --select` all funnel through it, differing only in `bare`.
+/// `ctl delegate --select` all funnel through it, with no per-caller dialect.
 ///
 /// Grammar:
 ///
-/// * `board=<name>` — exactly one board by node-local name. This is the
+/// * `id=<name>` — exactly one board by node-local name. This is the
 ///   "individual board" case: a degenerate selector, not a special case.
+/// * `board=<model>` — any board of that *model* (board type), e.g.
+///   `board=nrf52840dk`. This is the word devs use, so it means the generic
+///   thing; the instance selector is `id=`.
 /// * `chip=<name>` — any board with that probe-rs chip name.
-/// * `tag=<t>`, or a bare word under [`BareTerm::Tag`] — one required tag.
+/// * `tag=<t>`, or a bare word — one required tag. **A bare word is always a
+///   tag**, in every caller; `ctl lease nrf52840-dk-3` is therefore a tag
+///   selector and the operator writes `ctl lease id=nrf52840-dk-3`.
 /// * `a && b && …` — a conjunction, of tags only.
 ///
-/// `board=`/`chip=` are not conjoinable: the wire [`Constraint`] enum cannot
-/// express it, and quietly dropping the extra terms would widen a grant.
+/// `id=`/`board=`/`chip=` are not conjoinable: the wire [`Constraint`] enum
+/// cannot express it, and quietly dropping the extra terms would widen a
+/// grant.
 ///
 /// # Errors
 ///
 /// Returns a [`ConstraintParseError`] for an empty expression, an empty term
 /// value, a non-conjoinable term in a conjunction, or an unknown `key=value`.
-pub fn parse_constraint(expr: &str, bare: BareTerm) -> Result<Constraint, ConstraintParseError> {
+pub fn parse_constraint(expr: &str) -> Result<Constraint, ConstraintParseError> {
     let terms: Vec<&str> = expr
         .split("&&")
         .map(str::trim)
@@ -115,12 +110,19 @@ pub fn parse_constraint(expr: &str, bare: BareTerm) -> Result<Constraint, Constr
 
     // Single-term forms that are not tags.
     if terms.len() == 1 {
-        if let Some(name) = terms[0].strip_prefix("board=") {
+        if let Some(name) = terms[0].strip_prefix("id=") {
             let name = name.trim();
             if name.is_empty() {
+                return Err(ConstraintParseError::EmptyValue { term: "id" });
+            }
+            return Ok(Constraint::Id(BoardName(name.to_owned())));
+        }
+        if let Some(model) = terms[0].strip_prefix("board=") {
+            let model = model.trim();
+            if model.is_empty() {
                 return Err(ConstraintParseError::EmptyValue { term: "board" });
             }
-            return Ok(Constraint::Board(BoardName(name.to_owned())));
+            return Ok(Constraint::Model(model.to_owned()));
         }
         if let Some(chip) = terms[0].strip_prefix("chip=") {
             let chip = chip.trim();
@@ -129,22 +131,14 @@ pub fn parse_constraint(expr: &str, bare: BareTerm) -> Result<Constraint, Constr
             }
             return Ok(Constraint::Chip(chip.to_owned()));
         }
-        if bare == BareTerm::Board && !terms[0].contains('=') {
-            return Ok(Constraint::Board(BoardName(terms[0].to_owned())));
-        }
     }
 
     let mut tags = Vec::with_capacity(terms.len());
     for term in terms {
-        for key in ["board", "chip"] {
+        for key in ["id", "board", "chip"] {
             if term.starts_with(&format!("{key}=")) {
                 return Err(ConstraintParseError::NotConjoinable { term: key });
             }
-        }
-        let is_bare = !term.contains('=');
-        if is_bare && bare == BareTerm::Board {
-            // A conjunction of board names is meaningless.
-            return Err(ConstraintParseError::NotConjoinable { term: "board" });
         }
         let tag = term.strip_prefix("tag=").unwrap_or(term).trim();
         if tag.is_empty() {
@@ -160,8 +154,8 @@ pub fn parse_constraint(expr: &str, bare: BareTerm) -> Result<Constraint, Constr
 
 /// The canonical, round-trippable rendering of a [`Constraint`].
 ///
-/// `parse_constraint(&c.to_string(), BareTerm::Tag) == Ok(c)` for every
-/// constraint this grammar can produce. Grants store *this* form, so what a
+/// `parse_constraint(&c.to_string()) == Ok(c)` for every constraint this
+/// grammar can produce. Grants store *this* form, so what a
 /// grant means never depends on which CLI wrote it.
 ///
 /// Note this is deliberately **not** the sidecar's `lease_cache::fingerprint`,
@@ -170,7 +164,8 @@ pub fn parse_constraint(expr: &str, bare: BareTerm) -> Result<Constraint, Constr
 impl std::fmt::Display for Constraint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Constraint::Board(BoardName(name)) => write!(f, "board={name}"),
+            Constraint::Id(BoardName(name)) => write!(f, "id={name}"),
+            Constraint::Model(model) => write!(f, "board={model}"),
             Constraint::Chip(chip) => write!(f, "chip={chip}"),
             Constraint::Tags(tags) => {
                 for (i, tag) in tags.iter().enumerate() {
@@ -230,37 +225,48 @@ mod tests {
         Constraint::Tags(v.iter().map(|s| (*s).to_owned()).collect())
     }
 
+    /// One reading of a bare word, everywhere: it is a tag. `ctl lease foo`
+    /// used to mean the board named `foo`; it now means `tag=foo`, and the
+    /// instance form is `ctl lease id=foo`.
     #[test]
-    fn bare_term_means_tag_or_board_depending_on_the_caller() {
+    fn a_bare_word_is_always_a_tag() {
+        assert_eq!(parse_constraint("nrf52").unwrap(), tags(&["nrf52"]));
         assert_eq!(
-            parse_constraint("nrf52", BareTerm::Tag).unwrap(),
-            tags(&["nrf52"])
+            parse_constraint("nrf52840-dk-3").unwrap(),
+            tags(&["nrf52840-dk-3"])
+        );
+    }
+
+    /// `board=` is the *model* (board type); `id=` is the one instance.
+    #[test]
+    fn board_is_the_model_and_id_is_the_instance() {
+        assert_eq!(
+            parse_constraint("board=nrf52840dk").unwrap(),
+            Constraint::Model("nrf52840dk".to_owned())
         );
         assert_eq!(
-            parse_constraint("nrf52840-dk-3", BareTerm::Board).unwrap(),
-            Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
+            parse_constraint("id=nrf52840-dk-3").unwrap(),
+            Constraint::Id(BoardName("nrf52840-dk-3".to_owned()))
         );
     }
 
     #[test]
-    fn explicit_terms_are_unambiguous_under_either_bare_rule() {
-        for bare in [BareTerm::Tag, BareTerm::Board] {
-            assert_eq!(
-                parse_constraint("board=b1", bare).unwrap(),
-                Constraint::Board(BoardName("b1".to_owned()))
-            );
-            assert_eq!(
-                parse_constraint("chip=nRF52840_xxAA", bare).unwrap(),
-                Constraint::Chip("nRF52840_xxAA".to_owned())
-            );
-            assert_eq!(parse_constraint("tag=lab", bare).unwrap(), tags(&["lab"]));
-        }
+    fn explicit_terms_are_unambiguous() {
+        assert_eq!(
+            parse_constraint("id=b1").unwrap(),
+            Constraint::Id(BoardName("b1".to_owned()))
+        );
+        assert_eq!(
+            parse_constraint("chip=nRF52840_xxAA").unwrap(),
+            Constraint::Chip("nRF52840_xxAA".to_owned())
+        );
+        assert_eq!(parse_constraint("tag=lab").unwrap(), tags(&["lab"]));
     }
 
     #[test]
     fn tags_conjoin_in_order() {
         assert_eq!(
-            parse_constraint("tag=nrf52 && bluetooth", BareTerm::Tag).unwrap(),
+            parse_constraint("tag=nrf52 && bluetooth").unwrap(),
             tags(&["nrf52", "bluetooth"])
         );
     }
@@ -269,48 +275,46 @@ mod tests {
     /// board — the difference between "no grant" and "grant everything".
     #[test]
     fn an_empty_expression_is_refused_not_defaulted() {
-        assert_eq!(
-            parse_constraint("", BareTerm::Tag),
-            Err(ConstraintParseError::Empty)
-        );
-        assert_eq!(
-            parse_constraint("  &&  ", BareTerm::Tag),
-            Err(ConstraintParseError::Empty)
-        );
+        assert_eq!(parse_constraint(""), Err(ConstraintParseError::Empty));
+        assert_eq!(parse_constraint("  &&  "), Err(ConstraintParseError::Empty));
     }
 
     #[test]
     fn non_conjoinable_terms_are_rejected_rather_than_truncated() {
         assert_eq!(
-            parse_constraint("board=b1 && tag=lab", BareTerm::Tag),
+            parse_constraint("id=b1 && tag=lab"),
+            Err(ConstraintParseError::NotConjoinable { term: "id" })
+        );
+        assert_eq!(
+            parse_constraint("board=nrf52840dk && tag=lab"),
             Err(ConstraintParseError::NotConjoinable { term: "board" })
         );
         assert_eq!(
-            parse_constraint("chip=x && tag=lab", BareTerm::Tag),
+            parse_constraint("chip=x && tag=lab"),
             Err(ConstraintParseError::NotConjoinable { term: "chip" })
-        );
-        assert_eq!(
-            parse_constraint("b1 && b2", BareTerm::Board),
-            Err(ConstraintParseError::NotConjoinable { term: "board" })
         );
     }
 
     #[test]
     fn empty_values_and_unknown_keys_are_errors() {
         assert_eq!(
-            parse_constraint("board=", BareTerm::Tag),
+            parse_constraint("id="),
+            Err(ConstraintParseError::EmptyValue { term: "id" })
+        );
+        assert_eq!(
+            parse_constraint("board="),
             Err(ConstraintParseError::EmptyValue { term: "board" })
         );
         assert_eq!(
-            parse_constraint("chip=", BareTerm::Tag),
+            parse_constraint("chip="),
             Err(ConstraintParseError::EmptyValue { term: "chip" })
         );
         assert_eq!(
-            parse_constraint("tag=", BareTerm::Tag),
+            parse_constraint("tag="),
             Err(ConstraintParseError::EmptyValue { term: "tag" })
         );
         assert_eq!(
-            parse_constraint("colour=red", BareTerm::Tag),
+            parse_constraint("colour=red"),
             Err(ConstraintParseError::UnsupportedTerm("colour=red".to_owned()))
         );
     }
@@ -320,14 +324,15 @@ mod tests {
     #[test]
     fn display_round_trips_through_the_parser() {
         for c in [
-            Constraint::Board(BoardName("nrf52840-dk-3".to_owned())),
+            Constraint::Id(BoardName("nrf52840-dk-3".to_owned())),
+            Constraint::Model("nrf52840dk".to_owned()),
             Constraint::Chip("nRF52840_xxAA".to_owned()),
             tags(&["nrf52"]),
             tags(&["nrf52", "bluetooth", "lab"]),
         ] {
             let rendered = c.to_string();
             assert_eq!(
-                parse_constraint(&rendered, BareTerm::Tag),
+                parse_constraint(&rendered),
                 Ok(c.clone()),
                 "round trip failed for {rendered}"
             );
@@ -337,10 +342,16 @@ mod tests {
     #[test]
     fn display_is_canonical() {
         assert_eq!(
-            parse_constraint("nrf52 && tag=lab", BareTerm::Tag)
-                .unwrap()
-                .to_string(),
+            parse_constraint("nrf52 && tag=lab").unwrap().to_string(),
             "tag=nrf52 && tag=lab"
+        );
+        assert_eq!(
+            parse_constraint("id=b1").unwrap().to_string(),
+            "id=b1"
+        );
+        assert_eq!(
+            parse_constraint("board=nrf52840dk").unwrap().to_string(),
+            "board=nrf52840dk"
         );
     }
 }

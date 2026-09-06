@@ -1036,7 +1036,7 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
         .collect::<Vec<_>>()
         .join(" && ");
     let selector =
-        match fleet_proto::lease::parse_constraint(&selector, fleet_proto::lease::BareTerm::Tag) {
+        match fleet_proto::lease::parse_constraint(&selector) {
             Ok(c) => c.to_string(),
             Err(e) => {
                 warn!(error = %e, "a CI auth key's tags do not form a valid selector");

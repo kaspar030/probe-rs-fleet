@@ -516,7 +516,7 @@ mod tests {
     async fn sidecar_envelope_roundtrip() {
         let (mut a_tx, _a_rx, _b_tx, mut b_rx) = mock::pair();
         let msg = SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardName("b1".to_owned())),
+            select: Constraint::Id(BoardName("b1".to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         });

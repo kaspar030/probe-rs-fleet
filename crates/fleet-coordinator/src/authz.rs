@@ -244,6 +244,7 @@ mod tests {
             id: BoardRef::new(org(org_name), AgentId("node-1".to_owned()), name),
             agent: AgentId("node-1".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
+            model: None,
             tags: vec![],
             exclusive: true,
             power: PowerKind::None,
@@ -253,7 +254,7 @@ mod tests {
 
     fn lease_req(name: &str) -> LeaseRequest {
         LeaseRequest {
-            select: Constraint::Board(BoardName(name.to_owned())),
+            select: Constraint::Id(BoardName(name.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         }
@@ -288,7 +289,7 @@ mod tests {
                 grants: vec![fleet_core::access::GrantScope {
                     id: "g1".to_owned(),
                     org: org(board_org),
-                    selector: Constraint::Board(BoardName("b1".to_owned())),
+                    selector: Constraint::Id(BoardName("b1".to_owned())),
                     ops: vec![fleet_proto::token::AllowedOp::Attach],
                     expires: None,
                 }],

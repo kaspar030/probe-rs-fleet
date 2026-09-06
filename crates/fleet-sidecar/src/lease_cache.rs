@@ -59,7 +59,8 @@ impl CacheKey {
 #[must_use]
 pub fn fingerprint(select: &Constraint) -> String {
     match select {
-        Constraint::Board(b) => format!("board:{}", b.0),
+        Constraint::Id(b) => format!("id:{}", b.0),
+        Constraint::Model(m) => format!("model:{m}"),
         Constraint::Chip(c) => format!("chip:{c}"),
         Constraint::Tags(tags) => {
             let mut sorted = tags.clone();
@@ -198,7 +199,7 @@ mod tests {
     }
 
     fn board_sel() -> Constraint {
-        Constraint::Board(BoardName("nrf52840-dk-3".to_owned()))
+        Constraint::Id(BoardName("nrf52840-dk-3".to_owned()))
     }
 
     #[test]
@@ -268,6 +269,23 @@ mod tests {
         let a = Constraint::Tags(vec!["nrf52".to_owned(), "bluetooth".to_owned()]);
         let b = Constraint::Tags(vec!["bluetooth".to_owned(), "nrf52".to_owned()]);
         assert_eq!(fingerprint(&a), fingerprint(&b));
+    }
+
+    /// An instance and a model selector spelling the same word are different
+    /// selectors, so they must be different cache keys — `id:x` and `model:x`,
+    /// never a shared `board:` prefix.
+    #[test]
+    fn an_id_and_a_model_never_share_a_key() {
+        let id = Constraint::Id(BoardName("nrf52840dk".to_owned()));
+        let model = Constraint::Model("nrf52840dk".to_owned());
+        assert_eq!(fingerprint(&id), "id:nrf52840dk");
+        assert_eq!(fingerprint(&model), "model:nrf52840dk");
+        assert_ne!(fingerprint(&id), fingerprint(&model));
+
+        let mut cache = LeaseCache::new();
+        let p = subject("dev").key();
+        cache.insert(&id, &p, CachedLease::new(grant(1000, "dev")));
+        assert!(cache.get(&model, &p, 500).is_none());
     }
 
     #[test]

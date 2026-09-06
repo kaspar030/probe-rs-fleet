@@ -32,6 +32,7 @@ const BOARD = {
   board: { key: 'gh-1/gh-1/rpi-1/dk-3', org: 'gh-1', node: 'gh-1/rpi-1', name: 'dk-3' },
   node: 'gh-1/rpi-1',
   chip: 'nRF52840_xxAA',
+  model: 'nrf52840dk',
   tags: ['lab', 'nrf'],
   exclusive: true,
   power: 'uhubctl',
@@ -79,6 +80,7 @@ test('devices renders the inventory and gates its actions by role', () => {
   const text = textOf(asHolder);
   assert.match(text, /dk-3/);
   assert.match(text, /nRF52840_xxAA/);
+  assert.match(text, /nrf52840dk/);
   assert.match(text, /gh-1:user:gh-2/);
   assert.ok(labels(asHolder).includes('Release'), 'the holder sees Release');
 
@@ -94,6 +96,14 @@ test('devices disables power-cycle for a board with no power control', () => {
   const tree = devices.render({ boards: [{ ...BOARD, power: 'none' }], session: ADMIN });
   const button = find(tree, (n) => n.tag === 'button' && n.children.join('') === 'Power-cycle');
   assert.equal(button.attrs.disabled, true);
+});
+
+// A board with no declared model renders an em dash rather than "undefined":
+// it is the visible signal that no `board=` selector can reach it.
+test('devices renders a missing board model as a dash', () => {
+  const tree = devices.render({ boards: [{ ...BOARD, model: null }], session: ADMIN });
+  assert.ok(!textOf(tree).includes('undefined'));
+  assert.ok(!textOf(tree).includes('nrf52840dk'));
 });
 
 test('agents offers tags and adopt, never a rename', () => {
@@ -171,9 +181,14 @@ test('access hides the create form from a member and says why', () => {
 });
 
 test('the selector is the canonical string a CLI would send', () => {
+  // `board=` is the board MODEL; `id=` is the one board.
   assert.equal(
-    access.selectorString([{ kind: 'board', value: 'dk-3' }, { kind: 'tag', value: 'lab' }]),
-    'board=dk-3 && tag=lab',
+    access.selectorString([{ kind: 'board', value: 'nrf52840dk' }, { kind: 'tag', value: 'lab' }]),
+    'board=nrf52840dk && tag=lab',
+  );
+  assert.equal(
+    access.selectorString([{ kind: 'id', value: 'dk-3' }]),
+    'id=dk-3',
   );
   assert.equal(access.selectorString([{ kind: 'tag', value: '  ' }]), '');
   // A CI repo grantee needs the prefix `resolve_grantee` matches; a bare

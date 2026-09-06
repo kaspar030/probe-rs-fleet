@@ -95,6 +95,7 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
                 BoardPresence::Offline
             },
             chip: board.chip.clone(),
+            model: board.model.clone(),
             tags: board.tags.clone(),
             exclusive: board.exclusive,
             power: board.power.to_power_kind(),
@@ -141,6 +142,11 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
 ///   is honest. The visible consequence: `ctl lease --select 'chip=…'` will not
 ///   match an auto-adopted board until `boards.toml` annotates it. That is the
 ///   `boards.toml`-as-annotation story (§8), not a defect.
+/// * `model` is **`None`**, for exactly the same reason: `probe-rs list`
+///   reports the probe (a J-Link), never the board it is wired to, so the
+///   agent cannot know that this is an `nrf52840dk`. The visible consequence:
+///   `--select 'board=<model>'` never matches an adopted board until
+///   `boards.toml` declares its `model`.
 /// * `power` is [`PowerSpec::None`] — nobody declared this board, so nothing is
 ///   wired up to cut its power.
 /// * `vid`/`pid` stay `0`. [`ProcessBackend::serve_spec`] re-enumerates at
@@ -161,6 +167,7 @@ pub fn adopted_board_spec(probe: &DiscoveredProbe) -> Option<BoardSpec> {
         vid: 0,
         pid: 0,
         chip: String::new(),
+        model: None,
         tags: inferred_tags(probe),
         exclusive: true,
         power: PowerSpec::None,
@@ -233,6 +240,7 @@ pub fn adopted_board_status(spec: &BoardSpec, presence: BoardPresence) -> BoardS
         serial: spec.serial.clone(),
         presence,
         chip: spec.chip.clone(),
+        model: spec.model.clone(),
         tags: spec.tags.clone(),
         exclusive: spec.exclusive,
         power: spec.power.to_power_kind(),

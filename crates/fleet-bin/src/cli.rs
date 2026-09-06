@@ -701,18 +701,26 @@ pub struct SidecarArgs {
     /// The fleet whose `[user]` credential the shim connects with.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
     pub fleet: String,
-    /// Explicit board id to lease (e.g. `nrf52840-dk-1`).
+    /// Board **model** to lease (e.g. `nrf52840dk`): any idle board of that
+    /// type. This is the generic selector — use `--id` for one specific board.
     ///
-    /// Overrides both `PROBE_RS_FLEET_BOARD` and `_SELECT` in the environment.
-    /// An empty value is treated as if the flag were absent.
-    #[arg(long, conflicts_with = "select")]
+    /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
+    /// environment. An empty value is treated as if the flag were absent.
+    #[arg(long, conflicts_with_all = ["id", "select"])]
     pub board: Option<String>,
-    /// Board selector expression: `tag=<t> && <t>`, `chip=<c>`, `board=<n>`, or
-    /// a bare term (a tag).
+    /// Explicit board **id** to lease (e.g. `nrf52840-dk-1`): exactly one
+    /// board, by its node-local name.
     ///
-    /// Overrides both `PROBE_RS_FLEET_BOARD` and `_SELECT` in the environment.
-    /// An empty value is treated as if the flag were absent.
-    #[arg(long, conflicts_with = "board")]
+    /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
+    /// environment. An empty value is treated as if the flag were absent.
+    #[arg(long, conflicts_with_all = ["board", "select"])]
+    pub id: Option<String>,
+    /// Board selector expression: `id=<name>`, `board=<model>`, `chip=<c>`,
+    /// `tag=<t> && <t>`, or a bare term (a tag).
+    ///
+    /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
+    /// environment. An empty value is treated as if the flag were absent.
+    #[arg(long, conflicts_with_all = ["board", "id"])]
     pub select: Option<String>,
     /// The probe-rs subcommand and its arguments, forwarded verbatim.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -756,9 +764,11 @@ pub struct CtlArgs {
 pub enum CtlCommand {
     /// List the fleet inventory (boards and their state).
     List,
-    /// Lease a board by id or selector (`tag=…`, `chip=…`).
+    /// Lease a board by selector (`id=…`, `board=…`, `tag=…`, `chip=…`).
     Lease {
-        /// Board id or selector: bare id, `tag=<t>` (repeatable), or `chip=<c>`.
+        /// Board selector: `id=<name>` for one board, `board=<model>` for any
+        /// board of a model, `chip=<c>`, `tag=<t> && <t>`, or a bare word
+        /// (which is a tag).
         selector: String,
         /// Requested hold duration in seconds (0 = policy default).
         #[arg(long, default_value_t = 0)]
@@ -800,8 +810,8 @@ pub enum CtlCommand {
     /// fleet identity, cannot enumerate the fleet or ask for another board, and
     /// cannot outlive the lease. Revoke by releasing the lease.
     Delegate {
-        /// Which board to lease: `board=<name>`, `tag=<t> && <t>`, `chip=<c>`,
-        /// or a bare board name.
+        /// Which board to lease: `id=<name>`, `board=<model>`, `chip=<c>`,
+        /// `tag=<t> && <t>`, or a bare word (a tag).
         #[arg(long)]
         select: String,
         /// Operations to delegate, comma-separated
@@ -845,8 +855,9 @@ pub struct GrantArgs {
     /// `--repo-owner`.
     #[arg(long, conflicts_with = "subject")]
     pub repo: Option<String>,
-    /// Which boards to share: `tag=<t> && <t>`, `chip=<c>`, or `board=<name>`
-    /// for a single board (a degenerate selector, not a special case).
+    /// Which boards to share: `board=<model>` for every board of a type,
+    /// `tag=<t> && <t>`, `chip=<c>`, or `id=<name>` for a single board (a
+    /// degenerate selector, not a special case).
     #[arg(long)]
     pub select: Option<String>,
     /// Operations to confer, comma-separated
@@ -1027,7 +1038,7 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     }
                 },
                 Command::Sidecar(args) => {
-                    let flags = SelectorFlags::new(args.board, args.select);
+                    let flags = SelectorFlags::new(args.board, args.id, args.select);
                     roles::sidecar::run(args.probe_rs_args, &args.fleet, flags).await
                 }
                 Command::Ctl(args) => roles::ctl::run(args).await,
@@ -1564,6 +1575,7 @@ mod tests {
             Command::Sidecar(a) => {
                 assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
                 assert_eq!(a.board, None);
+                assert_eq!(a.id, None);
                 assert_eq!(a.select, None);
             }
             other => panic!("expected sidecar, got {other:?}"),
@@ -1596,16 +1608,39 @@ mod tests {
     #[test]
     fn sidecar_board_flag_parses_without_a_double_dash() {
         // The ergonomic form people actually type: `--` is optional.
+        // `--board` is the board MODEL.
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
             "sidecar",
             "--board",
+            "nrf52840dk",
+            "list",
+        ]));
+        match cli.command {
+            Command::Sidecar(a) => {
+                assert_eq!(a.board.as_deref(), Some("nrf52840dk"));
+                assert_eq!(a.id, None);
+                assert_eq!(a.select, None);
+                assert_eq!(a.probe_rs_args, os(&["list"]));
+            }
+            other => panic!("expected sidecar, got {other:?}"),
+        }
+    }
+
+    /// `--id` is the instance selector that `--board` used to be.
+    #[test]
+    fn sidecar_id_flag_parses() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "sidecar",
+            "--id",
             "nrf52840-dk-1",
             "list",
         ]));
         match cli.command {
             Command::Sidecar(a) => {
-                assert_eq!(a.board.as_deref(), Some("nrf52840-dk-1"));
+                assert_eq!(a.id.as_deref(), Some("nrf52840-dk-1"));
+                assert_eq!(a.board, None);
                 assert_eq!(a.select, None);
                 assert_eq!(a.probe_rs_args, os(&["list"]));
             }
@@ -1659,7 +1694,7 @@ mod tests {
             "--select",
             "tag=x",
             "--board",
-            "nrf52840-dk-1",
+            "nrf52840dk",
             "--",
             "list",
         ]))
@@ -1667,6 +1702,28 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--board"), "{msg}");
         assert!(msg.contains("--select"), "{msg}");
+    }
+
+    /// All three selector flags are mutually exclusive: a model, an instance
+    /// and an expression are different questions, never a precedence rule.
+    #[test]
+    fn sidecar_id_conflicts_with_board_and_select() {
+        for other in [["--board", "nrf52840dk"], ["--select", "tag=x"]] {
+            let err = Cli::try_parse_from(os(&[
+                "probe-rs-fleet",
+                "sidecar",
+                "--id",
+                "nrf52840-dk-1",
+                other[0],
+                other[1],
+                "--",
+                "list",
+            ]))
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("--id"), "{msg}");
+            assert!(msg.contains(other[0]), "{msg}");
+        }
     }
 
     #[test]
@@ -1695,7 +1752,7 @@ mod tests {
     #[test]
     fn ctl_delegate_defaults_to_flash_attach_for_two_hours() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "ctl", "delegate", "--select", "board=b1",
+            "probe-rs-fleet", "ctl", "delegate", "--select", "id=b1",
         ]));
         match cli.command {
             Command::Ctl(a) => match a.command {

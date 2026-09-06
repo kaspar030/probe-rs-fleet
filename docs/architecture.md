@@ -319,8 +319,9 @@ the inventory). They describe the *machine*, not the fleet, so they are not
 per-fleet and are not duplicated when a machine joins a second one.
 
 Credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`; the selector
-vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) keep their names (`sidecar --board` /
-`--select` override them, §7). `PROBE_RS_FLEET_PROFILE`
+vars (`PROBE_RS_FLEET_BOARD` — a board **model** — `PROBE_RS_FLEET_ID` and
+`_SELECT`) keep their names (`sidecar --board` / `--id` / `--select` override
+them, §7). `PROBE_RS_FLEET_PROFILE`
 is gone, replaced by `PROBE_RS_FLEET` (a fleet name).
 
 **Writers are read-modify-write plus atomic rename.** A laptop has two
@@ -594,10 +595,11 @@ node tokens, is an obvious follow-up and deliberately not built here.)
 (`{product-slug}-{serial}`, or `probe-{vid}{pid}-{serial}` where the probe
 reports no product), so it survives a restart and a reordered `probe-rs list` —
 a lease selector names that id. Its tags are the probe type plus a literal
-`auto`. Its `chip` is **empty**, because `probe-rs list` reports the probe and
-not the target attached to it; the honest consequence is that `ctl lease
---select 'chip=…'` will not match an adopted board until `boards.toml`
-annotates it. Two probes are never adopted: one that is `inaccessible` (the
+`auto`. Its `chip` is **empty** and its `model` is **absent**, because
+`probe-rs list` reports the probe and neither the target attached to it nor the
+board it is wired to; the honest consequence is that neither `ctl lease
+chip=…` nor `ctl lease board=<model>` will match an adopted board until
+`boards.toml` annotates it. Two probes are never adopted: one that is `inaccessible` (the
 lease would fail at `probe-rs serve` spawn time) and one reporting no serial
 (which can be neither stably named nor fenced with `ProbeAccess::Allow`).
 
@@ -649,8 +651,9 @@ rest of the client-cert model.
 
 Resolution precedence is **explicit flag / env var > fleet config**. The
 credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`. The *selector*
-vars (`PROBE_RS_FLEET_BOARD` / `_SELECT`) keep their names but are no longer the
-only mechanism: `sidecar --board` / `--select` override them (§7).
+vars (`PROBE_RS_FLEET_BOARD` / `_ID` / `_SELECT`) keep their names but are no
+longer the only mechanism: `sidecar --board` / `--id` / `--select` override them
+(§7).
 
 **A sandboxed agent is never given these credentials.** It receives a
 lease-bound capability token instead (`ctl delegate`, §6.5).
@@ -1026,13 +1029,26 @@ The model, deliberately minimal:
 
 #### What shipped (grants, ACL evaluation, `ctl delegate`)
 
-**One selector grammar, extended by one term.** `board=<name>`, `chip=<c>`,
-`tag=<t>`, and `a && b` conjunctions of tags, parsed by a single function in
-`fleet-proto`. The sidecar's `PROBE_RS_FLEET_SELECT` and `ctl lease <sel>` are
-thin delegates that differ only in what a *bare* word means — a tag for the
-former, a board for the latter, which is a real difference between the two
-surfaces rather than an accident. `board=<name>` is the individual-board grant:
-a degenerate selector, not a special case. A grant stores the **canonical
+**One selector grammar, one reading of every term.** `id=<name>`,
+`board=<model>`, `chip=<c>`, `tag=<t>`, and `a && b` conjunctions of tags,
+parsed by a single function in `fleet-proto`. The sidecar's
+`PROBE_RS_FLEET_SELECT`, `ctl lease <sel>`, `ctl delegate --select` and
+`grant --select` are thin delegates with **no per-surface dialect**: a bare word
+is a *tag* everywhere (so `ctl lease nrf52840-dk-3` is a tag selector and the
+board is named `ctl lease id=nrf52840-dk-3`).
+
+The word "board" means the board **model** — the board type a developer asks
+for ("I need an nrf52840dk") — on every surface: the `board=` term, the
+`sidecar --board` flag and `PROBE_RS_FLEET_BOARD`. It is *not* the chip: a
+Nordic DK and a custom nRF52840 board share `nRF52840_xxAA` and are not
+interchangeable. The model is declared per board in `boards.toml`; the agent
+cannot infer it, so a board with no declared model (in particular every
+auto-adopted one) is never matched by `board=`. `id=<name>` is the
+individual-board grant: a degenerate selector, not a special case.
+`id=`/`board=`/`chip=` are not conjoinable — the wire `Constraint` has no
+representation for it, and dropping the extra terms would widen a grant.
+
+A grant stores the **canonical
 rendering** (`Constraint`'s `Display`) and evaluation re-parses it, so a grant's
 meaning never depends on which CLI wrote it; a row that will not re-parse is
 dropped **closed**, never widened into a match-anything. An empty expression is
@@ -1436,22 +1452,30 @@ Observations that shape the sidecar:
 
 Proposed selector convention (additive, no laze change required):
 
-- `PROBE_RS_FLEET_BOARD` — explicit board id, or
+- `PROBE_RS_FLEET_BOARD` — board **model**: any idle board of that type
+  (e.g. `nrf52840dk`), or
+- `PROBE_RS_FLEET_ID` — one specific board, by node-local id
+  (e.g. `nrf52840-dk-3`), or
 - `PROBE_RS_FLEET_SELECT` — constraint expr (e.g. `tag=nrf52 && bluetooth`).
 - `PROBE_RS_FLEET_TOKEN` / `…_COORDINATOR` — auth + endpoint.
 - Absent ⇒ sidecar falls back to local probe-rs (transparent local DX).
+- Setting more than one of the three selector vars is `AmbiguousSelector`, not
+  a precedence rule.
 
 For interactive use the explicit subcommand also takes the selector as a flag:
 
 ```sh
 probe-rs-fleet sidecar --select 'tag=nrf52840dk' -- list
-probe-rs-fleet sidecar --board nrf52840-dk-1 -- run --chip nRF52840_xxAA app.elf
+probe-rs-fleet sidecar --board nrf52840dk -- run --chip nRF52840_xxAA app.elf
+probe-rs-fleet sidecar --id nrf52840-dk-1 -- run --chip nRF52840_xxAA app.elf
 ```
 
-- **Flag > env**, and a flag *replaces both* selector vars (so `--select` next
-  to a stale `PROBE_RS_FLEET_BOARD` is the flag, not an ambiguity error). It is
+- **Flag > env**, and a flag *replaces all three* selector vars (so `--select`
+  next to a stale `PROBE_RS_FLEET_BOARD` is the flag, not an ambiguity error).
+  It is
   layered over the environment as an `EnvSource` overlay, not written into it.
-- `--board` and `--select` conflict in clap; a capability token plus either is
+- `--board`, `--id` and `--select` are mutually exclusive in clap; a capability
+  token plus any of them is
   still refused (the board is inside the token, §6.5).
 - Flags go **before** the probe-rs subcommand / `--`; everything after is
   forwarded verbatim.

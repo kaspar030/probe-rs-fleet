@@ -470,7 +470,7 @@ async fn take_lease(
 
     match session
         .request(SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardName(board_name.to_owned())),
+            select: Constraint::Id(BoardName(board_name.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         }))
@@ -640,7 +640,7 @@ async fn a_waiter_promoted_during_the_teardown_is_not_stranded() {
 
     let want = || {
         SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardName("dk-3".to_owned())),
+            select: Constraint::Id(BoardName("dk-3".to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         })

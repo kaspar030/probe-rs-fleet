@@ -17,18 +17,21 @@
 #
 #   adopt = "auto"     — undeclared probes are adopted automatically, with a
 #                        derived id and inferred tags. This file is then where
-#                        you give one a STABLE id, a chip name, curated tags, or
-#                        power wiring — none of which the agent can infer.
+#                        you give one a STABLE id, a chip name, a board model,
+#                        curated tags, or power wiring — none of which the agent
+#                        can infer.
 #   adopt = "declared" — only the boards below are leasable.
 #
-# An auto-adopted board has no `chip`: `probe-rs list` reports the probe, not
-# the target attached to it. So `ctl lease --select 'chip=…'` will not match one
-# until you set `chip` here. That is the trade, not a defect.
+# An auto-adopted board has no `chip` AND no `model`: `probe-rs list` reports
+# the probe (a J-Link), not the target attached to it and not the board it is
+# wired to. So neither `ctl lease chip=…` nor `ctl lease board=<model>` will
+# match one until you set `chip` / `model` here. That is the trade, not a
+# defect.
 
 # Repeat one [[board]] table per board you want to declare or annotate.
 
 [[board]]
-# Stable board id, referenced by `ctl lease`.
+# Stable board id, referenced by `ctl lease id=<name>`.
 #
 # Unique WITHIN THIS NODE, not across the fleet: a board is identified
 # fleet-wide by (org, node, id) — see architecture §6.1. Auto-adoption is
@@ -41,7 +44,24 @@ id        = "nrf52840-dk-3"
 serial    = "001050257890"
 
 # probe-rs target/chip name (informational; the client still selects in-band).
+# Matched by `ctl lease chip=<name>`.
 chip      = "nRF52840_xxAA"
+
+# Board MODEL (board type) — matched by `ctl lease board=<model>`, and the
+# thing a grant is normally written against (`grant bob --select
+# 'board=nrf52840dk'`).
+#
+# Three different things, easily confused:
+#
+#   chip  = the MCU        (`nRF52840_xxAA`) — a Nordic DK and a custom
+#                            nRF52840 board share it and are NOT interchangeable
+#   model = the board type (`nrf52840dk`)   — what a dev means by "I need an
+#                            nrf52840dk": any board of this type will do
+#   tags  = free-form convention (`lab`, `bluetooth`) — whatever you agree on
+#
+# The agent cannot infer the model, so omit the key (do NOT write `model = ""`,
+# which is rejected) and no `board=` selector will reach this board.
+model     = "nrf52840dk"
 
 # Free-form selection tags (matched by `ctl lease tag=<t>`).
 tags      = ["nrf52", "bluetooth"]
@@ -64,6 +84,7 @@ port = 2
 # id     = "stm32f4-disco-1"
 # serial = "066BFF555654827167161721"
 # chip   = "STM32F407VGTx"
+# model  = "stm32f4discovery"
 # tags   = ["stm32", "cortex-m4"]
 #
 # [board.power]

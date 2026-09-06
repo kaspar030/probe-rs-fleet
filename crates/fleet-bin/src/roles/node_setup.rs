@@ -225,9 +225,10 @@ pub fn starter_boards_toml() -> String {
 # becomes leasable is this node's `adopt` policy (see node.toml):
 #
 #   adopt = "auto"     — undeclared probes are adopted automatically, with a
-#                        derived id, inferred tags, and NO `chip` (the agent
-#                        cannot know what target is attached to a probe). Add a
-#                        [[board]] here to give one a stable id, a chip name,
+#                        derived id, inferred tags, and NO `chip` and NO
+#                        `model` (the agent cannot know what target, or what
+#                        board, is attached to a probe). Add a [[board]] here
+#                        to give one a stable id, a chip name, a board model,
 #                        curated tags, or power wiring.
 #   adopt = "declared" — only the boards below are leasable.
 #
@@ -242,6 +243,13 @@ pub fn starter_boards_toml() -> String {
 # # probe-rs target/chip name (informational, but `ctl lease --select 'chip=…'`
 # # matches on it — an auto-adopted board has none until you set it here).
 # chip      = "nRF52840_xxAA"
+# # Board MODEL (board type) — what `--select 'board=<model>'` matches. This is
+# # the word developers use ("I need an nrf52840dk"), and it is NOT the chip: a
+# # Nordic DK and a custom nRF52840 board share `nRF52840_xxAA` and are not
+# # interchangeable. The agent cannot infer it (`probe-rs list` reports the
+# # probe, never the board wired to it), so without this line no `board=`
+# # selector will ever match this board.
+# model     = "nrf52840dk"
 # # Free-form selection tags.
 # tags      = ["nrf52", "bluetooth"]
 # # Whether the board admits only one lease at a time (default true).

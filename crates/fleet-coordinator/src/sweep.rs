@@ -202,6 +202,7 @@ mod tests {
             id: BoardRef::new(org(), AgentId("agent-a".to_owned()), "b1"),
             agent: AgentId("agent-a".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
+            model: None,
             tags: vec![],
             exclusive: true,
             power: PowerKind::None,
@@ -239,7 +240,7 @@ mod tests {
         // alice grabs a short lease.
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         let req = LeaseRequest {
-            select: Constraint::Board(BoardName("b1".to_owned())),
+            select: Constraint::Id(BoardName("b1".to_owned())),
             duration_secs: 10,
             priority: Priority::Interactive,
         };

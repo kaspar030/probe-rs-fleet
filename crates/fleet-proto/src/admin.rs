@@ -41,6 +41,10 @@ pub struct BoardSummary {
     pub agent: AgentId,
     /// probe-rs target/chip name.
     pub chip: String,
+    /// Board *model* (board type), e.g. `nrf52840dk` — what `board=<model>`
+    /// matches. `None` when the board did not declare one (every adopted
+    /// board), in which case no `board=` selector can ever reach it.
+    pub model: Option<String>,
     /// Free-form selection tags.
     pub tags: Vec<String>,
     /// Whether the board admits only one lease at a time.

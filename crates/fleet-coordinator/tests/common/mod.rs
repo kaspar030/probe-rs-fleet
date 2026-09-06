@@ -259,7 +259,7 @@ impl TestCoordinator {
             .unwrap_or_else(|| panic!("{repo} is not a valid owner/name"));
         let key = fleet_proto::ids::workload_subject_key(&normalised);
         let selector =
-            fleet_proto::lease::parse_constraint(selector, fleet_proto::lease::BareTerm::Tag)
+            fleet_proto::lease::parse_constraint(selector)
                 .unwrap()
                 .to_string();
         // Unique per call: the id is the revocation handle and two grants in one
@@ -496,6 +496,19 @@ impl TestCoordinator {
     /// got there; standing up a real agent for each one would drown the
     /// property being tested.
     pub async fn seed_board(&self, org: &OrgId, node: &str, name: &str, tags: &[&str]) -> BoardRef {
+        self.seed_board_with_model(org, node, name, tags, None).await
+    }
+
+    /// As [`seed_board`](Self::seed_board), but declaring a board **model** —
+    /// what a `board=<model>` selector matches.
+    pub async fn seed_board_with_model(
+        &self,
+        org: &OrgId,
+        node: &str,
+        name: &str,
+        tags: &[&str],
+        model: Option<&str>,
+    ) -> BoardRef {
         use fleet_proto::board::{Board, BoardState, PowerKind};
 
         self.db().ensure_org(org, "personal").await.unwrap();
@@ -510,6 +523,7 @@ impl TestCoordinator {
             id: BoardRef::new(org.clone(), agent.clone(), name),
             agent,
             chip: "nRF52840_xxAA".to_owned(),
+            model: model.map(str::to_owned),
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             exclusive: true,
             power: PowerKind::None,

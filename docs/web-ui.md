@@ -437,8 +437,10 @@ caller's own org (it enrolls a node *into* it); a grant points outward, handing
 the org's hardware to somebody who is not in it at all.
 
 `selector` is the **canonical selector string** and is canonicalised
-server-side: `board=<name>`, `chip=<c>`, `tag=<t>`, and `a && b` conjunctions,
-parsed by `fleet_proto::lease::parse_constraint` with `BareTerm::Tag` and stored
+server-side: `id=<name>` (one board), `board=<model>` (any board of that board
+type), `chip=<c>`, `tag=<t>`, and `a && b` conjunctions of tags, parsed by
+`fleet_proto::lease::parse_constraint` — where a bare word is always a tag —
+and stored
 as `Constraint`'s `Display`. A grant's meaning must never depend on which
 surface wrote it, so the UI sends the same string a CLI would and does **not**
 build a structured selector of its own. An empty expression is refused (an empty

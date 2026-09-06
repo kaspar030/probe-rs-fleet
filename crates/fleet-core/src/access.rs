@@ -169,7 +169,8 @@ pub fn selector_matches(board: &Board, constraint: &Constraint) -> bool {
     match constraint {
         // The request side carries a node-local name (the caller does not know
         // the node), so only the name half is compared.
-        Constraint::Board(name) => board.id.name == name.0,
+        Constraint::Id(name) => board.id.name == name.0,
+        Constraint::Model(model) => board.model.as_deref() == Some(model.as_str()),
         Constraint::Tags(tags) => tags.iter().all(|t| board.tags.contains(t)),
         Constraint::Chip(chip) => &board.chip == chip,
     }
@@ -190,10 +191,19 @@ mod tests {
             id: BoardRef::new(org(org_name), AgentId("node-1".to_owned()), name),
             agent: AgentId("node-1".to_owned()),
             chip: chip.to_owned(),
+            model: None,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             exclusive: true,
             power: PowerKind::None,
             state: BoardState::Idle,
+        }
+    }
+
+    /// The same board, plus a declared board model.
+    fn modelled_board(org_name: &str, name: &str, model: &str) -> Board {
+        Board {
+            model: Some(model.to_owned()),
+            ..board(org_name, name, "nRF52840_xxAA", &[])
         }
     }
 
@@ -219,6 +229,13 @@ mod tests {
     fn access_matrix() {
         let a_board = board("a", "b1", "nRF52840_xxAA", &["nrf52", "lab"]);
         let c_board = board("c", "b1", "nRF52840_xxAA", &["nrf52"]);
+        // Two boards of the same model in org `a`, one in org `c`, and one
+        // that declares no model at all (the adopted-board shape).
+        let a_dk_1 = modelled_board("a", "dk-1", "nrf52840dk");
+        let a_dk_2 = modelled_board("a", "dk-2", "nrf52840dk");
+        let a_other_model = modelled_board("a", "pico-1", "rpi-pico");
+        let c_dk = modelled_board("c", "dk-9", "nrf52840dk");
+        let a_no_model = board("a", "adopted-1", "", &[]);
 
         let member_of_a = Access::own_org(org("a"));
         let granted_flash = Access {
@@ -242,7 +259,7 @@ mod tests {
             own_org: Some(org("b")),
             grants: vec![grant(
                 "a",
-                Constraint::Board(BoardName("b1".to_owned())),
+                Constraint::Id(BoardName("b1".to_owned())),
                 &[AllowedOp::Attach],
                 None,
             )],
@@ -257,6 +274,17 @@ mod tests {
             )],
         };
         let outsider = Access::own_org(org("b"));
+        // A grant written against a board *model*: the requirement this whole
+        // selector exists for (`grant bob --select 'board=nrf52840dk'`).
+        let by_model = Access {
+            own_org: Some(org("b")),
+            grants: vec![grant(
+                "a",
+                Constraint::Model("nrf52840dk".to_owned()),
+                &[AllowedOp::Attach],
+                None,
+            )],
+        };
 
         #[allow(clippy::type_complexity)]
         let cases: &[(&str, &Access, &Board, AllowedOp, bool)] = &[
@@ -273,12 +301,20 @@ mod tests {
             ("an expired grant confers nothing", &expired, &a_board, AllowedOp::Attach, false),
             ("a grant whose selector misses confers nothing", &selector_miss, &a_board, AllowedOp::Attach, false),
             // The degenerate individual-board grant.
-            ("board= is a normal selector", &by_board_name, &a_board, AllowedOp::Attach, true),
+            ("id= is a normal selector", &by_board_name, &a_board, AllowedOp::Attach, true),
             ("chip= is a normal selector", &by_chip, &a_board, AllowedOp::Gdb, true),
+            // board= is the MODEL selector: it covers EVERY board of that
+            // model in the granting org, and nothing else.
+            ("board= covers one board of the model", &by_model, &a_dk_1, AllowedOp::Attach, true),
+            ("board= covers every board of the model", &by_model, &a_dk_2, AllowedOp::Attach, true),
+            ("board= does not cover another model", &by_model, &a_other_model, AllowedOp::Attach, false),
+            ("board= never matches a board with no model", &by_model, &a_no_model, AllowedOp::Attach, false),
+            ("board= confers only its ops", &by_model, &a_dk_1, AllowedOp::Flash, false),
             // THE ORG FENCE: a grant issued by org A must not reach org C's
             // identically tagged board, even though the selector matches it.
             ("a grant never crosses into a third org", &granted_flash, &c_board, AllowedOp::Flash, false),
-            ("a board= grant never crosses either", &by_board_name, &c_board, AllowedOp::Attach, false),
+            ("an id= grant never crosses either", &by_board_name, &c_board, AllowedOp::Attach, false),
+            ("a model grant never crosses either", &by_model, &c_dk, AllowedOp::Attach, false),
             // Deny by default.
             ("empty access allows nothing", &Access::none(), &a_board, AllowedOp::Attach, false),
         ];

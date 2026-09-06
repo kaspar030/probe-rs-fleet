@@ -75,6 +75,14 @@ pub struct BoardStatus {
     /// probe-rs target/chip name (informational; the caller still passes
     /// `--chip` in-band).
     pub chip: String,
+    /// Board *model* (board type), e.g. `nrf52840dk` — what `board=<model>`
+    /// matches.
+    ///
+    /// Declared in `boards.toml`; the agent **cannot infer it** (`probe-rs
+    /// list` reports the probe, never the board wired to it), exactly as it
+    /// cannot infer `chip`. `None` for an adopted board, which is therefore
+    /// never reachable by `board=`.
+    pub model: Option<String>,
     /// Free-form selection tags, e.g. `["nrf52", "bluetooth"]`.
     pub tags: Vec<String>,
     /// Whether the board admits only one lease at a time.
@@ -86,8 +94,9 @@ pub struct BoardStatus {
     /// `boards.toml`.
     ///
     /// Carried so the coordinator can audit it and `ctl list` can show it: an
-    /// adopted board has a derived id and no `chip`, which is exactly what an
-    /// operator wondering why `--select 'chip=…'` does not match needs to see.
+    /// adopted board has a derived id and neither `chip` nor `model`, which is
+    /// exactly what an operator wondering why `--select 'chip=…'` or
+    /// `--select 'board=…'` does not match needs to see.
     pub adopted: bool,
 }
 
@@ -317,6 +326,7 @@ mod tests {
                 serial: "001050257890".to_owned(),
                 presence: BoardPresence::Online,
                 chip: "nRF52840_xxAA".to_owned(),
+                model: Some("nrf52840dk".to_owned()),
                 tags: vec!["nrf52".to_owned()],
                 exclusive: true,
                 power: PowerKind::None,

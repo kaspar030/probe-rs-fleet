@@ -30,7 +30,7 @@ pub use ids::{
     OrgId, Role, Subject, SubjectKey, SubjectKind, UserId, WORKLOAD_NS_GHA,
 };
 pub use lease::{
-    parse_constraint, BareTerm, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest,
+    parse_constraint, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest,
 };
 pub use token::{
     normalize_ops, parse_ops, AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner,
@@ -94,4 +94,14 @@ pub struct ChannelId(pub u64);
 ///   the grant verbs (`GrantCreate`/`GrantList`/`GrantRevoke`) and `Delegate`,
 ///   with their replies; adding variants to a postcard enum shifts every later
 ///   discriminant, so this is not wire-compatible either way.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// * 7 → 8: board **models** (`board=<model>`). The old `Constraint::Board`
+///   is renamed [`Constraint::Id`] and a new [`Constraint::Model`] variant is
+///   inserted after it, so `board=` now selects any board of a model and the
+///   instance selector is `id=`. [`agent_api::BoardStatus`] and
+///   [`admin::BoardSummary`] gained `model`. postcard is positional in both
+///   respects — variant order and field order — so every envelope carrying a
+///   `Constraint` or an inventory report re-encodes. Agent and coordinator
+///   must be deployed together, and a coordinator DB whose stored grant
+///   selectors say `board=<instance>` must be wiped: those rows now parse as
+///   a *model* selector and match nothing.
+pub const PROTOCOL_VERSION: u32 = 8;

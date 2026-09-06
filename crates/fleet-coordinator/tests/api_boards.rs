@@ -80,7 +80,7 @@ async fn take_lease(
 
     match session
         .request(SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardName(board_name.to_owned())),
+            select: Constraint::Id(BoardName(board_name.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         }))

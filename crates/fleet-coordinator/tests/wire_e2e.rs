@@ -247,7 +247,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // Lease the board.
     let grant = session
         .lease(&LeaseRequest {
-            select: Constraint::Board(board_name.clone()),
+            select: Constraint::Id(board_name.clone()),
             duration_secs: 600,
             priority: Priority::Interactive,
         })

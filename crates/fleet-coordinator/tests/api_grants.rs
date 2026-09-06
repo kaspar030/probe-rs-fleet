@@ -106,7 +106,7 @@ async fn take_lease(
 
     match session
         .request(SidecarToCoord::Lease(LeaseRequest {
-            select: Constraint::Board(BoardName(board_name.to_owned())),
+            select: Constraint::Id(BoardName(board_name.to_owned())),
             duration_secs: 600,
             priority: Priority::Interactive,
         }))
@@ -386,7 +386,7 @@ async fn a_selector_is_canonicalised_and_an_empty_one_is_refused() {
     let (alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     fleet.seed_github_user(2, "bob", Role::Member).await;
 
-    // A bare term is a tag (`BareTerm::Tag`), and whitespace is normalised
+    // A bare term is a tag, and whitespace is normalised
     // away: the stored form is the parser's, not the caller's.
     let (status, body) = as_browser(
         &fleet,

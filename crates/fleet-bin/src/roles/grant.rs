@@ -98,18 +98,15 @@ async fn create(args: GrantArgs) -> Result<ExitCode> {
     };
     let selector = args
         .select
-        .context("--select is required: which boards to share (e.g. 'tag=nrf52', 'board=dk-3')")?;
+        .context("--select is required: which boards to share (e.g. 'tag=nrf52', 'board=nrf52840dk', 'id=dk-3')")?;
 
     // Validate the selector locally so a typo is a clear message rather than a
     // round trip, and normalise it to the canonical form the coordinator
-    // stores. Bare terms are tags here: a grant describes a *set* of boards,
-    // and the individual-board case is spelled `board=<name>`.
-    let selector = fleet_proto::lease::parse_constraint(
-        &selector,
-        fleet_proto::lease::BareTerm::Tag,
-    )
-    .map_err(|e| anyhow::anyhow!("invalid --select: {e}"))?
-    .to_string();
+    // stores. Bare terms are tags: a grant describes a *set* of boards, and the
+    // individual-board case is spelled `id=<name>`.
+    let selector = fleet_proto::lease::parse_constraint(&selector)
+        .map_err(|e| anyhow::anyhow!("invalid --select: {e}"))?
+        .to_string();
 
     let requested = parse_ops_arg(&args.ops)?;
     let ops = fleet_proto::token::normalize_ops(requested.clone());

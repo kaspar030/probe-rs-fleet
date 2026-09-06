@@ -130,9 +130,14 @@ jobs:
       # other reason. Do not wrap it in `|| true`.
       #
       # PROBE_RS_FLEET_SELECT is a constraint expression: bare words are tags,
-      # and `&&` conjoins them (`nrf52 && bluetooth`). Use
-      # PROBE_RS_FLEET_BOARD instead to name one specific board; setting both
-      # is refused rather than guessed at.
+      # and `&&` conjoins them (`nrf52 && bluetooth`). The two shorthands are
+      # PROBE_RS_FLEET_BOARD, which names a board MODEL (`nrf52840dk`) and
+      # matches any idle board of that type, and PROBE_RS_FLEET_ID, which names
+      # one specific board (`nrf52840-dk-3`). Setting more than one of the
+      # three is refused rather than guessed at.
+      #
+      # Prefer the model or a tag in CI: naming one board serialises every job
+      # in the matrix behind that board.
       # ---------------------------------------------------------------------
       - name: Flash and run the embedded tests
         env:

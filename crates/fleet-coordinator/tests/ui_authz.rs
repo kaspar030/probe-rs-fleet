@@ -140,7 +140,7 @@ async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
         use fleet_wire::{CoordToSidecar, SidecarToCoord};
         match session
             .request(SidecarToCoord::Lease(LeaseRequest {
-                select: Constraint::Board(BoardName("dk-3".to_owned())),
+                select: Constraint::Id(BoardName("dk-3".to_owned())),
                 duration_secs: 600,
                 priority: Priority::Interactive,
             }))
