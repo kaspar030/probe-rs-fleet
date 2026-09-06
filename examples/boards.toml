@@ -8,6 +8,21 @@
 # `probe-rs-fleet share` / `agent up` scaffold a commented version of this file.
 #
 # ---------------------------------------------------------------------------
+# You do not have to write this by hand
+# ---------------------------------------------------------------------------
+#
+#   probe-rs-fleet node board list          # declared vs. attached-but-undeclared
+#   probe-rs-fleet node board add           # pick a probe, prompt for id/chip/model
+#   probe-rs-fleet node board add --serial 001050047405 --id nrf52840-dk-1 \
+#       --chip nRF52840_xxAA --model nrf52840dk --tag nrf52    # scriptable
+#
+# `add` **appends** a [[board]] table to this file and never rewrites the rest
+# of it, so every comment you have written here survives. The flip side: it is
+# the only verb — EDITING and REMOVING a declaration are still hand-edits.
+#
+# The agent reads this file once at startup, so restart it after any change.
+#
+# ---------------------------------------------------------------------------
 # ANNOTATION AND OVERRIDE, not admission control (architecture §8)
 # ---------------------------------------------------------------------------
 #

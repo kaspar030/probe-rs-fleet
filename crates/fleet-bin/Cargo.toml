@@ -34,6 +34,9 @@ rand_core = { workspace = true, features = ["getrandom"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `node_board`'s tests need their own `ProbeLister` stub: fleet-agent's is
+# `#[cfg(test)]`-private, so it cannot be borrowed across the crate boundary.
+async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 fleet-coordinator = { workspace = true }
 fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }

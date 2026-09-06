@@ -221,6 +221,10 @@ adopt = "{adopt}"
 pub fn starter_boards_toml() -> String {
     r#"# probe-rs-fleet agent board inventory
 #
+# Easiest way to add an entry: `probe-rs-fleet node board add`, which discovers
+# attached probes and APPENDS a [[board]] table here (your comments survive;
+# editing and removing are still hand-edits).
+#
 # ANNOTATION AND OVERRIDE, not admission control. Whether an undeclared probe
 # becomes leasable is this node's `adopt` policy (see node.toml):
 #
@@ -315,13 +319,16 @@ pub fn print_summary(e: &Enrollment<'_>) {
         AdoptPolicy::Auto => {
             println!("Probes you plug in are adopted automatically and become leasable.");
             println!(
-                "Annotate them in {} for a stable id, a chip name, or power wiring.",
+                "Annotate them in {} for a stable id, a chip name, or power wiring \
+                 — or run `probe-rs-fleet node board add`.",
                 boards_path.display()
             );
         }
         AdoptPolicy::Declared => {
             println!(
-                "Undeclared probes are reported but NOT leasable. Declare each board in\n  {}",
+                "Undeclared probes are reported but NOT leasable. Declare each board in\n  {}\n\
+                 or run `probe-rs-fleet node board add`, which discovers attached probes\n\
+                 and writes the declaration for you.",
                 boards_path.display()
             );
         }
@@ -355,6 +362,18 @@ mod tests {
             assert!(settings.boards_path.is_none());
             assert_eq!(settings.adopt, Some(adopt));
         }
+    }
+
+    /// The scaffold has to name the command that fills it in: this file is
+    /// where an operator is standing when they need it, and under `adopt =
+    /// "declared"` hand-editing it is otherwise the only path.
+    #[test]
+    fn the_boards_scaffold_names_the_helper_verb() {
+        let text = starter_boards_toml();
+        assert!(text.contains("node board add"), "{text}");
+        // And it must say what the helper will not do, or the first person who
+        // wants to remove a board goes looking for `node board remove`.
+        assert!(text.contains("APPENDS"), "{text}");
     }
 
     /// The scaffolded `adopt` must be the policy the node was actually enrolled

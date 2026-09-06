@@ -1570,6 +1570,24 @@ coordinator keep whichever it upserted last while the agent resolved the
 declared one — so a lease taken out for the adopted probe would drive the
 declared board's hardware.
 
+**Declaring a board without hand-editing.** `probe-rs-fleet node board add`
+discovers attached probes (the same `probe-rs list` shell-out the agent uses),
+prompts for the values discovery cannot supply, and appends a `[[board]]` table;
+`node board list` shows declared boards against attached-but-undeclared probes,
+named by this node's `adopt` policy so the second section does not read as an
+alarm on an `auto` node. Both are node-local: no coordinator, no credential.
+
+Two properties of `add` are deliberate. It **appends only** — the previous file
+contents are a byte-for-byte prefix of what it writes — because this file is a
+commented reference the operator owns and the TOML serialiser in the tree is not
+format-preserving; a deserialise/re-serialise round trip would silently delete
+every comment. Editing and removing a declaration therefore stay hand-edits.
+And it **validates the candidate text through the agent's own loader** before
+writing, so a duplicate id or serial is refused with the message the agent would
+have failed to start with, leaving the file untouched. Because `boards.toml` is
+read once at agent startup (there is no watcher), every successful add prints
+that the agent must be restarted.
+
 ## 9. Crate layout (proposed)
 
 ```

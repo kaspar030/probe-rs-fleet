@@ -290,3 +290,26 @@ fn the_superseded_examples_are_gone() {
     assert!(!examples_dir().join("client.toml").exists());
     assert!(!examples_dir().join("agent.toml").exists());
 }
+
+/// The example must name the helper that writes entries into it, and must say
+/// what the helper will *not* do.
+///
+/// Under `adopt = "declared"` — the recommended lab/CI policy — hand-editing
+/// this file was the only path, and this example is where a reader looks first.
+/// The append-only caveat has to travel with the recommendation: someone who
+/// learns `node board add` here and then goes looking for `node board remove`
+/// should find the answer in the same paragraph.
+#[test]
+fn the_boards_example_names_the_helper_and_its_append_only_limit() {
+    let text = std::fs::read_to_string(examples_dir().join("boards.toml")).unwrap();
+    assert!(text.contains("node board add"), "{text}");
+    assert!(text.contains("node board list"), "{text}");
+    assert!(
+        text.contains("appends") || text.contains("APPENDS"),
+        "the example must say the helper only appends"
+    );
+    assert!(
+        text.contains("restart"),
+        "boards.toml is read once at agent startup; the example must say so"
+    );
+}

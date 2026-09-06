@@ -59,8 +59,8 @@ pub enum Command {
     Grant(GrantArgs),
     /// CI-runner verbs. Today: exchange a workload identity for a fleet token.
     Ci(CiArgs),
-    /// Node-side operator verbs. Today: approve a machine that is asking to
-    /// join your org.
+    /// Node-side operator verbs: approve a machine that is asking to join your
+    /// org, and declare this machine's boards.
     Node(NodeArgs),
     /// List the fleets this machine has a config for.
     Fleets,
@@ -442,6 +442,131 @@ pub struct NodeArgs {
 pub enum NodeCommand {
     /// Approve (or deny) a machine that printed a short code and is waiting.
     Approve(NodeApproveArgs),
+    /// Declare or inspect this machine's boards (`boards.toml`).
+    Board(NodeBoardArgs),
+}
+
+/// Arguments for `probe-rs-fleet node board`.
+///
+/// Under `node` rather than `agent` because it edits **node-local config**: no
+/// fleet connection, no credential, no coordinator. The `agent` group is about
+/// *running* the agent.
+#[derive(Debug, Args)]
+pub struct NodeBoardArgs {
+    /// The board verb.
+    #[command(subcommand)]
+    pub command: NodeBoardCommand,
+}
+
+/// `node board` subcommands.
+///
+/// `add` **appends**; editing or removing a declaration stays a hand-edit. That
+/// is the price of never touching a byte of the operator's comments (the file
+/// ships as a commented reference and `toml` 0.8 is not format-preserving), and
+/// it is why there is no `remove` here yet.
+#[derive(Debug, Subcommand)]
+pub enum NodeBoardCommand {
+    /// Discover attached probes and declare one as a board.
+    Add(NodeBoardAddArgs),
+    /// Show declared boards and probes that are attached but undeclared.
+    List(NodeBoardListArgs),
+}
+
+/// Arguments for `probe-rs-fleet node board add`.
+///
+/// Appends a `[[board]]` table to this node's `boards.toml` for a probe that is
+/// physically attached. With every value given as a flag it needs no terminal,
+/// so it works in an image build; with none it prompts.
+// Four bools, and they are four independent binary questions an operator
+// answers on the command line (`--no-exclusive`, `--dry-run`, and the
+// `--interactive` / `--no-interactive` pair `interactive_choice` collapses).
+// clap's derive gives no other spelling for a flag, and grouping them into a
+// struct would only move the same four names one level down.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Args)]
+pub struct NodeBoardAddArgs {
+    /// Serial of the attached probe to declare.
+    ///
+    /// Without it: a picker interactively, an error naming the attached serials
+    /// otherwise.
+    #[arg(long)]
+    pub serial: Option<String>,
+    /// Stable board id (`ctl lease id=<name>`, and what grants are written
+    /// against). Required when not prompting.
+    ///
+    /// Never invented for you: it is the name other people's commands depend
+    /// on. Interactively it is offered as a default derived from the probe.
+    #[arg(long)]
+    pub id: Option<String>,
+    /// probe-rs target/chip name, e.g. `nRF52840_xxAA` (`ctl lease chip=<c>`).
+    ///
+    /// Cannot be discovered: `probe-rs list` reports the probe, never the
+    /// target wired to it. May be left empty, at the cost of `chip=`.
+    #[arg(long)]
+    pub chip: Option<String>,
+    /// Board MODEL / board type, e.g. `nrf52840dk` (`ctl lease board=<model>`).
+    ///
+    /// Also undiscoverable, and distinct from `--chip`: a Nordic DK and a
+    /// custom nRF52840 board share `nRF52840_xxAA` and are not interchangeable.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Free-form selection tag (`ctl lease tag=<t>`); repeatable.
+    #[arg(long = "tag")]
+    pub tags: Vec<String>,
+    /// Let the board hold more than one lease at a time (default: exclusive).
+    #[arg(long)]
+    pub no_exclusive: bool,
+    /// Print the table that would be appended and write nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Prompt for anything not given as a flag, even without a terminal.
+    #[arg(long, conflicts_with = "no_interactive")]
+    pub interactive: bool,
+    /// Never prompt: fail naming the missing flag instead.
+    #[arg(long)]
+    pub no_interactive: bool,
+    /// Write to this `boards.toml` instead of the one `node.toml` resolves.
+    #[arg(long)]
+    pub boards_path: Option<std::path::PathBuf>,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+    /// The `probe-rs` binary used to enumerate probes.
+    #[arg(long, hide = true, default_value = "probe-rs")]
+    pub probe_rs: String,
+}
+
+impl NodeBoardAddArgs {
+    /// The operator's explicit choice about prompting, or `None` for "decide
+    /// from whether there is a terminal".
+    ///
+    /// Same two-flag shape as [`AgentUpArgs::interactive_choice`], collapsed to
+    /// one tri-state, so there is one convention in this binary rather than
+    /// two.
+    #[must_use]
+    pub fn interactive_choice(&self) -> Option<bool> {
+        match (self.interactive, self.no_interactive) {
+            (true, _) => Some(true),
+            (_, true) => Some(false),
+            _ => None,
+        }
+    }
+}
+
+/// Arguments for `probe-rs-fleet node board list`.
+#[derive(Debug, Args)]
+pub struct NodeBoardListArgs {
+    /// Read this `boards.toml` instead of the one `node.toml` resolves.
+    #[arg(long)]
+    pub boards_path: Option<std::path::PathBuf>,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+    /// The `probe-rs` binary used to enumerate probes.
+    #[arg(long, hide = true, default_value = "probe-rs")]
+    pub probe_rs: String,
 }
 
 /// Arguments for `probe-rs-fleet ci`.
@@ -1063,6 +1188,16 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         roles::node_approve::run(&approve).await?;
                         Ok(ExitCode::SUCCESS)
                     }
+                    NodeCommand::Board(board) => match board.command {
+                        NodeBoardCommand::Add(add) => {
+                            roles::node_board::add(&add).await?;
+                            Ok(ExitCode::SUCCESS)
+                        }
+                        NodeBoardCommand::List(list) => {
+                            roles::node_board::list(&list).await?;
+                            Ok(ExitCode::SUCCESS)
+                        }
+                    },
                 },
                 Command::Ci(args) => match args.command {
                     CiCommand::Login(login) => roles::ci::run(login).await,
@@ -2014,5 +2149,90 @@ mod tests {
             .is_err(),
             "an unrecognised purpose must be a parse error, never a silent default"
         );
+    }
+
+    /// The scriptable shape from the spec: every value a flag, no terminal
+    /// needed.
+    #[test]
+    fn parses_node_board_add() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "node",
+            "board",
+            "add",
+            "--serial",
+            "001050047405",
+            "--id",
+            "nrf52840-dk-1",
+            "--chip",
+            "nRF52840_xxAA",
+            "--model",
+            "nrf52840dk",
+            "--tag",
+            "nrf52",
+            "--tag",
+            "lab",
+        ]));
+        match cli.command {
+            Command::Node(n) => match n.command {
+                NodeCommand::Board(b) => match b.command {
+                    NodeBoardCommand::Add(a) => {
+                        assert_eq!(a.serial.as_deref(), Some("001050047405"));
+                        assert_eq!(a.id.as_deref(), Some("nrf52840-dk-1"));
+                        assert_eq!(a.chip.as_deref(), Some("nRF52840_xxAA"));
+                        assert_eq!(a.model.as_deref(), Some("nrf52840dk"));
+                        assert_eq!(a.tags, ["nrf52", "lab"]);
+                        // The documented defaults, not flags anybody has to pass.
+                        assert!(!a.no_exclusive);
+                        assert!(!a.dry_run);
+                        assert_eq!(a.probe_rs, "probe-rs");
+                        assert_eq!(a.interactive_choice(), None);
+                    }
+                    NodeBoardCommand::List(other) => panic!("expected add, got {other:?}"),
+                },
+                NodeCommand::Approve(other) => panic!("expected board, got {other:?}"),
+            },
+            other => panic!("expected node, got {other:?}"),
+        }
+    }
+
+    /// Bare `node board add` must parse: with a terminal it prompts for
+    /// everything, which is the interactive shape from the spec.
+    #[test]
+    fn parses_a_bare_node_board_add_and_list() {
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "board", "add"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "board", "list"])).is_ok());
+    }
+
+    /// Same tri-state convention as `agent up`, including the contradiction
+    /// clap must catch.
+    #[test]
+    fn node_board_add_interactive_flags_are_a_tri_state() {
+        let both = os(&[
+            "probe-rs-fleet",
+            "node",
+            "board",
+            "add",
+            "--interactive",
+            "--no-interactive",
+        ]);
+        assert!(Cli::try_parse_from(both).is_err());
+
+        let on = ("--interactive", Some(true));
+        let off = ("--no-interactive", Some(false));
+        for (flag, expected) in [on, off] {
+
+            let cli = Cli::parse_from(os(&["probe-rs-fleet", "node", "board", "add", flag]));
+            match cli.command {
+                Command::Node(n) => match n.command {
+                    NodeCommand::Board(b) => match b.command {
+                        NodeBoardCommand::Add(a) => assert_eq!(a.interactive_choice(), expected),
+                        NodeBoardCommand::List(other) => panic!("expected add, got {other:?}"),
+                    },
+                    NodeCommand::Approve(other) => panic!("expected board, got {other:?}"),
+                },
+                other => panic!("expected node, got {other:?}"),
+            }
+        }
     }
 }

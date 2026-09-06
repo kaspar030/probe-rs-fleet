@@ -80,6 +80,36 @@ pub fn load_node_settings(path: &std::path::Path) -> Result<NodeSettings> {
     toml::from_str(&text).with_context(|| format!("parsing node settings {}", path.display()))
 }
 
+/// Resolve this node's `boards.toml` path.
+///
+/// Precedence, highest first:
+///
+/// 1. `explicit` — a `--boards-path` flag, when the verb has one;
+/// 2. `boards_path` in `<node_dir>/node.toml`;
+/// 3. `<node_dir>/boards.toml`, the scaffolded default.
+///
+/// One function rather than one copy per caller: [`run`] and
+/// [`crate::roles::node_board`] must agree about which file the agent will
+/// read, or `node board add` writes a declaration into a file nobody loads.
+/// No `~` expansion is applied — nothing in this tree does that, and inventing
+/// it here would make the two disagree in the other direction.
+///
+/// # Errors
+///
+/// Returns an error if `node.toml` exists but is malformed.
+pub fn resolve_boards_path(
+    node_dir: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    let settings = load_node_settings(&node_dir.join("node.toml"))?;
+    Ok(settings
+        .boards_path
+        .unwrap_or_else(|| node_dir.join("boards.toml")))
+}
+
 /// Persists a rotated node token into the fleet file's `[node]` table.
 ///
 /// Read-modify-write on every call (see [`crate::fleet_config`]): a rotation
@@ -207,10 +237,9 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         None => paths::node_config_dir()?,
     };
     let settings = load_node_settings(&node_dir.join("node.toml"))?;
-    let boards_path = settings
-        .boards_path
-        .clone()
-        .unwrap_or_else(|| node_dir.join("boards.toml"));
+    // Same rule, one implementation, shared with `node board add` (which must
+    // write into the file this will read).
+    let boards_path = resolve_boards_path(&node_dir, None)?;
 
     let agent_config = assemble_agent_config(&file, &node, &settings, boards_path.clone());
     agent_config

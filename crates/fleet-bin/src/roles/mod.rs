@@ -14,6 +14,8 @@
 //! - [`grant`] → share a subset of this org's boards with another person
 //! - [`ci`] → exchange a CI job's workload identity for a per-job fleet token
 //! - [`node_approve`] → approve a headless machine that printed a short code
+//! - [`node_board`] → declare a board (discover probes, append to
+//!   `boards.toml`) instead of hand-editing it
 //! - [`agent_up`] → the §4.2 credential ladder, then [`agent`]
 //! - [`node_setup`] → the enrollment mechanics [`share`] and [`agent_up`] share
 //!
@@ -35,6 +37,7 @@ pub mod grant;
 pub mod init;
 pub mod login;
 pub mod node_approve;
+pub mod node_board;
 pub mod node_setup;
 pub mod share;
 pub mod sidecar;
