@@ -157,8 +157,11 @@ rather than only in that document:
 * Mutating `/api/v1` calls whose credential arrived in a cookie must also carry
   an `X-Fleet-Csrf` header, and the coordinator emits **no CORS headers
   anywhere**, which is what makes that header a second independent control.
-  Phase 1 ships exactly one mutating route (`POST /api/v1/session/logout`), so
-  the machinery is exercised before there is anything worth abusing through it.
+  Phase 1a shipped exactly one mutating route (`POST /api/v1/session/logout`),
+  so the machinery was exercised before there was anything worth abusing
+  through it; phase 1b adds the node verbs (`PATCH` / `DELETE
+  /api/v1/nodes/{name}`, `POST /api/v1/nodes/pending/{code}`) behind the same
+  single check.
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
 reaped on a timeout we do not control, so the node connection must run
@@ -474,21 +477,50 @@ It obtains a node token by whichever of these applies, in order:
    single-use, carrying default tags. This is the unattended/image path.
 
 > **Implementation status (task 3451).** All four rungs ship. Rung 3's approval
-> is a **CLI verb, not a browser form**, and that is a decision rather than an
+> was a **CLI verb, not a browser form**, and that was a decision rather than an
 > unfinished edge: `login` is the GitHub *device* flow, which by design has no
 > `redirect_uri` and no cookie session (§6.4), so a page served by the
-> coordinator cannot know who is looking at it. Building one would mean an OAuth
-> redirect flow plus cookies in the coordinator, which contradicts §6.4 and
-> reopens §10 Q6. `GET /node/approve` is therefore an *informational* page that
-> says what to run.
+> coordinator could not know who was looking at it. Building one would have
+> meant an OAuth redirect flow plus cookies in the coordinator, which
+> contradicted §6.4 and reopened §10 Q6. `GET /node/approve` was therefore an
+> *informational* page that says what to run.
 >
-> The design deliberately does not foreclose a real browser flow later.
+> The design deliberately did not foreclose a real browser flow later.
 > Approval is keyed by `user_code` and is a pure function of `(code, decision,
 > authenticated user)`, factored so that a future cookie-authenticated handler
 > resolves its subject its own way and calls the same function; the node-side
 > wire contract (`start` / `poll`) never learns which mechanism approved it, so
 > adding one is additive and deployed agents keep working; and the page that
 > would grow the form already exists at the URL agents already print.
+>
+> **That later arrived (task 3573, `docs/web-ui.md` phase 1b), and the
+> commitment held exactly as written.** The coordinator now has an OAuth
+> redirect flow and a cookie session — `docs/web-ui.md` D1 reverses §6.4's
+> "no browser session" premise and records what it costs — and
+> `POST /api/v1/nodes/pending/{code}` approves from the browser. It resolves its
+> subject from the session cookie and calls **the same**
+> `http::decide_pending_node`, with no schema change and no second binding site;
+> it shares the CLI route's membership check and writes the same
+> `node.approve.*` audit rows. Three things about it are worth pinning here,
+> because each is a place the browser could have quietly made rung 3 weaker:
+>
+> * **`GET /node/approve` did not grow the form.** It stays informational and
+>   reflects nothing — no code in the URL, no query parameter echoed — so it
+>   cannot become a confused-deputy surface, and the URL every deployed agent
+>   prints keeps meaning what it meant.
+> * **There is no pending-registration listing.** `pending_node.org_id` is
+>   `NULL` until approval binds it, so a listing could only show every live
+>   code in the deployment: a cross-tenant index that would turn §6.4's
+>   "guess ~40 bits" into "read the list". Approval stays code-driven
+>   (`docs/web-ui.md` §3/§4).
+> * **The phishing warning travels with the response.** Because nothing lists
+>   pending rows, the approver has only what `inspect` returns; the sentence the
+>   CLI prints — you cannot see this machine, approve only an enrollment you
+>   started — is a server-sent field on that response, not frontend copy.
+>
+> The cross-tenant code-enumeration risk below is **unchanged** by the browser
+> path: same handler, same entropy, same TTL, same audit row, same "the
+> enrolling machine prints which org it landed in" control.
 >
 > **The rung is gated on there being a human.** `--interactive` /
 > `--no-interactive`, defaulting to whether stdout is a terminal: a service unit
@@ -818,11 +850,28 @@ which binds the pending row to **their** org and user; the machine's next poll
 mints its node token through the same code path `share` uses, so the resulting
 `node` row is identical. Three decisions and three accepted risks:
 
-- **Approval is a CLI verb, not a browser form**, for the reason §4.2 records:
-  the device flow has no cookie session, so a coordinator-served page cannot
-  know who is looking at it. `GET /node/approve` is informational and
-  **reflects nothing** — no code in the URL, no query parameter echoed — so it
-  cannot become a confused-deputy surface.
+- **Approval is a CLI verb, *and now also* a browser form** — but not the one
+  this bullet originally forbade. The original reason stands and is recorded in
+  §4.2: the *device* flow has no cookie session, so a coordinator-served page
+  driven by it could not know who was looking at it. What changed is that the
+  coordinator gained a real browser session of its own (`docs/web-ui.md` D1,
+  which reverses this section's "no browser session" premise and records its
+  cost), so `POST /api/v1/nodes/pending/{code}` resolves its subject from that
+  cookie and calls the same `decide_pending_node` the CLI route calls, with the
+  same membership check and the same audit rows.
+
+  `GET /node/approve` is **still** informational and **reflects nothing** — no
+  code in the URL, no query parameter echoed — so it cannot become a
+  confused-deputy surface, and the URL deployed agents print keeps its meaning.
+  Please do not "finish the job" by putting the form there.
+
+  There is deliberately **no** browser listing of pending registrations:
+  `pending_node.org_id` is `NULL` until approval binds it, so a listing could
+  only be a cross-tenant index of every live code — which would turn the
+  enumeration risk below from "guess ~40 bits" into "read the list"
+  (`docs/web-ui.md` §3/§4). The phishing warning the CLI prints rides on the
+  JSON `inspect` response for the same reason: with nothing to browse, that
+  response is all the approver has.
 - **Membership is sufficient to approve**, as it is to `share`, and the node is
   owned by the approver (`node.owner_user_id`).
 - **Approval refuses to take over an existing node.** The requesting machine

@@ -2237,6 +2237,149 @@ impl OrgDb<'_> {
         Ok(out)
     }
 
+    /// One node of this org by its node-local name.
+    ///
+    /// The browser API addresses nodes by `name` (`UNIQUE (org_id, name)`)
+    /// because the id contains a slash and cannot go in a URL path
+    /// (`docs/web-ui.md` §3). Scoped through [`OrgDb`], so a name that exists
+    /// only in another tenant resolves to `None` — which is what makes
+    /// "another org's node" and "no such node" the same answer at the handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails, or
+    /// [`CoordinatorError::State`](crate::error::CoordinatorError::State) if
+    /// the stored `adopt_policy` is unrecognised, exactly as
+    /// [`OrgDb::list_nodes`] does.
+    pub async fn node_by_name(&self, name: &str) -> Result<Option<NodeRow>> {
+        let row: Option<NodeDbRow> = sqlx::query_as(
+            "SELECT id, name, tags, owner_user_id, adopt_policy, last_seen, created_at
+             FROM node WHERE org_id = ?1 AND name = ?2",
+        )
+        .bind(self.org.0.as_str())
+        .bind(name)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some((id, name, tags, owner, adopt, last_seen, created_at)) = row else {
+            return Ok(None);
+        };
+        let adopt = AdoptPolicy::from_label(&adopt).ok_or_else(|| {
+            crate::error::CoordinatorError::State(format!(
+                "node {id} has unknown adopt_policy `{adopt}`"
+            ))
+        })?;
+        let boards: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM board WHERE org_id = ?1 AND node_id = ?2 ORDER BY name",
+        )
+        .bind(self.org.0.as_str())
+        .bind(id.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(Some(NodeRow {
+            id: AgentId(id),
+            name,
+            tags: split_tags(&tags),
+            owner_user_id: owner,
+            adopt,
+            last_seen,
+            created_at,
+            boards: boards.into_iter().map(|(b,)| b).collect(),
+        }))
+    }
+
+    /// Update a node's tags and/or adoption policy, returning the fresh row.
+    ///
+    /// **`name` is deliberately not updatable.** The node id is `{org}/{name}`
+    /// and is the primary key `board.node_id` references under
+    /// `PRAGMA foreign_keys = ON`, so a rename would have to cascade through
+    /// `board`, the `leases.node_id` column (which has no foreign key and
+    /// therefore would *not* be caught) and every live `BoardRef` in the
+    /// in-memory scheduler. Refusing is the v1 answer (`docs/web-ui.md` §3);
+    /// there is no partial version of it here to be found and "finished" by
+    /// somebody who missed the scheduler half.
+    ///
+    /// `None` for a field leaves it alone — the browser sends a partial
+    /// document, and an absent key must not mean "clear it". `Some(vec![])`
+    /// *does* clear the tags, which is why tags are an `Option<&[String]>` and
+    /// not a bare slice.
+    ///
+    /// Returns `None` if this org has no node by that name, so the caller
+    /// cannot distinguish it from another tenant's.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write or the re-read fails.
+    pub async fn update_node(
+        &self,
+        name: &str,
+        tags: Option<&[String]>,
+        adopt: Option<AdoptPolicy>,
+    ) -> Result<Option<NodeRow>> {
+        // Both columns in one statement, each guarded by a NULL sentinel, so a
+        // partial update is one round trip and cannot half-apply.
+        sqlx::query(
+            "UPDATE node
+                SET tags = COALESCE(?3, tags),
+                    adopt_policy = COALESCE(?4, adopt_policy)
+              WHERE org_id = ?1 AND name = ?2",
+        )
+        .bind(self.org.0.as_str())
+        .bind(name)
+        .bind(tags.map(|t| t.join("\n")))
+        .bind(adopt.map(AdoptPolicy::as_str))
+        .execute(self.db.pool())
+        .await?;
+        self.node_by_name(name).await
+    }
+
+    /// Delete a node of this org and the `board` rows that reference it.
+    ///
+    /// Returns `true` if a row was deleted.
+    ///
+    /// # Why this exists next to [`Db::delete_node`]
+    ///
+    /// [`Db::delete_node`] is a bare `DELETE FROM node WHERE id = ?`, and
+    /// `board.node_id REFERENCES node(id)` is **enforced** (`0001_init.sql`
+    /// sets `PRAGMA foreign_keys = ON`), so it fails outright for any node that
+    /// has ever reported a board — i.e. every node worth deleting. The board
+    /// rows go first, in one transaction, so a failure leaves the node either
+    /// wholly present or wholly gone rather than boardless-but-alive.
+    ///
+    /// This is only the *persistent* half of a deletion. Deleting the row
+    /// revokes the node's token (§4.2), so the caller
+    /// ([`crate::core::Coordinator::delete_node_core`]) must also tear down the
+    /// node's live leases, drop it from the registry and remove its boards from
+    /// the scheduler — none of which this layer can see.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if any statement fails.
+    pub async fn delete_node(&self, name: &str) -> Result<bool> {
+        let mut tx = self.db.pool().begin().await?;
+        let Some((id,)): Option<(String,)> =
+            sqlx::query_as("SELECT id FROM node WHERE org_id = ?1 AND name = ?2")
+                .bind(self.org.0.as_str())
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            return Ok(false);
+        };
+        sqlx::query("DELETE FROM board WHERE org_id = ?1 AND node_id = ?2")
+            .bind(self.org.0.as_str())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM node WHERE org_id = ?1 AND id = ?2")
+            .bind(self.org.0.as_str())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(deleted > 0)
+    }
+
     /// Every grant this org has issued, newest first.
     ///
     /// # Errors
@@ -3473,6 +3616,153 @@ mod tests {
             .await
             .unwrap();
         assert!(db.scoped(org).list_nodes().await.is_err());
+    }
+
+    /// `node_by_name` is the browser API's lookup, and its tenancy is the
+    /// `OrgDb` handle's: the *same* name in another org is `None`, not a
+    /// different tenant's row. That is what lets the handler answer "no such
+    /// node" and "not yours" identically without having to remember to.
+    #[tokio::test]
+    async fn node_by_name_is_org_scoped() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let mine = org(DEFAULT_ORG_ID);
+        let theirs = org("other");
+        db.ensure_org(&mine, "personal").await.unwrap();
+        db.ensure_org(&theirs, "personal").await.unwrap();
+        db.register_node(&mine, "rpi", "h-a", &[], 10)
+            .await
+            .unwrap();
+        db.register_node(&theirs, "rpi", "h-b", &[], 10)
+            .await
+            .unwrap();
+
+        let found = db.scoped(mine.clone()).node_by_name("rpi").await.unwrap();
+        assert_eq!(found.as_ref().map(|n| n.id.0.as_str()), Some("default/rpi"));
+        assert!(db
+            .scoped(mine.clone())
+            .node_by_name("absent")
+            .await
+            .unwrap()
+            .is_none());
+        // The other tenant's identically-named node is invisible, not merely
+        // filtered: this handle cannot express a query that reaches it.
+        assert_eq!(
+            db.scoped(theirs)
+                .node_by_name("rpi")
+                .await
+                .unwrap()
+                .map(|n| n.id.0),
+            Some("other/rpi".to_owned())
+        );
+    }
+
+    /// `update_node` writes only what it was asked to: `None` leaves a column
+    /// alone, `Some(vec![])` clears the tags, and the **name never moves** —
+    /// there is no parameter for it, because the id is a foreign key target.
+    #[tokio::test]
+    async fn update_node_is_partial_and_never_renames() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let o = org(DEFAULT_ORG_ID);
+        db.ensure_org(&o, "personal").await.unwrap();
+        db.register_node_full(
+            &o,
+            "rpi",
+            "h",
+            &["lab".to_owned()],
+            None,
+            AdoptPolicy::Declared,
+            10,
+        )
+        .await
+        .unwrap();
+        let scoped = db.scoped(o.clone());
+
+        // Adopt only: the tags survive.
+        let row = scoped
+            .update_node("rpi", None, Some(AdoptPolicy::Auto))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.adopt, AdoptPolicy::Auto);
+        assert_eq!(row.tags, ["lab"]);
+
+        // Tags only: the policy survives.
+        let row = scoped
+            .update_node("rpi", Some(&["a".to_owned(), "b".to_owned()]), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.tags, ["a", "b"]);
+        assert_eq!(row.adopt, AdoptPolicy::Auto);
+
+        // An empty list clears; `None` would not have.
+        let row = scoped
+            .update_node("rpi", Some(&[]), None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.tags.is_empty());
+
+        // Neither: a no-op that still reports the row.
+        let row = scoped
+            .update_node("rpi", None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.name, "rpi");
+        assert_eq!(row.id.0, "default/rpi");
+
+        // A name this org does not have is `None`, not an error.
+        assert!(scoped
+            .update_node("absent", None, None)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The cascade `Db::delete_node` cannot do: `board.node_id REFERENCES
+    /// node(id)` is enforced, so a bare node delete fails for any node that
+    /// ever reported a board. This test would fail against that bare delete,
+    /// which is the point of having it.
+    #[tokio::test]
+    async fn delete_node_cascades_to_its_boards() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
+        let theirs = seeded(&db, "other", "rpi-2").await;
+        db.scoped(mine.clone())
+            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), 10)
+            .await
+            .unwrap();
+        db.scoped(theirs.clone())
+            .record_board(&board_in("other", "rpi-2", "dk-1"), 10)
+            .await
+            .unwrap();
+
+        // `ensure_node` writes the full id into `name` (see `list_nodes`), so
+        // that is what this node is addressed by here.
+        assert!(db.scoped(mine.clone()).delete_node("rpi-1").await.unwrap());
+        assert!(db
+            .scoped(mine.clone())
+            .node_by_name("rpi-1")
+            .await
+            .unwrap()
+            .is_none());
+        let boards: Vec<(String,)> = sqlx::query_as("SELECT node_id FROM board")
+            .fetch_all(db.pool_for_test())
+            .await
+            .unwrap();
+        assert_eq!(boards, vec![("rpi-2".to_owned(),)], "only ours went");
+
+        // Deleting again is `false`, not an error — and another org's node of
+        // any name is not reachable through this handle.
+        assert!(!db.scoped(mine.clone()).delete_node("rpi-1").await.unwrap());
+        assert!(!db.scoped(mine).delete_node("rpi-2").await.unwrap());
+        assert!(db
+            .scoped(theirs)
+            .node_by_name("rpi-2")
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

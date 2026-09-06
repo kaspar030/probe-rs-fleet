@@ -89,6 +89,40 @@ impl TestCoordinator {
         self.seed_node_at(org, name, self.coord.now()).await
     }
 
+    /// Seed a node **owned** by `owner`, the way `share` from a logged-in shell
+    /// enrolls one.
+    ///
+    /// [`TestCoordinator::seed_node`] takes the auth-key path, which leaves
+    /// `owner_user_id = NULL` — and "NULL owner means admin-only" is a rule the
+    /// node-mutation tests have to be able to exercise from *both* sides, so
+    /// the owned shape needs a seed of its own.
+    pub async fn seed_owned_node(
+        &self,
+        org: &str,
+        name: &str,
+        owner: &str,
+        adopt: fleet_proto::adopt::AdoptPolicy,
+    ) -> (String, AgentId) {
+        let org = OrgId(org.to_owned());
+        self.db().ensure_org(&org, "personal").await.unwrap();
+        let token = OpaqueToken::mint(TokenKind::Node);
+        let now = i64::try_from(self.coord.now()).unwrap();
+        let node = self
+            .db()
+            .register_node_full(
+                &org,
+                name,
+                token.hash().as_str(),
+                &[],
+                Some(owner),
+                adopt,
+                now,
+            )
+            .await
+            .unwrap();
+        (token.to_secret_string(), node)
+    }
+
     /// As [`TestCoordinator::seed_node`], with an explicit `token_issued_at`,
     /// so a test can present a token that is already due for rotation.
     pub async fn seed_node_at(&self, org: &str, name: &str, issued_at: u64) -> (String, AgentId) {
@@ -356,7 +390,6 @@ impl TestCoordinator {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
-
 
     /// As [`TestCoordinator::http_auth`], but with arbitrary request headers
     /// and the **response** headers returned.

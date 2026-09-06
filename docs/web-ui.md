@@ -174,8 +174,8 @@ types are shaped for postcard, and any that do not serialize to pleasant JSON
 coordinator**, never a divergent field set in `fleet-proto`.
 
 **The honest cost.** Today's operator methods on `Coordinator` are private, and
-several verbs the UI needs **have no wire verb at all**: node list / rename /
-tags / adopt-policy / delete, member list, pending-registration list. Those are
+several verbs the UI needs **have no wire verb at all**: node list / tags /
+adopt-policy / delete, member list. Those are
 new `Coordinator` methods plus new `state.rs` / `OrgDb` queries — real
 implementation work in the follow-up tasks, not plumbing. Every new query goes
 through `OrgDb` so the tenancy fence holds by construction (`audit_log.org_id`
@@ -220,7 +220,8 @@ build` that needs node (breaks the cross-compilation story in
 
 **In:** read-only inventory (boards, leases, nodes, grants, auth keys, audit
 log), plus the management verbs — power-cycle, release someone else's lease as
-admin, node rename / tags / adopt-policy / delete, pending-node approval, grant
+admin, node tags / adopt-policy / delete (**not** rename; see §3), pending-node
+approval, grant
 create / list / revoke, auth-key mint / list / revoke.
 
 **Out**, each with its reason:
@@ -307,22 +308,38 @@ bundle, since D3 means there is no build to branch in.
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
 | `GET /api/v1/nodes` | — | `[{"id","name","tags","adopt","owner","last_seen","online","boards"}]` | **new** `Coordinator::list_nodes` → **new** `OrgDb::list_nodes` (+ `AgentRegistry` for `online`) | member |
-| `PATCH /api/v1/nodes/{name}` | `{"name"?,"tags"?,"adopt"?}` | the updated node row | **new** `Coordinator::update_node` → **new** `OrgDb::update_node` | node owner, or admin |
-| `DELETE /api/v1/nodes/{name}` | — | `204` | **new** `Coordinator::delete_node` → `Db::delete_node` + lease teardown + drop the live connection | node owner, or admin |
-| `GET /api/v1/nodes/pending` | — | `[{"user_code","node_name","tags","adopt","source_ip","created_at","expires"}]` | **new** `Coordinator::list_pending_nodes` → `Db::live_pending_codes` widened to full rows | member |
-| `POST /api/v1/nodes/pending/{code}` | `{"decision":"inspect"\|"approve"\|"deny","replace":false}` | `NodeApprovalResponse` | `http::decide_pending_node` (**unchanged**) | member |
+| `PATCH /api/v1/nodes/{name}` | `{"tags"?,"adopt"?}` | the updated node row | `Coordinator::update_node_core` → `OrgDb::update_node` | node owner, or admin |
+| `DELETE /api/v1/nodes/{name}` | — | `204` | `Coordinator::delete_node_core` → lease teardown + scheduler removal + `OrgDb::delete_node` + drop the live connection | node owner, or admin |
+| `POST /api/v1/nodes/pending/{code}` | `{"decision":"inspect"\|"approve"\|"deny","replace":false}` | `NodeApprovalResponse` + a `warning` field | `http::decide_pending_node` (**unchanged**) | member |
+
+There is deliberately **no** `GET /api/v1/nodes/pending`. An earlier revision of
+this table had one; it is dropped, for the reason §4 now records:
+`pending_node.org_id` is `NULL` until an approval binds it, so there is no
+attribution to filter a listing on, and a member-visible list of live codes
+would be exactly the cross-tenant index §4 forbids. Approval stays code-driven.
+Adding an org column to `pending_node` is a separate design question, not
+something to smuggle in alongside a listing.
 
 `DELETE` is a revocation, not a tidy-up: deleting the `node` row invalidates its
 token (§4.2), so the implementation must also tear down that node's live leases
 and drop its connection, or the machine keeps relaying until its lease TTL runs
 out — the same trap `grant_revoke` already solves by going through the whole
-release path.
+release path. It also has to remove the node's `board` rows: `board.node_id
+REFERENCES node(id)` is enforced, so a bare `DELETE FROM node` fails for any
+node that has ever reported a board.
 
-`PATCH` renaming a node is a rename of the row's `name` only. The node id
-(`{org}/{name}`) is a primary key referenced by `board.node_id`, so a rename
-either cascades or is refused; **refusing is the v1 answer** — offer `tags` and
-`adopt` first and treat renaming as a follow-up if the cascade turns out to be
-more than a transaction. Record whichever the implementation picks.
+**`PATCH` does not rename, and says so.** The node id is `{org}/{name}`; it is a
+primary key referenced by `board.node_id` under `PRAGMA foreign_keys = ON`, it
+is carried (with *no* foreign key, so nothing would catch a stale one) in
+`leases.node_id`, and it is embedded in every live `BoardRef` in the in-memory
+scheduler. A rename would therefore have to cascade through three places, one
+of which the database cannot help with. **Refusing is the v1 answer** — the
+recorded decision this table asked the implementation to make. `PATCH` offers
+`tags` and `adopt` only, and a `name` field in the body is a `400
+invalid_request`, never a silent no-op: an operator must not be left believing a
+rename happened while their scripts, their `boards.toml` and the audit log all
+disagree. Renaming, if it is ever wanted, is "delete and re-enroll" or a
+deliberate follow-up that moves all three.
 
 ### Boards and leases
 
@@ -417,9 +434,9 @@ against the *target object's* org through the existing evaluator —
 | auth-key revoke | **creator, or admin** | `http::revoke_auth_key` |
 | audit log | **admin** | `Coordinator::logs` (+ `OrgDb` scoping, a second independent fence) |
 | org / member list | membership | new, `require_role(Member)` |
-| pending-node list / approve / deny | membership | §6.4, `decide_pending_node` |
+| pending-node approve / deny | membership | §6.4, `decide_pending_node` (there is no listing; see §3/§4) |
 | node list | membership | new |
-| node rename / tags / adopt / delete | **owner (`node.owner_user_id`), or admin** | **new policy, fixed here** |
+| node tags / adopt / delete | **owner (`node.owner_user_id`), or admin** | **new policy, fixed here** (rename is refused; see §3) |
 
 Three notes on that table.
 
@@ -435,14 +452,26 @@ unchanged.** An authenticated member who guesses a `user_code` can inspect and
 approve into their own org a registration somebody in another org started. The
 browser does not make this worse — it is the same handler, the same ~40 bits
 behind a 15-minute TTL, the same audit row, and the same "the enrolling machine
-prints which org it landed in" control that lets the victim notice. But the UI
-must not pretend it goes away, and in particular a "pending registrations" list
-must show only *this org's* pending rows once approved and must not become a
-browsable index of live codes across tenants: `GET /api/v1/nodes/pending`
-returns rows this org started only where that is knowable, and otherwise it
-shows nothing and approval stays code-driven. Whichever the implementation can
-do, the phishing warning the CLI prints must appear verbatim in the form: *you
-cannot see this machine; approve only an enrollment you started.*
+prints which org it landed in" control that lets the victim notice.
+
+What the browser must not do is make it *better-indexed*, and that is why
+**there is no pending-registration listing**. `pending_node.org_id` is `NULL`
+until an approval binds it (`migrations/0005_pending_node.sql`) and
+`Db::live_pending_codes` is org-blind, so a listing has no attribution to filter
+on: it could only show *every* live code in the deployment. That is precisely
+the cross-tenant index this section forbids, and it would strictly worsen the
+accepted risk above — turning "guess ~40 bits" into "read the list". So `GET
+/api/v1/nodes/pending` is dropped (see §3) and approval stays code-driven: you
+approve an enrollment whose code somebody handed you, which is the ceremony the
+CLI already implements.
+
+Because nothing lists them, the human deciding has *only* what the `inspect`
+response tells them, so the phishing warning the CLI prints must appear
+verbatim in the form: *you cannot see this machine; approve only an enrollment
+you started.* It ships as a server-sent `warning` field on the `inspect`
+response (`api.rs`'s `APPROVAL_WARNING`, byte-identical to the CLI's sentence)
+rather than as frontend copy, so a frontend that forgets to render it shows a
+visibly empty box instead of silently dropping the mitigation.
 
 **Errors stay coarse.** A cross-org object and a nonexistent one must be
 indistinguishable (`AuthzError::lease_message`, `denied()`, the flat
@@ -513,9 +542,10 @@ mutating endpoint at all**, so the cookie, CSP and CSRF machinery ship and get
 exercised before anything exists that could be abused through them.
 
 **Phase 2 — node management and pending approvals.** `PATCH` / `DELETE` on
-nodes, `GET /api/v1/nodes/pending`, and `/node/approve` grows a real form behind
-the session — the §4.2 commitment cashed in, calling the existing
-`decide_pending_node`.
+nodes and `POST /api/v1/nodes/pending/{code}` — the §4.2 commitment cashed in,
+calling the existing `decide_pending_node`. (`/node/approve` growing a real form
+behind the session is *not* part of it: the browser approves through the JSON
+API, and that page stays informational and reflection-free.)
 
 **Phase 3 — grants and auth keys.** The admin-gated, outward-pointing verbs, and
 the shown-once auth-key panel. Deliberately after phase 2: these are the two
@@ -537,16 +567,18 @@ Named so follow-up tasks can be scoped precisely.
   `/auth/github/*` routes; a cookie-aware sibling of `authenticate_request`
   (same `Subject` construction, one extra credential *carrier*, not a new
   credential *kind*), with the carrier allowlisted per route; the CSRF
-  derivation and check; `/node/approve` grows a form calling the existing
-  `decide_pending_node`. **The module doc's "please do not bolt a session onto
+  derivation and check. **The module doc's "please do not bolt a session onto
   the coordinator" paragraph must be rewritten, not quietly contradicted.**
+  (`/node/approve` stays informational: the browser approves through
+  `POST /api/v1/nodes/pending/{code}`, which calls the same
+  `decide_pending_node` and shares its membership check.)
 - **`crates/fleet-coordinator/src/core.rs`** — operator methods (`list_boards`,
   `who`, `logs`, `operator_power_cycle`, `grant_create`, `grant_list`,
   `grant_revoke`, `release_lease`) become `pub(crate)`; new methods for node
-  list / update / delete, member list, and pending-registration list.
+  list / update / delete-with-cascade and member list.
 - **`crates/fleet-coordinator/src/state.rs`** — new `OrgDb` queries for the
-  same: node listing / update / delete-with-teardown, member listing, live
-  pending rows with their full detail.
+  same: node listing / lookup by name / update / delete-with-board-cascade, and
+  member listing.
 - **`crates/fleet-coordinator/src/authz.rs`** — expected to need **no change**.
   If an endpoint seems to need a new rule, that is the signal to re-read §6.5,
   not to add one. The one genuinely new policy (node mutation = owner-or-admin)

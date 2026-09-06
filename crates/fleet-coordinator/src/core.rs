@@ -830,6 +830,284 @@ impl Coordinator {
         Ok(out)
     }
 
+    /// Update one node's tags and/or adoption policy.
+    ///
+    /// **New surface, no wire counterpart** — there is no `ctl node edit`. The
+    /// node is addressed by its node-local `name`, resolved inside the caller's
+    /// own org: the id is `{org}/{name}` and so contains a slash, which cannot
+    /// travel in a URL path segment (`docs/web-ui.md` §3).
+    ///
+    /// # The authorization is the one genuinely new policy
+    ///
+    /// **Owner ([`crate::state::NodeRow::owner_user_id`]), or org admin** —
+    /// composed here from the row and [`authz::is_org_admin`] rather than
+    /// added to `authz.rs`, because it is a rule about one table's column and
+    /// not a new notion of access (`docs/web-ui.md` §7).
+    ///
+    /// Its sharp edge is deliberate: a node enrolled with an auth key or from a
+    /// shell has `owner_user_id = NULL` and is therefore **admin-only**. The
+    /// same shape as an auth key with no recorded creator, and the alternative
+    /// — treating "nobody owns it" as "everybody owns it" — would let any
+    /// member re-point a machine nobody claimed.
+    ///
+    /// # Rename is refused
+    ///
+    /// The caller cannot change `name`; see [`crate::state::OrgDb::update_node`]
+    /// for why, and note that the handler rejects a `name` field outright
+    /// rather than ignoring it — a silent no-op would leave an operator
+    /// believing a rename had happened.
+    ///
+    /// Note also what is *not* here: nothing writes `adopt` from an inventory
+    /// report. [`OrgDb::ensure_node`](crate::state::OrgDb::ensure_node)
+    /// deliberately leaves the policy alone on every report, and this method
+    /// does not create a second path that would undo that — it writes only
+    /// what an authorized human asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] for a non-member, and for a member who is neither
+    /// the node's owner nor an org admin (a `node.update.denied` audit row is
+    /// written first, mirroring `grant.revoke.denied`); [`OpError::NotFound`]
+    /// when this org has no node by that name — **the same answer** a node in
+    /// another org produces, since [`crate::state::OrgDb`] cannot see one;
+    /// [`OpError::Internal`] on a database failure.
+    pub(crate) async fn update_node_core(
+        &self,
+        subject: &Subject,
+        name: &str,
+        tags: Option<&[String]>,
+        adopt: Option<AdoptPolicy>,
+    ) -> std::result::Result<NodeStatus, OpError> {
+        let org = subject.org.clone();
+        let row = self
+            .authorize_node_mutation(subject, name, "node.update.denied")
+            .await?;
+
+        let updated = self
+            .db
+            .scoped(org.clone())
+            .update_node(&row.name, tags, adopt)
+            .await
+            .map_err(OpError::Internal)?
+            // It existed a moment ago; if it does not now, somebody deleted it
+            // concurrently and "no such node" is the honest answer.
+            .ok_or_else(|| OpError::NotFound(format!("no node named {name}")))?;
+
+        let mut detail = Vec::new();
+        if let Some(tags) = tags {
+            detail.push(format!("tags={}", tags.join(",")));
+        }
+        if let Some(adopt) = adopt {
+            detail.push(format!("adopt={}", adopt.as_str()));
+        }
+        self.audit(
+            &org,
+            "node.update",
+            Some(&subject.key().to_string()),
+            Some(&updated.id.0),
+            None,
+            None,
+            (!detail.is_empty()).then(|| detail.join(" ")).as_deref(),
+        )
+        .await
+        .map_err(OpError::Internal)?;
+
+        let online = self.agents.get(&updated.id).await.is_some();
+        Ok(NodeStatus {
+            row: updated,
+            online,
+        })
+    }
+
+    /// Delete a node: revoke its token, and make the revocation *real*.
+    ///
+    /// Same authorization as [`Coordinator::update_node_core`] — owner or org
+    /// admin, `owner_user_id = NULL` meaning admin-only.
+    ///
+    /// # The cascade is the point
+    ///
+    /// Deleting the `node` row invalidates the node's token (architecture
+    /// §4.2: revocation *is* deleting the row). But a token is not the only
+    /// thing keeping a machine attached, so this goes, in order:
+    ///
+    /// 1. **live leases** on the node's boards are released through the whole
+    ///    shared release path ([`Coordinator::tear_down_lease`]) — relay
+    ///    channels closed, the lease closed and audited — exactly as the
+    ///    grant-revocation cascade does, and *repeatedly*, because that path
+    ///    promotes and persists a queued waiter onto each board it frees. Skip
+    ///    this and the machine keeps relaying bytes until the lease TTL runs
+    ///    out, while the operator believes it is gone;
+    /// 2. the boards leave the **scheduler**, so nothing new can be leased onto
+    ///    hardware that is no longer part of the fleet;
+    /// 3. the `board` and `node` rows are deleted in one transaction
+    ///    ([`crate::state::OrgDb::delete_node`]); the board rows *must* go
+    ///    first, since `board.node_id` is an enforced foreign key;
+    /// 4. the node is dropped from the [`crate::registry::AgentRegistry`],
+    ///    which closes its control-plane `WebSocket`: the connection task's
+    ///    writer drains an `mpsc` whose receiver dies with the handle, and the
+    ///    node's reconnect then fails authentication because its row is gone.
+    ///
+    /// The database write sits at (3) rather than first on purpose: if it
+    /// fails, the leases are already down (safe, if inconvenient — the machine
+    /// is still enrolled and can be leased again), whereas deleting the row
+    /// first and then failing would leave live leases against a node no
+    /// authorization check can resolve any more.
+    ///
+    /// One honest limit, the same one grant revocation has: a capability token
+    /// already minted stays cryptographically valid until it expires. Tearing
+    /// down the relay is what makes it useless — there is no path to the board
+    /// without the coordinator.
+    ///
+    /// Returns the deleted node's id.
+    ///
+    /// # Errors
+    ///
+    /// As [`Coordinator::update_node_core`], with `node.delete.denied` as the
+    /// refusal audit action.
+    pub(crate) async fn delete_node_core(
+        &self,
+        subject: &Subject,
+        name: &str,
+    ) -> std::result::Result<AgentId, OpError> {
+        let org = subject.org.clone();
+        let row = self
+            .authorize_node_mutation(subject, name, "node.delete.denied")
+            .await?;
+        let node_id = row.id.clone();
+
+        // (1) Live leases on this node's boards, through the whole release path.
+        //
+        // Looped, and that is not defensive coding: `tear_down_lease` promotes
+        // a queued waiter onto the board it just freed **and persists the
+        // promotion**, so a single pass can leave a brand-new open `leases` row
+        // against a node that is about to vanish — which step (2)'s
+        // `remove_board` would then drop from the scheduler silently, leaving
+        // the row open forever and the promoted holder believing it has a
+        // lease. Each pass consumes at least one waiter from the queue, so this
+        // terminates.
+        loop {
+            let held: Vec<(LeaseId, BoardRef, SubjectKey)> = {
+                let sched = self.scheduler.lock().await;
+                sched
+                    .boards()
+                    .filter(|b| b.agent == node_id)
+                    .filter_map(|b| match &b.state {
+                        BoardState::Leased { lease, by, .. } => {
+                            Some((*lease, b.id.clone(), by.key()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if held.is_empty() {
+                break;
+            }
+            for (lease, board_ref, holder) in held {
+                warn!(
+                    %board_ref, ?lease, node = %node_id,
+                    "releasing a lease on a node being deleted"
+                );
+                self.tear_down_lease(lease, &holder, "node deleted", "lease.revoke", subject)
+                    .await
+                    .map_err(OpError::Internal)?;
+            }
+        }
+
+        // (2) The boards leave the scheduler.
+        let board_refs: Vec<BoardRef> = {
+            let sched = self.scheduler.lock().await;
+            sched
+                .boards()
+                .filter(|b| b.agent == node_id)
+                .map(|b| b.id.clone())
+                .collect()
+        };
+        {
+            let mut sched = self.scheduler.lock().await;
+            for board_ref in &board_refs {
+                sched.remove_board(board_ref);
+            }
+        }
+
+        // (3) The rows, board-first, in one transaction.
+        let deleted = self
+            .db
+            .scoped(org.clone())
+            .delete_node(&row.name)
+            .await
+            .map_err(OpError::Internal)?;
+        if !deleted {
+            return Err(OpError::NotFound(format!("no node named {name}")));
+        }
+
+        // (4) The live connection.
+        self.agents.remove(&node_id).await;
+
+        self.audit(
+            &org,
+            "node.delete",
+            Some(&subject.key().to_string()),
+            Some(&node_id.0),
+            None,
+            None,
+            Some(&format!("{} boards removed", board_refs.len())),
+        )
+        .await
+        .map_err(OpError::Internal)?;
+        Ok(node_id)
+    }
+
+    /// The owner-or-admin check shared by the two node-mutation cores.
+    ///
+    /// Returns the node row, so the caller does not re-read it and cannot
+    /// accidentally act on a different one. Membership is checked first, for
+    /// the same reason `grant_revoke_core` does: a non-member must not be able
+    /// to probe which node names exist.
+    ///
+    /// A node in another org is invisible here — the lookup goes through
+    /// [`crate::state::OrgDb`] — so "not yours" and "no such node" produce the
+    /// same [`OpError::NotFound`]. The REST instinct to distinguish them turns
+    /// this API into a cross-tenant existence oracle (`docs/web-ui.md` §4).
+    async fn authorize_node_mutation(
+        &self,
+        subject: &Subject,
+        name: &str,
+        denied_action: &str,
+    ) -> std::result::Result<crate::state::NodeRow, OpError> {
+        let org = subject.org.clone();
+        if authz::require_role(&self.db, subject, &org, Role::Member)
+            .await
+            .is_err()
+        {
+            return Err(OpError::Denied);
+        }
+        let row = self
+            .db
+            .scoped(org.clone())
+            .node_by_name(name)
+            .await
+            .map_err(OpError::Internal)?
+            .ok_or_else(|| OpError::NotFound(format!("no node named {name}")))?;
+
+        // `owner_user_id = NULL` is admin-only, not everyone-owns-it.
+        let owned = row.owner_user_id.as_deref() == Some(subject.id.as_str());
+        if !owned && !authz::is_org_admin(&self.db, subject).await {
+            self.audit(
+                &org,
+                denied_action,
+                Some(&subject.key().to_string()),
+                Some(&row.id.0),
+                None,
+                None,
+                Some("neither the node's owner nor an org admin"),
+            )
+            .await
+            .map_err(OpError::Internal)?;
+            return Err(OpError::Denied);
+        }
+        Ok(row)
+    }
+
     /// The operator lease-holder table (`ctl who`), over the boards the
     /// caller may reach — their own org's, plus any a live grant covers.
     ///

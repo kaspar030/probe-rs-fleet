@@ -70,28 +70,31 @@
 //! explicit bearer. [`Carrier`] is that fence, and `tests/browser_auth.rs`
 //! asserts each of those five routes refuses a cookie-only request.
 //!
-//! `GET /node/approve` is **still** informational: growing it a form is phase 2
-//! of `docs/web-ui.md` §6, not something this change did on the way past.
-//! Please do not "fix" that either — the page's *unauthenticated* rendering
-//! must stay byte-identical whatever the query string, which is what makes it
-//! reflect nothing.
+//! `GET /node/approve` is **still** informational, and stays that way. Phase 1b
+//! of `docs/web-ui.md` shipped browser approval — but through
+//! `POST /api/v1/nodes/pending/{code}` ([`crate::api`]), not by growing this
+//! page a form. Please do not "fix" that: the page's *unauthenticated*
+//! rendering must stay byte-identical whatever the query string, which is what
+//! makes it reflect nothing, and it is the URL every deployed agent prints.
 //!
-//! The design keeps a real browser flow open, and these three properties are
-//! commitments, not accidents (the first is what phase 2 will cash in — a
-//! cookie-authenticated approval handler calls exactly [`decide_pending_node`]):
+//! The design kept a real browser flow open, and these three properties were
+//! commitments rather than accidents. Phase 1b cashed in the first, exactly as
+//! written — [`crate::api`]'s handler resolves its subject from the session
+//! cookie and calls this file's [`decide_pending_node`] **unchanged**, and
+//! shares [`require_membership_to_approve`] with the CLI route so the two
+//! surfaces cannot drift on who may approve or on what the audit log says:
 //!
 //! 1. approval is keyed by `user_code` and is a pure function of `(code,
 //!    decision, authenticated user)` — [`decide_pending_node`] takes an
-//!    already-resolved subject, so a future cookie-authenticated handler
-//!    resolves its subject its own way and calls the *same* function. No schema
-//!    change, no second binding site;
+//!    already-resolved subject, so a cookie-authenticated handler resolves its
+//!    subject its own way and calls the *same* function. No schema change, no
+//!    second binding site;
 //! 2. the node-side wire contract (`start` / `poll`) never learns which
-//!    approval mechanism ran, so adding one is additive on the coordinator and
+//!    approval mechanism ran, so adding one was additive on the coordinator and
 //!    already-deployed agents keep working;
-//! 3. `GET /node/approve` is the page that would grow the form, and it is
-//!    already what `verification_uri` points at — so the future change is "this
-//!    page gains a POST form behind a session", not "the printed URL changes",
-//!    which would break every deployed agent's printed instructions.
+//! 3. `GET /node/approve` is what `verification_uri` points at, and the printed
+//!    URL did not have to change — which is why it could stay reflection-free
+//!    instead of becoming the form.
 //!
 //! Three accepted risks, recorded rather than fixed:
 //!
@@ -2009,7 +2012,13 @@ fn valid_node_name(name: &str) -> bool {
 
 /// Whether a tag list is acceptable to store. Same charset as a node name, at
 /// most [`MAX_TAGS`] tags of [`MAX_TAG_LEN`] characters.
-fn valid_tags(tags: &[String]) -> bool {
+///
+/// `pub(crate)` so [`crate::api`]'s `PATCH /api/v1/nodes/{name}` validates tags
+/// with **this** function rather than a second copy of the rule. The charset is
+/// what `docs/web-ui.md` §5 leans on for "every piece of attacker-controlled
+/// text this UI renders is server-side charset-validated", and a divergent
+/// copy would erode exactly that claim while still passing its own tests.
+pub(crate) fn valid_tags(tags: &[String]) -> bool {
     tags.len() <= MAX_TAGS
         && tags.iter().all(|t| {
             !t.is_empty()
@@ -2024,8 +2033,14 @@ fn valid_tags(tags: &[String]) -> bool {
 /// `None` means this grant's default. A typo'd `adopt = "delcared"` quietly
 /// meaning `auto` would share probes the operator did not mean to share, so it
 /// is a `400`, never a silent default.
+///
+/// `pub(crate)` for the same reason [`valid_tags`] is: the browser's `PATCH`
+/// must accept exactly the labels the enrollment paths accept.
 #[allow(clippy::result_large_err)]
-fn parse_adopt(adopt: Option<&str>, default: AdoptPolicy) -> Result<AdoptPolicy, Response> {
+pub(crate) fn parse_adopt(
+    adopt: Option<&str>,
+    default: AdoptPolicy,
+) -> Result<AdoptPolicy, Response> {
     match adopt {
         None => Ok(default),
         Some(label) => AdoptPolicy::from_label(label)
@@ -2261,29 +2276,9 @@ async fn node_register_approve(
     let org = OrgId(auth.org_id.clone());
     let now_i64 = i64::try_from(coord.now()).unwrap_or(i64::MAX);
 
-    match coord.db().role_of(&org, &auth.id).await {
-        Ok(Some(_role)) => {}
-        Ok(None) => {
-            let _ = coord
-                .db()
-                .scoped(org.clone())
-                .append_audit(&AuditEntry {
-                    ts: now_i64,
-                    subject: Some(auth.id.as_str()),
-                    action: "node.approve.denied",
-                    node: None,
-                    board: None,
-                    lease: None,
-                    detail: Some("not a member of the org the session belongs to"),
-                })
-                .await;
-            warn!(org = %org, subject = %auth.id, "node approval by a non-member");
-            return reject(StatusCode::FORBIDDEN, "forbidden");
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to resolve membership");
-            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
-        }
+    match require_membership_to_approve(&coord, &org, &auth.id, now_i64).await {
+        Ok(()) => {}
+        Err(response) => return response,
     }
 
     decide_pending_node(
@@ -2296,6 +2291,53 @@ async fn node_register_approve(
         now_i64,
     )
     .await
+}
+
+/// Membership is sufficient to approve — and the check is not decorative.
+///
+/// Factored out of [`node_register_approve`] so the browser surface
+/// ([`crate::api`]'s `POST /api/v1/nodes/pending/{code}`) applies the *same*
+/// rule and writes the *same* `node.approve.denied` audit row. Two surfaces
+/// onto one ceremony must not disagree about who may perform it, and an audit
+/// log with two differently-named refusal actions is one nobody can query.
+///
+/// `authz::require_role` denies a non-member everywhere else, so a node created
+/// for one would be an orphan its "owner" could never use.
+///
+/// # Errors
+///
+/// The `403` / `500` [`Response`] to return, on refusal or a database failure.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn require_membership_to_approve(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+    now: i64,
+) -> Result<(), Response> {
+    match coord.db().role_of(org, user_id).await {
+        Ok(Some(_role)) => Ok(()),
+        Ok(None) => {
+            let _ = coord
+                .db()
+                .scoped(org.clone())
+                .append_audit(&AuditEntry {
+                    ts: now,
+                    subject: Some(user_id),
+                    action: "node.approve.denied",
+                    node: None,
+                    board: None,
+                    lease: None,
+                    detail: Some("not a member of the org the session belongs to"),
+                })
+                .await;
+            warn!(org = %org, subject = %user_id, "node approval by a non-member");
+            Err(reject(StatusCode::FORBIDDEN, "forbidden"))
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to resolve membership");
+            Err(reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error"))
+        }
+    }
 }
 
 /// Decide a pending registration on behalf of an already-resolved subject.

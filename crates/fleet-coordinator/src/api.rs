@@ -1,8 +1,9 @@
 //! The browser-facing JSON API at `/api/v1` (`docs/web-ui.md` D2).
 //!
 //! One `Router`, every JSON handler, and the view structs that shape the
-//! responses. Phase 1a is **read-only** apart from `POST /api/v1/session/logout`
-//! — see [§ Why one mutating route](#why-one-mutating-route).
+//! responses. Phase 1a was read-only apart from `POST /api/v1/session/logout`;
+//! phase 1b adds the node-management verbs — see
+//! [§ Which routes mutate, and why](#which-routes-mutate-and-why).
 //!
 //! # The no-drift guarantee is structural
 //!
@@ -39,17 +40,32 @@
 //! that might grow one, and `tests/api_readonly.rs` asserts no response body
 //! contains a token prefix.
 //!
-//! # Why one mutating route
+//! # Which routes mutate, and why
 //!
-//! `docs/web-ui.md` §6's phase fence says phase 1 ships "no mutating endpoint
-//! at all, so the cookie, CSP and CSRF machinery ship and get exercised before
-//! anything exists that could be abused through them". `POST
-//! /api/v1/session/logout` is the deliberate exception: it destroys only the
-//! caller's own credential, and shipping the CSRF check with exactly one
-//! consumer is how that machinery gets exercised at all. Please do not add a
-//! second mutating route here "while you are in there" — the fence is the
-//! reason the CSRF code can be trusted before there is anything worth
-//! attacking.
+//! `docs/web-ui.md` §6's phase fence put phase 1a's cookie, CSP and CSRF
+//! machinery in front of anything worth abusing: `POST /api/v1/session/logout`
+//! was its single, self-directed consumer. Phase **1b** is the first set of
+//! genuinely mutating endpoints, and the fence is what lets them be trusted:
+//!
+//! * `PATCH /api/v1/nodes/{name}` — tags and adoption policy. **Not the name**;
+//!   see [`update_node`].
+//! * `DELETE /api/v1/nodes/{name}` — a revocation, cascading through the live
+//!   leases, the scheduler and the node's connection; see [`delete_node`].
+//! * `POST /api/v1/nodes/pending/{code}` — inspect / approve / deny a pending
+//!   node registration, cashing in `docs/architecture.md` §4.2's promise that a
+//!   cookie-authenticated handler would call the *same*
+//!   [`crate::http::decide_pending_node`]; see [`decide_pending`].
+//!
+//! Every one of them calls [`csrf_ok`] before touching anything, and the check
+//! is a single shared helper rather than a per-handler line of code precisely
+//! so that "did this handler remember?" is answerable by grep.
+//!
+//! There is deliberately **no** `GET /api/v1/nodes/pending`. The doc's original
+//! table had one; it is dropped, and `docs/web-ui.md` §3/§4 are amended to say
+//! so. `pending_node.org_id` is `NULL` until an approval binds it, so there is
+//! no attribution to filter a listing on, and a member-visible list of live
+//! codes would be exactly the cross-tenant index §4 forbids — strictly
+//! worsening the enumeration risk §6.4 accepts. Approval stays code-driven.
 //!
 //! # Query strings
 //!
@@ -65,22 +81,24 @@
 
 use std::sync::Arc;
 
-use axum::extract::{RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+use fleet_auth::api::NodeApprovalDecision;
 use fleet_auth::TokenKind;
 use fleet_proto::admin::{BoardAvailability, BoardSummary, LeaseHolderSummary, LogLine};
+use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::board::PowerKind;
 use fleet_proto::ids::{BoardName, BoardRef, Role, Subject, SubjectKey};
 
 use crate::browser_auth::{cleared_session_cookies, csrf_ok};
 use crate::core::{Coordinator, NodeStatus, OpError};
-use crate::http::{authenticate_request_with, reject, Arrival, Carrier};
+use crate::http::{authenticate_request_with, parse_adopt, reject, valid_tags, Arrival, Carrier};
 
 /// Build the `/api/v1` router, merged into the coordinator's by
 /// [`crate::http::router`].
@@ -96,6 +114,11 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
         .route("/api/v1/org", get(org))
         .route("/api/v1/org/members", get(org_members))
         .route("/api/v1/nodes", get(nodes))
+        .route(
+            "/api/v1/nodes/{name}",
+            axum::routing::patch(update_node).delete(delete_node),
+        )
+        .route("/api/v1/nodes/pending/{code}", post(decide_pending))
         .route("/api/v1/boards", get(boards))
         .route("/api/v1/leases", get(leases))
         .route("/api/v1/audit", get(audit))
@@ -124,6 +147,35 @@ async fn api_auth(
         Carrier::HeaderOrCookie,
     )
     .await
+}
+
+/// Authenticate a **mutating** `/api/v1` call: [`api_auth`] plus the CSRF gate.
+///
+/// One function rather than a two-line preamble copied into each handler.
+/// That is not tidiness: three hand-written copies of a security check is the
+/// shape that drifts, and the drift here is silent — a handler that forgot the
+/// check would pass every one of its own tests and be exploitable only
+/// cross-site. A mutating handler that does not call this has no CSRF
+/// protection at all, so `grep mutating_auth` against the router's mutating
+/// routes is the whole audit.
+///
+/// The check is a no-op for a bearer-authenticated call, because that
+/// credential is not ambient; [`csrf_ok`] owns that distinction.
+async fn mutating_auth(
+    coord: &Coordinator,
+    headers: &HeaderMap,
+) -> Result<(fleet_auth::Authenticated, Subject), Response> {
+    let (auth, subject, arrival) = api_auth(coord, headers).await?;
+    if !csrf_ok(
+        coord,
+        headers,
+        auth.hash.as_str(),
+        arrival == Arrival::Cookie,
+    ) {
+        warn!(subject = %auth.id, "a cookie-authenticated mutating call had no valid CSRF header");
+        return Err(reject(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    Ok((auth, subject))
 }
 
 /// Turn an [`OpError`] into the uniform JSON rejection.
@@ -491,7 +543,7 @@ async fn session(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> R
 
 /// `POST /api/v1/session/logout` — destroy the caller's own session.
 ///
-/// The one mutating route in phase 1a, and the one consumer of the CSRF check;
+/// Phase 1a's only mutating route, and the first consumer of the CSRF check;
 /// see the module documentation. It deletes exactly the row the caller
 /// authenticated with — never one named in the request — so the worst a
 /// successful forgery could achieve is logging somebody out.
@@ -499,19 +551,10 @@ async fn session(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> R
 /// `204` with both cookies cleared, whether or not the row was there: a
 /// caller must not be able to distinguish "logged out" from "already gone".
 async fn logout(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (auth, _subject, arrival) = match api_auth(&coord, &headers).await {
+    let (auth, _subject) = match mutating_auth(&coord, &headers).await {
         Ok(v) => v,
         Err(response) => return response,
     };
-    if !csrf_ok(
-        &coord,
-        &headers,
-        auth.hash.as_str(),
-        arrival == Arrival::Cookie,
-    ) {
-        warn!(subject = %auth.id, "a cookie-authenticated mutating call had no valid CSRF header");
-        return reject(StatusCode::FORBIDDEN, "forbidden");
-    }
     if let Err(e) = coord.db().delete_session(auth.hash.as_str()).await {
         warn!(error = %e, "failed to delete a session on logout");
         return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
@@ -605,6 +648,239 @@ async fn nodes(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Res
         Ok(rows) => Json(rows.into_iter().map(NodeView::from).collect::<Vec<_>>()).into_response(),
         Err(e) => op_error(&e),
     }
+}
+
+/// The body of `PATCH /api/v1/nodes/{name}`.
+///
+/// Every field is optional and an absent one means "leave it alone": the
+/// browser sends a partial document, so `{"tags":[]}` clearing the tags and
+/// `{}` changing nothing have to be distinguishable, which is what the
+/// `Option`s buy.
+///
+/// `name` is present **so that it can be refused**. See [`update_node`].
+#[derive(Debug, Deserialize)]
+struct NodePatch {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    adopt: Option<String>,
+}
+
+/// `PATCH /api/v1/nodes/{name}` — a node's tags and adoption policy.
+///
+/// Owner-or-admin (`docs/web-ui.md` §7); the policy and its sharp edge — a
+/// node with `owner_user_id = NULL` is admin-only — live in
+/// [`Coordinator::update_node_core`], not here.
+///
+/// # Renaming is refused, loudly
+///
+/// A `name` field is a `400 invalid_request`, **not** a silent no-op. The node
+/// id is `{org}/{name}`, `board.node_id` references it under enforced foreign
+/// keys, `leases.node_id` carries it with no foreign key at all, and every live
+/// `BoardRef` in the scheduler embeds it; refusing is the v1 answer
+/// (`docs/web-ui.md` §3, amended by this change to record it). Ignoring the
+/// field instead would leave an operator believing a rename had happened while
+/// their `boards.toml`, their scripts and the audit log all disagreed.
+///
+/// # Validation is the existing validation
+///
+/// `tags` goes through [`crate::http::valid_tags`] and `adopt` through
+/// [`crate::http::parse_adopt`] — the same functions the enrollment paths use,
+/// not a copy. `docs/web-ui.md` §5's claim that every piece of
+/// attacker-controlled text this UI renders is server-side charset-validated is
+/// only true while there is one implementation of the charset.
+async fn update_node(
+    State(coord): State<Arc<Coordinator>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Ok(patch) = serde_json::from_slice::<NodePatch>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    if patch.name.is_some() {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    if patch.tags.as_deref().is_some_and(|t| !valid_tags(t)) {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    // `parse_adopt`'s default is never reached: `None` is already "leave it
+    // alone" and is mapped to `None` below, so the sentinel only has to be a
+    // value, not a meaningful one.
+    let adopt = match patch.adopt.as_deref() {
+        None => None,
+        Some(label) => match parse_adopt(Some(label), AdoptPolicy::Declared) {
+            Ok(adopt) => Some(adopt),
+            Err(response) => return response,
+        },
+    };
+    match coord
+        .update_node_core(&subject, &name, patch.tags.as_deref(), adopt)
+        .await
+    {
+        Ok(node) => Json(NodeView::from(node)).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/nodes/{name}` — de-enroll a machine.
+///
+/// A **revocation**, not a tidy-up: deleting the `node` row invalidates the
+/// node's token (architecture §4.2), and the cascade that makes that real —
+/// live leases through the whole release path, boards out of the scheduler and
+/// the `board` table, the connection dropped — lives in
+/// [`Coordinator::delete_node_core`], which is where a reader looking for "what
+/// else does this touch?" should go.
+///
+/// `204` with no body on success. There is nothing useful to return, and a body
+/// describing the deleted node would be a small existence oracle for the next
+/// caller who retries.
+async fn delete_node(
+    State(coord): State<Arc<Coordinator>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    match coord.delete_node_core(&subject, &name).await {
+        Ok(_id) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// The body of `POST /api/v1/nodes/pending/{code}`.
+///
+/// The code travels in the path, so this carries only the decision. `replace`
+/// defaults to `false` and the refusal it guards is enforced by
+/// [`crate::http::decide_pending_node`], not here: the requesting machine chose
+/// its `node_name` before any org existed, so without the guard an approver
+/// could be talked into silently re-credentialing a production node.
+#[derive(Debug, Deserialize)]
+struct PendingDecision {
+    decision: NodeApprovalDecision,
+    #[serde(default)]
+    replace: bool,
+}
+
+/// `POST /api/v1/nodes/pending/{code}` — inspect, approve or deny a pending
+/// node registration.
+///
+/// This is `docs/architecture.md` §4.2's commitment being cashed in: approval is
+/// a pure function of `(code, decision, authenticated user)`, and
+/// [`crate::http::decide_pending_node`] takes an already-resolved subject
+/// *precisely* so a cookie-authenticated handler could exist without a second
+/// binding site. It is called here **unchanged**. Membership suffices, exactly
+/// as on `POST /node/register/approve`, and the `node.approve.denied` audit row
+/// for a non-member is the same one — this handler reuses that route's check
+/// rather than writing a second opinion about who may approve.
+///
+/// # The phishing warning the frontend must show
+///
+/// The `inspect` response describes a machine the approver **cannot see**. RFC
+/// 8628 §5.4's mitigation is that they are told so before they decide, and the
+/// CLI prints it verbatim (`fleet-bin`'s `node approve`). The JSON API carries
+/// it in the `inspect` response body as a `warning` field, whose value is the
+/// constant [`APPROVAL_WARNING`]:
+///
+/// > Approving grants this machine access to hardware in your org, and you
+/// > cannot see it from here. Approve ONLY if you started this enrollment.
+///
+/// **The frontend (#3540) must render that string verbatim in the approval
+/// form, next to the confirm button.** It is not decoration and it is not the
+/// frontend's to reword: it is the only control standing between a phoned-in
+/// code and hardware access in the approver's org. It ships as a server-sent
+/// field rather than as prose in this doc comment so that a frontend which
+/// forgets to show it is showing a visibly empty box rather than silently
+/// dropping the mitigation.
+///
+/// # There is no listing endpoint to pair with this
+///
+/// `GET /api/v1/nodes/pending` is deliberately absent; see the module
+/// documentation and `docs/web-ui.md` §4.
+async fn decide_pending(
+    State(coord): State<Arc<Coordinator>>,
+    Path(code): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let (auth, subject) = match mutating_auth(&coord, &headers).await {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let Ok(request) = serde_json::from_slice::<PendingDecision>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+
+    let org = subject.org.clone();
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    // Membership, checked exactly as `node_register_approve` checks it, down to
+    // the audit action: two surfaces onto one ceremony must not disagree about
+    // who may perform it, nor leave two differently-named rows in the log.
+    if let Err(response) =
+        crate::http::require_membership_to_approve(&coord, &org, &auth.id, now).await
+    {
+        return response;
+    }
+
+    let response = crate::http::decide_pending_node(
+        &coord,
+        &org,
+        &auth.id,
+        &code,
+        request.decision,
+        request.replace,
+        now,
+    )
+    .await;
+    decorate_pending(response, request.decision).await
+}
+
+/// The verbatim warning an approval form must show; see [`decide_pending`].
+///
+/// Byte-identical to the sentence `probe-rs-fleet node approve` prints, so the
+/// two surfaces of one ceremony say the same thing. Both halves are
+/// load-bearing: the first says what is being granted, the second says the only
+/// safe reason to grant it.
+pub(crate) const APPROVAL_WARNING: &str =
+    "Approving grants this machine access to hardware in your org, and you \
+     cannot see it from here. Approve ONLY if you started this enrollment.";
+
+/// Attach [`APPROVAL_WARNING`] to a successful `inspect` response.
+///
+/// Done by re-shaping the JSON rather than by widening
+/// `fleet_auth::api::NodeApprovalResponse`: that type is the **wire** contract
+/// the CLI parses, and growing it for the browser's benefit would put a
+/// browser-shaped field in the shared crate — the drift `docs/web-ui.md` D2
+/// exists to prevent. A non-200, or a body that is not the object we expect, is
+/// passed through untouched.
+async fn decorate_pending(response: Response, decision: NodeApprovalDecision) -> Response {
+    use axum::body::to_bytes;
+
+    if decision != NodeApprovalDecision::Inspect || response.status() != StatusCode::OK {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    // The body is one small JSON object this process just produced; the cap is
+    // a bound, not a policy.
+    let Ok(bytes) = to_bytes(body, 64 * 1024).await else {
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    };
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_slice(&bytes) else {
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    };
+    object.insert(
+        "warning".to_owned(),
+        serde_json::Value::String(APPROVAL_WARNING.to_owned()),
+    );
+    Json(serde_json::Value::Object(object)).into_response()
 }
 
 /// `GET /api/v1/boards` — the same inventory `ctl list` renders.
