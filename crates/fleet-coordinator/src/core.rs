@@ -3120,7 +3120,9 @@ mod tests {
                 SidecarToCoord::Extend {
                     lease: grant.lease,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3135,7 +3137,9 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         let CoordToSidecar::ChannelOpened { token: to_sidecar, .. } = rx.recv().await.unwrap()
@@ -3200,7 +3204,9 @@ mod tests {
             .handle_sidecar_message(
                 &alice,
                 SidecarToCoord::Extend { lease: grant.lease },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3218,7 +3224,9 @@ mod tests {
             .handle_sidecar_message(
                 &alice,
                 SidecarToCoord::Release { lease: grant.lease },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3242,7 +3250,9 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "alice"),
                 SidecarToCoord::Lease(lease_req("b1")),
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
@@ -3252,7 +3262,9 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "bob"),
                 SidecarToCoord::Lease(lease_req("b1")),
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3687,7 +3699,9 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "alice"),
                 SidecarToCoord::Extend { lease: LeaseId(99) },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3725,7 +3739,9 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3747,7 +3763,9 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3783,7 +3801,9 @@ mod tests {
                     lease: grant.lease,
                     kind: fleet_proto::ChannelKind::Data,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3863,7 +3883,9 @@ mod tests {
                     duration_secs: 600,
                     priority: Priority::Interactive,
                 }),
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3993,7 +4015,9 @@ mod tests {
                     board: None,
                     follow: false,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -4016,7 +4040,9 @@ mod tests {
                     board: None,
                     follow: false,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -4031,7 +4057,9 @@ mod tests {
                     board: None,
                     follow: false,
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -4134,7 +4162,9 @@ mod tests {
                 SidecarToCoord::PowerCycle {
                     board: BoardName("dk".to_owned()),
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -4175,7 +4205,9 @@ mod tests {
                 SidecarToCoord::PowerCycle {
                     board: BoardName("b1".to_owned()),
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -4194,7 +4226,9 @@ mod tests {
                 SidecarToCoord::PowerCycle {
                     board: BoardName("b1".to_owned()),
                 },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -4273,7 +4307,9 @@ mod tests {
             .handle_sidecar_message(
                 &user(DEFAULT_ORG_ID, "op"),
                 SidecarToCoord::ListBoards,
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -5156,7 +5192,9 @@ mod tests {
                     duration_secs: 600,
                     priority: Priority::Interactive,
                 }),
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -5169,7 +5207,9 @@ mod tests {
             .handle_sidecar_message(
                 &alice,
                 SidecarToCoord::GrantRevoke { id: id[..8].to_owned() },
-                &tx, RequesterId::DETACHED,)
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(
