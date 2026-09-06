@@ -264,11 +264,17 @@ async fn run_fleet(
         // the id), so drop it and lease cold. `acquire_lease` cannot hit
         // again — the entry is gone — so this cannot loop.
         tracing::debug!("the cached lease named a different board; leasing afresh");
-        drop(acquired);
-        if let Some(store) = store.as_mut() {
-            store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
-            store.save(now);
+        // Forget *before* dropping `acquired`, i.e. while we still hold the
+        // record's use-lock. Releasing it first would let a concurrent
+        // invocation claim the slot and record its own entry in the window, and
+        // this `forget` would then delete that live entry instead of ours.
+        if acquired.owns_slot {
+            if let Some(store) = store.as_mut() {
+                store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
+                store.save(now);
+            }
         }
+        drop(acquired);
         let fresh = acquire_lease(&session, &cfg, store.as_mut(), now).await?;
         let (channel, token) = open_channel_verified(&session, fresh.grant.lease, kind, None)
             .await?
@@ -299,23 +305,50 @@ async fn run_fleet(
     )
     .await;
 
-    if let Some(store) = store.as_mut() {
-        if acquired.disposition == Disposition::Keep {
-            store.touch_expiry(
-                &cfg.coordinator,
-                &cfg.token,
-                &cfg.select,
-                latest_expires.load(Ordering::Relaxed),
-            );
-        } else {
-            store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
-        }
-        store.save(now_secs());
-    }
+    release_slot(
+        store.as_mut(),
+        &cfg,
+        &acquired,
+        latest_expires.load(Ordering::Relaxed),
+        now_secs(),
+    );
     // Only now is the record's use-lock dropped: it covers the whole
     // invocation, including the final save.
     drop(acquired);
     code
+}
+
+/// Write this invocation's verdict on its cached lease back to the store: keep
+/// the entry with its latest expiry, or forget it.
+///
+/// Split out of [`run_fleet`] purely so a test can drive it — it is where a
+/// wrong ownership judgement does its damage, and the damage is invisible from
+/// inside one invocation.
+///
+/// **A slot may only be written by the invocation that holds its use-lock.**
+/// [`Disposition::Release`] does not imply ownership: [`acquire_lease`] also
+/// returns it when another live invocation held the lock and we leased cold. In
+/// that case the record on disk is *theirs*, and one they mean to keep —
+/// forgetting it would leave their board held with nothing naming it, so
+/// nothing could reuse it and nothing would release it before the policy TTL.
+/// Hence the [`Acquired::owns_slot`] gate rather than a disposition check.
+pub fn release_slot(
+    store: Option<&mut LeaseStore>,
+    cfg: &selector::FleetConfig,
+    acquired: &Acquired,
+    latest_expires: u64,
+    now_secs: u64,
+) {
+    if !acquired.owns_slot {
+        return;
+    }
+    let Some(store) = store else { return };
+    if acquired.disposition == Disposition::Keep {
+        store.touch_expiry(&cfg.coordinator, &cfg.token, &cfg.select, latest_expires);
+    } else {
+        store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
+    }
+    store.save(now_secs);
 }
 
 /// A lease this invocation may use, plus what to do with it on the way out.
@@ -329,6 +362,18 @@ pub struct Acquired {
     pub reused: bool,
     /// Release at exit, or keep the lease for the next invocation.
     pub disposition: Disposition,
+    /// Whether this invocation holds the record's use-lock, i.e. whether the
+    /// store slot for `(coordinator, token, selector)` is **ours**.
+    ///
+    /// Not the same question as `disposition`, and conflating the two strands
+    /// boards. A concurrent invocation that found the slot taken leases cold and
+    /// gets [`Disposition::Release`] — but the record on disk belongs to the
+    /// *other* invocation, which is still running and deliberately keeping it.
+    /// Writing to that slot on the way out would delete a live entry, leaving
+    /// its board held with nothing naming it: held until the policy TTL, and
+    /// unreusable in the meantime. So every store mutation outside
+    /// [`acquire_lease`] is gated on this flag.
+    pub owns_slot: bool,
     /// The record's use-lock, held for the whole invocation so a *concurrent*
     /// invocation cannot take the same cached lease (`lease_store` Decision 5).
     _guard: Option<UseGuard>,
@@ -394,6 +439,7 @@ pub async fn acquire_lease(
                         grant,
                         reused: true,
                         disposition: Disposition::Keep,
+                        owns_slot: true,
                         _guard: guard,
                     });
                 }
@@ -456,6 +502,7 @@ pub async fn acquire_lease(
         grant,
         reused: false,
         disposition,
+        owns_slot: guard.is_some(),
         _guard: guard,
     })
 }

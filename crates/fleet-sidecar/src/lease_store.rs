@@ -89,6 +89,15 @@
 //! `Queued` → `board contended` behaviour exactly, rather than inventing a new
 //! error.
 //!
+//! **Holding the lock is what makes a slot ours to write.** An invocation that
+//! failed to take it leases cold and must then leave the store completely
+//! alone: the record on disk belongs to the invocation that *is* holding the
+//! lock, and is one it deliberately intends to keep. Deleting it would leave a
+//! board held with nothing naming it — unreusable, and unreleased until the
+//! policy TTL. So `forget` / `touch_expiry` outside `acquire_lease` are gated
+//! on `Acquired::owns_slot`, and a `forget` always happens *before* the guard
+//! is dropped, never after.
+//!
 //! `flock` is used instead of a pid + timestamp marker because the kernel gives
 //! us liveness for free, with no staleness window to tune:
 //!
@@ -98,6 +107,14 @@
 //!    killed sidecar cannot wedge the cache.
 //! 3. Two separate `open()`s conflict within one process, so contention is
 //!    testable without spawning helper binaries.
+//!
+//! One caveat follows from (1): a lock lives on the *open file description*,
+//! and `O_CLOEXEC` is cleared at `exec`, not at `fork`. So between a `fork()`
+//! and the matching `exec()` a child transiently pins whatever locks the parent
+//! held, and a re-acquire in that window gets `EWOULDBLOCK`. It costs nothing
+//! here — the sidecar forks exactly once, for the probe-rs child, and the next
+//! invocation is a different process arriving later — but it is why the
+//! use-lock unit test retries instead of asserting on the first attempt.
 //!
 //! **Lock ordering.** A use-lock is only ever acquired *outside* a `save`, and
 //! `save` never touches a use-lock. Keep it that way: taking them in both orders
@@ -308,6 +325,18 @@ mod imp {
         }
 
         /// Replace the loaded record set (and the cache built from it).
+        ///
+        /// The cache is keyed on `(selector fingerprint, SubjectKey)`, which is
+        /// *coarser* than the file key: two records under one selector for one
+        /// subject — two coordinators, or a stale entry from a previous login —
+        /// would otherwise collide, and a lookup that found the right `Record`
+        /// by digest would judge it against another record's expiry. So each
+        /// entry is inserted under a **synthetic** `SubjectKey` whose id folds
+        /// in the record's digest: distinct records stay distinct, and the org /
+        /// kind that matter for the org-collision rules ride along unchanged.
+        /// Nothing reads this key back out — the real holder lives in
+        /// `Record::holder` — so the synthesis is invisible outside `adopt` and
+        /// [`LeaseStore::get`].
         fn adopt(&mut self, records: Vec<Record>) {
             self.cache = LeaseCache::new();
             self.records = BTreeMap::new();
@@ -315,10 +344,12 @@ mod imp {
                 let Ok(select) = parse_selector_key(&record.selector) else {
                     continue;
                 };
+                let digest = record.key().digest();
                 let mut cached = CachedLease::new(record.grant());
                 cached.refresh_margin_secs = record.refresh_margin_secs;
-                self.cache.insert(&select, &record.holder, cached);
-                self.records.insert(record.key().digest(), record);
+                self.cache
+                    .insert(&select, &cache_key_for(&record.holder, &digest), cached);
+                self.records.insert(digest, record);
             }
         }
 
@@ -348,8 +379,11 @@ mod imp {
             let key = Self::key_for(coordinator, token, select);
             let digest = key.digest();
             let record = self.records.get(&digest)?.clone();
-            // The validity judgement lives in `lease_cache`, not here.
-            self.cache.get(select, &record.holder, now_secs)?;
+            // The validity judgement lives in `lease_cache`, not here — under
+            // the same synthetic subject `adopt` inserted it with, so one
+            // record's expiry can never be read for another's.
+            self.cache
+                .get(select, &cache_key_for(&record.holder, &digest), now_secs)?;
             let guard = self.lock_use(&digest)?;
             Some((record, guard))
         }
@@ -433,6 +467,20 @@ mod imp {
         /// each other's *different* entries. Expired records are dropped on the
         /// way through. Best-effort: a failure means the next invocation misses,
         /// which is not worth an error.
+        ///
+        /// # Blocking I/O on the runtime
+        ///
+        /// This takes a *blocking* `LOCK_EX` and does the read/write/`fsync`
+        /// inline, on whatever thread calls it — in practice a tokio worker.
+        /// Deliberate, and safe in proportion: the critical section is a few
+        /// hundred bytes of JSON between two invocations of the same user, so it
+        /// runs in well under a millisecond, and it happens a handful of times
+        /// per process (never inside the splice loop). The one way it could
+        /// stall is a foreign holder stopped mid-`save` (`SIGSTOP`, a debugger),
+        /// which would block this thread for as long as that lasts. Moving it to
+        /// `spawn_blocking` would buy nothing against that — the invocation
+        /// cannot proceed without the store either way — and would cost the
+        /// `&mut self` borrow that keeps the merge honest.
         pub fn save(&mut self, now_secs: u64) {
             if self.pending.is_empty() {
                 return;
@@ -487,6 +535,18 @@ mod imp {
         fn lock_use(&self, digest: &str) -> Option<UseGuard> {
             let path = self.dir.join(format!("use-{digest}.lock"));
             lock_file(&path, false).map(|file| UseGuard { _file: file })
+        }
+    }
+
+    /// The [`SubjectKey`] a record is cached under: the real holder with the
+    /// record's digest folded into the id, so records that share a selector and
+    /// a subject but differ in coordinator or token never alias. See
+    /// [`LeaseStore::adopt`].
+    fn cache_key_for(holder: &SubjectKey, digest: &str) -> SubjectKey {
+        SubjectKey {
+            org: holder.org.clone(),
+            kind: holder.kind,
+            id: format!("{}#{digest}", holder.id),
         }
     }
 
@@ -686,6 +746,43 @@ mod imp {
         }
 
         #[test]
+        fn two_records_sharing_a_selector_and_subject_never_alias() {
+            // The in-memory cache is keyed on (selector, SubjectKey), which is
+            // coarser than the file key. Two coordinators (or a stale entry
+            // from a previous login) with the same selector and the same user
+            // would collide, and a lookup that found the right `Record` by
+            // digest would judge it against the *other* record's expiry. The
+            // digest folded into the cached subject is what keeps them apart.
+            let dir = tempfile::tempdir().unwrap();
+            let mut store = LeaseStore::open_at(dir.path()).unwrap();
+            // Same selector, same holder, different coordinator; the second one
+            // is long-lived, the first expires soon.
+            store.record("c:1", "tok", &select(), &grant(2_000, SubjectKind::User));
+            store.record("c:2", "tok", &select(), &grant(500_000, SubjectKind::User));
+            store.save(1_000);
+
+            let mut store = LeaseStore::open_at(dir.path()).unwrap();
+            // Each is judged against its own expiry: at t=100_000 the first is
+            // long gone and the second is still fine.
+            assert!(
+                store.get("c:1", "tok", &select(), 100_000).is_none(),
+                "the short-lived entry must not inherit the other's expiry"
+            );
+            assert!(
+                store.get("c:2", "tok", &select(), 100_000).is_some(),
+                "the long-lived entry must not inherit the other's expiry"
+            );
+            // And at t=1_000 both are valid and distinct.
+            let mut store = LeaseStore::open_at(dir.path()).unwrap();
+            let (first, _g1) = store.get("c:1", "tok", &select(), 1_000).unwrap();
+            assert_eq!(first.coordinator, "c:1");
+            assert_eq!(first.expires, 2_000);
+            let (second, _g2) = store.get("c:2", "tok", &select(), 1_000).unwrap();
+            assert_eq!(second.coordinator, "c:2");
+            assert_eq!(second.expires, 500_000);
+        }
+
+        #[test]
         fn an_expired_entry_is_never_handed_out_and_is_swept_on_save() {
             let dir = tempfile::tempdir().unwrap();
             let mut store = LeaseStore::open_at(dir.path()).unwrap();
@@ -834,8 +931,29 @@ mod imp {
 
             // Releasing the slot lets the next invocation hit again — this is
             // also what the kernel does for us when a holder is SIGKILLed.
+            //
+            // Retried rather than asserted once: an `flock` lives on the *open
+            // file description*, so any `fork()` elsewhere in this process
+            // duplicates the fd and keeps the lock pinned until that child
+            // `exec`s (`O_CLOEXEC` only fires at exec, not at fork). With the
+            // rest of the suite spawning processes in parallel, a re-acquire
+            // immediately after a drop can transiently lose that race — which
+            // is a property of the test harness, not of the store: in the real
+            // sidecar the next invocation is a whole new process, arriving
+            // milliseconds later. See the `fork()` caveat in the module doc.
             drop(guard);
-            assert!(second.get("c:1", "tok", &select(), 1_000).is_some());
+            let mut hit = None;
+            for _ in 0..200 {
+                hit = second.get("c:1", "tok", &select(), 1_000);
+                if hit.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                hit.is_some(),
+                "the slot must become reusable once the holder lets go"
+            );
         }
 
         #[test]
@@ -961,7 +1079,7 @@ mod imp {
 /// existed (lease and release per invocation).
 #[cfg(not(unix))]
 mod imp {
-    use fleet_proto::ids::{AgentId, BoardRef, SubjectKey};
+    use fleet_proto::ids::{AgentId, BoardRef, Subject, SubjectKey};
     use fleet_proto::lease::{Constraint, LeaseGrant};
     use fleet_proto::LeaseId;
 
@@ -992,10 +1110,27 @@ mod imp {
 
     impl Record {
         /// Rebuild a [`LeaseGrant`] from this record, with an empty token.
-        /// Unreachable off unix — the store never yields a record.
+        ///
+        /// Off unix the store never yields a `Record`, so nothing in the crate
+        /// calls this — but `Record`'s fields are public, so a caller could
+        /// build one anyway. It returns the same empty-token grant the unix
+        /// implementation does rather than panicking: an unreachable branch is
+        /// not worth a crash in somebody else's code.
         #[must_use]
         pub fn grant(&self) -> LeaseGrant {
-            unreachable!("the non-unix lease store never yields a record")
+            LeaseGrant {
+                lease: self.lease,
+                board: self.board.clone(),
+                agent: self.agent.clone(),
+                holder: Subject {
+                    org: self.holder.org.clone(),
+                    kind: self.holder.kind,
+                    id: self.holder.id.clone(),
+                    groups: Vec::new(),
+                },
+                expires: self.expires,
+                token: Vec::new(),
+            }
         }
     }
 

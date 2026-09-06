@@ -529,6 +529,115 @@ async fn a_concurrent_invocation_does_not_take_the_cached_lease() {
     peer.await.unwrap();
 }
 
+/// A concurrent invocation that lost the cache slot must not touch the store on
+/// the way out — in *either* finishing order.
+///
+/// Regression test. `acquire_lease` returns `Disposition::Release` both when the
+/// lease is unshareable *and* when another live invocation holds the slot, so
+/// `run_fleet`'s epilogue used to key its `forget` on the disposition alone. If
+/// B (the loser) finished after A, B deleted A's record: A's board stayed held
+/// — `Keep` is deliberate — with nothing in the store naming it, so nothing
+/// could reuse it and nothing released it until the policy TTL. Exactly the
+/// stranding Guard A exists to prevent, via the concurrent path.
+///
+/// The A-then-B order is the one that breaks; B-then-A self-heals, because A's
+/// `touch_expiry` still finds the entry in its in-memory records and `save`
+/// merges it back. So this test finishes them A first, B second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_losing_concurrent_invocation_never_deletes_the_winners_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        let mut leases = 0u64;
+        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+            match msg {
+                // A selector matching several boards: B gets a *different*
+                // board rather than being queued, which is what makes both
+                // invocations run concurrently and the bug reachable.
+                SidecarToCoord::Lease(_) => {
+                    leases += 1;
+                    let name = if leases == 1 { "b1" } else { "b2" };
+                    fleet_wire::send(
+                        &mut coord_tx,
+                        &CoordToSidecar::Lease(grant_for(leases, name, 9_999, SubjectKind::User)),
+                    )
+                    .await
+                    .unwrap();
+                }
+                SidecarToCoord::Extend { lease } => {
+                    fleet_wire::send(
+                        &mut coord_tx,
+                        &CoordToSidecar::Extended {
+                            lease,
+                            expires: 19_999,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+
+    // A leases b1 cold and records it; it owns the slot and keeps the lease.
+    let mut store_a = LeaseStore::open_at(dir.path()).unwrap();
+    let a = fleet_sidecar::acquire_lease(&session, &cfg(), Some(&mut store_a), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(a.disposition, Disposition::Keep);
+    assert!(a.owns_slot, "A took the slot");
+    assert_eq!(a.grant.board.name, "b1");
+
+    // B starts while A is live: the slot is taken, so B leases b2 cold and must
+    // release at exit. Crucially it does **not** own the slot.
+    let mut store_b = LeaseStore::open_at(dir.path()).unwrap();
+    let b = fleet_sidecar::acquire_lease(&session, &cfg(), Some(&mut store_b), 1_000)
+        .await
+        .unwrap();
+    assert_eq!(b.disposition, Disposition::Release);
+    assert!(
+        !b.owns_slot,
+        "B lost the slot, so the record on disk is not B's to write"
+    );
+    assert_eq!(b.grant.board.name, "b2");
+
+    // A finishes first: it owns the slot, so its epilogue persists the latest
+    // expiry and keeps b1 for the next invocation.
+    fleet_sidecar::release_slot(Some(&mut store_a), &cfg(), &a, 19_999, 1_000);
+    drop(a);
+
+    // B finishes second, through the *same* epilogue. This is the ordering that
+    // used to delete A's record: B's disposition is `Release`, so an epilogue
+    // keyed on the disposition alone would `forget` a slot B never owned.
+    fleet_sidecar::release_slot(Some(&mut store_b), &cfg(), &b, 9_999, 1_000);
+    drop(b);
+
+    // A's record must still be there, and still reusable.
+    let mut next = LeaseStore::open_at(dir.path()).unwrap();
+    let (record, _guard) = next
+        .get(COORDINATOR, TOKEN, &cfg().select, 1_000)
+        .expect("A's kept lease must survive B's exit");
+    assert_eq!(record.lease, LeaseId(1));
+    assert_eq!(
+        record.board.name, "b1",
+        "the board A is still holding is the one the store names"
+    );
+    assert_eq!(
+        record.expires, 19_999,
+        "and it carries A's heartbeat expiry, not B's"
+    );
+
+    drop(session);
+    peer.await.unwrap();
+}
+
 /// A channel token naming a **different** board forces a cold re-lease.
 ///
 /// Lease ids restart at 1 on every coordinator boot and nothing on the wire
