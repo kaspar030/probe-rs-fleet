@@ -22,7 +22,7 @@ export function render(state) {
   children.push(
     h(
       'form',
-      { class: 'panel', on: { submit: (e) => { e.preventDefault(); state.onFilter(e.target.elements.board.value); } } },
+      { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onFilter(e.target.elements.board.value); } } },
       h('label', {}, h('span', { class: 'label' }, 'Filter by board (node-local name)'),
         h('input', { name: 'board', value: board || '', autocomplete: 'off' })),
       h('div', { class: 'row' },
@@ -67,7 +67,7 @@ export async function load(ctx) {
 
   state.onFilter = (board) => {
     ctx.auditBoard = String(board || '').trim();
-    void ctx.reload();
+    return ctx.reload();
   };
 
   const query = state.board ? `?board=${encodeURIComponent(state.board)}` : '';

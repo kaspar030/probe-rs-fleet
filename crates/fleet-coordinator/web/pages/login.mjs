@@ -64,9 +64,20 @@ export function render(state) {
 // rather than as a link — which is correct: the value comes from GitHub via the
 // coordinator, and a UI that turned an upstream string into a live link would
 // be one upstream change away from an open redirect.
+//
+// The in-flight device flow lives on `ctx`, not in a local: `load()` runs again
+// on every `reload()`, so a local would be rebuilt empty and the code the user
+// is meant to type would vanish the instant it was fetched.
 export async function load(ctx) {
   const { api } = ctx;
-  const state = { method: null, device: null, error: null, polling: false, onStart: null };
+  const state = {
+    method: null,
+    device: ctx.device || null,
+    error: ctx.loginError || null,
+    polling: Boolean(ctx.polling),
+    onStart: null,
+  };
+  ctx.loginError = null;
   try {
     const methods = await api.get('/api/v1/auth/methods', { quiet: true });
     state.method = methods && methods.login;
@@ -76,15 +87,19 @@ export async function load(ctx) {
   }
 
   state.onStart = async () => {
+    // One flow at a time: a second `start` overwrites the `HttpOnly` cookie
+    // holding the first device code, stranding a login the user may already
+    // have half-completed on github.com.
+    if (ctx.device) return;
     try {
       const started = await api.post('/api/v1/session/device/start', {}, { quiet: true });
-      state.device = started;
-      state.polling = true;
-      ctx.reload();
+      ctx.device = started;
+      ctx.polling = true;
+      await ctx.reload();
       pollUntilSignedIn(ctx, started.interval);
     } catch (err) {
-      state.error = api.describe(err);
-      ctx.reload();
+      ctx.loginError = api.describe(err);
+      await ctx.reload();
     }
   };
   return render(state);
@@ -103,7 +118,13 @@ function pollUntilSignedIn(ctx, intervalSecs) {
         return;
       }
     } catch {
-      return; // expired or denied: the page shows the code until reloaded.
+      // Expired or denied. Say so and offer a fresh start, rather than looping
+      // forever on a flow the coordinator has already forgotten.
+      ctx.device = null;
+      ctx.polling = false;
+      ctx.loginError = 'That sign-in expired or was refused. Start a new one.';
+      await ctx.reload();
+      return;
     }
     window.setTimeout(() => { void tick(); }, wait);
   };

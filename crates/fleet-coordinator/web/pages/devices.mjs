@@ -11,7 +11,7 @@
 // every action is checked server-side, and a hidden button changes nothing
 // about what the server will do (tests/ui_authz.rs).
 
-import { h, tags, when, errorBox, findAll } from '../dom.mjs';
+import { h, tags, when, errorBox } from '../dom.mjs';
 
 /** Whether `holder` is the signed-in caller. */
 function isSelf(holder, session) {
@@ -125,9 +125,4 @@ export async function load(ctx) {
   };
 
   return render(state);
-}
-
-/** Test helper: every button label in a rendered tree. */
-export function buttonLabels(vnode) {
-  return findAll(vnode, (n) => n.tag === 'button').map((n) => n.children.join(''));
 }

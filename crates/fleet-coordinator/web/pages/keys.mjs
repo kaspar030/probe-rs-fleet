@@ -53,7 +53,7 @@ export function render(state) {
     h('h2', {}, 'Mint a key'),
     h(
       'form',
-      { class: 'panel', on: { submit: (e) => { e.preventDefault(); state.onCreate(); } } },
+      { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onCreate(); } } },
       h(
         'label',
         {},
@@ -166,12 +166,12 @@ export async function load(ctx) {
 
   state.onField = (field, value) => {
     ctx.keyForm[field] = value;
-    if (field === 'purpose' || field === 'multi_use') void ctx.reload();
+    if (field === 'purpose' || field === 'multi_use') return ctx.reload();
   };
 
   state.onDismiss = () => {
     ctx.mintedKey = null;
-    void ctx.reload();
+    return ctx.reload();
   };
 
   state.onCreate = async () => {

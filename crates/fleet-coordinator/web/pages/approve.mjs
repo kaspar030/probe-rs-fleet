@@ -28,7 +28,7 @@ export function render(state) {
     ),
     h(
       'form',
-      { class: 'panel', on: { submit: (e) => { e.preventDefault(); state.onInspect(e.target.elements.code.value); } } },
+      { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onInspect(e.target.elements.code.value); } } },
       h('label', {}, h('span', { class: 'label' }, 'Code'),
         h('input', { name: 'code', value: code || '', placeholder: 'ABCD-1234', autocomplete: 'off' })),
       h('button', { class: 'primary', type: 'submit' }, 'Look up'),
@@ -102,7 +102,7 @@ export async function load(ctx) {
 
   state.onReplace = (on) => {
     ctx.replace = on;
-    void ctx.reload();
+    return ctx.reload();
   };
 
   state.onInspect = async (raw) => {

@@ -81,7 +81,7 @@ export function render(state) {
             { colspan: 8 },
             h(
               'form',
-              { class: 'panel', on: { submit: (e) => { e.preventDefault(); state.onSave(node.name, e.target); } } },
+              { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onSave(node.name, e.target); } } },
               h('label', {}, h('span', { class: 'label' }, 'Tags (comma-separated)'),
                 h('input', { name: 'tags', value: (node.tags || []).join(', '), autocomplete: 'off' })),
               h(
@@ -141,7 +141,7 @@ export async function load(ctx) {
 
   state.onEdit = (name) => {
     ctx.editing = name;
-    void ctx.reload();
+    return ctx.reload();
   };
 
   state.onSave = async (name, form) => {

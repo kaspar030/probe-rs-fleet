@@ -113,7 +113,7 @@ export function render(state) {
     h('h2', {}, 'Create a grant'),
     h(
       'form',
-      { class: 'panel', on: { submit: (e) => { e.preventDefault(); state.onCreate(); } } },
+      { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onCreate(); } } },
       h(
         'label',
         {},
@@ -164,7 +164,13 @@ export function render(state) {
             h('input', {
               value: row.value,
               autocomplete: 'off',
-              on: { input: (e) => state.onSelectorValue(index, e.target.value) },
+              on: {
+                input: (e) => state.onSelectorValue(index, e.target.value),
+                // `change` fires on blur/enter, not per keystroke: refreshing
+                // the preview on `input` would take focus out of the field the
+                // user is still typing in.
+                change: () => state.onSelectorCommit(),
+              },
             }),
             h('button', { type: 'button', on: { click: () => state.onRemoveTerm(index) } }, 'Remove'),
           ),
@@ -269,18 +275,23 @@ export async function load(ctx) {
 
   state.onField = (field, value) => {
     ctx.grantForm[field] = value;
-    if (field === 'granteeKind') void ctx.reload();
+    if (field === 'granteeKind') return ctx.reload();
   };
-  state.onSelectorKind = (index, kind) => { ctx.grantForm.selector[index].kind = kind; };
+  state.onSelectorKind = (index, kind) => {
+    ctx.grantForm.selector[index].kind = kind;
+    return ctx.reload();
+  };
   state.onSelectorValue = (index, value) => { ctx.grantForm.selector[index].value = value; };
+  /** Refresh the "exactly what will be sent" preview once a term is finished. */
+  state.onSelectorCommit = () => ctx.reload();
   state.onAddTerm = () => {
     ctx.grantForm.selector.push({ kind: 'tag', value: '' });
-    void ctx.reload();
+    return ctx.reload();
   };
   state.onRemoveTerm = (index) => {
     ctx.grantForm.selector.splice(index, 1);
     if (ctx.grantForm.selector.length === 0) ctx.grantForm.selector.push({ kind: 'tag', value: '' });
-    void ctx.reload();
+    return ctx.reload();
   };
   state.onOp = (op, on) => {
     const set = new Set(ctx.grantForm.ops);
@@ -293,7 +304,7 @@ export async function load(ctx) {
       set.delete(op.op);
     }
     ctx.grantForm.ops = [...set];
-    void ctx.reload();
+    return ctx.reload();
   };
 
   state.onCreate = async () => {
@@ -328,6 +339,7 @@ export async function load(ctx) {
         expires,
       });
       ctx.grantForm = null;
+      ctx.grantNotice = `Granted ${selector} to ${granteeString(form.granteeKind, form.grantee)}.`;
     } catch (err) {
       ctx.grantNotice = api.describe(err);
     }

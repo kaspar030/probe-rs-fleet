@@ -23,24 +23,53 @@ const PAGE_MODULES = { devices, agents, approve, access, keys, audit };
 // touched anywhere in this tree (see api.mjs).
 let session = null;
 
+// The live page's own scratch object: which node is being edited, the pending
+// registration just inspected, the half-filled grant form, the auth key shown
+// once. It survives a `reload()` of the *same* page and is **dropped whole the
+// moment the user navigates away**, which is what makes the keys page's
+// shown-once panel honest rather than merely worded strongly: there is no
+// second reference to the key anywhere, so leaving the page is what deletes it.
+//
+// One object per mounted page rather than one per `draw()`: a fresh context on
+// every render would silently discard everything a page put on it, so an Edit
+// button would set a field and then re-render without it.
+let mounted = null;
+let pageState = {};
+
+/** The context a page's `load()` receives: its own state plus the plumbing. */
+function contextFor(page) {
+  if (page !== mounted) {
+    mounted = page;
+    pageState = {};
+  }
+  pageState.api = api;
+  pageState.session = session;
+  pageState.navigate = navigate;
+  pageState.reload = draw;
+  return pageState;
+}
+
 /** Re-render the current page. Passed to pages so an action can refresh. */
 async function draw() {
   const app = document.getElementById('app');
   if (!session) {
     renderChrome();
-    mount(app, await login.load({ api, navigate, reload: draw }));
+    mount(app, await login.load(contextFor('login')));
     return;
   }
   const { page } = route(window.location.pathname);
   renderChrome(page);
   const mod = PAGE_MODULES[page];
   if (!mod) {
+    mounted = null;
+    pageState = {};
     mount(app, h('section', {}, h('h1', {}, 'Not found'), h('p', { class: 'hint' }, 'No such page.')));
     return;
   }
+  const ctx = contextFor(page);
   mount(app, h('p', { class: 'loading' }, 'Loading…'));
   try {
-    mount(app, await mod.load({ api, session, navigate, reload: draw }));
+    mount(app, await mod.load(ctx));
   } catch (err) {
     mount(app, errorBox(api.describe(err)));
   }
@@ -104,6 +133,9 @@ async function signOut() {
     // and there is nothing useful to retry from here.
   }
   session = null;
+  // Everything the last page held, including a minted auth key, goes with it.
+  mounted = null;
+  pageState = {};
   window.history.pushState({}, '', '/ui/');
   void draw();
 }
@@ -119,6 +151,8 @@ async function loadSession() {
 
 api.setUnauthorizedHandler(() => {
   session = null;
+  mounted = null;
+  pageState = {};
   void draw();
 });
 
