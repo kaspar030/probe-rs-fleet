@@ -252,9 +252,10 @@ async fn run_fleet(
 /// mock coordinator peer (`tests/lease_lifecycle.rs`).
 ///
 /// On shutdown the returned code is `128 + signum`, exactly what the shell sees
-/// from a signalled child; `work` is dropped, which kills the genuine probe-rs
-/// ([`transport::exec_remote_probe_rs`] sets `kill_on_drop`) *before* we give
-/// the lease away.
+/// from a signalled child. `work` is dropped explicitly *before* the release,
+/// which kills the genuine probe-rs ([`transport::exec_remote_probe_rs`] sets
+/// `kill_on_drop`) rather than leaving it driving a board we are in the middle
+/// of handing back.
 ///
 /// # Errors
 ///
@@ -268,7 +269,12 @@ pub async fn hold_and_run<F>(
 where
     F: std::future::Future<Output = Result<i32, RunError>>,
 {
-    tokio::pin!(work);
+    // `Box::pin`, not `tokio::pin!`: the latter lives in a function-scope local
+    // that cannot be dropped early, so `work` would outlive the release below
+    // (which itself spends up to 2s draining the ack) and the genuine probe-rs
+    // would keep running across it. `work` only borrows `session` / `grant`, so
+    // dropping it first is fine.
+    let mut work = Box::pin(work);
     tokio::pin!(shutdown);
 
     let result = tokio::select! {
@@ -277,9 +283,14 @@ where
         signum = &mut shutdown => Ok(128 + signum),
     };
 
-    // Always release the lease before returning (best-effort). Reached on every
-    // arm, including the shutdown one — that is the entire point of the signal
-    // handling: a Ctrl-C must not strand the board until the TTL expires.
+    // Kill the genuine probe-rs before handing the lease back: on the shutdown
+    // arm the child is still running, and a board we release may be granted to
+    // somebody else immediately.
+    drop(work);
+
+    // Always release the lease (best-effort). Reached on every arm, including
+    // the shutdown one — that is the entire point of the signal handling: a
+    // Ctrl-C must not strand the board until the TTL expires.
     session.release(grant.lease).await;
     result
 }

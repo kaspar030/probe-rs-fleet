@@ -282,10 +282,18 @@ impl CoordSession {
     /// the authoritative signal that a lease is gone is the relay dying, not
     /// this call. Callers log and keep going.
     ///
+    /// That refusal also *stays* in `ctrl_rx`, where the next `next_ctrl`
+    /// caller consumes it in place of its own reply — the mirror image of the
+    /// off-by-one the `Extended` slot exists to prevent. It is harmless today
+    /// and deliberately left alone: nothing reads `ctrl_rx` during a splice,
+    /// and the one caller that follows a heartbeat is `release`, which ignores
+    /// whatever it drains. Anything added between the two would need to care.
+    ///
     /// # Errors
     ///
     /// [`TransportError::Connect`] if the connection is gone,
-    /// [`TransportError::Declined`] if no reply arrives in time.
+    /// [`TransportError::Declined`] if no reply arrives in time,
+    /// [`TransportError::Wire`] if the reply names a different lease.
     pub async fn extend(&self, lease: fleet_proto::LeaseId) -> Result<u64, TransportError> {
         self.send(SidecarToCoord::Extend { lease }).await?;
         let mut slot = self.extend_rx.lock().await;
