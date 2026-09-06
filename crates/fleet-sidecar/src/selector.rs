@@ -73,6 +73,14 @@ pub mod env {
     /// the delegated path; a board selector must **not** also be set, because
     /// the board is inside the token.
     pub const CAPABILITY: &str = "PROBE_RS_FLEET_CAPABILITY";
+    /// Set to a non-empty value to disable the cross-invocation lease store
+    /// ([`crate::lease_store`]) entirely.
+    ///
+    /// This restores the pre-cache behaviour exactly: every invocation leases a
+    /// board of its own and releases it on the way out, so no board is ever
+    /// held between two `probe-rs` commands. The escape hatch for a shared
+    /// workstation, or for debugging the cache itself.
+    pub const NO_LEASE_CACHE: &str = "PROBE_RS_FLEET_NO_LEASE_CACHE";
 }
 
 /// A source of environment variables. Implemented for the real process

@@ -675,8 +675,9 @@ as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
 6. Heartbeats to renew the lease for long-lived sessions (`attach`, `gdb`).
    **Implemented**: the fleet path requests the coordinator's policy-default
    TTL (`duration_secs: 0`) and heartbeats it for the whole invocation, so a
-   session longer than one TTL is not swept mid-flight. It also releases on
-   SIGINT/SIGTERM.
+   session longer than one TTL is not swept mid-flight. It releases on
+   SIGINT/SIGTERM *unless* the lease is shared with the next invocation, which
+   §6.6 explains.
 
 #### Credentials (revision 2)
 
@@ -1450,22 +1451,68 @@ reset, gdb, re-flash — to support multi-step debugging sessions. Mechanics:
   optional erase).
 - Explicit `fleet ctl release` frees it immediately.
 
-**Status.** The *within-invocation* half is implemented: the sidecar requests
-`duration_secs: 0` — i.e. the operator's `Policy::default_ttl_secs`, never a
-TTL of its own — and heartbeats it (`Extend`) for the life of one probe-rs
-invocation, so `attach` / `gdb` sessions longer than the policy TTL are not
-swept. A renewal re-applies the lease's *granted* duration, so heartbeating
-extends the hold without promoting it to the priority-class cap. On SIGINT /
-SIGTERM the sidecar releases before exiting; a **SIGKILLed** sidecar releases
-nothing, but the board now returns to the pool after one policy TTL instead of
-the hardcoded hour the sidecar used to request.
+**Status.** Both halves are implemented.
 
-The *cross-invocation* half — reusing one lease across successive `probe-rs`
-commands, keyed by selector + subject key — is **not** implemented.
-`fleet_sidecar::lease_cache` holds the mechanism but is not wired up, and it
-needs a persistence layer (e.g. under `$XDG_RUNTIME_DIR`) for the cache to
-survive between processes at all. Until then each invocation leases and
-releases on its own.
+The *within-invocation* half: the sidecar requests `duration_secs: 0` — i.e.
+the operator's `Policy::default_ttl_secs`, never a TTL of its own — and
+heartbeats it (`Extend`) for the life of one probe-rs invocation, so `attach` /
+`gdb` sessions longer than the policy TTL are not swept. A renewal re-applies
+the lease's *granted* duration, so heartbeating extends the hold without
+promoting it to the priority-class cap. A **SIGKILLed** sidecar releases
+nothing, but the board returns to the pool after one policy TTL instead of the
+hardcoded hour the sidecar used to request.
+
+The *cross-invocation* half: `fleet_sidecar::lease_store` persists a grant under
+`$XDG_RUNTIME_DIR/probe-rs-fleet/leases.json` (0600, in a 0700 directory,
+written via a temp file + `fsync` + `rename` under a `flock`), and
+`acquire_lease` consults it before leasing. `lease_cache` stays pure logic and is
+unchanged: the store feeds a loaded record through it, so the expiry /
+refresh-margin judgement has exactly one implementation. `$XDG_RUNTIME_DIR` is a
+unix concept, so the store is `cfg(unix)`; elsewhere it is a stub that disables
+caching. The decisions worth knowing:
+
+- **The key is `(coordinator, token fingerprint, selector fingerprint)`** — not
+  the subject key. The sidecar never sees a `Subject` before it leases (the
+  coordinator resolves it from the bearer token), so a pre-lease lookup cannot
+  use one; the *in-memory* cache still keys on the real `SubjectKey`, recovered
+  from the stored record. The token's fingerprint is `SHA-256(token)[..16]`, so
+  a re-login is a miss rather than a risk of crossing identities. Nothing secret
+  is written: neither the bearer token nor the grant's capability token.
+- **A cache hit still opens a channel and takes a fresh per-channel
+  credential.** Only the *lease* is reused. The stored grant's token is the
+  delegation artefact (§6.5) and is not persisted at all.
+- **Release is TTL-driven.** A shareable lease is deliberately **not** released
+  at the end of an invocation — releasing it every time is exactly what would
+  make the cache never hit. **This includes SIGINT / SIGTERM: Ctrl-C now keeps a
+  shareable lease**, because a Ctrl-C'd `probe-rs run` is nearly always followed
+  by another one. `fleet ctl release` frees the board immediately; otherwise it
+  returns after one policy TTL, the same worst case as a SIGKILLed sidecar. A
+  CI (`Workload`) or node holder, the delegated path, and the
+  `PROBE_RS_FLEET_NO_LEASE_CACHE` opt-out all release at exit exactly as before,
+  so a finished CI job never strands a board.
+- **A stale hit degrades, never errors.** A hit is revalidated with a short
+  `Extend` probe first. A refusal drops the entry and leases afresh; an
+  inconclusive answer releases the lease best-effort before re-leasing, so a
+  fresh `Lease` under an `Id` selector cannot queue behind our own hold.
+- **A per-record `flock` use-lock preserves the concurrency interlock.** Without
+  it two concurrent invocations would both take the cached lease and drive one
+  board — the coordinator caps neither channels per lease nor sessions per
+  board, and its `Queued` reply was what prevented this. A hit is only taken if
+  the record's use-lock is free; otherwise the invocation falls through to a
+  fresh `Lease` and gets today's "board contended" answer. The kernel releases
+  the lock when the holder dies, SIGKILL included, so no staleness heuristic is
+  needed.
+- **A reused lease id is cross-checked against the board.** Lease ids restart at
+  1 on every coordinator boot and nothing on the wire identifies a boot, so a
+  persisted id can name a different lease after a restart. The channel token
+  carries the `BoardRef` it was minted for; a mismatch closes the channel and
+  re-leases cold. Adding a coordinator boot id to `Welcome` would be the
+  systemic fix and is a follow-up.
+
+This reduces re-lease queue collisions but does not remove them: two invocations
+starting from a *cold* store still both send `Lease`, and under an `id=`
+selector the loser is queued. That is the scheduler-queue work, and independent
+of this.
 
 This is what makes remote DX feel local: you grab a board, iterate freely, then
 let it go — exactly like a board on your own desk.

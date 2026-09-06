@@ -6,6 +6,12 @@
 //! and released only on the happy path — so a Ctrl-C'd or killed invocation sat
 //! on an exclusive board for a full hour.
 //!
+//! Since task 3620 the release is conditional: a lease shared across
+//! invocations by the lease store is deliberately kept. These tests pass
+//! `Disposition::Release` explicitly so the release assertions keep meaning what
+//! they always meant, plus one sibling case pinning the `Keep` arm.
+//! `tests/lease_reuse.rs` covers the sharing itself.
+//!
 //! Everything runs over `fleet_wire::mock::pair`: no coordinator, no TLS, no
 //! probe-rs binary. `hold_and_run` takes its shutdown future as a parameter
 //! precisely so this file can fire "a signal" without raising a real one at the
@@ -16,6 +22,7 @@ use std::sync::Arc;
 use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
 use fleet_proto::{LeaseId, PROTOCOL_VERSION};
+use fleet_sidecar::lease_store::Disposition;
 use fleet_sidecar::transport::CoordSession;
 use fleet_wire::{CoordToSidecar, SidecarToCoord, WireRx, WireTx};
 use tokio::sync::{mpsc, Mutex};
@@ -156,7 +163,14 @@ async fn a_shutdown_signal_releases_the_lease() {
     };
     let shutdown = async move { fire_rx.recv().await.unwrap_or(2) };
 
-    let held = fleet_sidecar::hold_and_run(&session, &granted, work, shutdown);
+    let held = fleet_sidecar::hold_and_run(
+        &session,
+        &granted,
+        Disposition::Release,
+        None,
+        work,
+        shutdown,
+    );
     tokio::pin!(held);
     tokio::select! {
         code = &mut held => panic!("returned {code:?} before the signal"),
@@ -170,6 +184,91 @@ async fn a_shutdown_signal_releases_the_lease() {
         *released.lock().await,
         "the coordinator must have seen a Release"
     );
+    peer.await.unwrap();
+}
+
+/// A **shareable** lease survives the same shutdown: no `Release` is sent.
+///
+/// The mirror image of the test above, and the one invariant task 3620
+/// deliberately reverses. Releasing a cached lease on every Ctrl-C would make
+/// the cross-invocation cache miss every time — which is the whole feature — so
+/// a `Keep` disposition holds the board for the next `probe-rs`. It still
+/// returns `128 + signum`, and it still kills the child first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_signal_keeps_a_shareable_lease() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let released = Arc::new(Mutex::new(false));
+    let released_peer = Arc::clone(&released);
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            SidecarToCoord::Lease(_) => {}
+            other => panic!("expected Lease, got {other:?}"),
+        }
+        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+            .await
+            .unwrap();
+        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+            match msg {
+                SidecarToCoord::Release { .. } => {
+                    *released_peer.lock().await = true;
+                    break;
+                }
+                // A heartbeat may race in; ignore it.
+                SidecarToCoord::Extend { lease } => {
+                    fleet_wire::send(
+                        &mut coord_tx,
+                        &CoordToSidecar::Extended {
+                            lease,
+                            expires: 19_999,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let granted = session.lease(&lease_request()).await.unwrap();
+
+    let (fire_tx, mut fire_rx) = mpsc::channel::<i32>(1);
+    let work = async {
+        std::future::pending::<()>().await;
+        unreachable!()
+    };
+    let shutdown = async move { fire_rx.recv().await.unwrap_or(2) };
+
+    let mut held = Box::pin(fleet_sidecar::hold_and_run(
+        &session,
+        &granted,
+        Disposition::Keep,
+        None,
+        work,
+        shutdown,
+    ));
+    tokio::select! {
+        code = &mut held => panic!("returned {code:?} before the signal"),
+        () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+    fire_tx.send(2).await.unwrap();
+    let code = held.as_mut().await.unwrap();
+
+    assert_eq!(code, 130, "SIGINT still propagates as 128 + 2");
+    // Give any (wrongly) sent Release time to reach the peer before asserting.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !*released.lock().await,
+        "a shareable lease must survive Ctrl-C so the next invocation reuses it"
+    );
+    // Tearing the connection down is what ends the peer's read loop.
+    drop(held);
+    drop(session);
     peer.await.unwrap();
 }
 
@@ -242,9 +341,16 @@ async fn a_long_session_is_kept_alive() {
         Ok(7)
     };
     let shutdown = std::future::pending::<i32>();
-    let code = fleet_sidecar::hold_and_run(&session, &granted, work, shutdown)
-        .await
-        .unwrap();
+    let code = fleet_sidecar::hold_and_run(
+        &session,
+        &granted,
+        Disposition::Release,
+        None,
+        work,
+        shutdown,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(code, 7, "the work's exit code is propagated");
     let first = seen_rx.recv().await.expect("a first heartbeat");

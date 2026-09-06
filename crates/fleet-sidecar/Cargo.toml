@@ -15,11 +15,18 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 fleet-agent = { workspace = true }
 fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

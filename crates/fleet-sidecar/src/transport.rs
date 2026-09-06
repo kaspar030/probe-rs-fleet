@@ -46,6 +46,20 @@ pub enum TransportError {
     Io(String),
 }
 
+/// What a [`CoordSession::revalidate_lease`] probe learned about a lease read
+/// back from the cross-invocation store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revalidation {
+    /// The lease is still ours; carries the coordinator's new expiry.
+    Live(u64),
+    /// The coordinator refused: the lease expired, was swept, or was released
+    /// out of band. Drop the cached entry and lease afresh.
+    Gone(String),
+    /// No usable answer (a timeout, or the connection died). The lease *may*
+    /// still be ours, so release it before leasing afresh.
+    Inconclusive(String),
+}
+
 /// The active relay channel's data sink: when set, the reader routes inbound
 /// `Data` frames for that channel to the splice.
 type DataSink = Arc<Mutex<Option<(ChannelId, mpsc::Sender<DataFrame>)>>>;
@@ -307,6 +321,80 @@ impl CoordSession {
                 "no Extended reply within 5s".to_owned(),
             )),
         }
+    }
+
+    /// Probe whether a **cached** lease is still ours, returning its expiry.
+    ///
+    /// The cross-invocation lease store ([`crate::lease_store`]) hands out a
+    /// lease id it read from disk; the coordinator may have expired or swept it
+    /// while no sidecar was running. This is the revalidation probe that turns
+    /// such a stale hit into a fresh `Lease` rather than a broken session
+    /// (`lease_store`'s Decision 4).
+    ///
+    /// It exists *instead of* reusing [`CoordSession::extend`] because a
+    /// coordinator refusal arrives as an `Error` on `ctrl_rx`, which `extend`
+    /// neither waits for nor consumes — its doc says as much, and warns that
+    /// "anything added between the two would need to care". This is that thing:
+    /// it selects on both slots, so a refusal is reported promptly *and* taken
+    /// off the control stream instead of poisoning the next `open_channel`.
+    /// `extend` itself is deliberately left alone: the keepalive's best-effort
+    /// semantics are covered by their own tests.
+    ///
+    /// Only safe **before** the work future starts, which is where the store
+    /// calls it: nothing else is reading `ctrl_rx` at that point, so consuming
+    /// a control frame cannot steal somebody else's reply.
+    ///
+    /// The three outcomes are deliberately *not* a `Result`: every one of them
+    /// ends in a working session, and the caller must be able to tell a
+    /// coordinator's "that lease is gone" ([`Revalidation::Gone`]) from "we
+    /// don't know" ([`Revalidation::Inconclusive`]) — the latter needs a
+    /// best-effort `Release` first, or a fresh `Lease` under an `Id` selector
+    /// would queue behind our own still-live hold.
+    pub async fn revalidate_lease(&self, lease: fleet_proto::LeaseId) -> Revalidation {
+        if self.send(SidecarToCoord::Extend { lease }).await.is_err() {
+            return Revalidation::Inconclusive("connection closed".to_owned());
+        }
+        let mut extended = self.extend_rx.lock().await;
+        let mut ctrl = self.ctrl_rx.lock().await;
+        let probe = async {
+            loop {
+                tokio::select! {
+                    reply = extended.recv() => match reply {
+                        Some((got, expires)) if got == lease => return Revalidation::Live(expires),
+                        // An `Extended` for another lease is not ours to judge;
+                        // keep waiting for the one we asked about.
+                        Some(_) => {}
+                        None => {
+                            return Revalidation::Inconclusive("connection closed".to_owned())
+                        }
+                    },
+                    reply = ctrl.recv() => match reply {
+                        Some(CoordToSidecar::Error { message }) => {
+                            return Revalidation::Gone(message)
+                        }
+                        // Anything else here is a straggler from an earlier
+                        // exchange; drop it rather than hand it on.
+                        Some(_) => {}
+                        None => {
+                            return Revalidation::Inconclusive("connection closed".to_owned())
+                        }
+                    },
+                }
+            }
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(2), probe).await {
+            Ok(outcome) => outcome,
+            Err(_) => Revalidation::Inconclusive("no reply within 2s".to_owned()),
+        }
+    }
+
+    /// Close a relay channel (best-effort).
+    ///
+    /// Used when a channel was opened against a lease that turned out to name
+    /// the wrong board (see [`crate::open_channel_verified`]): the channel is
+    /// handed back rather than left dangling until the lease expires.
+    pub async fn close_channel(&self, channel: ChannelId) {
+        let _ = self.send(SidecarToCoord::CloseChannel { channel }).await;
     }
 
     /// Release a held lease (best-effort).

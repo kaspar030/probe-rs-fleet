@@ -31,6 +31,8 @@
 //! * [`selector`] — resolve the fleet configuration from the environment, with
 //!   a clean no-selector → local fallback.
 //! * [`lease_cache`] — time-based lease sharing keyed by selector + subject key.
+//! * [`lease_store`] — the persistence layer under that cache: a locked JSON
+//!   file in `$XDG_RUNTIME_DIR` so successive invocations share one lease.
 //! * [`proxy`] — the documented relay seam (lease / byte-splice contract).
 //! * [`transport`] — the live `WebSocket` + byte-opaque relay client: lease a board, open
 //!   a relay channel, splice the genuine probe-rs client's bytes verbatim.
@@ -46,13 +48,28 @@
 //! The sidecar asks for `duration_secs: 0`, i.e. the coordinator's own
 //! `Policy::default_ttl_secs`, and **heartbeats** (`Extend`) for the life of
 //! the invocation, so a long `attach` / `gdb` session is not cut short by a
-//! short policy TTL. On SIGINT/SIGTERM it releases before exiting. A sidecar
-//! that is killed outright releases nothing — nothing can — but the board comes
-//! back after one policy TTL rather than the hardcoded hour this replaced.
+//! short policy TTL. A sidecar that is killed outright releases nothing —
+//! nothing can — but the board comes back after one policy TTL rather than the
+//! hardcoded hour this replaced.
+//!
+//! Across invocations the lease is **shared**, not re-taken: [`lease_store`]
+//! persists the grant under `$XDG_RUNTIME_DIR` and [`acquire_lease`] consults it
+//! before leasing, so `probe-rs download` followed by `probe-rs attach` holds
+//! one board throughout. A hit still opens a fresh channel and takes a fresh
+//! per-channel credential — only the *lease* is reused.
+//!
+//! That makes the release policy TTL-driven: a shareable lease is deliberately
+//! **not** released at the end of an invocation, Ctrl-C included, because
+//! releasing it every time is exactly what would make the cache never hit.
+//! `fleet ctl release` frees a board immediately; otherwise it returns after one
+//! policy TTL. A CI (`Workload`) or node lease, a delegated lease, and anything
+//! run under [`selector::env::NO_LEASE_CACHE`] are released at exit exactly as
+//! before. [`lease_store`]'s module doc records the decisions in full.
 
 pub mod cli;
 pub mod gdb;
 pub mod lease_cache;
+pub mod lease_store;
 pub mod local;
 pub mod proxy;
 pub mod selector;
@@ -60,7 +77,12 @@ pub mod signal;
 pub mod transport;
 
 use std::ffi::OsString;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use fleet_proto::ids::BoardRef;
+use fleet_proto::{ChannelId, ChannelKind, LeaseId};
+
+use lease_store::{Disposition, LeaseStore, UseGuard};
 use selector::{EnvSource, Resolution};
 
 /// Errors from the top-level [`run`] entry point.
@@ -205,45 +227,300 @@ where
     }
 }
 
-/// Drive the fleet path: lease a board, open a relay channel, expose a local
-/// endpoint, and either exec the genuine probe-rs against it (data plane) or
-/// tunnel the local gdb client (gdb plane).
+/// Drive the fleet path: acquire a lease (reusing a cached one when there is
+/// one), open a relay channel, expose a local endpoint, and either exec the
+/// genuine probe-rs against it (data plane) or tunnel the local gdb client (gdb
+/// plane).
 async fn run_fleet(
     cfg: selector::FleetConfig,
     invocation: cli::ProbeRsInvocation,
     original_argv: Vec<String>,
 ) -> Result<i32, RunError> {
-    use fleet_proto::lease::{LeaseRequest, Priority};
+    use fleet_proto::ChannelKind;
 
     let session = transport::CoordSession::connect(&cfg).await?;
+    let mut store = lease_store::LeaseStore::open(&selector::ProcessEnv);
+    let now = now_secs();
+
+    let acquired = acquire_lease(&session, &cfg, store.as_mut(), now).await?;
+    let kind = if matches!(invocation, cli::ProbeRsInvocation::Gdb { .. }) {
+        ChannelKind::Gdb
+    } else {
+        ChannelKind::Data
+    };
+
+    // A *reused* lease id is only as trustworthy as the coordinator's lease
+    // numbering, which restarts at 1 on every boot, so the channel token's board
+    // is cross-checked against the one we cached. A freshly granted lease needs
+    // no such check: the board came straight back from the coordinator.
+    let expect = acquired.reused.then(|| acquired.grant.board.clone());
+    let opened =
+        open_channel_verified(&session, acquired.grant.lease, kind, expect.as_ref()).await?;
+    let (acquired, channel, channel_token) = if let Some((channel, token)) = opened {
+        (acquired, channel, token)
+    } else {
+        // Exactly one retry, and only from the cache-hit path: the cached
+        // lease named somebody else's board (a coordinator restart aliased
+        // the id), so drop it and lease cold. `acquire_lease` cannot hit
+        // again — the entry is gone — so this cannot loop.
+        tracing::debug!("the cached lease named a different board; leasing afresh");
+        drop(acquired);
+        if let Some(store) = store.as_mut() {
+            store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
+            store.save(now);
+        }
+        let fresh = acquire_lease(&session, &cfg, store.as_mut(), now).await?;
+        let (channel, token) = open_channel_verified(&session, fresh.grant.lease, kind, None)
+            .await?
+            .expect("a channel opened without an expected board always verifies");
+        (fresh, channel, token)
+    };
+
+    let work = async {
+        match &invocation {
+            cli::ProbeRsInvocation::Gdb {
+                connection_string, ..
+            } => run_fleet_gdb(&session, channel, connection_string.as_deref()).await,
+            _ => run_fleet_data(&session, channel, &channel_token, &original_argv).await,
+        }
+    };
+
+    // The keepalive publishes each renewal here, so the store records how long
+    // the lease actually lives rather than the expiry it was granted with; a
+    // stale (too early) expiry would turn a live lease into a miss.
+    let latest_expires = AtomicU64::new(acquired.grant.expires);
+    let code = hold_and_run(
+        &session,
+        &acquired.grant,
+        acquired.disposition,
+        Some(&latest_expires),
+        work,
+        signal::shutdown_signal(),
+    )
+    .await;
+
+    if let Some(store) = store.as_mut() {
+        if acquired.disposition == Disposition::Keep {
+            store.touch_expiry(
+                &cfg.coordinator,
+                &cfg.token,
+                &cfg.select,
+                latest_expires.load(Ordering::Relaxed),
+            );
+        } else {
+            store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
+        }
+        store.save(now_secs());
+    }
+    // Only now is the record's use-lock dropped: it covers the whole
+    // invocation, including the final save.
+    drop(acquired);
+    code
+}
+
+/// A lease this invocation may use, plus what to do with it on the way out.
+#[derive(Debug)]
+pub struct Acquired {
+    /// The lease. On a cache hit this is *reconstructed* from the store and its
+    /// `token` is deliberately empty — the data-plane credential comes fresh
+    /// from `ChannelOpened` on every path (architecture §6.5).
+    pub grant: fleet_proto::lease::LeaseGrant,
+    /// Whether the lease came from the store rather than a fresh `Lease`.
+    pub reused: bool,
+    /// Release at exit, or keep the lease for the next invocation.
+    pub disposition: Disposition,
+    /// The record's use-lock, held for the whole invocation so a *concurrent*
+    /// invocation cannot take the same cached lease (`lease_store` Decision 5).
+    _guard: Option<UseGuard>,
+}
+
+/// Acquire a lease for `cfg`: reuse the stored one if it is still ours, else
+/// lease afresh and store it if it is shareable.
+///
+/// This is the whole cross-invocation half of lease sharing, in one seam so an
+/// integration test can drive it against a mock coordinator peer
+/// (`tests/lease_reuse.rs`). The order matters and each step is a decision
+/// recorded in [`lease_store`]'s module doc:
+///
+/// 1. A stored record is only taken if its per-record use-lock is free — that
+///    lock is what still prevents two concurrent invocations from driving one
+///    board now that the coordinator's `Queued` reply is no longer in the way.
+/// 2. A hit is revalidated with a short `Extend` probe. A refusal drops the
+///    entry; an inconclusive answer drops it *and* releases first, so the fresh
+///    `Lease` below cannot queue behind our own hold.
+/// 3. A fresh grant is stored only for a `User` holder: a CI job must not strand
+///    a board for a policy TTL after it finishes.
+/// 4. The store is written **before** the work starts, so even a `SIGKILL`ed
+///    sidecar leaves a reusable entry behind.
+///
+/// No branch here surfaces a stale cache as an error: every degradation ends in
+/// an ordinary fresh lease.
+///
+/// # Errors
+///
+/// Returns [`RunError`] only if the fresh `Lease` itself fails (the board is
+/// contended, or the connection died).
+pub async fn acquire_lease(
+    session: &transport::CoordSession,
+    cfg: &selector::FleetConfig,
+    store: Option<&mut LeaseStore>,
+    now_secs: u64,
+) -> Result<Acquired, RunError> {
+    use fleet_proto::lease::{LeaseRequest, Priority};
+    use transport::Revalidation;
+
+    let mut store = store;
+    let mut guard = None;
+
+    if let Some(store) = store.as_deref_mut() {
+        if let Some((record, held)) = store.get(&cfg.coordinator, &cfg.token, &cfg.select, now_secs)
+        {
+            // Whatever happens next, this invocation owns the cache slot: keep
+            // the lock for the cold path too, so a concurrent invocation does
+            // not record a competing entry underneath us.
+            guard = Some(held);
+            match session.revalidate_lease(record.lease).await {
+                Revalidation::Live(expires) => {
+                    tracing::info!(
+                        board = %record.board,
+                        lease = ?record.lease,
+                        "reusing the lease from a previous invocation"
+                    );
+                    store.touch_expiry(&cfg.coordinator, &cfg.token, &cfg.select, expires);
+                    store.save(now_secs);
+                    let mut grant = record.grant();
+                    grant.expires = expires;
+                    return Ok(Acquired {
+                        grant,
+                        reused: true,
+                        disposition: Disposition::Keep,
+                        _guard: guard,
+                    });
+                }
+                Revalidation::Gone(reason) => {
+                    tracing::debug!(%reason, "the cached lease is gone; leasing afresh");
+                }
+                Revalidation::Inconclusive(reason) => {
+                    tracing::debug!(
+                        %reason,
+                        "could not revalidate the cached lease; releasing it before re-leasing"
+                    );
+                    // It may still be ours, and a fresh `Lease` under an `Id`
+                    // selector would then be queued behind our own hold.
+                    // Releasing a lease we no longer hold is a harmless refusal.
+                    session.release(record.lease).await;
+                }
+            }
+            store.forget(&cfg.coordinator, &cfg.token, &cfg.select);
+            store.save(now_secs);
+        }
+    }
+
+    if guard.is_none() {
+        if let Some(store) = store.as_ref() {
+            guard = store.claim(&cfg.coordinator, &cfg.token, &cfg.select);
+        }
+    }
+
     let request = LeaseRequest {
         select: cfg.select.clone(),
         // `0` means "the operator's `Policy::default_ttl_secs`". **Do not**
         // reintroduce a constant here, not even as a "sensible fallback": the
         // hardcoded 3600s this replaced meant a killed sidecar sat on a board
-        // for an hour, and a knob would just be a slower way back to it. The
-        // TTL is the coordinator's policy to set; we keep the lease alive for
-        // as long as we actually need it by heartbeating (see `keepalive`).
+        // for an hour, and a knob would just be a slower way back to it. Lease
+        // sharing does not change this — a cached lease is minted with exactly
+        // the same TTL; what changed is that we stop shortening its life by
+        // releasing at exit. The TTL is the coordinator's policy to set; we keep
+        // the lease alive for as long as we need it by heartbeating (see
+        // `keepalive`).
         duration_secs: 0,
         priority: Priority::Interactive,
     };
     let grant = session.lease(&request).await?;
     tracing::info!(board = %grant.board, lease = ?grant.lease, "leased board");
 
-    let work = async {
-        match &invocation {
-            cli::ProbeRsInvocation::Gdb {
-                connection_string, ..
-            } => run_fleet_gdb(&session, grant.lease, connection_string.as_deref()).await,
-            _ => run_fleet_data(&session, grant.lease, &original_argv).await,
+    // Shareable only if we hold the cache slot *and* the store accepts the
+    // holder. Anything else is released at exit exactly as before.
+    let mut disposition = Disposition::Release;
+    if guard.is_some() {
+        if let Some(store) = store.as_mut() {
+            if store.record(&cfg.coordinator, &cfg.token, &cfg.select, &grant) {
+                // Persist before any work starts.
+                store.save(now_secs);
+                disposition = Disposition::Keep;
+            }
         }
-    };
+    }
 
-    hold_and_run(&session, &grant, work, signal::shutdown_signal()).await
+    Ok(Acquired {
+        grant,
+        reused: false,
+        disposition,
+        _guard: guard,
+    })
+}
+
+/// Open a relay channel and, when `expect` is set, check that the credential it
+/// came back with really names that board.
+///
+/// Returns `Ok(None)` on a mismatch, having closed the channel again — the
+/// caller's cue to forget the cached lease and lease cold **once**.
+///
+/// Lease ids are per-coordinator-boot counters starting at 1, and nothing on the
+/// wire identifies a boot, so a lease id persisted across a coordinator restart
+/// can name a *different* live lease — one the same subject legitimately holds
+/// on another board, in which case even the `Extend` revalidation succeeds. The
+/// channel token is what settles it: it carries the `BoardRef` the coordinator
+/// minted it for. Decoding needs no verification key (the coordinator is what
+/// verifies the token; this only reads it), exactly as
+/// [`selector::DelegatedConfig::lease`] already does.
+///
+/// # Errors
+///
+/// Returns [`RunError`] if the channel cannot be opened at all.
+pub async fn open_channel_verified(
+    session: &transport::CoordSession,
+    lease: LeaseId,
+    kind: ChannelKind,
+    expect: Option<&BoardRef>,
+) -> Result<Option<(ChannelId, Vec<u8>)>, RunError> {
+    let (channel, token) = session.open_channel(lease, kind).await?;
+    let Some(expected) = expect else {
+        return Ok(Some((channel, token)));
+    };
+    let named = fleet_proto::token::SignedToken::from_wire(&token)
+        .ok()
+        .and_then(|signed| signed.decode_token().ok())
+        .map(|decoded| decoded.board);
+    match named {
+        // An undecodable token is not evidence of a mismatch: the sidecar has no
+        // stake in the token's shape, and the agent is what verifies it.
+        None => Ok(Some((channel, token))),
+        Some(board) if &board == expected => Ok(Some((channel, token))),
+        Some(board) => {
+            tracing::warn!(
+                %board, expected = %expected,
+                "the reused lease names a different board; discarding it"
+            );
+            session.close_channel(channel).await;
+            Ok(None)
+        }
+    }
+}
+
+/// Epoch seconds, or 0 if the clock is before the epoch.
+///
+/// Only ever used to *judge* a cached expiry, which is a local, conservative
+/// decision: a skewed clock costs an extra lease, never a wrong hold.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Hold `grant` for the duration of `work`: heartbeat it, abandon it on
-/// `shutdown`, and release it on the way out whichever arm wins.
+/// `shutdown`, and release it on the way out **unless** `disposition` says to
+/// keep it for the next invocation.
 ///
 /// Split out of [`run_fleet`] so the release-on-signal behaviour is testable
 /// without raising real signals at the test process: `shutdown` is a parameter,
@@ -255,7 +532,24 @@ async fn run_fleet(
 /// from a signalled child. `work` is dropped explicitly *before* the release,
 /// which kills the genuine probe-rs ([`transport::exec_remote_probe_rs`] sets
 /// `kill_on_drop`) rather than leaving it driving a board we are in the middle
-/// of handing back.
+/// of handing back. That drop happens whatever the disposition: a kept lease is
+/// still a lease nothing should be driving after we return.
+///
+/// # When the lease is deliberately *not* released
+///
+/// [`Disposition::Keep`] means the lease is recorded in the cross-invocation
+/// store and the next `probe-rs` command under the same selector will reuse it
+/// — so releasing here would make the cache miss every single time, which is the
+/// whole feature. This holds on the shutdown arm too: a Ctrl-C'd `probe-rs run`
+/// is nearly always followed by another one. The board comes back after one
+/// policy TTL if nobody picks it up, and `fleet ctl release` frees it at once.
+/// A CI or node holder, a delegated lease, and the
+/// [`selector::env::NO_LEASE_CACHE`] opt-out all pass
+/// [`Disposition::Release`] and behave exactly as before.
+///
+/// `expires_out`, when given, receives every heartbeat's new expiry, so the
+/// caller can persist how long the lease actually lives rather than the expiry
+/// it was granted with.
 ///
 /// # Errors
 ///
@@ -263,6 +557,8 @@ async fn run_fleet(
 pub async fn hold_and_run<F>(
     session: &transport::CoordSession,
     grant: &fleet_proto::lease::LeaseGrant,
+    disposition: Disposition,
+    expires_out: Option<&AtomicU64>,
     work: F,
     shutdown: impl std::future::Future<Output = i32>,
 ) -> Result<i32, RunError>
@@ -279,7 +575,7 @@ where
 
     let result = tokio::select! {
         r = &mut work => r,
-        never = keepalive(session, grant) => match never {},
+        never = keepalive(session, grant, expires_out) => match never {},
         signum = &mut shutdown => Ok(128 + signum),
     };
 
@@ -288,10 +584,18 @@ where
     // somebody else immediately.
     drop(work);
 
-    // Always release the lease (best-effort). Reached on every arm, including
-    // the shutdown one — that is the entire point of the signal handling: a
-    // Ctrl-C must not strand the board until the TTL expires.
-    session.release(grant.lease).await;
+    // Release the lease (best-effort) on every arm, the shutdown one included —
+    // that is the point of the signal handling: a Ctrl-C must not strand a board
+    // we are not going to reuse. A shareable lease is kept instead; see the
+    // section above for why that is not a regression of the same invariant.
+    if disposition == Disposition::Release {
+        session.release(grant.lease).await;
+    } else {
+        tracing::debug!(
+            lease = ?grant.lease,
+            "keeping the lease for the next invocation (`fleet ctl release` frees it now)"
+        );
+    }
     result
 }
 
@@ -315,6 +619,7 @@ where
 async fn keepalive(
     session: &transport::CoordSession,
     grant: &fleet_proto::lease::LeaseGrant,
+    expires_out: Option<&AtomicU64>,
 ) -> std::convert::Infallible {
     // The *local* clock is used only to pick an interval, never to judge
     // whether the lease is still valid: our clock may skew from the
@@ -338,6 +643,9 @@ async fn keepalive(
         match session.extend(grant.lease).await {
             Ok(expires) => {
                 failures = 0;
+                if let Some(out) = expires_out {
+                    out.store(expires, Ordering::Relaxed);
+                }
                 tracing::debug!(lease = ?grant.lease, expires, "renewed lease");
             }
             Err(error) => {
@@ -388,32 +696,42 @@ async fn run_delegated(
     let session = transport::CoordSession::connect_delegated(&cfg).await?;
     tracing::info!(?lease, "using a delegated lease");
 
+    // Deliberately no lease store on this path: the lease is not ours to cache
+    // (architecture §6.5), and a sandbox that could hand a delegated lease to
+    // the next invocation would be holding a board past the delegator's intent.
+    let kind = if matches!(invocation, cli::ProbeRsInvocation::Gdb { .. }) {
+        ChannelKind::Gdb
+    } else {
+        ChannelKind::Data
+    };
+    let (channel, channel_token) = session.open_channel(lease, kind).await?;
+
     match &invocation {
         cli::ProbeRsInvocation::Gdb {
             connection_string, ..
-        } => run_fleet_gdb(&session, lease, connection_string.as_deref()).await,
-        _ => run_fleet_data(&session, lease, &original_argv).await,
+        } => run_fleet_gdb(&session, channel, connection_string.as_deref()).await,
+        _ => run_fleet_data(&session, channel, &channel_token, &original_argv).await,
     }
     // Deliberately no `session.release(lease)`: the lease is not ours.
 }
 
-/// Data-plane path: open a data channel, bind a loopback endpoint the genuine
-/// probe-rs client dials as its remote host, splice it onto the relay, and exec
-/// the real probe-rs.
+/// Data-plane path: bind a loopback endpoint the genuine probe-rs client dials
+/// as its remote host, splice it onto an already-opened relay `channel`, and
+/// exec the real probe-rs.
 ///
-/// Takes a bare `lease` rather than a whole grant, because the delegated path
-/// has no grant — only a token, from which it decodes the lease locally. The
-/// data-plane credential comes from `ChannelOpened` either way, so the two
-/// paths converge here completely.
+/// Takes the opened channel and its credential rather than a lease, because the
+/// caller has to open the channel anyway: the fleet path cross-checks the board
+/// the credential names ([`open_channel_verified`]), and the delegated path has
+/// no grant at all — only a token, from which it decodes the lease locally. The
+/// data-plane credential comes from `ChannelOpened` on every path, so the two
+/// converge here completely. In particular a **reused** lease does not reuse a
+/// token: `channel_token` is always the fresh per-channel one.
 async fn run_fleet_data(
     session: &transport::CoordSession,
-    lease: fleet_proto::LeaseId,
+    channel: ChannelId,
+    channel_token: &[u8],
     original_argv: &[String],
 ) -> Result<i32, RunError> {
-    use fleet_proto::ChannelKind;
-
-    let (channel, channel_token) = session.open_channel(lease, ChannelKind::Data).await?;
-
     // Bind a loopback listener the probe-rs client treats as its remote host.
     // The client builds `{host}/worker` and dials it as a WebSocket, so `host`
     // must already carry the `ws://` scheme.
@@ -427,8 +745,10 @@ async fn run_fleet_data(
     // The **channel** token, not the lease grant's: this is the credential the
     // coordinator handed the agent, and therefore the one `probe-rs serve`
     // accepts. A lease grant's token is the delegation artefact and diverges
-    // from it after an `Extend` or under an attenuating grant.
-    let token = transport::hex_encode(&channel_token);
+    // from it after an `Extend` or under an attenuating grant — and a cached
+    // grant's token is staler still, which is why nothing on the cache-hit path
+    // ever touches it.
+    let token = transport::hex_encode(channel_token);
 
     // Accept the single probe-rs client connection and splice it in a task that
     // borrows the session for the duration of the child process.
@@ -458,16 +778,13 @@ async fn run_fleet_data(
     }
 }
 
-/// gdb-plane fleet path: open a gdb channel, bind the local gdb listener the
-/// user's gdb client connects to, and byte-splice it onto the relay.
+/// gdb-plane fleet path: bind the local gdb listener the user's gdb client
+/// connects to and byte-splice it onto the already-opened relay `channel`.
 async fn run_fleet_gdb(
     session: &transport::CoordSession,
-    lease: fleet_proto::LeaseId,
+    channel: ChannelId,
     connection_string: Option<&str>,
 ) -> Result<i32, RunError> {
-    use fleet_proto::ChannelKind;
-
-    let (channel, _token) = session.open_channel(lease, ChannelKind::Gdb).await?;
     let addr = gdb::resolve_listen_addr(connection_string)?;
     let listener = gdb::bind(addr).await?;
     tracing::info!(%addr, "gdb tunnel listening; point your gdb client here");
@@ -571,7 +888,6 @@ mod tests {
             RunError::Selector(selector::SelectorError::MissingSelector)
         ));
     }
-
 
     /// The fleet path reaches the transport rather than short-circuiting: with
     /// a bearer token and an unresolvable coordinator it must surface a
