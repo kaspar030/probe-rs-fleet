@@ -152,7 +152,7 @@ struct CoordinatorConfigToml {
     /// TCP address to listen on. Loopback by default: the expected deployment
     /// is behind a reverse proxy on the same host.
     listen_addr: SocketAddr,
-    /// The externally reachable base URL operators hand to `agent up` /
+    /// The externally reachable base URL operators hand to `node up` /
     /// `login`. Not derivable from `listen_addr` behind a proxy.
     public_url: String,
     /// Coordinator-terminated TLS. Omit it when a proxy terminates TLS (the

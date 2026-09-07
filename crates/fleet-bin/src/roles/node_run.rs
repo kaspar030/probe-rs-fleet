@@ -1,8 +1,8 @@
-//! The `agent` role: dial out to the coordinator and drive local probes.
+//! The `node run` role: dial out to the coordinator and drive local probes.
 //!
-//! # Where the agent's configuration comes from now
+//! # Where the node's configuration comes from now
 //!
-//! `agent.toml` is gone. The agent assembles its runtime config from two
+//! `agent.toml` is gone. The node assembles its runtime config from two
 //! sources with different lifetimes and different sensitivity:
 //!
 //! * the selected **fleet file**'s `[node]` table — the credential, the node id
@@ -27,7 +27,6 @@ use fleet_agent::connection;
 use fleet_agent::probers::ProcessBackend;
 use fleet_proto::AdoptPolicy;
 
-use crate::cli::AgentArgs;
 use crate::fleet_config;
 use crate::paths;
 
@@ -51,9 +50,9 @@ pub struct NodeSettings {
     /// What this node does with a probe `boards.toml` does not declare.
     ///
     /// **Advisory.** The coordinator's `node` row is authoritative for
-    /// enforcement; this only governs whether the agent synthesises board
+    /// enforcement; this only governs whether the node synthesises board
     /// metadata for undeclared probes at all. Editing it here does not change
-    /// what the coordinator will adopt — re-run `share` / `agent up --adopt …`.
+    /// what the coordinator will adopt — re-run `share` / `node up --adopt …`.
     ///
     /// Absent means `declared`, the conservative policy: a node whose settings
     /// file predates this key must not silently start offering probes nobody
@@ -89,10 +88,10 @@ pub fn load_node_settings(path: &std::path::Path) -> Result<NodeSettings> {
 /// 3. `<node_dir>/boards.toml`, the scaffolded default.
 ///
 /// One function rather than one copy per caller: [`run`] and
-/// [`crate::roles::node_board`] must agree about which file the agent will
+/// [`crate::roles::node_board`] must agree about which file the node will
 /// read, or `node board add` writes a declaration into a file nobody loads.
 /// A leading `~/` is expanded for **both** the flag and the `node.toml` value,
-/// so the two spellings agree and the file the agent reads is the file
+/// so the two spellings agree and the file the node reads is the file
 /// `node board add` writes — the scaffolded `node.toml` advertises a `~/` path,
 /// so without this it would write a config it could not itself read. `~user`
 /// and a bare `~` are left literal (see [`crate::paths::expand_tilde`]).
@@ -175,10 +174,10 @@ impl NodeTokenStore for FleetFileTokenStore {
     }
 }
 
-/// Assemble the agent's runtime config from the two sources that hold it.
+/// Assemble the node's runtime config from the two sources that hold it.
 ///
 /// Split out from [`run`] so the mapping is testable without a coordinator: this
-/// is the function that decides which token the agent dials with after a
+/// is the function that decides which token the node dials with after a
 /// restart, which is exactly what the lost-ack recovery depends on.
 fn assemble_agent_config(
     file: &crate::fleet_config::FleetFile,
@@ -187,7 +186,7 @@ fn assemble_agent_config(
     boards_path: PathBuf,
 ) -> AgentConfig {
     AgentConfig {
-        agent_id: node.node_id.clone(),
+        node_id: node.node_id.clone(),
         fleet_url: file.url.clone(),
         node_token: node.node_token.clone(),
         previous_node_token: node.previous_node_token.clone(),
@@ -205,39 +204,40 @@ fn assemble_agent_config(
     }
 }
 
-/// Load the agent's configuration, build the agent, and run its persistent
+/// Load the node's configuration, build the node, and run its persistent
 /// dial-out connection loop until a shutdown signal or a fatal setup error.
+///
+/// Takes the two settings rather than an args struct because three callers
+/// funnel here — `node run`, `node up` (after bootstrapping) and the
+/// deprecated bare `agent` — and each carries them in a different shape.
 ///
 /// # Errors
 ///
 /// Returns an error if the fleet has no `[node]` credential, either config file
-/// cannot be loaded, the agent cannot be constructed, or the connection loop
+/// cannot be loaded, the node cannot be constructed, or the connection loop
 /// fails with a non-retryable error.
-pub async fn run(args: AgentArgs) -> Result<()> {
-    let fleet_path = match &args.config_dir {
-        Some(dir) => dir.join(format!("{}.toml", args.fleet)),
-        None => paths::fleet_config_path(&args.fleet)?,
+pub async fn run(fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
+    let fleet_path = match &config_dir {
+        Some(dir) => dir.join(format!("{fleet}.toml")),
+        None => paths::fleet_config_path(fleet)?,
     };
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
             "loading fleet config {} — register this node with \
-             `probe-rs-fleet agent up --fleet {}` (after `login`), or \
-             `probe-rs-fleet agent up --fleet {} --fleet-url <url> --auth-key <key>`",
-            fleet_path.display(),
-            args.fleet,
-            args.fleet
+             `probe-rs-fleet node up --fleet {fleet}` (after `login`), or \
+             `probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>`",
+            fleet_path.display()
         )
     })?;
     let node = file.node.clone().with_context(|| {
         format!(
-            "fleet `{}` has no [node] credential on this machine; run \
-             `probe-rs-fleet share --fleet {}` (if you have logged in), or \
-             `probe-rs-fleet agent up --fleet {} --fleet-url <url> --auth-key <key>`",
-            args.fleet, args.fleet, args.fleet
+            "fleet `{fleet}` has no [node] credential on this machine; run \
+             `probe-rs-fleet share --fleet {fleet}` (if you have logged in), or \
+             `probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>`"
         )
     })?;
 
-    let node_dir = match &args.config_dir {
+    let node_dir = match &config_dir {
         Some(dir) => dir.join("node"),
         None => paths::node_config_dir()?,
     };
@@ -246,34 +246,34 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     // write into the file this will read).
     let boards_path = resolve_boards_path(&node_dir, None)?;
 
-    let agent_config = assemble_agent_config(&file, &node, &settings, boards_path.clone());
-    agent_config
+    let node_config = assemble_agent_config(&file, &node, &settings, boards_path.clone());
+    node_config
         .validate()
-        .context("validating the assembled agent configuration")?;
+        .context("validating the assembled node configuration")?;
 
     let boards = BoardsConfig::from_path(&boards_path)
         .with_context(|| format!("loading boards.toml {}", boards_path.display()))?;
 
     tracing::info!(
-        agent_id = %agent_config.agent_id,
-        coordinator = %agent_config.fleet_url,
-        fleet = %args.fleet,
+        node_id = %node_config.node_id,
+        coordinator = %node_config.fleet_url,
+        fleet = %fleet,
         boards = boards.boards.len(),
-        adopt = %agent_config.adopt,
-        discovery_secs = agent_config.discovery_secs,
-        "starting agent"
+        adopt = %node_config.adopt,
+        discovery_secs = node_config.discovery_secs,
+        "starting node"
     );
 
-    // The agent's probe-rs backend spawns `probe-rs` server processes and
+    // The node's probe-rs backend spawns `probe-rs` server processes and
     // writes their socket/config files under a per-process runtime directory.
     let runtime_dir =
         std::env::temp_dir().join(format!("probe-rs-fleet-agent-{}", std::process::id()));
     let backend = Arc::new(ProcessBackend::new(runtime_dir));
 
-    let agent =
-        Arc::new(Agent::new(agent_config.clone(), boards, backend).context("constructing agent")?);
+    let node =
+        Arc::new(Agent::new(node_config.clone(), boards, backend).context("constructing node")?);
 
-    // Seed the agent's inventory from `boards.toml` so declared boards are
+    // Seed the node's inventory from `boards.toml` so declared boards are
     // advertised on registration even before the first discovery pass (a node
     // whose probes are all attached behaves identically to before). The
     // connection loop then refines it every `discovery_secs` from a live
@@ -284,19 +284,19 @@ pub async fn run(args: AgentArgs) -> Result<()> {
     // on either: `ProcessBackend` resolves each board's USB vid/pid from a
     // fresh enumeration at session-open time (see
     // `ProcessBackend::serve_spec`).
-    agent.seed_inventory_from_boards().await;
+    node.seed_inventory_from_boards().await;
 
     let store: Arc<dyn NodeTokenStore> = Arc::new(FleetFileTokenStore { path: fleet_path });
 
     // `connection::run` owns the connect / serve / reconnect-with-backoff
     // lifecycle (task 1712); race it against shutdown for clean termination.
     tokio::select! {
-        result = connection::run(agent, agent_config, store) => {
-            result.context("agent connection loop exited with an error")?;
-            tracing::info!("agent stopped");
+        result = connection::run(node, node_config, store) => {
+            result.context("node connection loop exited with an error")?;
+            tracing::info!("node stopped");
         }
         () = crate::signal::shutdown() => {
-            tracing::info!("agent shutting down");
+            tracing::info!("node shutting down");
         }
     }
 
@@ -432,7 +432,7 @@ mod tests {
         // still considers T1 current.
         store.persist(&t2, Some(&t1)).unwrap();
 
-        // The agent restarts, loads T2, is refused, and falls back to T1.
+        // The node restarts, loads T2, is refused, and falls back to T1.
         let mut config = agent_config_from(&fleet_config::load(&path).unwrap());
         assert_eq!(config.node_token, t2);
         assert!(config.fall_back_to_previous_token());

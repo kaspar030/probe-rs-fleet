@@ -7,7 +7,7 @@
 //!
 //! Three chains:
 //!
-//! 1. `coordinator auth-key` → `agent up --auth-key` → the fleet file's
+//! 1. `coordinator auth-key` → `node up --auth-key` → the fleet file's
 //!    `[node]` table holds a node token that authenticates on `/agent`;
 //! 2. `coordinator user-token` → `login --token` → the fleet file's `[user]`
 //!    table holds a session token that authenticates on `/client` and can list
@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_bin::cli::{AgentUpArgs, LoginArgs};
+use fleet_bin::cli::{LoginArgs, NodeUpFlags};
 use fleet_coordinator::auth::Ed25519Signer;
 use fleet_coordinator::clock::SystemClock;
 use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
@@ -116,15 +116,15 @@ async fn mint_user_token(fleet: &Fleet, org: &str, login: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn auth_key_to_agent_up_yields_a_working_node_token() {
+async fn auth_key_to_node_up_yields_a_working_node_token() {
     let fleet = start_fleet().await;
     let key = mint_auth_key(&fleet, "default").await;
 
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("agent");
 
-    fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(key),
             node_name: Some("rpi-lab-1".to_owned()),
@@ -142,7 +142,7 @@ async fn auth_key_to_agent_up_yields_a_working_node_token() {
         Some(&config_dir),
     )
     .await
-    .expect("agent up");
+    .expect("node up");
 
     // The written fleet file parses ...
     let config_path = config_dir.join("default.toml");
@@ -264,16 +264,16 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
     }
 }
 
-/// `agent up` must fail loudly on a bad key rather than writing a config file
+/// `node up` must fail loudly on a bad key rather than writing a config file
 /// that only fails later, when the agent is running unattended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_up_refuses_an_invalid_auth_key_and_writes_nothing() {
+async fn node_up_refuses_an_invalid_auth_key_and_writes_nothing() {
     let fleet = start_fleet().await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("agent");
 
-    let result = fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    let result = fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(OpaqueToken::mint(TokenKind::AuthKey).to_secret_string()),
             node_name: Some("rpi-1".to_owned()),
@@ -329,8 +329,8 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
     .expect("login --token");
 
     // ... then enrolls the same machine as a node.
-    fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(key),
             node_name: Some("laptop".to_owned()),
@@ -348,10 +348,10 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
         Some(&config_dir),
     )
     .await
-    .expect("agent up");
+    .expect("node up");
 
     let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
-    let user = file.user.clone().expect("[user] survived agent up");
+    let user = file.user.clone().expect("[user] survived node up");
     let node = file.node.clone().expect("[node] was written");
     assert_eq!(user.session_token, session);
     assert_ne!(user.session_token, node.node_token);

@@ -18,9 +18,9 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
+use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
 use fleet_proto::PROTOCOL_VERSION;
-use fleet_wire::{AgentToCoord, CoordToAgent};
+use fleet_wire::{CoordToNode, NodeToCoord};
 
 /// Rotate anything older than a second, and give the node a second to ack, so
 /// the state machine is exercised without a long test.
@@ -36,11 +36,11 @@ async fn eager_rotation_fleet() -> TestCoordinator {
 /// Await the rotation push the coordinator sends on connect.
 async fn expect_push(rx: &mut fleet_wire::client::DialedRx) -> (String, u64) {
     loop {
-        match fleet_wire::recv::<CoordToAgent>(rx).await.unwrap() {
-            CoordToAgent::Command(CoordinatorCommand::RotateNodeToken { token, rotation_id }) => {
+        match fleet_wire::recv::<CoordToNode>(rx).await.unwrap() {
+            CoordToNode::Command(CoordinatorCommand::RotateNodeToken { token, rotation_id }) => {
                 return (token, rotation_id)
             }
-            CoordToAgent::Command(_) | CoordToAgent::Data(_) => {}
+            CoordToNode::Command(_) | CoordToNode::Data(_) => {}
         }
     }
 }
@@ -59,10 +59,10 @@ async fn ack_promotes_the_new_token_and_retires_the_old() {
     assert_eq!(fleet.upgrade_status("/agent", Some(&old_token)).await, 101);
     assert_eq!(fleet.upgrade_status("/agent", Some(&new_token)).await, 401);
 
-    // Ack it, as the agent does after persisting.
+    // Ack it, as the node does after persisting.
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }),
+        &NodeToCoord::Report(NodeReport::TokenRotated { rotation_id }),
     )
     .await
     .unwrap();
@@ -146,7 +146,7 @@ async fn a_lost_ack_leaves_the_previous_token_as_the_working_one() {
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&new_token)).await,
         401,
-        "this is the window the agent's one-shot previous-token retry closes"
+        "this is the window the node's one-shot previous-token retry closes"
     );
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&old_token)).await,
@@ -168,7 +168,7 @@ async fn a_stale_rotation_ack_is_ignored() {
 
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::TokenRotated {
+        &NodeToCoord::Report(NodeReport::TokenRotated {
             rotation_id: rotation_id.wrapping_add(999),
         }),
     )
@@ -177,7 +177,7 @@ async fn a_stale_rotation_ack_is_ignored() {
     // Keep the connection alive long enough for the ack to be processed.
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+        &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
     )
     .await
     .unwrap();
@@ -212,7 +212,7 @@ async fn an_unacked_rotation_times_out_and_is_retried() {
         loop {
             if fleet_wire::send(
                 &mut tx,
-                &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+                &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
             )
             .await
             .is_err()
@@ -253,8 +253,8 @@ async fn a_fresh_token_is_not_rotated_on_connect() {
     let (mut tx, mut rx) = fleet.dial("/agent", &token).await.unwrap();
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::Register {
-            agent: node.clone(),
+        &NodeToCoord::Report(NodeReport::Register {
+            node: node.clone(),
             protocol_version: PROTOCOL_VERSION,
         }),
     )
@@ -264,7 +264,7 @@ async fn a_fresh_token_is_not_rotated_on_connect() {
     // Nothing should arrive within a short window.
     let pushed = tokio::time::timeout(
         std::time::Duration::from_millis(300),
-        fleet_wire::recv::<CoordToAgent>(&mut rx),
+        fleet_wire::recv::<CoordToNode>(&mut rx),
     )
     .await;
     assert!(
@@ -306,10 +306,10 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
     let (mut tx, mut rx) = fleet.dial("/agent", &old_token).await.unwrap();
     let (new_token, rotation_id) = expect_push(&mut rx).await;
 
-    // Ack it, as the agent does after persisting.
+    // Ack it, as the node does after persisting.
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }),
+        &NodeToCoord::Report(NodeReport::TokenRotated { rotation_id }),
     )
     .await
     .unwrap();
@@ -335,18 +335,18 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
     while std::time::Instant::now() < watch_until {
         match tokio::time::timeout(
             std::time::Duration::from_millis(250),
-            fleet_wire::recv::<CoordToAgent>(&mut rx),
+            fleet_wire::recv::<CoordToNode>(&mut rx),
         )
         .await
         {
-            Ok(Ok(CoordToAgent::Command(CoordinatorCommand::RotateNodeToken { .. }))) => {
+            Ok(Ok(CoordToNode::Command(CoordinatorCommand::RotateNodeToken { .. }))) => {
                 extra_pushes += 1;
             }
             // Timeouts and other frames are the expected quiet case.
             _ => {
                 let _ = fleet_wire::send(
                     &mut tx,
-                    &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+                    &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
                 )
                 .await;
             }
@@ -383,7 +383,7 @@ async fn a_flooding_node_does_not_starve_the_rotation_tick() {
     let flood = tokio::spawn(async move {
         while fleet_wire::send(
             &mut tx,
-            &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+            &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )
         .await
         .is_ok()

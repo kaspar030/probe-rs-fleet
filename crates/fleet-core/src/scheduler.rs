@@ -66,7 +66,7 @@
 use std::collections::BTreeMap;
 
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{AgentId, BoardRef, LeaseId, Subject, SubjectKey};
+use fleet_proto::ids::{BoardRef, LeaseId, NodeId, Subject, SubjectKey};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 use crate::access::{selector_matches, Access};
@@ -98,8 +98,8 @@ pub struct GrantedLease {
     pub lease: LeaseId,
     /// The board handed to the holder.
     pub board: BoardRef,
-    /// The agent that owns the board.
-    pub agent: AgentId,
+    /// The node that owns the board.
+    pub node: NodeId,
     /// The subject that now holds the lease.
     pub holder: Subject,
     /// Expiry as epoch seconds.
@@ -108,7 +108,7 @@ pub struct GrantedLease {
 
 /// A lease that the scheduler has freed during [`Scheduler::expire`].
 ///
-/// The coordinator uses this to trigger agent-side cleanup (power-cycle/erase)
+/// The coordinator uses this to trigger node-side cleanup (power-cycle/erase)
 /// for the board that was reclaimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredLease {
@@ -116,8 +116,8 @@ pub struct ExpiredLease {
     pub lease: LeaseId,
     /// The board that was freed.
     pub board: BoardRef,
-    /// The agent that owns the board.
-    pub agent: AgentId,
+    /// The node that owns the board.
+    pub node: NodeId,
     /// The subject that had held the lease.
     pub holder: Subject,
 }
@@ -291,9 +291,9 @@ impl Scheduler {
         &self.policy
     }
 
-    /// Insert or update a board from an agent inventory report.
+    /// Insert or update a board from a node inventory report.
     ///
-    /// The agent reports inventory and identity; the scheduler owns lease
+    /// The node reports inventory and identity; the scheduler owns lease
     /// state. Reconciliation rule: if the board is already known and currently
     /// [`BoardState::Leased`], the live lease state is preserved (the reported
     /// `state` is ignored). Otherwise the reported board — including its
@@ -307,7 +307,7 @@ impl Scheduler {
         self.boards.insert(board.id.clone(), board);
     }
 
-    /// Remove a board entirely (e.g. an agent dropped it from inventory).
+    /// Remove a board entirely (e.g. a node dropped it from inventory).
     ///
     /// If the board was leased, the lease entry is dropped too. The removed
     /// board is returned so the caller can clean up; any active lease on it is
@@ -340,15 +340,15 @@ impl Scheduler {
         self.leases.get(&lease).map(|info| &info.holder)
     }
 
-    /// The board and owning agent a lease is bound to, if it is active.
+    /// The board and owning node a lease is bound to, if it is active.
     ///
     /// Replaces scanning [`Scheduler::boards`] for a matching lease id, which
     /// is both O(n) and easy to get wrong.
     #[must_use]
-    pub fn lease_target(&self, lease: LeaseId) -> Option<(&BoardRef, &AgentId)> {
+    pub fn lease_target(&self, lease: LeaseId) -> Option<(&BoardRef, &NodeId)> {
         let info = self.leases.get(&lease)?;
         let board = self.boards.get(&info.board)?;
-        Some((&info.board, &board.agent))
+        Some((&info.board, &board.node))
     }
 
     /// Is `board` a grant candidate for a caller with `access`?
@@ -436,7 +436,7 @@ impl Scheduler {
             by: holder.clone(),
             expires,
         };
-        let agent = board.agent.clone();
+        let node = board.node.clone();
         self.leases.insert(
             lease,
             LeaseInfo {
@@ -450,7 +450,7 @@ impl Scheduler {
         GrantedLease {
             lease,
             board: board_id.clone(),
-            agent,
+            node,
             holder,
             expires,
         }
@@ -806,15 +806,15 @@ impl Scheduler {
                 .leases
                 .remove(&lease)
                 .expect("lease id came from current leases");
-            let agent = self.boards.get(&info.board).map(|b| b.agent.clone());
+            let node = self.boards.get(&info.board).map(|b| b.node.clone());
             if let Some(board) = self.boards.get_mut(&info.board) {
                 board.state = BoardState::Idle;
             }
-            if let Some(agent) = agent {
+            if let Some(node) = node {
                 result.freed.push(ExpiredLease {
                     lease,
                     board: info.board.clone(),
-                    agent,
+                    node,
                     holder: info.holder,
                 });
                 freed_boards.push(info.board);
@@ -895,13 +895,13 @@ mod tests {
     }
 
     fn board_ref(org_name: &str, id: &str) -> BoardRef {
-        BoardRef::new(org(org_name), AgentId("agent-1".to_owned()), id)
+        BoardRef::new(org(org_name), NodeId("node-1".to_owned()), id)
     }
 
     fn board(id: &str, chip: &str, tags: &[&str]) -> Board {
         Board {
             id: board_ref(ORG, id),
-            agent: AgentId("agent-1".to_string()),
+            node: NodeId("node-1".to_string()),
             chip: chip.to_string(),
             model: None,
             tags: tags.iter().map(|t| (*t).to_string()).collect(),
@@ -1877,7 +1877,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_target_resolves_board_and_agent() {
+    fn lease_target_resolves_board_and_node() {
         let mut s = sched();
         s.upsert_board(board("b1", "nrf52", &[]));
         let g = match request_as(
@@ -1889,9 +1889,9 @@ mod tests {
             LeaseDecision::Granted(g) => g,
             other => panic!("expected a grant, got {other:?}"),
         };
-        let (board_id, agent) = s.lease_target(g.lease).expect("active lease");
+        let (board_id, node) = s.lease_target(g.lease).expect("active lease");
         assert_eq!(board_id, &board_ref(ORG, "b1"));
-        assert_eq!(agent, &AgentId("agent-1".to_owned()));
+        assert_eq!(node, &NodeId("node-1".to_owned()));
         assert!(s.lease_target(LeaseId(999)).is_none());
     }
 

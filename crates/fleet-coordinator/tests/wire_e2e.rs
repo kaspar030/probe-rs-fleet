@@ -1,9 +1,9 @@
 //! End-to-end "live wire" integration test.
 //!
-//! This wires a real agent dial-out connection and a real sidecar relay client
+//! This wires a real node dial-out connection and a real sidecar relay client
 //! to the coordinator's genuine `handle_agent` / `handle_sidecar` pumps over
 //! in-memory wire pairs (no HTTP, no TLS), and proves a byte travels
-//! sidecar -> coordinator -> agent -> backend -> back.
+//! sidecar -> coordinator -> node -> backend -> back.
 //!
 //! `ws_e2e.rs` is the same property over a *real* `WebSocket` against a real
 //! router; this one keeps the pumps testable without an HTTP layer, so a
@@ -23,7 +23,7 @@ use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::{RequesterId, Scheduler};
-use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Role, Subject, SubjectKind};
+use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Role, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
@@ -66,7 +66,7 @@ impl ProbeRsBackend for EchoBackend {
         _serve_token: &str,
     ) -> Result<Box<dyn Session>, String> {
         let (agent_side, mut peer) = tokio::io::duplex(4096);
-        // Echo task: bounce every byte the agent writes back to it.
+        // Echo task: bounce every byte the node writes back to it.
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             loop {
@@ -109,7 +109,7 @@ fn coordinator_config() -> CoordinatorConfig {
 
 fn agent_config(token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
     fleet_agent::config::AgentConfig {
-        agent_id: node_id().0,
+        node_id: node_id().0,
         fleet_url: "https://coordinator.example:7000".to_owned(),
         node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
         previous_node_token: None,
@@ -139,13 +139,13 @@ kind = "none"
     .unwrap()
 }
 
-/// The node id the coordinator mints for this test's agent.
+/// The node id the coordinator mints for this test's node.
 ///
-/// The agent's configured id, the `node` row and the board key must all be the
+/// The node's configured id, the `node` row and the board key must all be the
 /// same string, and in production that string comes from `node_id_for`. Built
 /// by calling it, so the fixture cannot drift from the shape production mints.
-fn node_id() -> AgentId {
-    fleet_coordinator::node_id_for(&OrgId("default".to_owned()), "agent-a")
+fn node_id() -> NodeId {
+    fleet_coordinator::node_id_for(&OrgId("default".to_owned()), "node-a")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -161,7 +161,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     db.ensure_user_member(&OrgId("default".to_owned()), "dev", Role::Admin)
         .await
         .unwrap();
-    // The node row resolves this agent's reports to an org: since task 3448
+    // The node row resolves this node's reports to an org: since task 3448
     // there is no `default_org` fallback, so a report from a node with no row
     // is dropped rather than filed into the configured tenant.
     db.scoped(OrgId("default".to_owned()))
@@ -177,10 +177,10 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         Arc::new(SystemClock),
     ));
 
-    // --- Agent dial-out over duplex A ---
-    let agent =
+    // --- Node dial-out over duplex A ---
+    let node =
         Arc::new(Agent::new(agent_config(&token_pubkey), boards(), Arc::new(EchoBackend)).unwrap());
-    agent.seed_inventory_from_boards().await;
+    node.seed_inventory_from_boards().await;
 
     let (coord_tx, coord_rx, agent_tx, agent_rx) = fleet_wire::mock::pair();
     {
@@ -196,7 +196,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         });
     }
     {
-        let agent = Arc::clone(&agent);
+        let node = Arc::clone(&node);
         let mut config = agent_config(&token_pubkey);
         tokio::spawn(async move {
             // A node that never persists its rotated token: these tests are
@@ -204,7 +204,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
             let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
                 Arc::new(fleet_agent::config::NullTokenStore);
             let _ = fleet_agent::connection::serve_connection(
-                &agent,
+                &node,
                 &mut config,
                 &store,
                 Box::new(agent_tx),
@@ -214,7 +214,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         });
     }
 
-    // Wait for the agent's inventory to populate the scheduler.
+    // Wait for the node's inventory to populate the scheduler.
     // The coordinator keys the board by (org, node, name); the sidecar asks for
     // it by node-local name.
     let board_name = BoardName("nrf52840-dk-1".to_owned());
@@ -266,7 +266,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);
-    assert_eq!(grant.agent, node_id());
+    assert_eq!(grant.node, node_id());
 
     // Open a data relay channel.
     let (channel, _channel_token) = session
@@ -275,7 +275,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         .unwrap();
 
     // A local "probe-rs client" duplex; the splice copies bytes to the relay,
-    // the agent forwards them to the echo backend, and they come back.
+    // the node forwards them to the echo backend, and they come back.
     let (mut client, client_peer) = tokio::io::duplex(4096);
     {
         // The splice borrows the session for the connection's lifetime.

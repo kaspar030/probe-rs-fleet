@@ -7,7 +7,7 @@
 //! directly
 //! — so it needs **a shell on the coordinator host**. A customer who has only
 //! run `probe-rs-fleet login` has no such shell, and therefore could not enroll
-//! a headless lab Pi at all: the `agent up` ladder's rung 2 (`--auth-key`)
+//! a headless lab Pi at all: the `node up` ladder's rung 2 (`--auth-key`)
 //! required our shell and rung 3 (an existing `[user]` session) requires a human
 //! sitting at the machine.
 //!
@@ -384,7 +384,7 @@ fn print_created(created: &AuthKeyCreated) {
         }
     } else {
         println!("Enroll a node with it:");
-        println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
+        println!("  probe-rs-fleet node up --fleet-url <url> --auth-key <key>");
     }
     println!();
     println!("This key is a bearer credential and is not stored anywhere (only its");

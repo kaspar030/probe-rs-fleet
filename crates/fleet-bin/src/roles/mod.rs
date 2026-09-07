@@ -4,7 +4,7 @@
 //! the owning sibling crate's entry point:
 //!
 //! - [`coordinator`] → [`fleet_coordinator::run`]
-//! - [`agent`] → [`fleet_agent::connection::run`]
+//! - [`node_run`] → [`fleet_agent::connection::run`]
 //! - [`sidecar`] → [`fleet_sidecar::run`]
 //! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
 //!   coordinator client the tree has
@@ -16,19 +16,17 @@
 //! - [`node_approve`] → approve a headless machine that printed a short code
 //! - [`node_board`] → declare a board (discover probes, append to
 //!   `boards.toml`) instead of hand-editing it
-//! - [`agent_up`] → the §4.2 credential ladder, then [`agent`]
-//! - [`node_setup`] → the enrollment mechanics [`share`] and [`agent_up`] share
+//! - [`node_up`] → the §4.2 credential ladder, then [`node_run`]
+//! - [`node_setup`] → the enrollment mechanics [`share`] and [`node_up`] share
 //!
 //! Every client role selects its credentials by **fleet name**
 //! (`--fleet` / `PROBE_RS_FLEET`), resolving to one file per fleet. See
 //! [`crate::fleet_config`].
 //!
-//! The daemon roles (`coordinator`, `agent`) race their service against
+//! The daemon roles (`coordinator`, `node_run`) race their service against
 //! [`crate::signal::shutdown`] for graceful termination.
 
 pub mod admin;
-pub mod agent;
-pub mod agent_up;
 pub mod auth_key;
 pub mod ci;
 pub mod coordinator;
@@ -38,7 +36,9 @@ pub mod init;
 pub mod login;
 pub mod node_approve;
 pub mod node_board;
+pub mod node_run;
 pub mod node_setup;
+pub mod node_up;
 pub mod share;
 pub mod sidecar;
 

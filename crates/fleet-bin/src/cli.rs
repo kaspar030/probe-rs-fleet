@@ -7,7 +7,7 @@
 //!    argument is treated as a probe-rs argument and forwarded to the sidecar
 //!    shim *without* running clap. This makes a `probe-rs` symlink on `PATH`
 //!    route through the fleet transparently.
-//! 2. **explicit subcommands** — `probe-rs-fleet <coordinator|agent|sidecar|ctl>`
+//! 2. **explicit subcommands** — `probe-rs-fleet <coordinator|node|sidecar|ctl>`
 //!    parsed with clap derive.
 
 use std::ffi::{OsStr, OsString};
@@ -24,7 +24,7 @@ use crate::roles::sidecar::SelectorFlags;
 #[command(
     name = "probe-rs-fleet",
     version,
-    about = "probe-rs-fleet: coordinator, agent, sidecar, and admin CLI in one binary",
+    about = "probe-rs-fleet: coordinator, node, sidecar, and admin CLI in one binary",
     propagate_version = true
 )]
 pub struct Cli {
@@ -37,7 +37,10 @@ pub struct Cli {
 pub enum Command {
     /// Run the fleet coordinator daemon (scheduler / leases / relay).
     Coordinator(CoordinatorArgs),
-    /// Run the fleet agent: dials out to the coordinator and drives local probes.
+    /// Deprecated spelling of `node run` / `node up`. Kept working — it is a
+    /// documented command and a deployed service unit — but hidden from help
+    /// so `--help` advertises one vocabulary.
+    #[command(hide = true)]
     Agent(AgentArgs),
     /// Sidecar shim: forward a probe-rs invocation through the fleet.
     ///
@@ -59,8 +62,8 @@ pub enum Command {
     Grant(GrantArgs),
     /// CI-runner verbs. Today: exchange a workload identity for a fleet token.
     Ci(CiArgs),
-    /// Node-side operator verbs: approve a machine that is asking to join your
-    /// org, and declare this machine's boards.
+    /// Node-side verbs: run this machine as a node, approve a machine that is
+    /// asking to join your org, and declare this machine's boards.
     Node(NodeArgs),
     /// List the fleets this machine has a config for.
     Fleets,
@@ -160,7 +163,7 @@ pub struct InitArgs {
 /// Arguments for `coordinator auth-key`.
 ///
 /// The **self-hosted / air-gapped escape hatch**, not the front door: a laptop
-/// with a login runs `probe-rs-fleet share`, a headless node runs `agent up`
+/// with a login runs `probe-rs-fleet share`, a headless node runs `node up`
 /// with a key its owner minted using `probe-rs-fleet auth-key create`, and
 /// neither needs a shell on the coordinator host. What is still only available
 /// here: minting with no login at all, and `--ttl 0` (a key that never
@@ -519,13 +522,46 @@ pub enum NodeCommand {
     Approve(NodeApproveArgs),
     /// Declare or inspect this machine's boards (`boards.toml`).
     Board(NodeBoardArgs),
+    /// Register this machine as a node if it is not one yet, then run it.
+    Up(NodeUpArgs),
+    /// Run the node with the `[node]` credential this machine already has.
+    Run(NodeRunArgs),
+}
+
+/// Arguments for `probe-rs-fleet node up`.
+#[derive(Debug, Args)]
+pub struct NodeUpArgs {
+    /// The bootstrap ladder's flags, shared verbatim with `agent up`.
+    #[command(flatten)]
+    pub flags: NodeUpFlags,
+    /// The fleet whose `[node]` credential this node connects with.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet node run`.
+#[derive(Debug, Args)]
+pub struct NodeRunArgs {
+    /// The fleet whose `[node]` credential this node connects with.
+    ///
+    /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`; the
+    /// node-local settings live in `node/node.toml`.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true)]
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// Arguments for `probe-rs-fleet node board`.
 ///
-/// Under `node` rather than `agent` because it edits **node-local config**: no
-/// fleet connection, no credential, no coordinator. The `agent` group is about
-/// *running* the agent.
+/// Under `node` rather than the deprecated `agent` group because it edits
+/// **node-local config**: no fleet connection, no credential, no coordinator.
 #[derive(Debug, Args)]
 pub struct NodeBoardArgs {
     /// The board verb.
@@ -617,7 +653,7 @@ impl NodeBoardAddArgs {
     /// The operator's explicit choice about prompting, or `None` for "decide
     /// from whether there is a terminal".
     ///
-    /// Same two-flag shape as [`AgentUpArgs::interactive_choice`], collapsed to
+    /// Same two-flag shape as [`NodeUpFlags::interactive_choice`], collapsed to
     /// one tri-state, so there is one convention in this binary rather than
     /// two.
     #[must_use]
@@ -726,7 +762,7 @@ pub struct CiLoginArgs {
 /// Arguments for `probe-rs-fleet node approve`.
 ///
 /// The approving half of architecture §4.2's rung 3: a headless machine ran
-/// `agent up`, printed a URL and a code, and is polling. This verb runs on a
+/// `node up`, printed a URL and a code, and is polling. This verb runs on a
 /// machine where you are **already logged in**, because the coordinator has no
 /// browser-authenticated surface (§6.4: `login` is the GitHub *device* flow,
 /// with no `redirect_uri` and no cookie session).
@@ -785,10 +821,14 @@ impl From<AdoptArg> for fleet_proto::AdoptPolicy {
     }
 }
 
-/// Arguments for the `agent` role.
+/// Arguments for the deprecated `agent` role.
+///
+/// Shape unchanged so `probe-rs-fleet agent` / `agent up` keep parsing exactly
+/// as they did; both dispatch into the same role functions `node run` /
+/// `node up` use.
 #[derive(Debug, Args)]
 pub struct AgentArgs {
-    /// The fleet whose `[node]` credential this agent connects with.
+    /// The fleet whose `[node]` credential this node connects with.
     ///
     /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`. There is no
     /// `--config` any more: `agent.toml` is gone, the credential lives in the
@@ -799,26 +839,31 @@ pub struct AgentArgs {
     /// packaging support.
     #[arg(long, hide = true, global = true)]
     pub config_dir: Option<std::path::PathBuf>,
-    /// Optional nested subcommand (e.g. `up`). When absent, the agent runs.
+    /// Optional nested subcommand (e.g. `up`). When absent, the node runs.
     #[command(subcommand)]
     pub command: Option<AgentCommand>,
 }
 
-/// `agent` subcommands.
+/// Deprecated `agent` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
-    /// Register this machine as a node if it is not one yet, then run the
-    /// agent.
-    Up(AgentUpArgs),
+    /// Register this machine as a node if it is not one yet, then run it.
+    Up(NodeUpFlags),
 }
 
-/// Arguments for `agent up`.
+/// The bootstrap flags shared by `node up` and the hidden `agent up`.
 ///
-/// `agent up` resolves a node credential by the §4.2 ladder and then **runs**
-/// the agent. Plain `probe-rs-fleet agent` is the subset that requires an
-/// existing `[node]` credential.
+/// `node up` resolves a node credential by the §4.2 ladder and then **runs**
+/// the node. `node run` is the subset that requires an existing `[node]`
+/// credential.
+///
+/// Split out from [`NodeUpArgs`] because [`AgentArgs`] declares `--fleet` /
+/// `--config-dir` as `global = true`: a nested `up` that declared them again
+/// would be a duplicate arg id, which clap reports as a **runtime panic**.
+/// Flattening the shared flags and adding the two args only on the `node up`
+/// side is what keeps both spellings parseable.
 #[derive(Debug, Args)]
-pub struct AgentUpArgs {
+pub struct NodeUpFlags {
     /// Base URL of the coordinator (`https://fleet.example`). A bare
     /// `host:port` is accepted and assumes https.
     ///
@@ -871,7 +916,7 @@ pub struct AgentUpArgs {
     pub no_interactive: bool,
 }
 
-impl AgentUpArgs {
+impl NodeUpFlags {
     /// The operator's explicit choice about interactive approval, or `None`
     /// for "decide from whether there is a terminal".
     ///
@@ -1183,6 +1228,10 @@ pub fn main() -> ExitCode {
 /// # Errors
 ///
 /// Propagates any error from a role handler.
+///
+/// One `match` arm per verb, so the length is the size of the CLI surface
+/// rather than a function doing several things.
+#[allow(clippy::too_many_lines)]
 async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<ExitCode> {
     match dispatch {
         Dispatch::Sidecar(probe_rs_args) => {
@@ -1225,13 +1274,15 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         Ok(ExitCode::SUCCESS)
                     }
                 },
+                // The deprecated spelling: same role functions, so `agent`
+                // and `node` cannot drift in what they do.
                 Command::Agent(args) => match args.command {
-                    Some(AgentCommand::Up(up)) => {
-                        roles::agent_up::run(up, &args.fleet, args.config_dir).await?;
+                    Some(AgentCommand::Up(flags)) => {
+                        roles::node_up::run(flags, &args.fleet, args.config_dir).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                     None => {
-                        roles::agent::run(args).await?;
+                        roles::node_run::run(&args.fleet, args.config_dir).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                 },
@@ -1271,6 +1322,14 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                             Ok(ExitCode::SUCCESS)
                         }
                     },
+                    NodeCommand::Up(up) => {
+                        roles::node_up::run(up.flags, &up.fleet, up.config_dir).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    NodeCommand::Run(run) => {
+                        roles::node_run::run(&run.fleet, run.config_dir).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
                 },
                 Command::Ci(args) => match args.command {
                     CiCommand::Login(login) => roles::ci::run(login).await,
@@ -1670,7 +1729,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_up() {
+    fn parses_node_up() {
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
             "agent",
@@ -1699,23 +1758,127 @@ mod tests {
         }
     }
 
-    /// The whole point of `agent up`: on a machine that has already logged in,
+    /// The whole point of `node up`: on a machine that has already logged in,
     /// it needs no flags at all. Both `--auth-key` and `--fleet-url` are
     /// optional, which is what makes paths 1 and 2 of the §4.2 ladder reachable
     /// without the operator knowing they exist.
     #[test]
-    fn agent_up_needs_no_flags() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "up"]));
-        match cli.command {
+    fn node_up_needs_no_flags() {
+        for argv in [
+            ["probe-rs-fleet", "node", "up"],
+            ["probe-rs-fleet", "agent", "up"],
+        ] {
+            let up = match Cli::parse_from(os(&argv)).command {
+                Command::Node(n) => match n.command {
+                    NodeCommand::Up(up) => up.flags,
+                    other => panic!("expected node up, got {other:?}"),
+                },
+                Command::Agent(a) => match a.command {
+                    Some(AgentCommand::Up(flags)) => flags,
+                    other => panic!("expected agent up, got {other:?}"),
+                },
+                other => panic!("expected node/agent, got {other:?}"),
+            };
+            assert!(up.auth_key.is_none());
+            assert!(up.fleet_url.is_none());
+        }
+    }
+
+    /// `node up` is canonical, `agent up` is the hidden alias, and they must
+    /// parse to the **same flags** — otherwise the two spellings silently do
+    /// different things.
+    ///
+    /// This also pins the [`NodeUpFlags`] split: [`AgentArgs`] declares
+    /// `--fleet` / `--config-dir` as `global = true`, so a nested `up` that
+    /// declared them again would be a duplicate arg id, which clap reports as
+    /// a **runtime panic** during parse rather than a compile error. Nothing
+    /// but a parse test catches that.
+    #[test]
+    fn node_up_and_agent_up_parse_to_the_same_flags() {
+        // The shared bootstrap flags, spelled identically on both sides.
+        let flags = [
+            "--fleet-url",
+            "https://fleet.example",
+            "--auth-key",
+            "prffk1_abc",
+            "--node-name",
+            "rpi-7",
+            "--no-interactive",
+        ];
+
+        // `node up` carries `--fleet` on the leaf; the deprecated `agent`
+        // declares it globally, so it sits before the subcommand there.
+        let mut canonical = vec!["probe-rs-fleet", "node", "up", "--fleet", "lab1"];
+        canonical.extend_from_slice(&flags);
+        let (canonical_fleet, canonical_flags) = match Cli::parse_from(os(&canonical)).command {
+            Command::Node(n) => match n.command {
+                NodeCommand::Up(up) => (up.fleet, up.flags),
+                other => panic!("expected node up, got {other:?}"),
+            },
+            other => panic!("expected node, got {other:?}"),
+        };
+
+        let mut alias = vec!["probe-rs-fleet", "agent", "--fleet", "lab1", "up"];
+        alias.extend_from_slice(&flags);
+        let (alias_fleet, alias_flags) = match Cli::parse_from(os(&alias)).command {
             Command::Agent(a) => match a.command {
-                Some(AgentCommand::Up(up)) => {
-                    assert!(up.auth_key.is_none());
-                    assert!(up.fleet_url.is_none());
-                }
+                Some(AgentCommand::Up(flags)) => (a.fleet, flags),
                 other => panic!("expected agent up, got {other:?}"),
             },
             other => panic!("expected agent, got {other:?}"),
-        }
+        };
+
+        assert_eq!(canonical_fleet, alias_fleet);
+        assert_eq!(canonical_fleet, "lab1");
+        assert_eq!(canonical_flags.fleet_url, alias_flags.fleet_url);
+        assert_eq!(canonical_flags.auth_key, alias_flags.auth_key);
+        assert_eq!(canonical_flags.node_name, alias_flags.node_name);
+        assert_eq!(
+            canonical_flags.interactive_choice(),
+            alias_flags.interactive_choice()
+        );
+        assert_eq!(canonical_flags.interactive_choice(), Some(false));
+    }
+
+    /// The run half of the same pair: `node run` and the bare `agent` reach
+    /// the same role with the same fleet.
+    #[test]
+    fn node_run_and_bare_agent_agree() {
+        let run = match Cli::parse_from(os(&["probe-rs-fleet", "node", "run", "--fleet", "lab1"]))
+            .command
+        {
+            Command::Node(n) => match n.command {
+                NodeCommand::Run(run) => run.fleet,
+                other => panic!("expected node run, got {other:?}"),
+            },
+            other => panic!("expected node, got {other:?}"),
+        };
+        let bare =
+            match Cli::parse_from(os(&["probe-rs-fleet", "agent", "--fleet", "lab1"])).command {
+                Command::Agent(a) => {
+                    assert!(a.command.is_none());
+                    a.fleet
+                }
+                other => panic!("expected agent, got {other:?}"),
+            };
+        assert_eq!(run, bare);
+        assert_eq!(run, "lab1");
+    }
+
+    /// `--help` advertises `node` and not the deprecated `agent`, while both
+    /// old spellings still parse.
+    #[test]
+    fn agent_is_hidden_from_help_but_still_usable() {
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("node"), "got: {help}");
+        assert!(
+            !help.lines().any(|l| l.trim_start().starts_with("agent")),
+            "the deprecated spelling must not be advertised: {help}"
+        );
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent", "up"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "up"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "run"])).is_ok());
     }
 
     /// `share` is the story-2 payoff: one word, no flags.
@@ -2466,7 +2629,9 @@ mod tests {
                     }
                     NodeBoardCommand::List(other) => panic!("expected add, got {other:?}"),
                 },
-                NodeCommand::Approve(other) => panic!("expected board, got {other:?}"),
+                NodeCommand::Approve(_) | NodeCommand::Up(_) | NodeCommand::Run(_) => {
+                    panic!("expected board")
+                }
             },
             other => panic!("expected node, got {other:?}"),
         }
@@ -2480,7 +2645,7 @@ mod tests {
         assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "board", "list"])).is_ok());
     }
 
-    /// Same tri-state convention as `agent up`, including the contradiction
+    /// Same tri-state convention as `node up`, including the contradiction
     /// clap must catch.
     #[test]
     fn node_board_add_interactive_flags_are_a_tri_state() {
@@ -2504,7 +2669,9 @@ mod tests {
                         NodeBoardCommand::Add(a) => assert_eq!(a.interactive_choice(), expected),
                         NodeBoardCommand::List(other) => panic!("expected add, got {other:?}"),
                     },
-                    NodeCommand::Approve(other) => panic!("expected board, got {other:?}"),
+                    NodeCommand::Approve(_) | NodeCommand::Up(_) | NodeCommand::Run(_) => {
+                        panic!("expected board")
+                    }
                 },
                 other => panic!("expected node, got {other:?}"),
             }

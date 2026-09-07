@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_bin::cli::{AdoptArg, AgentUpArgs, LoginArgs, ShareArgs};
+use fleet_bin::cli::{AdoptArg, LoginArgs, NodeUpFlags, ShareArgs};
 use fleet_coordinator::auth::Ed25519Signer;
 use fleet_coordinator::clock::SystemClock;
 use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
@@ -21,7 +21,7 @@ use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{AgentId, OrgId, Role};
+use fleet_proto::ids::{NodeId, OrgId, Role};
 use fleet_proto::AdoptPolicy;
 
 const SEED: [u8; 32] = [23u8; 32];
@@ -164,7 +164,7 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
     // out where the operator can read it.
     let node_toml = config_dir.join("node").join("node.toml");
     assert!(config_dir.join("node").join("boards.toml").exists());
-    let settings = fleet_bin::roles::agent::load_node_settings(&node_toml).unwrap();
+    let settings = fleet_bin::roles::node_run::load_node_settings(&node_toml).unwrap();
     assert_eq!(settings.adopt, Some(AdoptPolicy::Auto));
 
     // ... and, the point of the whole test, the token actually connects.
@@ -180,7 +180,7 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
 
     // The coordinator's row records the owner and the policy: "my laptop's
     // boards" is expressible, and auto-adoption is on.
-    let node_id = AgentId(node.node_id.clone());
+    let node_id = NodeId(node.node_id.clone());
     assert_eq!(
         fleet
             .coord
@@ -217,7 +217,7 @@ async fn share_honours_an_explicit_adopt_policy() {
     fleet_bin::roles::share::run(args).await.expect("share");
 
     let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
-    let node_id = AgentId(file.node.unwrap().node_id);
+    let node_id = NodeId(file.node.unwrap().node_id);
     assert_eq!(
         fleet
             .coord
@@ -231,7 +231,7 @@ async fn share_honours_an_explicit_adopt_policy() {
     );
 
     let settings =
-        fleet_bin::roles::agent::load_node_settings(&config_dir.join("node").join("node.toml"))
+        fleet_bin::roles::node_run::load_node_settings(&config_dir.join("node").join("node.toml"))
             .unwrap();
     assert_eq!(settings.adopt, Some(AdoptPolicy::Declared));
 }
@@ -328,18 +328,18 @@ async fn sharing_twice_without_force_is_refused() {
     .is_err());
 }
 
-/// `agent up` on a laptop that has logged in takes the same path `share` does,
+/// `node up` on a laptop that has logged in takes the same path `share` does,
 /// with no flags at all. This is §4.2's ladder rung 2, and the two verbs must
 /// not drift: the same node row, the same policy, the same scaffolding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_up_self_registers_from_an_existing_session() {
+async fn node_up_self_registers_from_an_existing_session() {
     let fleet = start_fleet().await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
 
-    fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: None,
             auth_key: None,
             node_name: Some("laptop".to_owned()),
@@ -357,12 +357,12 @@ async fn agent_up_self_registers_from_an_existing_session() {
         Some(&config_dir),
     )
     .await
-    .expect("agent up with a session and no flags");
+    .expect("node up with a session and no flags");
 
     let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
     let node = file.node.expect("[node] written");
     assert!(file.user.is_some(), "[user] must survive");
-    let node_id = AgentId(node.node_id);
+    let node_id = NodeId(node.node_id);
     assert_eq!(
         fleet
             .coord
@@ -391,7 +391,7 @@ async fn agent_up_self_registers_from_an_existing_session() {
 /// replaced. Re-registering a working node for no reason would invalidate the
 /// token it is currently connected with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_up_reuses_an_existing_node_credential() {
+async fn node_up_reuses_an_existing_node_credential() {
     let fleet = start_fleet().await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
@@ -405,8 +405,8 @@ async fn agent_up_reuses_an_existing_node_credential() {
         .unwrap()
         .node_token;
 
-    fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: None,
             auth_key: None,
             node_name: None,
@@ -424,7 +424,7 @@ async fn agent_up_reuses_an_existing_node_credential() {
         Some(&config_dir),
     )
     .await
-    .expect("agent up on an already-enrolled node");
+    .expect("node up on an already-enrolled node");
 
     let after = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
@@ -435,16 +435,16 @@ async fn agent_up_reuses_an_existing_node_credential() {
 }
 
 /// Rung 5: nothing to work with, and no terminal to run the interactive rung
-/// on. `agent up` must name every way out — login, interactive approval, and an
+/// on. `node up` must name every way out — login, interactive approval, and an
 /// auth key — rather than doing nothing quietly on a machine someone is waiting
 /// on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_up_with_no_credential_at_all_explains_itself() {
+async fn node_up_with_no_credential_at_all_explains_itself() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
 
-    let err = fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    let err = fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: None,
             auth_key: None,
             node_name: None,
@@ -500,8 +500,8 @@ async fn an_explicit_auth_key_beats_an_incidental_session() {
         .await
         .unwrap();
 
-    fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(key.to_secret_string()),
             node_name: Some("ci-runner".to_owned()),
@@ -519,10 +519,10 @@ async fn an_explicit_auth_key_beats_an_incidental_session() {
         Some(&config_dir),
     )
     .await
-    .expect("agent up --auth-key");
+    .expect("node up --auth-key");
 
     let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
-    let node_id = AgentId(file.node.unwrap().node_id);
+    let node_id = NodeId(file.node.unwrap().node_id);
     // The auth-key path leaves the node unowned and `declared` — which is how
     // you can tell which rung ran.
     assert!(fleet

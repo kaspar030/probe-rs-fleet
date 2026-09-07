@@ -350,14 +350,14 @@ pub enum TokenError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{AgentId, OrgId};
+    use crate::ids::{NodeId, OrgId};
 
     fn sample() -> CapabilityToken {
         CapabilityToken {
             lease: LeaseId(7),
             board: BoardRef::new(
                 OrgId("acme".to_owned()),
-                AgentId("rpi-1".to_owned()),
+                NodeId("rpi-1".to_owned()),
                 "nrf52840-dk-3",
             ),
             allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],

@@ -4,7 +4,7 @@
 #   $XDG_CONFIG_HOME/probe-rs-fleet/node/node.toml
 #   (i.e. ~/.config/probe-rs-fleet/node/node.toml)
 #
-# `probe-rs-fleet share` / `agent up` scaffold a commented version of this file.
+# `probe-rs-fleet share` / `node up` scaffold a commented version of this file.
 #
 # ---------------------------------------------------------------------------
 # Why this is NOT per fleet
@@ -36,13 +36,13 @@
 #                `ctl lease board=<model>` will match it until boards.toml
 #                annotates it.
 #   "declared" — report it, but keep it unleasable until it is declared in
-#                boards.toml. `agent up --auth-key` sets this: CI and lab nodes
+#                boards.toml. `node up --auth-key` sets this: CI and lab nodes
 #                want stable ids and no surprises.
 #
 # ADVISORY. The coordinator's `node` row is what actually decides; this setting
 # only governs whether this agent bothers to synthesise board metadata for
 # undeclared probes at all. Editing it here does NOT change what the coordinator
-# will adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `agent up
+# will adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `node up
 # --adopt <policy>`) for that.
 # adopt = "declared"
 

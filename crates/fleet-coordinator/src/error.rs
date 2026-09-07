@@ -1,6 +1,6 @@
 //! Error type for the coordinator.
 
-use fleet_proto::ids::{AgentId, LeaseId};
+use fleet_proto::ids::{LeaseId, NodeId};
 
 /// Errors produced by the coordinator's runtime and helpers.
 #[derive(Debug, thiserror::Error)]
@@ -54,9 +54,9 @@ pub enum CoordinatorError {
         ours: u32,
     },
 
-    /// The owning agent for a board is not currently connected.
-    #[error("agent {0} is not connected")]
-    AgentUnavailable(AgentId),
+    /// The owning node for a board is not currently connected.
+    #[error("node {0} is not connected")]
+    NodeUnavailable(NodeId),
 
     /// The referenced lease is not known to the scheduler.
     #[error("lease {0:?} not found")]

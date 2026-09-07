@@ -18,7 +18,7 @@
 //! `RotateNodeToken { rotation_id, .. }`, and promote it only on the matching
 //! `TokenRotated { rotation_id }` ack. A lost push costs one retry.
 //!
-//! The agent closes the mirror-image window (ack lost *after* it persisted) by
+//! The node closes the mirror-image window (ack lost *after* it persisted) by
 //! keeping its previous token and retrying once with it — client-side, no server
 //! state.
 

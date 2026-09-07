@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::board::PowerKind;
-use crate::ids::{AgentId, BoardRef, LeaseId, OrgId, Subject, SubjectKey};
+use crate::ids::{BoardRef, LeaseId, NodeId, OrgId, Subject, SubjectKey};
 use crate::token::AllowedOp;
 
 /// A coarse, operator-facing lifecycle label for a board in `ctl list`.
@@ -34,11 +34,11 @@ pub enum BoardAvailability {
 pub struct BoardSummary {
     /// The board's fleet-unique key.
     pub board: BoardRef,
-    /// The agent that owns the board.
+    /// The node that owns the board.
     ///
     /// Redundant with `board.node`, but kept so `ctl list` rendering and any
     /// consumer that only wants the node do not have to reach into the key.
-    pub agent: AgentId,
+    pub node: NodeId,
     /// probe-rs target/chip name.
     pub chip: String,
     /// Board *model* (board type), e.g. `nrf52840dk` — what `board=<model>`

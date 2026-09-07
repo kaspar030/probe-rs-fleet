@@ -36,7 +36,7 @@
 //! # The agent does not reload
 //!
 //! `boards.toml` is read **once at agent startup** (see
-//! [`crate::roles::agent::run`]); there is no file watcher and this module does
+//! [`crate::roles::node_run::run`]); there is no file watcher and this module does
 //! not add one. Every successful add therefore prints that the agent must be
 //! restarted.
 
@@ -50,7 +50,7 @@ use fleet_agent::discovery::{reconcile, ProbeLister, ProbeRsListLister};
 use fleet_proto::{AdoptPolicy, BoardPresence, DiscoveredProbe};
 
 use crate::cli::{NodeBoardAddArgs, NodeBoardListArgs};
-use crate::roles::agent::{load_node_settings, resolve_boards_path};
+use crate::roles::node_run::{load_node_settings, resolve_boards_path};
 use crate::roles::node_setup::starter_boards_toml;
 
 /// Discover attached probes and append a `[[board]]` declaration for one.

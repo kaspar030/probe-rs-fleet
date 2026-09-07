@@ -1,7 +1,7 @@
 //! Wire types for the coordinator's `WebSocket` planes.
 //!
 //! The codec and the control-plane envelopes live in the shared [`fleet_wire`]
-//! crate (so agents and sidecars can speak the wire without depending on the
+//! crate (so nodes and sidecars can speak the wire without depending on the
 //! coordinator's storage stack). This module re-exports them and carries the
 //! `WireError → CoordinatorError` conversion, preserving the historical
 //! `fleet_coordinator::proto` API.
@@ -12,7 +12,7 @@
 //! [`fleet_wire::WireRx`] traits are what the server speaks now.
 
 pub use fleet_wire::{
-    AgentToCoord, CoordToAgent, CoordToSidecar, SidecarToCoord, WireError, MAX_FRAME_LEN,
+    CoordToNode, CoordToSidecar, NodeToCoord, SidecarToCoord, WireError, MAX_FRAME_LEN,
 };
 
 use crate::error::CoordinatorError;

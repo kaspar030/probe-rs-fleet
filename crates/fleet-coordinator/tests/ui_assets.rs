@@ -315,7 +315,7 @@ async fn the_ui_swallows_no_other_prefix() {
         assert!(!body.contains("<main"), "{path} must not be the shell");
     }
 
-    // The page every deployed agent prints is untouched.
+    // The page every deployed node prints is untouched.
     let (status, headers, body) = fleet.http_full("GET", "/node/approve", &[], None).await;
     assert_eq!(status, 200);
     assert_eq!(

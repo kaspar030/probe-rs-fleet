@@ -1,8 +1,8 @@
-//! Control-plane message set exchanged between an agent and the coordinator.
+//! Control-plane message set exchanged between a node and the coordinator.
 //!
 //! These are the *payload* types for the dial-out control plane (architecture
-//! §5): the agent reports upward ([`AgentReport`]) and the coordinator commands
-//! downward ([`CoordinatorCommand`]) over the agent's single persistent
+//! §5): the node reports upward ([`NodeReport`]) and the coordinator commands
+//! downward ([`CoordinatorCommand`]) over the node's single persistent
 //! `WebSocket` connection (revision 2, §3.5 — it was a bespoke mTLS stream
 //! before). This module defines only the shared serde payloads so the two ends
 //! cannot drift; the framing lives in `fleet-wire`.
@@ -13,10 +13,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::board::PowerKind;
-use crate::ids::{AgentId, BoardName, BoardRef, LeaseId};
+use crate::ids::{BoardName, BoardRef, LeaseId, NodeId};
 use crate::ChannelId;
 
-/// A probe physically discovered on an agent host (via `probe-rs` enumeration).
+/// A probe physically discovered on a node host (via `probe-rs` enumeration).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveredProbe {
     /// Physical probe serial (matched against `boards.toml`).
@@ -54,11 +54,11 @@ pub enum BoardPresence {
 /// [`AdoptPolicy::Auto`](crate::AdoptPolicy::Auto)); [`BoardStatus::adopted`]
 /// says which.
 ///
-/// Carries the full leasable-board metadata declared in the agent's
+/// Carries the full leasable-board metadata declared in the node's
 /// `boards.toml` (chip / tags / exclusivity / power capability) in addition to
 /// the live presence, so the coordinator can reconstruct a
 /// [`fleet_proto::board::Board`] for its scheduler without a second message.
-/// The board's owning [`AgentId`] is known from the authenticated connection
+/// The board's owning [`NodeId`] is known from the authenticated connection
 /// (it is not repeated on the wire) and its lease state defaults to available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardStatus {
@@ -78,7 +78,7 @@ pub struct BoardStatus {
     /// Board *model* (board type), e.g. `nrf52840dk` — what `board=<model>`
     /// matches.
     ///
-    /// Declared in `boards.toml`; the agent **cannot infer it** (`probe-rs
+    /// Declared in `boards.toml`; the node **cannot infer it** (`probe-rs
     /// list` reports the probe, never the board wired to it), exactly as it
     /// cannot infer `chip`. `None` for an adopted board, which is therefore
     /// never reachable by `board=`.
@@ -87,7 +87,7 @@ pub struct BoardStatus {
     pub tags: Vec<String>,
     /// Whether the board admits only one lease at a time.
     pub exclusive: bool,
-    /// How the agent can cut/restore power to this board.
+    /// How the node can cut/restore power to this board.
     pub power: BoardPower,
     /// Whether this board was **adopted** from an undeclared probe under
     /// [`AdoptPolicy::Auto`](crate::AdoptPolicy::Auto) rather than declared in
@@ -111,7 +111,7 @@ pub struct ProbeInventory {
     pub unknown: Vec<DiscoveredProbe>,
 }
 
-/// Severity of an agent log line forwarded to the coordinator's audit log.
+/// Severity of a node log line forwarded to the coordinator's audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
     /// Diagnostic detail.
@@ -124,7 +124,7 @@ pub enum LogLevel {
     Error,
 }
 
-/// A USB-power transition the agent performed on a board.
+/// A USB-power transition the node performed on a board.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PowerAction {
     /// Power was cut.
@@ -135,18 +135,18 @@ pub enum PowerAction {
     Cycle,
 }
 
-/// What an opaque relay channel carries, and therefore how the agent sources /
+/// What an opaque relay channel carries, and therefore how the node sources /
 /// sinks its bytes.
 ///
 /// Both kinds ride the *same* relay machinery: once open, a channel is a pure
 /// [`crate::DataFrame`] byte pump and the coordinator never inspects it. The
-/// kind only matters at channel-open time, where it tells the agent what to
+/// kind only matters at channel-open time, where it tells the node what to
 /// splice the channel onto:
 ///
 /// * [`ChannelKind::Data`] — the board's `probe-rs serve` postcard-rpc stream
 ///   (the regular data plane; architecture §4.2).
 /// * [`ChannelKind::Gdb`] — a freshly-spawned, board-local `probe-rs gdb` TCP
-///   stub. `probe-rs gdb` is not remote-capable in 0.32, so the agent runs it
+///   stub. `probe-rs gdb` is not remote-capable in 0.32, so the node runs it
 ///   locally and tunnels its raw gdbremote TCP as a second opaque channel
 ///   (architecture §4.2 gap note, §10 Q3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -158,12 +158,12 @@ pub enum ChannelKind {
     Gdb,
 }
 
-/// Messages an agent sends *up* to the coordinator.
+/// Messages a node sends *up* to the coordinator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AgentReport {
+pub enum NodeReport {
     /// First message after the dial-out connection is established.
     Register {
-        /// The agent id this node believes it has.
+        /// The node id this node believes it has.
         ///
         /// **Advisory, and validated — never trusted.** Under bearer auth the
         /// node's identity comes from the token the coordinator resolved on the
@@ -171,17 +171,17 @@ pub enum AgentReport {
         /// coordinator compares it with the token-derived id and closes the
         /// connection on a mismatch (a node claiming another node's id is not a
         /// benign typo); routing and authorization use the token-derived id
-        /// regardless. The agent fills this field from the `node_id` the
+        /// regardless. The node fills this field from the `node_id` the
         /// token exchange returned.
-        agent: AgentId,
-        /// Wire protocol version this agent speaks.
+        node: NodeId,
+        /// Wire protocol version this node speaks.
         protocol_version: u32,
     },
     /// A fresh inventory snapshot (sent on register and on change).
     Inventory(ProbeInventory),
     /// Periodic liveness ping.
     Heartbeat {
-        /// Agent monotonic uptime in seconds (for drift detection).
+        /// Node monotonic uptime in seconds (for drift detection).
         uptime_secs: u64,
     },
     /// A board fault that should quarantine the board.
@@ -200,7 +200,7 @@ pub enum AgentReport {
         /// The message text.
         message: String,
     },
-    /// A power transition the agent performed.
+    /// A power transition the node performed.
     PowerEvent {
         /// The affected board (node-local name).
         board: BoardName,
@@ -230,13 +230,13 @@ pub enum AgentReport {
     },
 }
 
-/// Commands the coordinator sends *down* to an agent.
+/// Commands the coordinator sends *down* to a node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoordinatorCommand {
     /// Open a probe-rs session for `lease` on `board`, splicing its byte
-    /// stream onto `channel`. The agent verifies `token` locally before acting.
+    /// stream onto `channel`. The node verifies `token` locally before acting.
     ///
-    /// `kind` selects what the agent splices onto the channel: the board's
+    /// `kind` selects what the node splices onto the channel: the board's
     /// `probe-rs serve` data plane ([`ChannelKind::Data`]) or a board-local
     /// `probe-rs gdb` TCP stub ([`ChannelKind::Gdb`]). Both relay identically
     /// once open.
@@ -244,7 +244,7 @@ pub enum CoordinatorCommand {
         /// The authorising lease.
         lease: LeaseId,
         /// The target board, as the fleet-unique key the capability token is
-        /// scoped to. The agent compares it against the token verbatim and
+        /// scoped to. The node compares it against the token verbatim and
         /// uses only [`BoardRef::name`] for its local `boards.toml` lookup.
         board: BoardRef,
         /// The signed capability token (wire framing: see [`crate::token`]).
@@ -275,7 +275,7 @@ pub enum CoordinatorCommand {
         /// The board to power-cycle (node-local name).
         board: BoardName,
     },
-    /// Ask the agent to re-report its current state and inventory.
+    /// Ask the node to re-report its current state and inventory.
     QueryState,
     /// Push a replacement node token down the established connection.
     ///
@@ -285,10 +285,10 @@ pub enum CoordinatorCommand {
     ///
     /// **Ack-then-retire.** The coordinator holds the replacement in memory and
     /// keeps the *old* token authoritative until the node replies with
-    /// [`AgentReport::TokenRotated`] carrying the same `rotation_id`. The push
+    /// [`NodeReport::TokenRotated`] carrying the same `rotation_id`. The push
     /// is lost exactly when the connection dies mid-write — the expected case
     /// behind a proxy that reaps idle connections — and eagerly retiring the old
-    /// token would then de-enroll a headless node. The agent persists the new
+    /// token would then de-enroll a headless node. The node persists the new
     /// token *before* acking, and keeps the previous one until a connection with
     /// the new one succeeds, which closes the mirror-image window.
     RotateNodeToken {
@@ -301,7 +301,7 @@ pub enum CoordinatorCommand {
 
 /// The power kind a board declares, re-exported for control-plane consumers.
 ///
-/// (Alias so coordinator code can refer to `agent_api::BoardPower` without
+/// (Alias so coordinator code can refer to `node_api::BoardPower` without
 /// reaching into [`crate::board`].)
 pub type BoardPower = PowerKind;
 
@@ -311,12 +311,12 @@ mod tests {
     use crate::ids::OrgId;
 
     fn test_board_ref() -> BoardRef {
-        BoardRef::new(OrgId("acme".to_owned()), AgentId("rpi-1".to_owned()), "b1")
+        BoardRef::new(OrgId("acme".to_owned()), NodeId("rpi-1".to_owned()), "b1")
     }
 
     #[test]
     fn report_roundtrips_through_postcard() {
-        let report = AgentReport::Inventory(ProbeInventory {
+        let report = NodeReport::Inventory(ProbeInventory {
             boards: vec![BoardStatus {
                 board: BoardName("b1".to_owned()),
                 serial: "001050257890".to_owned(),
@@ -346,7 +346,7 @@ mod tests {
             ],
         });
         let bytes = postcard::to_allocvec(&report).unwrap();
-        let back: AgentReport = postcard::from_bytes(&bytes).unwrap();
+        let back: NodeReport = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(report, back);
     }
 
@@ -396,8 +396,8 @@ mod tests {
             cmd
         );
 
-        let ack = AgentReport::TokenRotated { rotation_id: 42 };
+        let ack = NodeReport::TokenRotated { rotation_id: 42 };
         let bytes = postcard::to_allocvec(&ack).unwrap();
-        assert_eq!(postcard::from_bytes::<AgentReport>(&bytes).unwrap(), ack);
+        assert_eq!(postcard::from_bytes::<NodeReport>(&bytes).unwrap(), ack);
     }
 }

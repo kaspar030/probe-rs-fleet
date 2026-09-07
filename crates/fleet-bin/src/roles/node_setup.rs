@@ -1,4 +1,4 @@
-//! Shared node-enrollment mechanics for `share` and `agent up`.
+//! Shared node-enrollment mechanics for `share` and `node up`.
 //!
 //! Both verbs end at the same place — a `[node]` credential in the fleet file
 //! and scaffolded node-local settings under `node/` — and differ only in *how*
@@ -196,7 +196,7 @@ pub fn starter_node_toml(adopt: AdoptPolicy) -> String {
 # ADVISORY. The coordinator's node row is what actually decides; this setting
 # only governs whether this agent bothers to synthesise board metadata for
 # undeclared probes. Editing it here does NOT change what the coordinator will
-# adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `agent up --adopt
+# adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `node up --adopt
 # <policy>`) for that.
 adopt = "{adopt}"
 
@@ -293,7 +293,7 @@ pub struct Enrollment<'a> {
     ///
     /// `share` sets this: it deliberately does not start the agent, so "plug in
     /// a board and it is leasable" is still one step away and saying so is the
-    /// difference between a working machine and a confused one. `agent up`
+    /// difference between a working machine and a confused one. `node up`
     /// does not, because it is about to run the agent itself.
     pub run_hint: bool,
 }
@@ -358,7 +358,7 @@ mod tests {
     fn the_scaffolds_are_valid_toml() {
         fleet_agent::config::BoardsConfig::from_str(&starter_boards_toml()).unwrap();
         for adopt in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
-            let settings: crate::roles::agent::NodeSettings =
+            let settings: crate::roles::node_run::NodeSettings =
                 toml::from_str(&starter_node_toml(adopt)).unwrap();
             assert!(settings.boards_path.is_none());
             assert_eq!(settings.adopt, Some(adopt));
@@ -386,7 +386,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let settings: crate::roles::agent::NodeSettings = toml::from_str(&uncommented).unwrap();
+        let settings: crate::roles::node_run::NodeSettings = toml::from_str(&uncommented).unwrap();
         let declared = settings
             .boards_path
             .expect("the scaffold must advertise a boards_path to uncomment");
@@ -482,12 +482,12 @@ mod tests {
         let node_dir = tmp.path().join("node");
 
         scaffold_node_dir(&node_dir, AdoptPolicy::Auto, false).unwrap();
-        let settings: crate::roles::agent::NodeSettings =
+        let settings: crate::roles::node_run::NodeSettings =
             toml::from_str(&std::fs::read_to_string(node_dir.join("node.toml")).unwrap()).unwrap();
         assert_eq!(settings.adopt, Some(AdoptPolicy::Auto));
 
         scaffold_node_dir(&node_dir, AdoptPolicy::Declared, true).unwrap();
-        let settings: crate::roles::agent::NodeSettings =
+        let settings: crate::roles::node_run::NodeSettings =
             toml::from_str(&std::fs::read_to_string(node_dir.join("node.toml")).unwrap()).unwrap();
         assert_eq!(settings.adopt, Some(AdoptPolicy::Declared));
     }

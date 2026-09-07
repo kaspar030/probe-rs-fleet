@@ -286,7 +286,7 @@ pub enum GithubError {
 
 /// Percent-encode one `application/x-www-form-urlencoded` *value*.
 ///
-/// Hand-rolled rather than pulled from `url`/`percent-encoding`: the agent has
+/// Hand-rolled rather than pulled from `url`/`percent-encoding`: the node has
 /// to cross-compile to armv7-musl and the workspace deliberately keeps its
 /// dependency graph small (see `http_client`'s notes on why `reqwest` is out).
 /// Encoding a form value is a dozen lines; a new crate in the tree is forever.

@@ -1,9 +1,9 @@
-//! The `agent up` subcommand: obtain a node credential by whichever path
-//! applies, then **run** the agent.
+//! The `node up` subcommand: obtain a node credential by whichever path
+//! applies, then **run** the node.
 //!
 //! This replaces `agent init`, which only ever knew one path (redeem an auth
 //! key) and exited afterwards. Architecture §4.2 lists four ways a machine can
-//! become a node; `agent up` walks them:
+//! become a node; `node up` walks them:
 //!
 //! 1. an existing `[node]` credential in the fleet file → just reconnect;
 //! 2. `--auth-key` → redeem it (the unattended / disk-image path; the key comes
@@ -48,7 +48,7 @@ use anyhow::{Context, Result};
 use fleet_auth::api::TokenResponse;
 use fleet_proto::AdoptPolicy;
 
-use crate::cli::{AgentArgs, AgentUpArgs};
+use crate::cli::NodeUpFlags;
 use crate::fleet_config::{self, FleetFile};
 use crate::roles::node_setup;
 
@@ -66,8 +66,8 @@ const MIN_POLL_INTERVAL: u64 = 5;
 /// unreachable, and saying so beats polling a dead endpoint for 15 minutes.
 const MAX_TRANSPORT_RETRIES: u32 = 5;
 
-/// Run `agent up` for the given fleet: bootstrap a credential if needed, then
-/// run the agent.
+/// Run `node up` for the given fleet: bootstrap a credential if needed, then
+/// run the node.
 ///
 /// `config_dir` overrides the XDG config root (test and packaging support); the
 /// fleet file then lives at `<config_dir>/<fleet>.toml` and node settings under
@@ -76,22 +76,17 @@ const MAX_TRANSPORT_RETRIES: u32 = 5;
 /// # Errors
 ///
 /// Returns an error if no credential can be obtained (and none can be derived),
-/// the credential exchange fails, any file cannot be written, or the agent's
+/// the credential exchange fails, any file cannot be written, or the node's
 /// connection loop exits with a non-retryable error.
-pub async fn run(args: AgentUpArgs, fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
+pub async fn run(args: NodeUpFlags, fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
     bootstrap(&args, fleet, config_dir.as_deref()).await?;
 
-    // Then be `probe-rs-fleet agent`: one implementation of "load the config
-    // and serve", so `agent up` and `agent` cannot drift in how they run.
-    crate::roles::agent::run(AgentArgs {
-        fleet: fleet.to_owned(),
-        config_dir,
-        command: None,
-    })
-    .await
+    // Then be `probe-rs-fleet node run`: one implementation of "load the config
+    // and serve", so `node up` and `node run` cannot drift in how they run.
+    crate::roles::node_run::run(fleet, config_dir).await
 }
 
-/// The credential half of `agent up`, without running the agent.
+/// The credential half of `node up`, without running the node.
 ///
 /// Split out so the ladder is testable — and reviewable — without a live
 /// connection loop.
@@ -99,7 +94,7 @@ pub async fn run(args: AgentUpArgs, fleet: &str, config_dir: Option<PathBuf>) ->
 /// # Errors
 ///
 /// See [`run`].
-pub async fn bootstrap(args: &AgentUpArgs, fleet: &str, config_dir: Option<&Path>) -> Result<()> {
+pub async fn bootstrap(args: &NodeUpFlags, fleet: &str, config_dir: Option<&Path>) -> Result<()> {
     let (fleet_path, node_dir) = node_setup::resolve_paths(fleet, config_dir)?;
     let existing = fleet_path
         .exists()
@@ -186,19 +181,19 @@ pub async fn bootstrap(args: &AgentUpArgs, fleet: &str, config_dir: Option<&Path
     anyhow::bail!(
         "fleet `{fleet}` has no [node] credential and no way to obtain one on this machine.\n\
          \n\
-         Either log in first, then bring the agent up:\n\
+         Either log in first, then bring the node up:\n\
          \x20   probe-rs-fleet login --fleet {fleet} --fleet-url <url>\n\
-         \x20   probe-rs-fleet agent up --fleet {fleet}\n\
+         \x20   probe-rs-fleet node up --fleet {fleet}\n\
          \n\
          ...or have somebody approve this machine from theirs. Run this where you\n\
          can read the output, and give them the code it prints:\n\
-         \x20   probe-rs-fleet agent up --fleet {fleet} --fleet-url <url> --interactive\n\
+         \x20   probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --interactive\n\
          \n\
          ...or enroll unattended with a key. Mint one on a machine where you are\n\
          logged in — no shell on the coordinator needed:\n\
          \x20   probe-rs-fleet auth-key create --tag lab\n\
          ...then, here:\n\
-         \x20   probe-rs-fleet agent up --fleet {fleet} --fleet-url <url> --auth-key <key>\n\
+         \x20   probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>\n\
          (Self-hosted, with a shell on the coordinator: `coordinator auth-key`.)\n\
          \n\
          {skipped}"
@@ -211,7 +206,7 @@ pub async fn bootstrap(args: &AgentUpArgs, fleet: &str, config_dir: Option<&Path
 /// means a systemd unit that would otherwise print a code into the journal and
 /// block for fifteen minutes on nobody. `--interactive` forces it on anyway,
 /// for the "I am tailing this log" case, and `--no-interactive` forces it off.
-fn interactive_allowed(args: &AgentUpArgs) -> bool {
+fn interactive_allowed(args: &NodeUpFlags) -> bool {
     args.interactive_choice()
         .unwrap_or_else(|| std::io::stdout().is_terminal())
 }
@@ -232,7 +227,7 @@ fn interactive_allowed(args: &AgentUpArgs) -> bool {
 /// Adopt default: `auto`. A human is approving this live, which is the `share`
 /// situation rather than the disk-image one.
 async fn approval_flow(
-    args: &AgentUpArgs,
+    args: &NodeUpFlags,
     node_name: &str,
     existing: Option<&FleetFile>,
 ) -> Result<(TokenResponse, String, AdoptPolicy)> {
@@ -325,7 +320,7 @@ async fn approval_flow(
 
 /// What to say when nobody approved in time. One sentence, two call sites.
 const EXPIRED: &str = "nobody approved this machine before the code expired; run \
-                       `probe-rs-fleet agent up` again for a fresh one";
+                       `probe-rs-fleet node up` again for a fresh one";
 
 /// Turn a `/node/register/start` failure into remediation-shaped text.
 fn describe_start_error(e: &fleet_auth::http_client::ClientError) -> anyhow::Error {
@@ -357,7 +352,7 @@ fn describe_start_error(e: &fleet_auth::http_client::ClientError) -> anyhow::Err
 /// Defaults to `adopt = declared`: a machine enrolled from an image or a
 /// provisioning script is a lab node, and CI wants stable ids and no surprises.
 async fn redeem(
-    args: &AgentUpArgs,
+    args: &NodeUpFlags,
     auth_key: &str,
     node_name: &str,
     existing: Option<&FleetFile>,
@@ -388,7 +383,7 @@ async fn redeem(
 /// Defaults to `adopt = auto`, exactly as `share` does: a machine whose owner
 /// is offering it wants a probe they plug in to be usable.
 async fn self_register(
-    args: &AgentUpArgs,
+    args: &NodeUpFlags,
     fleet: &str,
     file: &FleetFile,
     node_name: &str,
@@ -419,7 +414,7 @@ async fn self_register(
 /// on disk.
 #[allow(clippy::too_many_arguments)]
 fn finish(
-    args: &AgentUpArgs,
+    args: &NodeUpFlags,
     fleet: &str,
     fleet_path: &Path,
     node_dir: &Path,
@@ -445,14 +440,14 @@ fn finish(
         fleet_path,
         boards_path: &boards_path,
         node_settings_path: &node_settings_path,
-        // No run hint: `agent up` is about to run the agent itself.
+        // No run hint: `node up` is about to run the node itself.
         run_hint: false,
     });
     Ok(())
 }
 
 /// Decode `--server-cert-sha256`, if given.
-fn pin_of(args: &AgentUpArgs) -> Result<Option<[u8; 32]>> {
+fn pin_of(args: &NodeUpFlags) -> Result<Option<[u8; 32]>> {
     match &args.server_cert_sha256 {
         Some(hex) => Ok(Some(
             fleet_tls::parse_fingerprint(hex)

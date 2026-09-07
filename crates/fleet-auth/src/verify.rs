@@ -31,7 +31,7 @@ pub enum AuthError {
     ///
     /// For a node token this is the *revoked node* case, and it is the one the
     /// operator most needs named: see the `auth.reject.node_unknown` audit event
-    /// and the agent's `CredentialRejected` remediation text.
+    /// and the node's `CredentialRejected` remediation text.
     #[error("unknown {0} token")]
     Unknown(TokenKind),
     /// The credential matched a row that has expired.

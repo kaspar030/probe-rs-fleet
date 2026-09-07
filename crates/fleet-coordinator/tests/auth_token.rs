@@ -16,7 +16,7 @@ use common::TestCoordinator;
 
 use fleet_auth::api::TokenResponse;
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_proto::ids::{AgentId, Role};
+use fleet_proto::ids::{NodeId, Role};
 
 fn auth_key_body(key: &str, node_name: &str, tags: &[&str]) -> String {
     serde_json::json!({
@@ -69,7 +69,7 @@ async fn a_valid_auth_key_mints_a_working_node_token() {
         .await
         .unwrap()
         .expect("node row created");
-    assert_eq!(node, AgentId(node_id));
+    assert_eq!(node, NodeId(node_id));
     assert_eq!(org.0, "acme");
 
     // ... and the minted token authenticates a real upgrade. This is the step
@@ -144,7 +144,7 @@ async fn an_unknown_or_wrong_kind_key_is_refused() {
     assert_eq!(status, 401);
 }
 
-/// Re-running `agent up --auth-key` on the same machine must re-enroll it, not litter the
+/// Re-running `node up --auth-key` on the same machine must re-enroll it, not litter the
 /// org with a second row for one physical Pi — and the old token must stop
 /// working, since it is now a credential nobody holds.
 #[tokio::test]
@@ -286,7 +286,7 @@ async fn a_session_self_registers_a_working_node_owned_by_the_caller() {
     );
     let node_id = resp.node_id.clone().expect("node_id returned");
 
-    // The node token works on the agent plane...
+    // The node token works on the node plane...
     assert_eq!(fleet.upgrade_status("/agent", Some(&resp.token)).await, 101);
     // ...and only there: the two credentials stay distinct, which is what stops
     // a compromised laptop-as-node from being a compromised account.
@@ -296,7 +296,7 @@ async fn a_session_self_registers_a_working_node_owned_by_the_caller() {
     );
     assert_ne!(resp.token, session);
 
-    let node = AgentId(node_id);
+    let node = NodeId(node_id);
     assert_eq!(
         fleet.db().node_org_and_policy(&node).await.unwrap(),
         Some((
@@ -327,7 +327,7 @@ async fn an_explicit_adopt_policy_is_recorded() {
         .await;
     assert_eq!(status, 200, "body: {body}");
     let resp: TokenResponse = serde_json::from_str(&body).unwrap();
-    let node = AgentId(resp.node_id.unwrap());
+    let node = NodeId(resp.node_id.unwrap());
 
     assert_eq!(
         fleet
@@ -392,7 +392,7 @@ async fn a_non_member_with_a_valid_session_is_refused() {
     // Nothing was created.
     assert!(fleet
         .db()
-        .org_of_node(&AgentId("acme/trespasser".to_owned()))
+        .org_of_node(&NodeId("acme/trespasser".to_owned()))
         .await
         .unwrap()
         .is_none());
@@ -471,7 +471,7 @@ async fn re_sharing_the_same_machine_converges() {
     assert_eq!(
         fleet
             .db()
-            .node_org_and_policy(&AgentId(second.node_id.unwrap()))
+            .node_org_and_policy(&NodeId(second.node_id.unwrap()))
             .await
             .unwrap()
             .unwrap()
@@ -497,7 +497,7 @@ async fn an_auth_key_node_later_shared_converges_on_the_share_defaults() {
         )
         .await;
     let enrolled: TokenResponse = serde_json::from_str(&body).unwrap();
-    let node = AgentId(enrolled.node_id.clone().unwrap());
+    let node = NodeId(enrolled.node_id.clone().unwrap());
     assert_eq!(
         fleet
             .db()

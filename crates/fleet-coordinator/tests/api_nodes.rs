@@ -520,14 +520,14 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
         "the lease must be live before the delete"
     );
     // ... and a **real** `/agent` connection to drop. Deliberately not an
-    // `AgentStub`: a stub is a bare `mpsc` handle with nobody serving the far
+    // `NodeStub`: a stub is a bare `mpsc` handle with nobody serving the far
     // end, so it can only ever show that the registry entry went away — which
     // is exactly the weaker claim that let the connection-close bug hide here.
     let (node_tx, mut node_rx) = fleet.dial("/agent", &node_token).await.unwrap();
     // Wait for the server to register the connection before deleting, or the
     // test races the upgrade and passes for the wrong reason.
     loop {
-        if fleet.coord.agents().get(&board.node).await.is_some() {
+        if fleet.coord.nodes().get(&board.node).await.is_some() {
             break;
         }
         tokio::task::yield_now().await;
@@ -563,11 +563,11 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
 
     // The connection is really gone, not merely unrouted. The node's socket
     // must close: an operator who deleted a node expects the machine off the
-    // fleet, and `AgentRegistry::remove` alone cannot deliver that (the
+    // fleet, and `NodeRegistry::remove` alone cannot deliver that (the
     // connection task holds its own sender clone, so the registry's is only a
     // clone). This is the assertion that fails against a bare `remove`.
     assert!(
-        fleet.coord.agents().get(&board.node).await.is_none(),
+        fleet.coord.nodes().get(&board.node).await.is_none(),
         "the node kept its registry entry"
     );
     let closed_within = tokio::time::timeout(std::time::Duration::from_secs(5), async {

@@ -15,7 +15,7 @@
 //!
 //! It also covers the pin, which is the one surviving piece of the deleted
 //! certificate-pinning code: a self-hosted coordinator has no publicly trusted
-//! certificate, so the operator passes its SHA-256 to `agent up` / `login`.
+//! certificate, so the operator passes its SHA-256 to `node up` / `login`.
 
 mod common;
 
@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use common::TestCoordinator;
 
-use fleet_proto::agent_api::AgentReport;
+use fleet_proto::node_api::NodeReport;
 use fleet_wire::client::{dial, DialOpts};
-use fleet_wire::AgentToCoord;
+use fleet_wire::NodeToCoord;
 
 /// A TLS-terminating coordinator on a real socket, plus its cert's SHA-256.
 struct TlsFleet {
@@ -125,8 +125,8 @@ async fn a_pinning_client_completes_a_wss_websocket_upgrade() {
     // is what catches a `serve_connection` that lacks `_with_upgrades`.
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::Register {
-            agent: node.clone(),
+        &NodeToCoord::Report(NodeReport::Register {
+            node: node.clone(),
             protocol_version: fleet_proto::PROTOCOL_VERSION,
         }),
     )
@@ -135,7 +135,7 @@ async fn a_pinning_client_completes_a_wss_websocket_upgrade() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if tls.fleet.coord.agents().get(&node).await.is_some() {
+        if tls.fleet.coord.nodes().get(&node).await.is_some() {
             break;
         }
         assert!(

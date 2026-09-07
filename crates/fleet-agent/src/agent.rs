@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 
 use fleet_proto::token::AllowedOp;
 use fleet_proto::{
-    AgentReport, BoardName, BoardRef, ChannelId, ChannelKind, CoordinatorCommand, LeaseId,
+    BoardName, BoardRef, ChannelId, ChannelKind, CoordinatorCommand, LeaseId, NodeReport,
     PowerAction, PowerKind, ProbeInventory,
 };
 
@@ -85,7 +85,7 @@ pub struct Agent<B: ProbeRsBackend> {
     /// Open gdb-tunnel sessions, keyed by channel (parallel to `sessions`).
     gdb_sessions: Mutex<HashMap<ChannelId, GdbSession>>,
     /// Reports the agent wants to emit upward (drained by the connection loop).
-    outbox: Mutex<Vec<AgentReport>>,
+    outbox: Mutex<Vec<NodeReport>>,
     /// Builds power controllers (injectable for tests).
     power_factory: PowerFactory,
     /// Clock injection point for tests (epoch seconds).
@@ -275,11 +275,11 @@ impl<B: ProbeRsBackend> Agent<B> {
     }
 
     /// Drain queued upward reports.
-    pub async fn take_reports(&self) -> Vec<AgentReport> {
+    pub async fn take_reports(&self) -> Vec<NodeReport> {
         std::mem::take(&mut *self.outbox.lock().await)
     }
 
-    async fn emit(&self, report: AgentReport) {
+    async fn emit(&self, report: NodeReport) {
         self.outbox.lock().await.push(report);
     }
 
@@ -416,7 +416,7 @@ impl<B: ProbeRsBackend> Agent<B> {
                 session,
             },
         );
-        self.emit(AgentReport::Log {
+        self.emit(NodeReport::Log {
             level: fleet_proto::LogLevel::Info,
             board: Some(board.clone()),
             message: format!(
@@ -451,7 +451,7 @@ impl<B: ProbeRsBackend> Agent<B> {
                 connection,
             },
         );
-        self.emit(AgentReport::Log {
+        self.emit(NodeReport::Log {
             level: fleet_proto::LogLevel::Info,
             board: Some(board.clone()),
             message: format!(
@@ -468,7 +468,7 @@ impl<B: ProbeRsBackend> Agent<B> {
         let removed = self.sessions.lock().await.remove(&channel);
         if let Some(active) = removed {
             active.session.kill().await.map_err(AgentError::Probers)?;
-            self.emit(AgentReport::SessionClosed {
+            self.emit(NodeReport::SessionClosed {
                 channel,
                 exit_code: None,
             })
@@ -478,7 +478,7 @@ impl<B: ProbeRsBackend> Agent<B> {
         let gdb = self.gdb_sessions.lock().await.remove(&channel);
         if let Some(session) = gdb {
             session.connection.shutdown().await;
-            self.emit(AgentReport::SessionClosed {
+            self.emit(NodeReport::SessionClosed {
                 channel,
                 exit_code: None,
             })
@@ -504,7 +504,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     async fn cleanup_board(&self, board: &BoardName, erase: bool) -> Result<()> {
         let power = self.power_for(board).await?;
         power.cycle().await?;
-        self.emit(AgentReport::PowerEvent {
+        self.emit(NodeReport::PowerEvent {
             board: board.clone(),
             action: PowerAction::Cycle,
         })
@@ -514,7 +514,7 @@ impl<B: ProbeRsBackend> Agent<B> {
             // probe-rs session to the board and issuing `erase`. The seam is
             // here; the actual erase rides the same backend once the relay
             // splice lands. For now we record the intent.
-            self.emit(AgentReport::Log {
+            self.emit(NodeReport::Log {
                 level: fleet_proto::LogLevel::Info,
                 board: Some(board.clone()),
                 message: "erase-on-release requested (pending backend wiring)".to_owned(),
@@ -528,7 +528,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     async fn on_power_cycle(&self, board: &BoardName) -> Result<()> {
         let power = self.power_for(board).await?;
         power.cycle().await?;
-        self.emit(AgentReport::PowerEvent {
+        self.emit(NodeReport::PowerEvent {
             board: board.clone(),
             action: PowerAction::Cycle,
         })
@@ -539,7 +539,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     /// Re-report inventory upward.
     async fn on_query_state(&self) -> Result<()> {
         let inv = self.inventory.lock().await.clone();
-        self.emit(AgentReport::Inventory(inv)).await;
+        self.emit(NodeReport::Inventory(inv)).await;
         Ok(())
     }
 
@@ -556,7 +556,7 @@ impl<B: ProbeRsBackend> Agent<B> {
         }
         // Best-effort power-cycle; report the fault regardless.
         let _ = self.power_for(board).await.map(|_| ());
-        self.emit(AgentReport::Fault {
+        self.emit(NodeReport::Fault {
             board: board.clone(),
             reason,
         })
@@ -639,10 +639,10 @@ impl<B: ProbeRsBackend> Agent<B> {
         self.gdb_sessions.lock().await.len()
     }
 
-    /// The agent's configured id.
+    /// This node's configured id.
     #[must_use]
-    pub fn agent_id(&self) -> &str {
-        &self.config.agent_id
+    pub fn node_id(&self) -> &str {
+        &self.config.node_id
     }
 }
 
@@ -659,19 +659,19 @@ mod tests {
         SigningKey::from_bytes(&SEED)
     }
 
-    /// The node id the coordinator handed this agent at enrolment.
+    /// The node id the coordinator handed this node at enrolment.
     ///
     /// Org-namespaced, because that is what the coordinator mints
     /// (`fleet-coordinator/src/state.rs::node_id_for`) and returns as
     /// `TokenResponse::node_id`, which `fleet-bin`'s `node_setup` writes into
-    /// the config verbatim. The agent never builds this itself — it cannot,
+    /// the config verbatim. The node never builds this itself — it cannot,
     /// not knowing its own org — so a fixture that invents a bare `"pi-1"`
     /// describes a config production never writes.
     const NODE_ID: &str = "default/pi-1";
 
     fn agent_config() -> AgentConfig {
         AgentConfig {
-            agent_id: NODE_ID.to_owned(),
+            node_id: NODE_ID.to_owned(),
             fleet_url: "https://coordinator.example:7000".to_owned(),
             node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             previous_node_token: None,
@@ -717,7 +717,7 @@ port = 2
     fn board_ref(name: &str) -> BoardRef {
         BoardRef::new(
             fleet_proto::ids::OrgId("default".to_owned()),
-            fleet_proto::ids::AgentId(NODE_ID.to_owned()),
+            fleet_proto::ids::NodeId(NODE_ID.to_owned()),
             name,
         )
     }
@@ -857,14 +857,14 @@ port = 2
         // Expect a PowerEvent::Cycle among the emitted reports.
         assert!(reports.iter().any(|r| matches!(
             r,
-            AgentReport::PowerEvent {
+            NodeReport::PowerEvent {
                 action: PowerAction::Cycle,
                 ..
             }
         )));
         assert!(reports
             .iter()
-            .any(|r| matches!(r, AgentReport::SessionClosed { .. })));
+            .any(|r| matches!(r, NodeReport::SessionClosed { .. })));
     }
 
     #[tokio::test(start_paused = true)]
@@ -880,7 +880,7 @@ port = 2
         let reports = agent.take_reports().await;
         assert!(reports.iter().any(|r| matches!(
             r,
-            AgentReport::PowerEvent {
+            NodeReport::PowerEvent {
                 action: PowerAction::Cycle,
                 ..
             }
@@ -904,7 +904,7 @@ port = 2
         let reports = agent.take_reports().await;
         assert!(reports
             .iter()
-            .any(|r| matches!(r, AgentReport::Inventory(_))));
+            .any(|r| matches!(r, NodeReport::Inventory(_))));
     }
 
     #[tokio::test(start_paused = true)]
@@ -930,7 +930,7 @@ port = 2
         let reports = agent.take_reports().await;
         assert!(reports
             .iter()
-            .any(|r| matches!(r, AgentReport::Fault { .. })));
+            .any(|r| matches!(r, NodeReport::Fault { .. })));
     }
 
     #[tokio::test]

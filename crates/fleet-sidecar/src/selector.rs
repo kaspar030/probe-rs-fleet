@@ -67,7 +67,7 @@ pub mod env {
     pub const SERVER_CERT_SHA256: &str = "PROBE_RS_FLEET_SERVER_CERT_SHA256";
     /// A **capability token** (hex), from `probe-rs-fleet ctl delegate`.
     ///
-    /// The sandboxed-agent credential (architecture §6.5). It is not a fleet
+    /// The sandboxed-client credential (architecture §6.5). It is not a fleet
     /// identity: it authorises exactly one lease on exactly one board, expires
     /// with that lease, and can be revoked by releasing it. Setting it selects
     /// the delegated path; a board selector must **not** also be set, because
@@ -170,7 +170,7 @@ impl FleetConfig {
     }
 }
 
-/// A resolved **delegated** configuration: a sandboxed agent with a capability
+/// A resolved **delegated** configuration: a sandboxed client with a capability
 /// token and nothing else (architecture §6.5).
 ///
 /// Note what is absent, deliberately: no session token, no selector, no
@@ -771,14 +771,14 @@ mod tests {
     /// The lease is decoded from the token locally — no key, no round trip.
     #[test]
     fn the_lease_is_decodable_from_the_capability_token() {
-        use fleet_proto::ids::{AgentId, BoardRef, OrgId};
+        use fleet_proto::ids::{BoardRef, NodeId, OrgId};
         use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
 
         let token = CapabilityToken {
             lease: fleet_proto::LeaseId(42),
             board: BoardRef::new(
                 OrgId("acme".to_owned()),
-                AgentId("rpi-1".to_owned()),
+                NodeId("rpi-1".to_owned()),
                 "nrf52840-dk-3",
             ),
             allowed_ops: vec![AllowedOp::Flash, AllowedOp::Attach],

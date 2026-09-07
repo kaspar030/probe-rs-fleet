@@ -1,7 +1,7 @@
 //! Shared filesystem helpers used by the init scaffolding.
 //!
 //! These were originally private to [`crate::roles::init`]; they are factored
-//! out here so `coordinator init`, `agent up`, `share` and `login` reuse the exact same
+//! out here so `coordinator init`, `node up`, `share` and `login` reuse the exact same
 //! secret-writing, permission, and TOML-rendering behaviour rather than
 //! duplicating it. The per-fleet config file holds bearer credentials, so
 //! [`crate::fleet_config`] writes through [`write_secret`] too.

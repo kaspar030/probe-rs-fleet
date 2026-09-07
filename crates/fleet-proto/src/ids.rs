@@ -9,7 +9,7 @@
 //!   groups — is gone, replaced by [`Subject`].
 //! * A board is keyed `(org, node, name)` ([`BoardRef`]), not by a globally
 //!   unique string. The node-local half of that key is a [`BoardName`], which
-//!   is all an agent knows about itself.
+//!   is all a node knows about itself.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,17 +28,10 @@ pub struct UserId(pub String);
 
 /// A node id — a machine offering probes to the fleet.
 ///
-/// Architecture revision 2 calls these "nodes"; the Rust type [`AgentId`] is
-/// the historical spelling and is still what the wire and the scheduler use
-/// (renaming it fleet-wide is tracked separately). `NodeId` exists so new code
-/// and the DB layer can speak the revision-2 vocabulary.
+/// Namespaced by org (`gh-1/rpi-1`, see `state.rs::node_id_for`), so the same
+/// machine name in two tenants is two nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub String);
-
-/// Identifies an agent (the machine hosting probes). Synonym of [`NodeId`] in
-/// architecture revision-2 terms.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct AgentId(pub String);
 
 /// A group a subject belongs to. Groups are carried for future grant
 /// evaluation; they are deliberately **not** part of a subject's identity (see
@@ -53,7 +46,7 @@ pub struct LeaseId(pub u64);
 /// A board's node-local name, as declared in that node's `boards.toml`.
 ///
 /// **Not fleet-unique**: two orgs may each plug in an `nrf52840-dk`. Only a
-/// [`BoardRef`] identifies a board across the fleet. The agent genuinely does
+/// [`BoardRef`] identifies a board across the fleet. The node genuinely does
 /// not know its own org, so this is the only board identifier it can mint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BoardName(pub String);
@@ -68,7 +61,7 @@ pub struct BoardRef {
     /// The owning org.
     pub org: OrgId,
     /// The node hosting the board.
-    pub node: AgentId,
+    pub node: NodeId,
     /// The node-local board name.
     pub name: String,
 }
@@ -76,7 +69,7 @@ pub struct BoardRef {
 impl BoardRef {
     /// Build a board reference from its three parts.
     #[must_use]
-    pub fn new(org: OrgId, node: AgentId, name: impl Into<String>) -> Self {
+    pub fn new(org: OrgId, node: NodeId, name: impl Into<String>) -> Self {
         Self {
             org,
             node,
@@ -110,7 +103,7 @@ impl BoardRef {
     ///
     /// # Why counting segments does not work
     ///
-    /// A production [`AgentId`] is **already org-prefixed** (`gh-1/rpi-1`):
+    /// A production [`NodeId`] is **already org-prefixed** (`gh-1/rpi-1`):
     /// node ids are namespaced by org so the same machine name in two tenants
     /// is two nodes. So a `BoardRef` has a variable number of segments, and the
     /// obvious `split('/')` into `[org, node, name]` cannot address a real
@@ -129,7 +122,7 @@ impl BoardRef {
             return true;
         };
         // The node's short name: the trailing segment of its id, which is what
-        // the machine calls itself and what `share` / `agent up` were given.
+        // the machine calls itself and what `share` / `node up` were given.
         let node_short = self.node.0.rsplit('/').next().unwrap_or(&self.node.0);
         qualifier == self.node.0
             || qualifier == node_short
@@ -142,7 +135,8 @@ impl BoardRef {
 pub enum SubjectKind {
     /// A human, authenticated by a user session.
     User,
-    /// A node (agent machine), authenticated by its node credential.
+    /// A node (the machine hosting probes), authenticated by its node
+    /// credential.
     Node,
     /// A CI workload, authenticated by an exchanged workload token.
     Workload,
@@ -313,12 +307,6 @@ impl std::fmt::Display for UserId {
 }
 
 impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::fmt::Display for AgentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -687,7 +675,7 @@ mod tests {
     fn board_ref_renders_all_three_parts() {
         let r = BoardRef::new(
             OrgId("acme".to_owned()),
-            AgentId("rpi-1".to_owned()),
+            NodeId("rpi-1".to_owned()),
             "nrf52840-dk-3",
         );
         assert_eq!(r.to_string(), "acme/rpi-1/nrf52840-dk-3");
@@ -718,7 +706,7 @@ mod tests {
     fn a_board_answers_to_every_qualified_spelling() {
         let board = BoardRef::new(
             OrgId("gh-1".to_owned()),
-            AgentId("gh-1/rpi-1".to_owned()),
+            NodeId("gh-1/rpi-1".to_owned()),
             "dk-3",
         );
         for spelling in [
@@ -740,7 +728,7 @@ mod tests {
     fn a_board_refuses_a_qualifier_that_is_not_its_own() {
         let board = BoardRef::new(
             OrgId("gh-1".to_owned()),
-            AgentId("gh-1/rpi-1".to_owned()),
+            NodeId("gh-1/rpi-1".to_owned()),
             "dk-3",
         );
         for spelling in [
@@ -766,12 +754,12 @@ mod tests {
     fn qualified_names_separate_same_named_boards_in_two_orgs() {
         let mine = BoardRef::new(
             OrgId("gh-1".to_owned()),
-            AgentId("gh-1/rpi-1".to_owned()),
+            NodeId("gh-1/rpi-1".to_owned()),
             "dk-3",
         );
         let shared = BoardRef::new(
             OrgId("gh-2".to_owned()),
-            AgentId("gh-2/lab-pi".to_owned()),
+            NodeId("gh-2/lab-pi".to_owned()),
             "dk-3",
         );
         // The bare name is ambiguous: both answer to it, which is why the
@@ -788,11 +776,7 @@ mod tests {
     /// can have) still works, so the grammar is not coupled to the prefix.
     #[test]
     fn an_unprefixed_node_id_still_resolves() {
-        let board = BoardRef::new(
-            OrgId("acme".to_owned()),
-            AgentId("rpi-1".to_owned()),
-            "dk-3",
-        );
+        let board = BoardRef::new(OrgId("acme".to_owned()), NodeId("rpi-1".to_owned()), "dk-3");
         for spelling in ["dk-3", "rpi-1/dk-3", "acme/rpi-1/dk-3"] {
             assert!(board.answers_to(spelling), "{spelling} should resolve");
         }

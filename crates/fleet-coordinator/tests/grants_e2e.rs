@@ -607,13 +607,13 @@ async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
         .await
         .unwrap()
     {
-        // No agent is connected, so this is as far as resolution gets — but the
+        // No node is connected, so this is as far as resolution gets — but the
         // message names the node, which is what proves *which* board won.
         CoordToSidecar::Error { message } => assert!(
             message.contains(&bobs.node.0),
             "the bare name must resolve to bob's own board, got {message:?}"
         ),
-        other => panic!("expected the agent-not-connected error, got {other:?}"),
+        other => panic!("expected the node-not-connected error, got {other:?}"),
     }
 
     // Every qualified spelling reaches alice's board instead — including the
@@ -635,7 +635,7 @@ async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
                 message.contains(&alices.node.0),
                 "{spelling} should reach alice's board, got {message:?}"
             ),
-            other => panic!("expected the agent-not-connected error, got {other:?}"),
+            other => panic!("expected the node-not-connected error, got {other:?}"),
         }
     }
 

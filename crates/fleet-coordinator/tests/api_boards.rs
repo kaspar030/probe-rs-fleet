@@ -4,13 +4,13 @@
 //! Two verbs, both of which reach *hardware* rather than a table, so the
 //! coverage is shaped by what a mistake would hand somebody:
 //!
-//! * **power-cycle is the one `AllowedOp` the coordinator enforces.** The agent
+//! * **power-cycle is the one `AllowedOp` the coordinator enforces.** The node
 //!   enforces `attach` and `gdb` at channel open, and nothing enforces `flash` /
 //!   `erase` / `reset` at all — but a power-cycle command carries no capability
-//!   token for the agent to check, so if this handler does not refuse a grantee
+//!   token for the node to check, so if this handler does not refuse a grantee
 //!   without `AllowedOp::PowerCycle`, nothing does. Asserting on the status code
 //!   alone would not show that: the assertions here are against the **command
-//!   the agent received**, or against its absence;
+//!   the node received**, or against its absence;
 //! * **lease release is holder-or-admin**, where "admin" means the *board org's*
 //!   admin reclaiming their own hardware from someone they shared it with. A
 //!   stranger must get the answer they would get for a lease that never existed,
@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::{AgentStub, TestCoordinator};
+use common::{NodeStub, TestCoordinator};
 
 use fleet_proto::ids::{LeaseId, OrgId, Role};
 use fleet_proto::token::AllowedOp;
@@ -163,7 +163,7 @@ async fn a_cookie_authenticated_mutation_needs_the_csrf_header() {
 // Power-cycle
 // ---------------------------------------------------------------------------
 
-/// The happy path, asserted against the **command the agent received** rather
+/// The happy path, asserted against the **command the node received** rather
 /// than against a status code: a handler that answered `200` and sent nothing
 /// would leave an operator staring at a board that did not reboot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -172,7 +172,7 @@ async fn an_owner_power_cycles_a_board_and_the_agent_is_commanded() {
     let org = OrgId("acme".to_owned());
     let alice = fleet.seed_session("acme", "alice", Role::Member).await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
-    let mut agent = AgentStub::attach(&fleet, &board.node).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
 
     let (status, body) = as_browser(
         &fleet,
@@ -186,7 +186,7 @@ async fn an_owner_power_cycles_a_board_and_the_agent_is_commanded() {
     // The node-local name comes back, which is how a caller who sent a bare
     // name learns which board was cycled.
     assert_eq!(parse(&body)["board"], "dk-3");
-    assert_eq!(agent.expect_power_cycle().await.0, "dk-3");
+    assert_eq!(node.expect_power_cycle().await.0, "dk-3");
 
     // Audited exactly as the CLI path audits it: same action, same board.
     let rows = audit_rows(&fleet).await;
@@ -215,8 +215,8 @@ async fn the_qualified_board_spelling_the_ui_sends_resolves_unambiguously() {
     let alice = fleet.seed_session("acme", "alice", Role::Member).await;
     let first = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let second = fleet.seed_board(&org, "rpi-2", "dk-3", &["nrf52"]).await;
-    let mut agent_one = AgentStub::attach(&fleet, &first.node).await;
-    let mut agent_two = AgentStub::attach(&fleet, &second.node).await;
+    let mut agent_one = NodeStub::attach(&fleet, &first.node).await;
+    let mut agent_two = NodeStub::attach(&fleet, &second.node).await;
 
     // Exactly what the page puts in the body: `BoardKeyView.node` (already
     // `{org}/{name}`) then a slash then the node-local board name.
@@ -236,7 +236,7 @@ async fn the_qualified_board_spelling_the_ui_sends_resolves_unambiguously() {
     assert_eq!(agent_two.expect_power_cycle().await.0, "dk-3");
     assert!(
         agent_one.is_idle(),
-        "a qualified request reached the wrong node's agent"
+        "a qualified request reached the wrong node's node"
     );
 }
 
@@ -245,7 +245,7 @@ async fn the_qualified_board_spelling_the_ui_sends_resolves_unambiguously() {
 ///
 /// The grantee can *see* the board (they can lease it, `attach` to it and flash
 /// it), so resolution succeeds and only the op check stands between them and
-/// somebody else's power switch. The agent receiving nothing is the assertion
+/// somebody else's power switch. The node receiving nothing is the assertion
 /// that matters: a `403` with a command already sent would be the worst of both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grantee_without_the_power_cycle_op_is_refused() {
@@ -255,7 +255,7 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
     let board = fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
-    let mut agent = AgentStub::attach(&fleet, &board.node).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
 
     // Bob may attach and flash, but not cut the power.
     let (status, body) = as_browser(
@@ -290,8 +290,8 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
     );
     assert!(body.contains("forbidden"), "{body}");
     assert!(
-        agent.is_idle(),
-        "a refused power-cycle must not reach the agent at all"
+        node.is_idle(),
+        "a refused power-cycle must not reach the node at all"
     );
 
     // The same grantee *with* the op succeeds, so the refusal above is the op
@@ -322,7 +322,7 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(agent.expect_power_cycle().await.0, "dk-3");
+    assert_eq!(node.expect_power_cycle().await.0, "dk-3");
 }
 
 /// A board in another tenant is **"no such board"**, not "forbidden": the
@@ -338,7 +338,7 @@ async fn a_cross_org_board_is_no_such_board() {
     let theirs = fleet
         .seed_board(&other, "rpi-9", "theirs", &["nrf52"])
         .await;
-    let mut agent = AgentStub::attach(&fleet, &theirs.node).await;
+    let mut node = NodeStub::attach(&fleet, &theirs.node).await;
 
     let (cross_status, cross_body) = as_browser(
         &fleet,
@@ -363,8 +363,8 @@ async fn a_cross_org_board_is_no_such_board() {
         "another org's board must be indistinguishable from an absent one"
     );
     assert!(
-        agent.is_idle(),
-        "the other org's agent must not have been commanded"
+        node.is_idle(),
+        "the other org's node must not have been commanded"
     );
 }
 
@@ -621,7 +621,7 @@ async fn no_board_action_response_carries_a_capability_token() {
     let org = OrgId("acme".to_owned());
     let alice = fleet.seed_session("acme", "alice", Role::Member).await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
-    let _agent = AgentStub::attach(&fleet, &board.node).await;
+    let _agent = NodeStub::attach(&fleet, &board.node).await;
     let session = fleet.client_session(&alice).await;
     let lease = take_lease(&session, "dk-3").await;
 

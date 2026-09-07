@@ -1,6 +1,6 @@
 //! `WebSocket` framing + the control-plane envelopes.
 //!
-//! This crate is the shared **wire substrate** between the coordinator, agents,
+//! This crate is the shared **wire substrate** between the coordinator, nodes,
 //! and sidecars. It holds two things:
 //!
 //! 1. A **codec over `WebSocket` binary messages** ([`encode`] / [`decode`])
@@ -9,8 +9,8 @@
 //!    Revision 2 (architecture §3.5) moved the transport to WSS so it can sit
 //!    behind an ordinary HTTPS reverse proxy; the old `u32`-LE length prefix is
 //!    gone because `WebSocket` already delimits messages.
-//! 2. The **control-plane envelopes** for both planes: the agent direction
-//!    ([`AgentToCoord`] / [`CoordToAgent`]) and the sidecar direction
+//! 2. The **control-plane envelopes** for both planes: the node direction
+//!    ([`NodeToCoord`] / [`CoordToNode`]) and the sidecar direction
 //!    ([`SidecarToCoord`] / [`CoordToSidecar`]). The payload types they wrap
 //!    live in [`fleet_proto`]; the envelopes add an unambiguous discriminator
 //!    so control and data frames demultiplex over one connection. **These are
@@ -18,7 +18,7 @@
 //!
 //! # Why traits rather than a concrete `WebSocket` type
 //!
-//! The coordinator serves `axum`'s `WebSocket`; the agent, sidecar and ctl dial
+//! The coordinator serves `axum`'s `WebSocket`; the node, sidecar and ctl dial
 //! with `tokio-tungstenite`. Abstracting over "a stream of binary messages"
 //! rather than over one library's type is what lets `fleet-wire` — and
 //! therefore `fleet-agent` and `fleet-sidecar` — stay free of `axum`. Those
@@ -28,9 +28,9 @@
 //! lives here behind the `tungstenite` feature.
 
 use fleet_proto::admin::{BoardSummary, GrantSummary, LeaseHolderSummary, LogLine};
-use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
 use fleet_proto::ids::BoardName;
 use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest};
+use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
 use fleet_proto::token::AllowedOp;
 use fleet_proto::{ChannelId, ChannelKind, DataFrame, LeaseId};
 use serde::de::DeserializeOwned;
@@ -214,29 +214,29 @@ pub async fn recv<T: DeserializeOwned>(rx: &mut (impl WireRx + ?Sized)) -> Resul
     }
 }
 
-/// A framed message from an agent up to the coordinator.
+/// A framed message from a node up to the coordinator.
 ///
-/// The agent control plane multiplexes shared `fleet-proto` control payloads
-/// ([`AgentReport`]) and opaque data-plane bytes ([`DataFrame`]) over one
+/// The node control plane multiplexes shared `fleet-proto` control payloads
+/// ([`NodeReport`]) and opaque data-plane bytes ([`DataFrame`]) over one
 /// length-delimited stream. Wrapping them in this envelope gives the reader an
 /// unambiguous discriminator (the proto types themselves carry no tag
 /// distinguishing a report from a data frame), mirroring the symmetric sidecar
 /// plane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum AgentToCoord {
+pub enum NodeToCoord {
     /// A control-plane report.
-    Report(AgentReport),
+    Report(NodeReport),
     /// Opaque data-plane bytes from a probe-rs session.
     Data(DataFrame),
 }
 
-/// A framed message from the coordinator down to an agent.
+/// A framed message from the coordinator down to a node.
 ///
-/// The down-stream counterpart of [`AgentToCoord`]: it wraps a control command
+/// The down-stream counterpart of [`NodeToCoord`]: it wraps a control command
 /// ([`CoordinatorCommand`]) or an opaque [`DataFrame`] with a discriminator so
-/// the agent can demultiplex the two unambiguously.
+/// the node can demultiplex the two unambiguously.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CoordToAgent {
+pub enum CoordToNode {
     /// A control-plane command.
     Command(CoordinatorCommand),
     /// Opaque data-plane bytes to splice onto an open session.
@@ -276,7 +276,7 @@ pub enum SidecarToCoord {
         #[serde(default)]
         kind: ChannelKind,
     },
-    /// Opaque data-plane bytes destined for the owning agent.
+    /// Opaque data-plane bytes destined for the owning node.
     Data(DataFrame),
     /// Close a previously opened channel.
     CloseChannel {
@@ -327,7 +327,7 @@ pub enum SidecarToCoord {
         id: String,
     },
     /// Lease a board as yourself and hand back only its capability token, for
-    /// a sandboxed agent (`ctl delegate`).
+    /// a sandboxed client (`ctl delegate`).
     ///
     /// Deliberately **not** a grant: it creates no principal and no fleet
     /// identity. Replies with the ordinary [`CoordToSidecar::Lease`] /
@@ -384,9 +384,9 @@ pub enum CoordToSidecar {
         /// The allocated channel id.
         channel: ChannelId,
         /// The **exact wire bytes** of the capability token the coordinator
-        /// sent the owning agent in its `OpenSession` command.
+        /// sent the owning node in its `OpenSession` command.
         ///
-        /// This is the data-plane credential: the agent writes these same
+        /// This is the data-plane credential: the node writes these same
         /// bytes (hex-encoded) into the per-board `.probe-rs.toml` as the
         /// `probe-rs serve` user token, so the sidecar must export *this*
         /// value as `PROBE_RS_REMOTE_TOKEN` — **not**
@@ -401,12 +401,12 @@ pub enum CoordToSidecar {
         /// class of "two mints must be byte-identical" bugs.
         token: Vec<u8>,
     },
-    /// A channel was closed (by request, agent, or lease expiry).
+    /// A channel was closed (by request, node, or lease expiry).
     ChannelClosed {
         /// The channel that closed.
         channel: ChannelId,
     },
-    /// Opaque data-plane bytes relayed from the owning agent.
+    /// Opaque data-plane bytes relayed from the owning node.
     Data(DataFrame),
     /// Operator: the fleet inventory (reply to [`SidecarToCoord::ListBoards`]).
     BoardList(Vec<BoardSummary>),
@@ -463,7 +463,7 @@ pub enum CoordToSidecar {
 ///
 /// Exposed (behind `cfg(any(test, feature = "test-util"))`) because every crate
 /// that speaks the wire wants to drive its own read/write loops without a real
-/// socket — which is how `serve_connection` and `handle_agent` stay testable now
+/// socket — which is how `serve_connection` and `handle_node` stay testable now
 /// that the transport is a `WebSocket` rather than a duplex stream.
 #[cfg(any(test, feature = "test-util"))]
 pub mod mock {
@@ -538,14 +538,14 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
-    use fleet_proto::ids::{AgentId, BoardRef, OrgId};
+    use fleet_proto::ids::{BoardRef, NodeId, OrgId};
     use fleet_proto::lease::Priority;
+    use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
 
     fn test_board_ref() -> BoardRef {
         BoardRef::new(
             OrgId("default".to_owned()),
-            AgentId("agent-a".to_owned()),
+            NodeId("node-a".to_owned()),
             "b1",
         )
     }
@@ -584,27 +584,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_envelopes_roundtrip_and_demux() {
+    async fn node_envelopes_roundtrip_and_demux() {
         let (mut a_tx, _a_rx, _b_tx, mut b_rx) = mock::pair();
-        let cmd = CoordToAgent::Command(CoordinatorCommand::OpenSession {
+        let cmd = CoordToNode::Command(CoordinatorCommand::OpenSession {
             lease: LeaseId(1),
             board: test_board_ref(),
             token: vec![9, 9, 9],
             channel: ChannelId(2),
             kind: ChannelKind::Data,
         });
-        let data = CoordToAgent::Data(DataFrame {
+        let data = CoordToNode::Data(DataFrame {
             channel: ChannelId(2),
             bytes: vec![7, 7, 7],
         });
         send(&mut a_tx, &cmd).await.unwrap();
         send(&mut a_tx, &data).await.unwrap();
-        assert_eq!(recv::<CoordToAgent>(&mut b_rx).await.unwrap(), cmd);
-        assert_eq!(recv::<CoordToAgent>(&mut b_rx).await.unwrap(), data);
+        assert_eq!(recv::<CoordToNode>(&mut b_rx).await.unwrap(), cmd);
+        assert_eq!(recv::<CoordToNode>(&mut b_rx).await.unwrap(), data);
 
-        let report = AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 123 });
+        let report = NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 123 });
         send(&mut a_tx, &report).await.unwrap();
-        assert_eq!(recv::<AgentToCoord>(&mut b_rx).await.unwrap(), report);
+        assert_eq!(recv::<NodeToCoord>(&mut b_rx).await.unwrap(), report);
     }
 
     #[tokio::test]
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn garbage_payload_is_a_protocol_error() {
-        let err = decode::<CoordToAgent>(&[0xFF, 0xFF, 0xFF]).unwrap_err();
+        let err = decode::<CoordToNode>(&[0xFF, 0xFF, 0xFF]).unwrap_err();
         assert!(matches!(err, WireError::Protocol(_)));
     }
 }

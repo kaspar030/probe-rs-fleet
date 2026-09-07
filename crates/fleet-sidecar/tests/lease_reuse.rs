@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
+use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseGrant};
 use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken, SIGNATURE_LEN};
 use fleet_proto::{ChannelId, ChannelKind, LeaseId, PROTOCOL_VERSION};
@@ -29,7 +29,7 @@ const TOKEN: &str = "prfs1_bearer";
 fn board(name: &str) -> BoardRef {
     BoardRef::new(
         OrgId("default".to_owned()),
-        AgentId("node-a".to_owned()),
+        NodeId("node-a".to_owned()),
         name,
     )
 }
@@ -38,7 +38,7 @@ fn grant_for(lease: u64, board_name: &str, expires: u64, kind: SubjectKind) -> L
     LeaseGrant {
         lease: LeaseId(lease),
         board: board(board_name),
-        agent: AgentId("node-a".to_owned()),
+        node: NodeId("node-a".to_owned()),
         holder: Subject::new(OrgId("default".to_owned()), kind, "alice"),
         expires,
         // The delegation artefact. Nothing on the reuse path may hand this to a
@@ -60,7 +60,7 @@ fn cfg() -> FleetConfig {
 
 /// A channel token in the shape the coordinator mints: a postcard
 /// [`CapabilityToken`] followed by a signature. The signature is never checked
-/// on this path (the *agent* verifies it), so dummy bytes are enough.
+/// on this path (the *node* verifies it), so dummy bytes are enough.
 fn channel_token(lease: u64, board_name: &str) -> Vec<u8> {
     let token = CapabilityToken {
         lease: LeaseId(lease),
@@ -442,7 +442,7 @@ async fn a_workload_lease_is_not_shareable() {
 ///
 /// This is the interlock the cache would otherwise remove: today the second
 /// invocation's `Lease` is answered `Queued` → "board contended", and neither
-/// the coordinator nor the agent caps sessions per board. Holding the first
+/// the coordinator nor the node caps sessions per board. Holding the first
 /// invocation's use-lock makes the second one fall through to a fresh `Lease`,
 /// which reproduces exactly that pre-existing behaviour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

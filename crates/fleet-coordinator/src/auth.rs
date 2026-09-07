@@ -2,7 +2,7 @@
 //!
 //! The coordinator is the **signer**: it holds the ed25519 private key and
 //! mints a [`fleet_proto::token::SignedToken`] for every lease it grants. The
-//! agent (task 1712) holds only the public key and verifies the signature
+//! node (task 1712) holds only the public key and verifies the signature
 //! locally — no per-operation coordinator round-trip (architecture §6).
 //!
 //! This module is intentionally thin: the token *shape*, the canonical signing
@@ -46,7 +46,7 @@ impl Ed25519Signer {
 
     /// The coordinator's 32-byte ed25519 **public** key.
     ///
-    /// This is the value agents pin in their config to verify tokens.
+    /// This is the value nodes pin in their config to verify tokens.
     #[must_use]
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.key.verifying_key().to_bytes()
@@ -87,7 +87,7 @@ impl Ed25519Signer {
         Ok(LeaseGrant {
             lease: granted.lease,
             board: granted.board.clone(),
-            agent: granted.agent.clone(),
+            node: granted.node.clone(),
             holder: granted.holder.clone(),
             expires: granted.expires,
             token: wire,
@@ -108,9 +108,9 @@ impl TokenSigner for Ed25519Signer {
 
 /// The coordinator can verify the tokens it minted.
 ///
-/// Normally only the agent verifies (it holds the public key and nothing else),
+/// Normally only the node verifies (it holds the public key and nothing else),
 /// which is the point of §6.3. The coordinator needs it for exactly one route:
-/// `GET /delegate`, where a sandboxed agent presents a capability token as its
+/// `GET /delegate`, where a sandboxed node presents a capability token as its
 /// *only* credential. Deriving the verifying key from the signing key it
 /// already holds means no new key material and no new configuration.
 impl TokenVerifier for Ed25519Signer {
@@ -154,7 +154,7 @@ mod tests {
     use ed25519_dalek::{Verifier, VerifyingKey};
     use fleet_proto::ids::{BoardRef, LeaseId, OrgId, Subject, SubjectKind};
 
-    /// RFC 8032 ed25519 test-vector seed. The agent's verifier tests
+    /// RFC 8032 ed25519 test-vector seed. The node's verifier tests
     /// (`fleet-agent/src/token.rs`) use the same seed, so a token signed here
     /// verifies there: shared cross-crate test vector.
     const TEST_SEED: [u8; 32] = [
@@ -189,7 +189,7 @@ mod tests {
         }
     }
 
-    /// Verify a signed token the way the agent does (signature check only).
+    /// Verify a signed token the way the node does (signature check only).
     fn verify(pubkey: &[u8; 32], signed: &SignedToken) -> Result<CapabilityToken, TokenError> {
         let key = VerifyingKey::from_bytes(pubkey).map_err(|_| TokenError::BadSignature)?;
         let sig = ed25519_dalek::Signature::from_bytes(&signed.signature);
@@ -239,11 +239,11 @@ mod tests {
     fn grant_to_wire_produces_verifiable_token() {
         let s = signer();
         let org = OrgId("acme".to_owned());
-        let node = crate::state::node_id_for(&org, "agent-a");
+        let node = crate::state::node_id_for(&org, "node-a");
         let granted = GrantedLease {
             lease: LeaseId(11),
             board: BoardRef::new(org.clone(), node.clone(), "b1"),
-            agent: node,
+            node,
             holder: Subject::new(org, SubjectKind::User, "alice"),
             expires: 2_000_000_000,
         };

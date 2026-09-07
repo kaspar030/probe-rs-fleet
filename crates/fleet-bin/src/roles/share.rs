@@ -61,7 +61,7 @@ pub async fn run(args: ShareArgs) -> Result<()> {
         file.user.is_some(),
         "fleet `{fleet}` has no [user] credential on this machine; \
          run `probe-rs-fleet login --fleet {fleet}` first, or enroll this node \
-         unattended with `probe-rs-fleet agent up --auth-key <key>`"
+         unattended with `probe-rs-fleet node up --auth-key <key>`"
     );
 
     // Refresh through the shared path rather than reaching for the raw token: a

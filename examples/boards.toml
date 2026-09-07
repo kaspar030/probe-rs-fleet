@@ -5,7 +5,7 @@
 # ~/.config/probe-rs-fleet/node/boards.toml; override it with `boards_path` in
 # node.toml (see examples/node.toml).
 #
-# `probe-rs-fleet share` / `agent up` scaffold a commented version of this file.
+# `probe-rs-fleet share` / `node up` scaffold a commented version of this file.
 #
 # ---------------------------------------------------------------------------
 # You do not have to write this by hand

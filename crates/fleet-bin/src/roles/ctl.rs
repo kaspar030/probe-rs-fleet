@@ -197,7 +197,7 @@ impl CtlClient {
                         let model = b.model.unwrap_or_else(|| "-".to_owned());
                         println!(
                             "{:<32} {:<16} {:<14} {:<16} {:<12} {}",
-                            b.board, b.agent.0, model, b.chip, state, holder
+                            b.board, b.node.0, model, b.chip, state, holder
                         );
                     }
                 }
@@ -230,7 +230,7 @@ impl CtlClient {
             CoordToSidecar::Lease(grant) => {
                 println!(
                     "leased {} (lease {}) on agent {} until {} (epoch)",
-                    grant.board, grant.lease.0, grant.agent.0, grant.expires
+                    grant.board, grant.lease.0, grant.node.0, grant.expires
                 );
                 Ok(())
             }

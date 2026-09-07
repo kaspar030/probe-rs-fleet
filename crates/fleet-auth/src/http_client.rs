@@ -1,9 +1,9 @@
 //! The HTTP client for the coordinator's `/auth/*` JSON surface (feature
 //! `client`).
 //!
-//! `share`, `agent up --auth-key`, `auth-key create` and a session-token
+//! `share`, `node up --auth-key`, `auth-key create` and a session-token
 //! refresh each need to make
-//! exactly one HTTP request, and `agent up` runs on the Pi — so this stack is inside the
+//! exactly one HTTP request, and `node up` runs on the Pi — so this stack is inside the
 //! hard cross-compilation constraint that forced `ring` over `aws-lc-rs`.
 //!
 //! # Why hyper rather than reqwest

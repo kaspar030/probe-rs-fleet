@@ -1,8 +1,8 @@
-//! `agent up --interactive` + `probe-rs-fleet node approve` end to end, through
+//! `node up --interactive` + `probe-rs-fleet node approve` end to end, through
 //! the CLI's own code paths (architecture §4.2 rung 3, §6.4).
 //!
 //! The story this asserts: a headless Pi with **no credential of any kind**
-//! runs `agent up`, a colleague on a logged-in laptop approves it, and the Pi
+//! runs `node up`, a colleague on a logged-in laptop approves it, and the Pi
 //! ends up with a `[node]` credential that works against the live coordinator.
 //! Nothing long-lived is copy-pasted anywhere — which is the property the rung
 //! exists for, given that `auth-key create` (task 3454) already covers "a
@@ -13,7 +13,7 @@
 //! `fleet-coordinator/tests/device_flow.rs`), and the sessions are minted far
 //! from expiry so `ensure_fresh_session` never writes to the real XDG path.
 //!
-//! **How the approver learns the code.** `agent up` prints it, and a sibling
+//! **How the approver learns the code.** `node up` prints it, and a sibling
 //! task cannot read another task's stdout. So the laptop side polls
 //! `Db::live_pending_codes` — the same query a `node list-pending` verb would
 //! use — which is the seam that lets this test cover the interesting half
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_bin::cli::{AgentUpArgs, LoginArgs, NodeApproveArgs};
+use fleet_bin::cli::{LoginArgs, NodeApproveArgs, NodeUpFlags};
 use fleet_coordinator::auth::Ed25519Signer;
 use fleet_coordinator::clock::SystemClock;
 use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
@@ -31,7 +31,7 @@ use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{AgentId, OrgId, Role};
+use fleet_proto::ids::{NodeId, OrgId, Role};
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -113,8 +113,8 @@ async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str) {
     .expect("login --token");
 }
 
-fn up_args(fleet: &Fleet, node_name: &str) -> AgentUpArgs {
-    AgentUpArgs {
+fn up_args(fleet: &Fleet, node_name: &str) -> NodeUpFlags {
+    NodeUpFlags {
         fleet_url: Some(fleet.base_url.clone()),
         auth_key: None,
         node_name: Some(node_name.to_owned()),
@@ -171,7 +171,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
     let args = up_args(&fleet, "rpi-lab-3");
     let pi_dir = pi.clone();
     let bootstrap = tokio::spawn(async move {
-        fleet_bin::roles::agent_up::bootstrap(&args, "default", Some(&pi_dir)).await
+        fleet_bin::roles::node_up::bootstrap(&args, "default", Some(&pi_dir)).await
     });
 
     // The laptop: read the code (as a human would off the Pi's screen) and
@@ -184,7 +184,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
     bootstrap
         .await
         .unwrap()
-        .expect("agent up must finish once the registration is approved");
+        .expect("node up must finish once the registration is approved");
 
     let node = fleet_bin::fleet_config::load(&pi.join("default.toml"))
         .unwrap()
@@ -206,7 +206,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
 
     // Owned by the approver, in her org, with the policy the rung asked for —
     // identical to what `share` would have produced.
-    let node_id = AgentId(node.node_id.clone());
+    let node_id = NodeId(node.node_id.clone());
     let (org, adopt) = fleet
         .coord
         .db()
@@ -239,7 +239,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
         .is_empty());
 }
 
-/// Denial is a first-class outcome: `agent up` stops with a clear message
+/// Denial is a first-class outcome: `node up` stops with a clear message
 /// rather than spinning until the code expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_denied_machine_is_told_and_gives_up() {
@@ -252,7 +252,7 @@ async fn a_denied_machine_is_told_and_gives_up() {
     let args = up_args(&fleet, "rpi-lab-4");
     let pi_dir = pi.clone();
     let bootstrap = tokio::spawn(async move {
-        fleet_bin::roles::agent_up::bootstrap(&args, "default", Some(&pi_dir)).await
+        fleet_bin::roles::node_up::bootstrap(&args, "default", Some(&pi_dir)).await
     });
 
     let code = await_pending_code(&fleet, "rpi-lab-4").await;
@@ -310,7 +310,7 @@ async fn approving_requires_membership_of_the_org_the_node_would_join() {
     .await
     .expect("login --token");
 
-    // Start a registration directly: no `agent up` task to leave running.
+    // Start a registration directly: no `node up` task to leave running.
     let grant = fleet_auth::http_client::node_register_start(
         &fleet.base_url,
         None,

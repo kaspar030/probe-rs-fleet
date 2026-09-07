@@ -103,7 +103,7 @@ pub fn verify_wire(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use fleet_proto::ids::{AgentId, OrgId};
+    use fleet_proto::ids::{NodeId, OrgId};
 
     /// The fleet-unique board key a token is scoped to. The agent treats it as
     /// opaque for matching: it compares the whole `(org, node, name)` triple,
@@ -116,7 +116,7 @@ mod tests {
     fn board() -> BoardRef {
         BoardRef::new(
             OrgId("acme".to_owned()),
-            AgentId("acme/rpi-1".to_owned()),
+            NodeId("acme/rpi-1".to_owned()),
             "nrf52840-dk-3",
         )
     }
@@ -130,7 +130,7 @@ mod tests {
     fn other_org_board() -> BoardRef {
         BoardRef::new(
             OrgId("evil".to_owned()),
-            AgentId("evil/rpi-1".to_owned()),
+            NodeId("evil/rpi-1".to_owned()),
             "nrf52840-dk-3",
         )
     }

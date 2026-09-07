@@ -83,7 +83,7 @@ pub enum TlsError {
 ///
 /// rustls panics if `install_default` is called twice, and returns an error if a
 /// provider is already installed — both of which are trivially reachable once
-/// the agent, the coordinator and the token-exchange client all build configs in
+/// the node, the coordinator and the token-exchange client all build configs in
 /// one process (`fleet-bin` links all three). Every entry point that builds a
 /// rustls config calls this first; it is idempotent and cheap.
 pub fn install_crypto_provider() {
@@ -263,7 +263,7 @@ pub fn parse_fingerprint(hex: &str) -> Option<[u8; 32]> {
 /// bootstrap mechanism — there is no bootstrap handshake — but the way a
 /// self-hosted deployment without public DNS establishes trust: the operator
 /// reads the fingerprint off the coordinator host and passes it to
-/// `agent up --server-cert-sha256` / `login --server-cert-sha256`.
+/// `node up --server-cert-sha256` / `login --server-cert-sha256`.
 ///
 /// It accepts self-signed / leaf-only chains and ignores the server name and
 /// intermediates; the pin is the sole check.

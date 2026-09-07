@@ -170,7 +170,7 @@ impl LeaseCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::ids::{AgentId, BoardName, BoardRef, LeaseId, OrgId, Subject, SubjectKind};
+    use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, Subject, SubjectKind};
 
     fn subject(holder: &str) -> Subject {
         subject_in("default", holder)
@@ -185,10 +185,10 @@ mod tests {
             lease: LeaseId(1),
             board: BoardRef::new(
                 OrgId("default".to_owned()),
-                AgentId("agent-1".to_owned()),
+                NodeId("node-1".to_owned()),
                 "nrf52840-dk-3",
             ),
-            agent: AgentId("agent-1".to_owned()),
+            node: NodeId("node-1".to_owned()),
             holder: subject(holder),
             expires,
             token: vec![1, 2, 3],

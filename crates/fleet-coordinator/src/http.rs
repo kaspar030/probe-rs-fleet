@@ -3,9 +3,9 @@
 //! | Route | Who | What |
 //! |---|---|---|
 //! | `GET /healthz` | anyone | liveness, for the proxy |
-//! | `GET /agent` | nodes | `WebSocket` upgrade → the agent control plane |
+//! | `GET /agent` | nodes | `WebSocket` upgrade → the node control plane |
 //! | `GET /client` | users, workloads | `WebSocket` upgrade → the sidecar/ctl plane |
-//! | `GET /delegate` | a sandboxed agent | `WebSocket` upgrade → a **crippled** relay-only plane |
+//! | `GET /delegate` | a sandboxed client | `WebSocket` upgrade → a **crippled** relay-only plane |
 //! | `POST /auth/token` | node enrollment, session refresh | JSON token exchange |
 //! | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys |
 //! | `POST /auth/device/start` | anyone | begin a GitHub device flow |
@@ -89,7 +89,7 @@
 //! `POST /api/v1/nodes/pending/{code}` ([`crate::api`]), not by growing this
 //! page a form. Please do not "fix" that: the page's *unauthenticated*
 //! rendering must stay byte-identical whatever the query string, which is what
-//! makes it reflect nothing, and it is the URL every deployed agent prints.
+//! makes it reflect nothing, and it is the URL every deployed node prints.
 //!
 //! Phase 2 (the UI itself) added **one static paragraph** linking to
 //! `/ui/approve`, where the same JSON endpoint is driven from a real form. That
@@ -112,7 +112,7 @@
 //!    second binding site;
 //! 2. the node-side wire contract (`start` / `poll`) never learns which
 //!    approval mechanism ran, so adding one was additive on the coordinator and
-//!    already-deployed agents keep working;
+//!    already-deployed nodes keep working;
 //! 3. `GET /node/approve` is what `verification_uri` points at, and the printed
 //!    URL did not have to change — which is why it could stay reflection-free
 //!    instead of becoming the form.
@@ -216,7 +216,7 @@
 //!
 //! The one route that does not go through [`authenticate_request`], and the
 //! reason is architectural rather than convenient: delegating a board to a
-//! sandboxed agent (§6.5) must create **no principal**. The sandbox presents a
+//! sandboxed client (§6.5) must create **no principal**. The sandbox presents a
 //! hex-encoded **capability token** as its bearer; [`delegate_ws`] verifies the
 //! ed25519 signature with the coordinator's own key, checks expiry, and hands
 //! the decoded token to a relay-only loop with a flat message allowlist
@@ -268,7 +268,7 @@ use fleet_auth::api::{
 use fleet_auth::github::{self, DevicePoll, GithubApp, GithubEndpoints};
 use fleet_auth::{AuthError, Authenticated, OpaqueToken, TokenKind};
 use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::ids::{AgentId, OrgId, Role, Subject, SubjectKind};
+use fleet_proto::ids::{NodeId, OrgId, Role, Subject, SubjectKind};
 
 use crate::core::Coordinator;
 use crate::state::AuditEntry;
@@ -277,7 +277,7 @@ use crate::state::AuditEntry;
 pub fn router(coord: Arc<Coordinator>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/agent", get(agent_ws))
+        .route("/agent", get(node_ws))
         .route("/client", get(client_ws))
         .route("/delegate", get(delegate_ws))
         .route("/auth/token", post(auth_token))
@@ -503,7 +503,7 @@ async fn audit_reject(coord: &Coordinator, org: &OrgId, subject_id: &str, e: &Au
 }
 
 /// `GET /agent` — a node's persistent control-plane connection.
-async fn agent_ws(
+async fn node_ws(
     State(coord): State<Arc<Coordinator>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -512,27 +512,22 @@ async fn agent_ws(
         Ok(v) => v,
         Err(response) => return response,
     };
-    let agent_id = AgentId(auth.id.clone());
+    let node_id = NodeId(auth.id.clone());
     let org = OrgId(auth.org_id.clone());
-    info!(%agent_id, %org, "agent connected");
+    info!(%node_id, %org, "node connected");
 
     ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
         .max_frame_size(fleet_wire::MAX_FRAME_LEN)
         .on_upgrade(move |socket| async move {
             let (tx, rx) = crate::ws_axum::split(socket);
-            if let Err(e) = crate::server::handle_agent(
-                coord,
-                Box::new(tx),
-                Box::new(rx),
-                agent_id.clone(),
-                auth,
-            )
-            .await
+            if let Err(e) =
+                crate::server::handle_node(coord, Box::new(tx), Box::new(rx), node_id.clone(), auth)
+                    .await
             {
                 if fleet_wire::is_benign_close(&e.as_wire()) {
-                    debug!(%agent_id, "agent connection closed");
+                    debug!(%node_id, "node connection closed");
                 } else {
-                    debug!(%agent_id, error = %e, "agent connection closed");
+                    debug!(%node_id, error = %e, "node connection closed");
                 }
             }
         })
@@ -579,7 +574,7 @@ async fn client_ws(
         })
 }
 
-/// `GET /delegate` — a sandboxed agent holding nothing but a capability token.
+/// `GET /delegate` — a sandboxed client holding nothing but a capability token.
 ///
 /// The one authenticated route that mints **no [`Subject`]** (see the module
 /// docs). The bearer is the hex-encoded wire form of a
@@ -2391,7 +2386,7 @@ async fn node_register_start(
 /// **`access_denied` is not guaranteed to be observed.** The sweep deletes
 /// consumed rows, and a denial marks the row consumed, so a sweep landing
 /// between the denial and the machine's next poll downgrades the answer to
-/// `expired_token` — the agent then reports the code as expired for a machine
+/// `expired_token` — the node then reports the code as expired for a machine
 /// that was in fact explicitly denied. Accepted: the sweep interval is short
 /// relative to the poll interval so it is rare, the remediation is identical
 /// either way, and keeping denied rows around purely to improve one log line
@@ -2428,8 +2423,8 @@ async fn node_register_poll(
         // a well-formed `prfnd1_` secret nobody issued is indistinguishable
         // from one whose row aged out. The plan's outcome table said
         // `unknown → invalid_grant`; this is the deliberate deviation, because
-        // the distinction is not knowable after a sweep and the agent's
-        // remediation ("run `agent up` again for a fresh code") is the same for
+        // the distinction is not knowable after a sweep and the node's
+        // remediation ("run `node up` again for a fresh code") is the same for
         // all three.
         Ok(None) => {
             return reject(StatusCode::UNAUTHORIZED, "expired_token");

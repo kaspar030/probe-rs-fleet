@@ -395,7 +395,7 @@ impl From<BoardSummary> for BoardView {
     fn from(b: BoardSummary) -> Self {
         Self {
             board: BoardKeyView::from(&b.board),
-            node: b.agent.0,
+            node: b.node.0,
             chip: b.chip,
             model: b.model,
             tags: b.tags,
@@ -1088,7 +1088,7 @@ async fn leases(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Re
 /// wins, then granted orgs — and re-checks [`AllowedOp::PowerCycle`] for a
 /// grantee. That second check is not redundant: resolution proves the caller may
 /// *see* the board, not that they may cut its power, and this is the one op the
-/// **coordinator** enforces rather than the agent (the agent's power-cycle
+/// **coordinator** enforces rather than the node (the node's power-cycle
 /// command carries no capability token to check).
 ///
 /// A board in another tenant is a `404`, identical to one that does not exist.
@@ -1567,7 +1567,7 @@ mod tests {
     fn a_board_key_carries_both_shapes() {
         let board = BoardRef::new(
             fleet_proto::ids::OrgId("gh-1".to_owned()),
-            fleet_proto::ids::AgentId("gh-1/rpi-1".to_owned()),
+            fleet_proto::ids::NodeId("gh-1/rpi-1".to_owned()),
             "dk-3",
         );
         let view = BoardKeyView::from(&board);
@@ -1584,10 +1584,10 @@ mod tests {
         let json = serde_json::to_string(&BoardView::from(BoardSummary {
             board: BoardRef::new(
                 fleet_proto::ids::OrgId("o".to_owned()),
-                fleet_proto::ids::AgentId("o/n".to_owned()),
+                fleet_proto::ids::NodeId("o/n".to_owned()),
                 "b",
             ),
-            agent: fleet_proto::ids::AgentId("o/n".to_owned()),
+            node: fleet_proto::ids::NodeId("o/n".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec![],

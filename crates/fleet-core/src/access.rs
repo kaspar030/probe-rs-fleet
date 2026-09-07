@@ -180,7 +180,7 @@ pub fn selector_matches(board: &Board, constraint: &Constraint) -> bool {
 mod tests {
     use super::*;
     use fleet_proto::board::{BoardState, PowerKind};
-    use fleet_proto::ids::{AgentId, BoardName, BoardRef};
+    use fleet_proto::ids::{BoardName, BoardRef, NodeId};
 
     fn org(name: &str) -> OrgId {
         OrgId(name.to_owned())
@@ -188,8 +188,8 @@ mod tests {
 
     fn board(org_name: &str, name: &str, chip: &str, tags: &[&str]) -> Board {
         Board {
-            id: BoardRef::new(org(org_name), AgentId("node-1".to_owned()), name),
-            agent: AgentId("node-1".to_owned()),
+            id: BoardRef::new(org(org_name), NodeId("node-1".to_owned()), name),
+            node: NodeId("node-1".to_owned()),
             chip: chip.to_owned(),
             model: None,
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),

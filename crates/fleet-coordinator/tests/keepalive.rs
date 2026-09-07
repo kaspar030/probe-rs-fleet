@@ -4,7 +4,7 @@
 //! HTTPS reverse proxy in front of the coordinator, and a proxy reaps idle
 //! `WebSocket`s on a timeout nobody here controls. A lab node's connection is
 //! idle almost all the time, so without ping/pong the fleet's control plane
-//! would evaporate every few minutes and the agent's reconnect backoff would
+//! would evaporate every few minutes and the node's reconnect backoff would
 //! become the primary mechanism rather than the fallback.
 //!
 //! The two properties worth pinning:
@@ -18,8 +18,8 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::agent_api::AgentReport;
-use fleet_wire::{AgentToCoord, WireEvent, WireRx, WireTx};
+use fleet_proto::node_api::NodeReport;
+use fleet_wire::{NodeToCoord, WireEvent, WireRx, WireTx};
 
 /// An idle connection stays up: the coordinator pings, tungstenite answers
 /// automatically, and nothing is dropped.
@@ -37,8 +37,8 @@ async fn an_idle_connection_survives_several_ping_intervals() {
     // Register, then go completely silent at the application level.
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::Register {
-            agent: node.clone(),
+        &NodeToCoord::Report(NodeReport::Register {
+            node: node.clone(),
             protocol_version: fleet_proto::PROTOCOL_VERSION,
         }),
     )
@@ -46,7 +46,7 @@ async fn an_idle_connection_survives_several_ping_intervals() {
     .unwrap();
 
     // Drive the receiver so tungstenite processes (and auto-answers) the
-    // coordinator's pings, exactly as the agent's read loop does.
+    // coordinator's pings, exactly as the node's read loop does.
     let pump = tokio::spawn(async move {
         let mut pings_seen = 0u32;
         loop {
@@ -62,7 +62,7 @@ async fn an_idle_connection_survives_several_ping_intervals() {
 
     // Still registered: the coordinator has not reaped us.
     assert!(
-        fleet.coord.agents().get(&node).await.is_some(),
+        fleet.coord.nodes().get(&node).await.is_some(),
         "an idle connection that answers pings must not be dropped"
     );
     pump.abort();
@@ -84,8 +84,8 @@ async fn a_peer_that_never_pongs_is_eventually_dropped() {
     let (mut tx, rx) = fleet.dial("/agent", &token).await.unwrap();
     fleet_wire::send(
         &mut tx,
-        &AgentToCoord::Report(AgentReport::Register {
-            agent: node.clone(),
+        &NodeToCoord::Report(NodeReport::Register {
+            node: node.clone(),
             protocol_version: fleet_proto::PROTOCOL_VERSION,
         }),
     )
@@ -95,7 +95,7 @@ async fn a_peer_that_never_pongs_is_eventually_dropped() {
     // Wait for the registration to land, then stop reading entirely: the
     // receive half is parked, so pings are never answered.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while fleet.coord.agents().get(&node).await.is_none() {
+    while fleet.coord.nodes().get(&node).await.is_none() {
         assert!(std::time::Instant::now() < deadline, "never registered");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -103,7 +103,7 @@ async fn a_peer_that_never_pongs_is_eventually_dropped() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
-        if fleet.coord.agents().get(&node).await.is_none() {
+        if fleet.coord.nodes().get(&node).await.is_none() {
             break;
         }
         assert!(
@@ -133,7 +133,7 @@ async fn inbound_traffic_counts_as_liveness() {
     for _ in 0..8 {
         fleet_wire::send(
             &mut tx,
-            &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+            &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )
         .await
         .unwrap();
@@ -141,7 +141,7 @@ async fn inbound_traffic_counts_as_liveness() {
     }
 
     assert!(
-        fleet.coord.agents().get(&node).await.is_some(),
+        fleet.coord.nodes().get(&node).await.is_some(),
         "a connection carrying traffic must not be reaped"
     );
     pump.abort();

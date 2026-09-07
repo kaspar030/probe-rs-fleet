@@ -749,7 +749,7 @@ async fn a_workload_token_is_refused_on_the_node_and_key_surfaces() {
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&token)).await,
         403,
-        "the agent plane is for nodes"
+        "the node plane is for nodes"
     );
     let (status, body) = fleet
         .http_auth(

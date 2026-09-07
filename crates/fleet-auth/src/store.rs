@@ -15,7 +15,7 @@ use crate::token::TokenHash;
 /// A node row, as verification needs to see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRecord {
-    /// The node's id (its `AgentId` on the wire).
+    /// The node's id (its `NodeId` on the wire).
     pub node_id: String,
     /// The org the node belongs to.
     ///

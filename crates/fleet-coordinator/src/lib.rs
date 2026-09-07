@@ -12,9 +12,9 @@
 //! credentials, `GET /healthz` answers the proxy. Every principal presents
 //! `Authorization: Bearer …` on the upgrade; there are no client certificates.
 //!
-//! * **Agents** dial *out* and hold one persistent `WebSocket`. They send
-//!   [`fleet_proto::agent_api::AgentReport`]s up; the coordinator sends
-//!   [`fleet_proto::agent_api::CoordinatorCommand`]s back down the same
+//! * **Nodes** dial *out* and hold one persistent `WebSocket`. They send
+//!   [`fleet_proto::node_api::NodeReport`]s up; the coordinator sends
+//!   [`fleet_proto::node_api::CoordinatorCommand`]s back down the same
 //!   connection. A node is identified by the `node` row its token hash matched.
 //! * **Sidecars and `ctl`** connect to request/extend/release leases and to open
 //!   relay channels ([`proto::SidecarToCoord`] / [`proto::CoordToSidecar`]).
@@ -31,7 +31,7 @@
 //!
 //! When a sidecar opens a channel, the coordinator validates the lease, mints a
 //! signed [`fleet_proto::token::CapabilityToken`] (ed25519; see [`auth`]),
-//! allocates a [`fleet_proto::ChannelId`], asks the owning agent to open its
+//! allocates a [`fleet_proto::ChannelId`], asks the owning node to open its
 //! probe-rs session, then relays opaque [`fleet_proto::DataFrame`]s between the
 //! two ends without ever parsing probe-rs traffic.
 //!

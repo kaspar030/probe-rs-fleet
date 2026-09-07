@@ -42,7 +42,7 @@
 //!   it is dropped from both stores whatever the policy says.
 //!
 //! The invariant that falls out: **the DB set is the scheduler set plus
-//! declared-but-offline boards, and nothing else.** So the Agents page (which
+//! declared-but-offline boards, and nothing else.** So the Nodes page (which
 //! counts rows) may legitimately show more boards than Devices (which lists
 //! the scheduler); any other divergence is a bug. The write side of this rule
 //! lives in [`crate::core::Coordinator::reconcile_inventory`].
@@ -52,9 +52,9 @@ use sqlx::SqlitePool;
 
 use fleet_core::access::GrantScope;
 use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::agent_api::BoardPresence;
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{AgentId, BoardRef, LeaseId, OrgId, Role, SubjectKey};
+use fleet_proto::ids::{BoardRef, LeaseId, NodeId, OrgId, Role, SubjectKey};
+use fleet_proto::node_api::BoardPresence;
 use fleet_proto::token::AllowedOp;
 
 use crate::error::Result;
@@ -607,13 +607,13 @@ impl Db {
     pub async fn node_by_token_hash(
         &self,
         token_hash: &str,
-    ) -> Result<Option<(AgentId, OrgId, i64)>> {
+    ) -> Result<Option<(NodeId, OrgId, i64)>> {
         let row: Option<(String, String, Option<i64>)> =
             sqlx::query_as("SELECT id, org_id, token_issued_at FROM node WHERE token_hash = ?1")
                 .bind(token_hash)
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(row.map(|(id, org, issued)| (AgentId(id), OrgId(org), issued.unwrap_or(0))))
+        Ok(row.map(|(id, org, issued)| (NodeId(id), OrgId(org), issued.unwrap_or(0))))
     }
 
     /// Replace a node's token hash, recording when it was issued.
@@ -627,7 +627,7 @@ impl Db {
     /// Returns a database error if the write fails.
     pub async fn set_node_token_hash(
         &self,
-        node: &AgentId,
+        node: &NodeId,
         token_hash: &str,
         issued_at: i64,
     ) -> Result<()> {
@@ -657,7 +657,7 @@ impl Db {
         token_hash: &str,
         tags: &[String],
         now: i64,
-    ) -> Result<AgentId> {
+    ) -> Result<NodeId> {
         self.register_node_full(
             org,
             name,
@@ -673,7 +673,7 @@ impl Db {
     /// Register (or refresh) a node, recording its owner and adoption policy.
     ///
     /// The node id is derived from `(org, name)` so re-running `share` /
-    /// `agent up` on the same machine re-enrolls it rather than creating a
+    /// `node up` on the same machine re-enrolls it rather than creating a
     /// duplicate.
     ///
     /// `ON CONFLICT` **does** overwrite `owner_user_id` and `adopt_policy`: a
@@ -699,7 +699,7 @@ impl Db {
         owner_user_id: Option<&str>,
         adopt: AdoptPolicy,
         now: i64,
-    ) -> Result<AgentId> {
+    ) -> Result<NodeId> {
         let node_id = node_id_for(org, name);
         sqlx::query(
             "INSERT INTO node (id, org_id, owner_user_id, name, tags, token_hash, token_issued_at, adopt_policy, last_seen, created_at)
@@ -729,7 +729,7 @@ impl Db {
     /// # Errors
     ///
     /// Returns a database error if the write fails.
-    pub async fn delete_node(&self, node: &AgentId) -> Result<()> {
+    pub async fn delete_node(&self, node: &NodeId) -> Result<()> {
         sqlx::query("DELETE FROM node WHERE id = ?1")
             .bind(node.0.as_str())
             .execute(&self.pool)
@@ -1476,7 +1476,7 @@ impl Db {
     /// # Errors
     ///
     /// Returns a database error if the query fails.
-    pub async fn org_of_node(&self, node: &AgentId) -> Result<Option<OrgId>> {
+    pub async fn org_of_node(&self, node: &NodeId) -> Result<Option<OrgId>> {
         let row: Option<(String,)> = sqlx::query_as("SELECT org_id FROM node WHERE id = ?1")
             .bind(node.0.as_str())
             .fetch_optional(&self.pool)
@@ -1494,7 +1494,7 @@ impl Db {
     /// # Errors
     ///
     /// Returns a database error if the query fails.
-    pub async fn node_owner(&self, node: &AgentId) -> Result<Option<String>> {
+    pub async fn node_owner(&self, node: &NodeId) -> Result<Option<String>> {
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT owner_user_id FROM node WHERE id = ?1")
                 .bind(node.0.as_str())
@@ -1520,10 +1520,7 @@ impl Db {
     /// Returns a database error if the query fails, or
     /// [`CoordinatorError::State`](crate::error::CoordinatorError::State) if
     /// the stored policy is unrecognised.
-    pub async fn node_org_and_policy(
-        &self,
-        node: &AgentId,
-    ) -> Result<Option<(OrgId, AdoptPolicy)>> {
+    pub async fn node_org_and_policy(&self, node: &NodeId) -> Result<Option<(OrgId, AdoptPolicy)>> {
         let row: Option<(String, String)> =
             sqlx::query_as("SELECT org_id, adopt_policy FROM node WHERE id = ?1")
                 .bind(node.0.as_str())
@@ -1836,7 +1833,7 @@ impl OrgDb<'_> {
     /// # Errors
     ///
     /// Returns a database error if the write fails.
-    pub async fn ensure_node(&self, node: &AgentId, now: i64) -> Result<()> {
+    pub async fn ensure_node(&self, node: &NodeId, now: i64) -> Result<()> {
         sqlx::query(
             "INSERT INTO node (id, org_id, name, adopt_policy, last_seen, created_at)
              VALUES (?1, ?2, ?3, 'declared', ?4, ?4)
@@ -1861,7 +1858,7 @@ impl OrgDb<'_> {
     /// node declares (see the module docs), so a board that is declared but has
     /// never been plugged in must still have a row — otherwise
     /// [`OrgDb::prune_boards`]'s keep/delete rule would be incoherent and the
-    /// board would silently never appear on the Agents page. Which boards count
+    /// board would silently never appear on the Nodes page. Which boards count
     /// as admitted is decided by the caller
     /// ([`crate::core::Coordinator::reconcile_inventory`]); an adopted board
     /// reported offline is a tombstone and must not be recorded.
@@ -1938,12 +1935,12 @@ impl OrgDb<'_> {
     /// reported `Offline`, because an offline **declared** board is still
     /// declared (see the module docs). A board absent from `keep` is one the
     /// node stopped declaring: renamed, or removed from `boards.toml`. No
-    /// tombstone ever arrives for such a board — the agent only reports what is
+    /// tombstone ever arrives for such a board — the node only reports what is
     /// still in its config — so a set difference is the only thing that can
     /// retire the row.
     ///
     /// An **empty** `keep` deletes every row for this node, deliberately: an
-    /// agent that reports an empty inventory declares nothing, and the rows
+    /// node that reports an empty inventory declares nothing, and the rows
     /// really are gone. The statement degenerates to a plain
     /// `DELETE … WHERE org_id = ? AND node_id = ?` rather than to a
     /// syntactically invalid `NOT IN ()`.
@@ -1963,7 +1960,7 @@ impl OrgDb<'_> {
     /// # Errors
     ///
     /// Returns a database error if the delete fails.
-    pub async fn prune_boards(&self, node: &AgentId, keep: &[String]) -> Result<u64> {
+    pub async fn prune_boards(&self, node: &NodeId, keep: &[String]) -> Result<u64> {
         // sqlx has no list binding, so the placeholder list is built here; the
         // names are still bound, never interpolated.
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM board WHERE org_id = ");
@@ -2333,7 +2330,7 @@ impl OrgDb<'_> {
     /// `last_seen` arrive once per board. Two statements, assembled here.
     ///
     /// `online` is not a column and is not answered here: liveness lives in the
-    /// in-memory [`crate::registry::AgentRegistry`], and a database column that
+    /// in-memory [`crate::registry::NodeRegistry`], and a database column that
     /// tried to track it would be wrong every time a process died. The caller
     /// composes the two.
     ///
@@ -2371,7 +2368,7 @@ impl OrgDb<'_> {
                 .map(|(_, board)| board.clone())
                 .collect();
             out.push(NodeRow {
-                id: AgentId(id),
+                id: NodeId(id),
                 name,
                 tags: split_tags(&tags),
                 owner_user_id: owner,
@@ -2423,7 +2420,7 @@ impl OrgDb<'_> {
         .fetch_all(self.db.pool())
         .await?;
         Ok(Some(NodeRow {
-            id: AgentId(id),
+            id: NodeId(id),
             name,
             tags: split_tags(&tags),
             owner_user_id: owner,
@@ -2592,7 +2589,7 @@ pub struct MemberRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRow {
     /// The node's fleet id (`{org}/{name}`).
-    pub id: AgentId,
+    pub id: NodeId,
     /// The node-local name, `UNIQUE (org_id, name)`.
     pub name: String,
     /// Free-form tags.
@@ -2688,7 +2685,7 @@ async fn unique_personal_slug(
 
 /// Derive a node's id from `(org, name)`.
 ///
-/// Deterministic on purpose: re-running `share` / `agent up` on the same
+/// Deterministic on purpose: re-running `share` / `node up` on the same
 /// machine re-enrolls that node (replacing its token) instead of littering the
 /// org with duplicate rows for one physical Pi. The id is namespaced by org so
 /// the same node name in two tenants is two nodes.
@@ -2702,8 +2699,8 @@ async fn unique_personal_slug(
 /// (`tests/common/mod.rs::seed_board`) both call this, so there is exactly one
 /// definition of the shape.
 #[must_use]
-pub fn node_id_for(org: &OrgId, name: &str) -> AgentId {
-    AgentId(format!("{}/{name}", org.0))
+pub fn node_id_for(org: &OrgId, name: &str) -> NodeId {
+    NodeId(format!("{}/{name}", org.0))
 }
 
 /// The node-local name inside an org-namespaced node id: the inverse of
@@ -2715,7 +2712,7 @@ pub fn node_id_for(org: &OrgId, name: &str) -> AgentId {
 /// comes from the authenticated node subject), so the fallback is unreachable
 /// in practice — but a `NOT NULL` column that the browser API keys off is the
 /// wrong place to discover that assumption was wrong.
-fn node_name_for<'a>(org: &OrgId, node: &'a AgentId) -> &'a str {
+fn node_name_for<'a>(org: &OrgId, node: &'a NodeId) -> &'a str {
     node.0
         .strip_prefix(&format!("{}/", org.0))
         .unwrap_or(node.0.as_str())
@@ -2762,7 +2759,7 @@ mod tests {
     /// The node id production would mint for `(org, name)` — by calling the
     /// production constructor rather than re-spelling its format string, so a
     /// fixture cannot quietly describe a node shape the fleet never produces.
-    fn node_id(org_name: &str, node: &str) -> AgentId {
+    fn node_id(org_name: &str, node: &str) -> NodeId {
         node_id_for(&org(org_name), node)
     }
 
@@ -2773,7 +2770,7 @@ mod tests {
     fn board_in(org_name: &str, node: &str, name: &str) -> Board {
         Board {
             id: board_ref(org_name, node, name),
-            agent: node_id(org_name, node),
+            node: node_id(org_name, node),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec!["nrf52".to_owned(), "ble".to_owned()],
@@ -2888,7 +2885,7 @@ mod tests {
     /// [`OrgDb::prune_boards`] is a set difference, and the set it applies to
     /// is exactly one node of one org.
     ///
-    /// Also pins the empty-`keep` path: an agent that reports an empty
+    /// Also pins the empty-`keep` path: a node that reports an empty
     /// inventory declares nothing, so all of *its* rows go — and the statement
     /// must degenerate to a plain `DELETE` rather than an invalid `NOT IN ()`.
     #[tokio::test]
@@ -3367,11 +3364,11 @@ mod tests {
     #[tokio::test]
     async fn lease_lifecycle() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         let scoped = db.scoped(o);
         scoped
             .record_board(
-                &board_in(DEFAULT_ORG_ID, "agent-a", "b1"),
+                &board_in(DEFAULT_ORG_ID, "node-a", "b1"),
                 BoardPresence::Online,
                 1000,
             )
@@ -3381,7 +3378,7 @@ mod tests {
         scoped
             .record_lease(
                 lease,
-                &board_ref(DEFAULT_ORG_ID, "agent-a", "b1"),
+                &board_ref(DEFAULT_ORG_ID, "node-a", "b1"),
                 &holder(DEFAULT_ORG_ID, "alice"),
                 1000,
                 1600,
@@ -3419,7 +3416,7 @@ mod tests {
                 ts: 1000,
                 subject: Some("default/user:alice"),
                 action: "lease.grant",
-                node: Some("agent-a"),
+                node: Some("node-a"),
                 board: Some("b1"),
                 lease: Some(LeaseId(1)),
                 detail: Some("interactive"),
@@ -3431,7 +3428,7 @@ mod tests {
                 ts: 1001,
                 subject: None,
                 action: "lease.expire",
-                node: Some("agent-a"),
+                node: Some("node-a"),
                 board: Some("b1"),
                 lease: Some(LeaseId(1)),
                 detail: None,
@@ -3449,9 +3446,9 @@ mod tests {
     #[tokio::test]
     async fn ensure_node_creates_a_row_with_a_parseable_policy() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         assert_eq!(
-            db.node_org_and_policy(&node_id(DEFAULT_ORG_ID, "agent-a"))
+            db.node_org_and_policy(&node_id(DEFAULT_ORG_ID, "node-a"))
                 .await
                 .unwrap(),
             Some((o, AdoptPolicy::Declared)),
@@ -3551,16 +3548,16 @@ mod tests {
     #[tokio::test]
     async fn an_unrecognised_stored_policy_is_an_error_not_a_default() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         sqlx::query("UPDATE node SET adopt_policy = 'manual' WHERE id = ?1")
-            .bind(node_id(DEFAULT_ORG_ID, "agent-a").0)
+            .bind(node_id(DEFAULT_ORG_ID, "node-a").0)
             .execute(db.pool())
             .await
             .unwrap();
         let _ = o;
 
         let err = db
-            .node_org_and_policy(&node_id(DEFAULT_ORG_ID, "agent-a"))
+            .node_org_and_policy(&node_id(DEFAULT_ORG_ID, "node-a"))
             .await
             .unwrap_err();
         assert!(
@@ -3719,7 +3716,7 @@ mod tests {
     #[tokio::test]
     async fn pending_node_approve_then_consume_exactly_once() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         db.ensure_user_member(&o, "alice", Role::Member)
             .await
             .unwrap();
@@ -3782,7 +3779,7 @@ mod tests {
     #[tokio::test]
     async fn pending_node_denial_is_final() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         db.ensure_user_member(&o, "alice", Role::Member)
             .await
             .unwrap();
@@ -3814,7 +3811,7 @@ mod tests {
     #[tokio::test]
     async fn pending_node_expiry_is_enforced_at_every_transition() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         db.ensure_user_member(&o, "alice", Role::Member)
             .await
             .unwrap();
@@ -3849,7 +3846,7 @@ mod tests {
     #[tokio::test]
     async fn live_pending_codes_excludes_spent_and_expired_rows() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         db.ensure_user_member(&o, "alice", Role::Member)
             .await
             .unwrap();
@@ -3911,8 +3908,8 @@ mod tests {
     #[tokio::test]
     async fn node_id_in_org_by_name_is_org_scoped() {
         let db = Db::connect_in_memory().await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
-        let other = seeded(&db, "other", "agent-b").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
+        let other = seeded(&db, "other", "node-b").await;
         db.register_node(&o, "rpi-lab-3", "hash", &[], 1_000)
             .await
             .unwrap();
@@ -4351,10 +4348,10 @@ mod tests {
         let path = dir.path().join("coord.sqlite");
         let path_str = path.to_str().unwrap();
         let db = Db::connect(path_str).await.unwrap();
-        let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
+        let o = seeded(&db, DEFAULT_ORG_ID, "node-a").await;
         db.scoped(o.clone())
             .record_board(
-                &board_in(DEFAULT_ORG_ID, "agent-a", "b1"),
+                &board_in(DEFAULT_ORG_ID, "node-a", "b1"),
                 BoardPresence::Online,
                 1000,
             )

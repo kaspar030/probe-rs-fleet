@@ -77,7 +77,7 @@ async fn a_member_is_refused_every_admin_action_the_ui_hides() {
 
 /// A member may not touch a node they do not own, whatever the page drew.
 ///
-/// The agents page shows Edit/Revoke only for `owner == me` or an admin; the
+/// The nodes page shows Edit/Revoke only for `owner == me` or an admin; the
 /// rule itself is `Coordinator::update_node_core`'s, and it holds for a caller
 /// who never saw the page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -104,7 +104,7 @@ async fn a_member_cannot_mutate_a_node_it_does_not_own() {
     let (status, response) = as_browser(&fleet, "DELETE", "/api/v1/nodes/rpi-1", &bob, None).await;
     assert_eq!(status, 403, "a non-owner revoked a node: {response}");
 
-    // And a rename is refused for the *owner* too — the agents page offers
+    // And a rename is refused for the *owner* too — the nodes page offers
     // tags and adopt only, and says why, because the server 400s a `name`.
     let (status, response) = as_browser(
         &fleet,

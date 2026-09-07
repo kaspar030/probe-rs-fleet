@@ -10,7 +10,7 @@
 # You do not normally write this file by hand. It is managed by:
 #   probe-rs-fleet login       → writes [user]
 #   probe-rs-fleet share       → writes [node], using the login you already have
-#   probe-rs-fleet agent up    → writes [node] (session, or --auth-key)
+#   probe-rs-fleet node up    → writes [node] (session, or --auth-key)
 # All of them preserve the other's table.
 #
 # ---------------------------------------------------------------------------
@@ -93,7 +93,7 @@ expires = 1788600000
 
 
 # ---------------------------------------------------------------------------
-# [node] — written by `probe-rs-fleet share` / `agent up`, refreshed by the agent
+# [node] — written by `probe-rs-fleet share` / `node up`, refreshed by the agent
 # ---------------------------------------------------------------------------
 #
 # Present only if this machine offers probes to the fleet. Node-local settings

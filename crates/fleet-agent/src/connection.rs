@@ -35,10 +35,10 @@ use crate::config::{AgentConfig, NodeTokenStore};
 use crate::error::{AgentError, Result};
 use crate::probers::ProbeRsBackend;
 
-use fleet_proto::agent_api::AgentReport;
+use fleet_proto::node_api::NodeReport;
 use fleet_proto::{ChannelId, ChannelKind, CoordinatorCommand, DataFrame, PROTOCOL_VERSION};
 use fleet_wire::client::{dial, DialOpts};
-use fleet_wire::{AgentToCoord, CoordToAgent, WireError, WireEvent, WireRx, WireTx};
+use fleet_wire::{CoordToNode, NodeToCoord, WireError, WireEvent, WireRx, WireTx};
 
 /// How often the agent pings an otherwise idle connection.
 ///
@@ -301,10 +301,10 @@ where
 {
     let mut rx = rx;
     // Single writer task: every producer (register/inventory/heartbeat, drained
-    // reports, and per-channel splice tasks) funnels `AgentToCoord` messages
+    // reports, and per-channel splice tasks) funnels `NodeToCoord` messages
     // through this mpsc so only one task owns the write half. Pings ride their
     // own channel so a backlog of data frames cannot starve the keepalive.
-    let (out_tx, mut out_rx) = mpsc::channel::<AgentToCoord>(256);
+    let (out_tx, mut out_rx) = mpsc::channel::<NodeToCoord>(256);
     let (ping_tx, mut ping_rx) = mpsc::channel::<()>(1);
     let writer_task = tokio::spawn(async move {
         let mut tx = tx;
@@ -328,11 +328,11 @@ where
 
     // 1. Register. The id is advisory — the coordinator authenticates us by our
     //    token and will close the connection if this contradicts it.
-    let agent_id = fleet_proto::ids::AgentId(config.agent_id.clone());
+    let node_id = fleet_proto::ids::NodeId(config.node_id.clone());
     send_report(
         &out_tx,
-        AgentReport::Register {
-            agent: agent_id,
+        NodeReport::Register {
+            node: node_id,
             protocol_version: PROTOCOL_VERSION,
         },
     )
@@ -341,7 +341,7 @@ where
     // 2. Report the current inventory snapshot so the coordinator populates its
     //    scheduler and the boards become leasable.
     let inventory = agent.current_inventory().await;
-    send_report(&out_tx, AgentReport::Inventory(inventory)).await?;
+    send_report(&out_tx, NodeReport::Inventory(inventory)).await?;
 
     // Per-channel routing for inbound data frames: each open session's splice
     // task drains its own receiver.
@@ -366,11 +366,11 @@ where
                 last_seen = tokio::time::Instant::now();
                 match event {
                     Ok(WireEvent::Binary(bytes)) => {
-                        match fleet_wire::decode::<CoordToAgent>(&bytes) {
-                            Ok(CoordToAgent::Command(cmd)) => {
+                        match fleet_wire::decode::<CoordToNode>(&bytes) {
+                            Ok(CoordToNode::Command(cmd)) => {
                                 handle_inbound_command(agent, config, store, &out_tx, &routes, cmd).await;
                             }
-                            Ok(CoordToAgent::Data(data)) => {
+                            Ok(CoordToNode::Data(data)) => {
                                 route_inbound_data(&routes, data).await;
                             }
                             Err(e) => {
@@ -391,7 +391,7 @@ where
             // *agent* is healthy, not merely that the socket is open).
             _ = heartbeat.tick() => {
                 let uptime_secs = started.elapsed().as_secs();
-                if send_report(&out_tx, AgentReport::Heartbeat { uptime_secs }).await.is_err() {
+                if send_report(&out_tx, NodeReport::Heartbeat { uptime_secs }).await.is_err() {
                     break Err(AgentError::Connection("writer closed".to_owned()));
                 }
             }
@@ -449,7 +449,7 @@ async fn periodic(period: Duration) -> tokio::time::Interval {
 /// this can return is a closed writer.
 async fn report_discovery<B: ProbeRsBackend>(
     agent: &Arc<Agent<B>>,
-    out_tx: &mpsc::Sender<AgentToCoord>,
+    out_tx: &mpsc::Sender<NodeToCoord>,
 ) -> Result<()> {
     let Some(inventory) = agent.discovery_pass().await else {
         return Ok(());
@@ -459,12 +459,12 @@ async fn report_discovery<B: ProbeRsBackend>(
         unknown = inventory.unknown.len(),
         "probe inventory changed"
     );
-    send_report(out_tx, AgentReport::Inventory(inventory)).await
+    send_report(out_tx, NodeReport::Inventory(inventory)).await
 }
 
-async fn send_report(out_tx: &mpsc::Sender<AgentToCoord>, report: AgentReport) -> Result<()> {
+async fn send_report(out_tx: &mpsc::Sender<NodeToCoord>, report: NodeReport) -> Result<()> {
     out_tx
-        .send(AgentToCoord::Report(report))
+        .send(NodeToCoord::Report(report))
         .await
         .map_err(|_| AgentError::Connection("writer closed".to_owned()))
 }
@@ -472,7 +472,7 @@ async fn send_report(out_tx: &mpsc::Sender<AgentToCoord>, report: AgentReport) -
 /// Drain any reports the agent queued and forward them upward.
 async fn drain_reports<B: ProbeRsBackend>(
     agent: &Arc<Agent<B>>,
-    out_tx: &mpsc::Sender<AgentToCoord>,
+    out_tx: &mpsc::Sender<NodeToCoord>,
 ) -> Result<()> {
     for report in agent.take_reports().await {
         send_report(out_tx, report).await?;
@@ -499,7 +499,7 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
     config: &mut AgentConfig,
     store: &Arc<dyn NodeTokenStore>,
-    out_tx: &mpsc::Sender<AgentToCoord>,
+    out_tx: &mpsc::Sender<NodeToCoord>,
     routes: &Arc<Mutex<HashMap<ChannelId, mpsc::Sender<DataFrame>>>>,
     cmd: CoordinatorCommand,
 ) {
@@ -527,7 +527,7 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
         tracing::warn!(error = %e, "command dispatch failed");
         // Surface the failure as a log report; the coordinator decides policy.
         let _ = out_tx
-            .send(AgentToCoord::Report(AgentReport::Log {
+            .send(NodeToCoord::Report(NodeReport::Log {
                 level: fleet_proto::LogLevel::Error,
                 board: None,
                 message: format!("command failed: {e}"),
@@ -556,7 +556,7 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
 async fn rotate_token(
     config: &mut AgentConfig,
     store: &Arc<dyn NodeTokenStore>,
-    out_tx: &mpsc::Sender<AgentToCoord>,
+    out_tx: &mpsc::Sender<NodeToCoord>,
     token: &str,
     rotation_id: u64,
 ) {
@@ -570,7 +570,7 @@ async fn rotate_token(
     }
     let previous = std::mem::replace(&mut config.node_token, token.to_owned());
     config.previous_node_token = Some(previous);
-    if send_report(out_tx, AgentReport::TokenRotated { rotation_id })
+    if send_report(out_tx, NodeReport::TokenRotated { rotation_id })
         .await
         .is_err()
     {
@@ -586,7 +586,7 @@ async fn rotate_token(
 async fn spawn_splice<B: ProbeRsBackend + 'static>(
     agent: &Arc<Agent<B>>,
     _config: &AgentConfig,
-    out_tx: &mpsc::Sender<AgentToCoord>,
+    out_tx: &mpsc::Sender<NodeToCoord>,
     routes: &Arc<Mutex<HashMap<ChannelId, mpsc::Sender<DataFrame>>>>,
     channel: ChannelId,
     kind: ChannelKind,
@@ -616,7 +616,7 @@ async fn spawn_splice<B: ProbeRsBackend + 'static>(
 /// Bidirectionally splice a session's byte stream with the relay data channel.
 ///
 /// * Bytes read from `io` (← `probe-rs serve`) are wrapped as `DataFrame` and
-///   sent up as `AgentToCoord::Data` (→ coordinator → sidecar → probe-rs
+///   sent up as `NodeToCoord::Data` (→ coordinator → sidecar → probe-rs
 ///   client).
 /// * `DataFrame`s arriving on `from_relay` (← the client) are written to `io`.
 ///
@@ -624,7 +624,7 @@ async fn spawn_splice<B: ProbeRsBackend + 'static>(
 async fn splice_io(
     channel: ChannelId,
     io: Box<dyn crate::probers::SpliceIo>,
-    out_tx: mpsc::Sender<AgentToCoord>,
+    out_tx: mpsc::Sender<NodeToCoord>,
     mut from_relay: mpsc::Receiver<DataFrame>,
 ) -> std::result::Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -638,7 +638,7 @@ async fn splice_io(
                     return Ok(());
                 }
                 let frame = DataFrame { channel, bytes: buf[..n].to_vec() };
-                if out_tx.send(AgentToCoord::Data(frame)).await.is_err() {
+                if out_tx.send(NodeToCoord::Data(frame)).await.is_err() {
                     return Ok(());
                 }
             }
@@ -720,7 +720,7 @@ mod tests {
     fn agent_config() -> AgentConfig {
         let pubkey_hex = hex_encode(&SigningKey::from_bytes(&SEED).verifying_key().to_bytes());
         AgentConfig {
-            agent_id: NODE_ID.to_owned(),
+            node_id: NODE_ID.to_owned(),
             fleet_url: "https://coordinator.example:7000".to_owned(),
             node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             previous_node_token: None,
@@ -783,7 +783,7 @@ kind = "none"
     fn board_ref(name: &str) -> fleet_proto::BoardRef {
         fleet_proto::BoardRef::new(
             fleet_proto::OrgId("default".to_owned()),
-            fleet_proto::AgentId(NODE_ID.to_owned()),
+            fleet_proto::NodeId(NODE_ID.to_owned()),
             name,
         )
     }
@@ -853,25 +853,25 @@ kind = "none"
         };
 
         // 1. Register.
-        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
-            AgentToCoord::Report(AgentReport::Register {
-                agent,
+            NodeToCoord::Report(NodeReport::Register {
+                node,
                 protocol_version,
             }) => {
-                assert_eq!(agent.0, NODE_ID);
+                assert_eq!(node.0, NODE_ID);
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
             }
             other => panic!("expected Register, got {other:?}"),
         }
         // 2. Inventory (one online board with full metadata).
-        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
-            AgentToCoord::Report(AgentReport::Inventory(inv)) => {
+            NodeToCoord::Report(NodeReport::Inventory(inv)) => {
                 assert_eq!(inv.boards.len(), 1);
                 assert_eq!(inv.boards[0].board.0, "b1");
                 assert_eq!(inv.boards[0].chip, "nRF52840_xxAA");
@@ -883,7 +883,7 @@ kind = "none"
         let token = signed_token(7, "b1", vec![AllowedOp::Attach], u64::MAX);
         fleet_wire::send(
             &mut coord_tx,
-            &CoordToAgent::Command(CoordinatorCommand::OpenSession {
+            &CoordToNode::Command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
@@ -907,7 +907,7 @@ kind = "none"
         // 4. Data round-trip: coordinator -> agent -> serve socket.
         fleet_wire::send(
             &mut coord_tx,
-            &CoordToAgent::Data(DataFrame {
+            &CoordToNode::Data(DataFrame {
                 channel: ChannelId(1),
                 bytes: b"ping".to_vec(),
             }),
@@ -923,12 +923,12 @@ kind = "none"
         peer.flush().await.unwrap();
         // Skip any interleaved Log reports; assert the data frame arrives.
         let data = loop {
-            match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
-                AgentToCoord::Data(f) => break f,
-                AgentToCoord::Report(_) => {}
+                NodeToCoord::Data(f) => break f,
+                NodeToCoord::Report(_) => {}
             }
         };
         assert_eq!(data.channel, ChannelId(1));
@@ -989,14 +989,14 @@ kind = "none"
         };
 
         // Register, then the seeded inventory (declared boards only).
-        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        let _register = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
-            AgentToCoord::Report(AgentReport::Inventory(inv)) => {
+            NodeToCoord::Report(NodeReport::Inventory(inv)) => {
                 assert!(inv.boards.iter().all(|b| !b.adopted));
             }
             other => panic!("expected the seeded Inventory, got {other:?}"),
@@ -1005,13 +1005,13 @@ kind = "none"
         // The first discovery tick finds the undeclared probe and reports it.
         let adopted = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+                match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                     .await
                     .unwrap()
                 {
-                    AgentToCoord::Report(AgentReport::Inventory(inv)) => break inv,
+                    NodeToCoord::Report(NodeReport::Inventory(inv)) => break inv,
                     // Heartbeats are expected traffic; anything else is not.
-                    AgentToCoord::Report(AgentReport::Heartbeat { .. }) => {}
+                    NodeToCoord::Report(NodeReport::Heartbeat { .. }) => {}
                     other => panic!("unexpected {other:?}"),
                 }
             }
@@ -1025,8 +1025,8 @@ kind = "none"
         // window.)
         let quiet = tokio::time::timeout(Duration::from_secs(4), async {
             loop {
-                if let AgentToCoord::Report(AgentReport::Inventory(_)) =
-                    fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+                if let NodeToCoord::Report(NodeReport::Inventory(_)) =
+                    fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                         .await
                         .unwrap()
                 {
@@ -1080,10 +1080,10 @@ kind = "none"
             })
         };
 
-        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        let _register = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        let _seed = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        let _seed = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
 
@@ -1092,14 +1092,14 @@ kind = "none"
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         let alive = tokio::time::timeout(
             Duration::from_secs(3),
-            fleet_wire::recv::<AgentToCoord>(&mut coord_rx),
+            fleet_wire::recv::<NodeToCoord>(&mut coord_rx),
         )
         .await
         .expect("the connection must survive failed enumeration")
         .unwrap();
         assert!(matches!(
             alive,
-            AgentToCoord::Report(AgentReport::Heartbeat { .. })
+            NodeToCoord::Report(NodeReport::Heartbeat { .. })
         ));
         assert_eq!(
             agent.current_inventory().await,
@@ -1144,17 +1144,17 @@ kind = "none"
         };
 
         // Drain Register + Inventory.
-        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        let _ = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        let _ = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+        let _ = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
 
         let new_token = "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
         fleet_wire::send(
             &mut coord_tx,
-            &CoordToAgent::Command(CoordinatorCommand::RotateNodeToken {
+            &CoordToNode::Command(CoordinatorCommand::RotateNodeToken {
                 token: new_token.to_owned(),
                 rotation_id: 7,
             }),
@@ -1164,8 +1164,8 @@ kind = "none"
 
         // The ack arrives ...
         let ack = loop {
-            if let AgentToCoord::Report(AgentReport::TokenRotated { rotation_id }) =
-                fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            if let NodeToCoord::Report(NodeReport::TokenRotated { rotation_id }) =
+                fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                     .await
                     .unwrap()
             {
@@ -1349,7 +1349,7 @@ kind = "none"
     #[test]
     fn credential_rejection_names_the_remedy() {
         let rendered = AgentError::CredentialRejected("401".to_owned()).to_string();
-        assert!(rendered.contains("agent up"), "got: {rendered}");
+        assert!(rendered.contains("node up"), "got: {rendered}");
         assert!(rendered.contains("--auth-key"), "got: {rendered}");
     }
 }

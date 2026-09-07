@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
+use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
 use fleet_proto::{LeaseId, PROTOCOL_VERSION};
 use fleet_sidecar::lease_store::Disposition;
@@ -32,8 +32,8 @@ use tokio::sync::{mpsc, Mutex};
 fn grant(expires: u64) -> LeaseGrant {
     LeaseGrant {
         lease: LeaseId(1),
-        board: BoardRef::new(OrgId("default".to_owned()), AgentId("a".to_owned()), "b1"),
-        agent: AgentId("a".to_owned()),
+        board: BoardRef::new(OrgId("default".to_owned()), NodeId("a".to_owned()), "b1"),
+        node: NodeId("a".to_owned()),
         holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
         expires,
         token: vec![0xab],

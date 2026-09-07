@@ -18,7 +18,7 @@ use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{AgentId, BoardRef, OrgId, Role};
+use fleet_proto::ids::{BoardRef, NodeId, OrgId, Role};
 
 /// The signing seed every test coordinator uses.
 pub const SEED: [u8; 32] = [7u8; 32];
@@ -85,7 +85,7 @@ impl TestCoordinator {
     }
 
     /// Seed a node row with a fresh token; returns the token's string form.
-    pub async fn seed_node(&self, org: &str, name: &str) -> (String, AgentId) {
+    pub async fn seed_node(&self, org: &str, name: &str) -> (String, NodeId) {
         self.seed_node_at(org, name, self.coord.now()).await
     }
 
@@ -102,7 +102,7 @@ impl TestCoordinator {
         name: &str,
         owner: &str,
         adopt: fleet_proto::adopt::AdoptPolicy,
-    ) -> (String, AgentId) {
+    ) -> (String, NodeId) {
         let org = OrgId(org.to_owned());
         self.db().ensure_org(&org, "personal").await.unwrap();
         let token = OpaqueToken::mint(TokenKind::Node);
@@ -125,7 +125,7 @@ impl TestCoordinator {
 
     /// As [`TestCoordinator::seed_node`], with an explicit `token_issued_at`,
     /// so a test can present a token that is already due for rotation.
-    pub async fn seed_node_at(&self, org: &str, name: &str, issued_at: u64) -> (String, AgentId) {
+    pub async fn seed_node_at(&self, org: &str, name: &str, issued_at: u64) -> (String, NodeId) {
         let org = OrgId(org.to_owned());
         self.db().ensure_org(&org, "personal").await.unwrap();
         let token = OpaqueToken::mint(TokenKind::Node);
@@ -506,10 +506,10 @@ impl TestCoordinator {
         (token.to_secret_string(), org, user_id)
     }
 
-    /// Put a board into the scheduler directly, bypassing an agent connection.
+    /// Put a board into the scheduler directly, bypassing a node connection.
     ///
     /// Authorization tests care about who may reach a board, not about how it
-    /// got there; standing up a real agent for each one would drown the
+    /// got there; standing up a real node for each one would drown the
     /// property being tested.
     pub async fn seed_board(&self, org: &OrgId, node: &str, name: &str, tags: &[&str]) -> BoardRef {
         self.seed_board_with_model(org, node, name, tags, None)
@@ -532,16 +532,16 @@ impl TestCoordinator {
         // The node id production would mint for this `(org, node)`, built by
         // calling the production constructor rather than re-spelling its
         // format string — the one definition of the shape lives in `state.rs`.
-        let agent = fleet_coordinator::node_id_for(org, node);
+        let node = fleet_coordinator::node_id_for(org, node);
         let now = i64::try_from(self.coord.now()).unwrap();
         self.db()
             .scoped(org.clone())
-            .ensure_node(&agent, now)
+            .ensure_node(&node, now)
             .await
             .unwrap();
         let board = Board {
-            id: BoardRef::new(org.clone(), agent.clone(), name),
-            agent,
+            id: BoardRef::new(org.clone(), node.clone(), name),
+            node,
             chip: "nRF52840_xxAA".to_owned(),
             model: model.map(str::to_owned),
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
@@ -551,7 +551,7 @@ impl TestCoordinator {
         };
         self.db()
             .scoped(org.clone())
-            .record_board(&board, fleet_proto::agent_api::BoardPresence::Online, now)
+            .record_board(&board, fleet_proto::node_api::BoardPresence::Online, now)
             .await
             .unwrap();
         let id = board.id.clone();
@@ -568,27 +568,27 @@ impl TestCoordinator {
     }
 }
 
-/// A stand-in for a connected agent, registered directly in the coordinator's
+/// A stand-in for a connected node, registered directly in the coordinator's
 /// registry.
 ///
 /// The delegation tests care about which capability token the coordinator hands
 /// the node, not about running a real `probe-rs serve`; standing up a full
-/// agent for that would bury the property under scaffolding. `ws_e2e.rs`
-/// already covers the real agent end to end.
-pub struct AgentStub {
-    rx: tokio::sync::mpsc::Receiver<fleet_coordinator::registry::AgentMessage>,
+/// node for that would bury the property under scaffolding. `ws_e2e.rs`
+/// already covers the real node end to end.
+pub struct NodeStub {
+    rx: tokio::sync::mpsc::Receiver<fleet_coordinator::registry::NodeMessage>,
 }
 
-impl AgentStub {
+impl NodeStub {
     /// Register a stub handle for `node`.
-    pub async fn attach(fleet: &TestCoordinator, node: &AgentId) -> Self {
+    pub async fn attach(fleet: &TestCoordinator, node: &NodeId) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         fleet
             .coord
-            .agents()
+            .nodes()
             .insert(
                 node.clone(),
-                fleet_coordinator::registry::AgentHandle::new(tx),
+                fleet_coordinator::registry::NodeHandle::new(tx),
             )
             .await;
         Self { rx }
@@ -599,8 +599,8 @@ impl AgentStub {
     /// The token is what makes this helper worth having: it is the byte string
     /// the node will check, and therefore the one the client must present.
     pub async fn expect_open_session(&mut self) -> (fleet_proto::ChannelId, Vec<u8>) {
-        match self.rx.recv().await.expect("agent connection closed") {
-            fleet_coordinator::registry::AgentMessage::Command(
+        match self.rx.recv().await.expect("node connection closed") {
+            fleet_coordinator::registry::NodeMessage::Command(
                 fleet_proto::CoordinatorCommand::OpenSession { channel, token, .. },
             ) => (channel, token),
             other => panic!("expected OpenSession, got {other:?}"),
@@ -614,8 +614,8 @@ impl AgentStub {
     /// implementation that authorized correctly and then sent nothing, or sent
     /// the wrong board, would pass a status-code-only test.
     pub async fn expect_power_cycle(&mut self) -> fleet_proto::ids::BoardName {
-        match self.rx.recv().await.expect("agent connection closed") {
-            fleet_coordinator::registry::AgentMessage::Command(
+        match self.rx.recv().await.expect("node connection closed") {
+            fleet_coordinator::registry::NodeMessage::Command(
                 fleet_proto::CoordinatorCommand::PowerCycle { board },
             ) => board,
             other => panic!("expected PowerCycle, got {other:?}"),
@@ -625,7 +625,7 @@ impl AgentStub {
     /// Whether any command is queued for this stub, without waiting.
     ///
     /// For the negative half of a power-cycle test: a *refused* request must
-    /// have left the agent with nothing to do, which "the response was a 403"
+    /// have left the node with nothing to do, which "the response was a 403"
     /// alone does not show.
     pub fn is_idle(&mut self) -> bool {
         self.rx.try_recv().is_err()

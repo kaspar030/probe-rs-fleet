@@ -38,7 +38,7 @@ CLI-only:
 | board actions | `ctl lease` / `ctl release` / `ctl power-cycle` / `ctl delegate` |
 | sharing | `grant <subject> …` / `grant list` / `grant revoke` |
 | credentials | `auth-key create` / `auth-key list` / `auth-key revoke` |
-| enrollment | `share`, `agent up`, `node approve <code>` |
+| enrollment | `share`, `node up`, `node approve <code>` |
 
 The only browser surface the coordinator had was `GET /node/approve`
 (`crates/fleet-coordinator/src/http.rs`, `NODE_APPROVE_PAGE`): a static,
@@ -331,7 +331,7 @@ require the `X-Fleet-Csrf` header. Errors keep the existing shape:
 Two path-shape decisions, both forced by the id grammar:
 
 - **A `BoardRef` has four slash-separated segments** (`org/org/node/name` —
-  `state.rs::node_id_for` builds `AgentId("{org}/{name}")`), so boards are never
+  `state.rs::node_id_for` builds `NodeId("{org}/{name}")`), so boards are never
   addressed in a path. Board-targeting endpoints take the node-local name (or a
   qualified name, per §6.5's `BoardRef::answers_to` grammar) **in the body**,
   exactly as the wire verbs do, and the coordinator resolves it within the
@@ -377,7 +377,7 @@ bundle, since D3 means there is no build to branch in.
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/nodes` | — | `[{"id","name","tags","adopt","owner","last_seen","online","boards"}]` | **new** `Coordinator::list_nodes` → **new** `OrgDb::list_nodes` (+ `AgentRegistry` for `online`) | member |
+| `GET /api/v1/nodes` | — | `[{"id","name","tags","adopt","owner","last_seen","online","boards"}]` | **new** `Coordinator::list_nodes` → **new** `OrgDb::list_nodes` (+ `NodeRegistry` for `online`) | member |
 | `PATCH /api/v1/nodes/{name}` | `{"tags"?,"adopt"?}` | the updated node row | `Coordinator::update_node_core` → `OrgDb::update_node` | node owner, or admin |
 | `DELETE /api/v1/nodes/{name}` | — | `204` | `Coordinator::delete_node_core` → lease teardown + scheduler removal + `OrgDb::delete_node` + close the live connection | node owner, or admin |
 | `POST /api/v1/nodes/pending/{code}` | `{"decision":"inspect"\|"approve"\|"deny","replace":false}` | `NodeApprovalResponse` + a `warning` field | `http::decide_pending_node` (**unchanged**) | member |
@@ -409,7 +409,7 @@ node that has ever reported a board. And it must *close* the node's
 control-plane socket, not merely drop its registry entry: the connection task
 holds its own sender, so removing the entry makes the node unroutable while the
 socket lives on — an operator who deleted a node would still have the machine
-attached. `AgentRegistry::remove_and_close` is the revocation-side call.
+attached. `NodeRegistry::remove_and_close` is the revocation-side call.
 
 **`PATCH` does not rename, and says so.** The node id is `{org}/{name}`; it is a
 primary key referenced by `board.node_id` under `PRAGMA foreign_keys = ON`, it

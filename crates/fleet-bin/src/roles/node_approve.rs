@@ -333,13 +333,13 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         "invalid_grant" => {
             "no pending registration matches that code. It may be mistyped, \
              already approved or denied, or expired (codes live 15 minutes) — \
-             re-run `agent up` on the machine to get a fresh one"
+             re-run `node up` on the machine to get a fresh one"
         }
         "node_name_taken" => {
             "your org already has a node with the name this machine asked for. \
              Approving would re-credential it and knock the running machine off \
              the fleet. If that is genuinely what you want, re-run with \
-             --replace; otherwise re-run `agent up --node-name <other>` on the \
+             --replace; otherwise re-run `node up --node-name <other>` on the \
              waiting machine"
         }
         "forbidden" => {

@@ -47,7 +47,7 @@ fn fleet_example_parses_with_both_tables() {
 fn node_example_parses_as_all_defaults() {
     let path = examples_dir().join("node.toml");
     let text = std::fs::read_to_string(&path).unwrap();
-    let settings: fleet_bin::roles::agent::NodeSettings = toml::from_str(&text).unwrap();
+    let settings: fleet_bin::roles::node_run::NodeSettings = toml::from_str(&text).unwrap();
     assert!(settings.boards_path.is_none());
     assert!(settings.heartbeat_secs.is_none());
     assert!(settings.discovery_secs.is_none());
@@ -73,7 +73,8 @@ fn the_node_example_documents_both_adopt_policies_and_they_parse() {
         let uncommented = text
             .replace("# adopt = ", "adopt = ")
             .replace("adopt = \"declared\"", &format!("adopt = \"{policy}\""));
-        let settings: fleet_bin::roles::agent::NodeSettings = toml::from_str(&uncommented).unwrap();
+        let settings: fleet_bin::roles::node_run::NodeSettings =
+            toml::from_str(&uncommented).unwrap();
         assert_eq!(
             settings.adopt.map(fleet_proto::AdoptPolicy::as_str),
             Some(policy),

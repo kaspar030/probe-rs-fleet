@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, BoardName, BoardRef, LeaseId, Subject};
+use crate::ids::{BoardName, BoardRef, LeaseId, NodeId, Subject};
 
 /// A request to lease a board, by id or by constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +31,7 @@ pub enum Constraint {
     Id(BoardName),
     /// Any idle board of this board *model* (board type), e.g. `nrf52840dk`.
     ///
-    /// The model is declared by the operator in `boards.toml`; the agent
+    /// The model is declared by the operator in `boards.toml`; the node
     /// cannot infer it (`probe-rs list` reports the probe, never the board it
     /// is wired to), so an auto-adopted board has no model and is never
     /// matched by `board=`.
@@ -129,7 +129,7 @@ fn looks_like_a_wildcard(value: &str) -> bool {
 /// contention — a diagnostic about the fleet, for a typo.
 ///
 /// Tag values are *not* charset-validated in general, and that is a decision,
-/// not an omission: board tags come from `boards.toml`, which the agent never
+/// not an omission: board tags come from `boards.toml`, which the node never
 /// charset-validates, so an alnum/`.`/`_`/`-` rule would reject tags that work
 /// today, and would do it at selection time, far from the file. An unmatchable
 /// tag is not dangerous either — it fails closed. Only the syntactically
@@ -259,13 +259,13 @@ pub enum LeaseOutcome {
     },
 }
 
-/// A granted lease. The capability `token` is verified locally by the agent;
+/// A granted lease. The capability `token` is verified locally by the node;
 /// it does not require a coordinator round-trip per operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseGrant {
     pub lease: LeaseId,
     pub board: BoardRef,
-    pub agent: AgentId,
+    pub node: NodeId,
     pub holder: Subject,
     /// Expiry as epoch seconds; extend via heartbeat before this.
     pub expires: u64,
@@ -274,7 +274,7 @@ pub struct LeaseGrant {
     /// **This is not the data-plane credential.** It is the *delegation*
     /// artefact (`ctl delegate` hands exactly these bytes to a sandbox) and
     /// the lease cache's identity. The bytes a probe-rs client must present to
-    /// `probe-rs serve` are the ones the coordinator sent the agent, returned
+    /// `probe-rs serve` are the ones the coordinator sent the node, returned
     /// per channel in `CoordToSidecar::ChannelOpened { token }` — they differ
     /// as soon as the lease is extended or a grant attenuates `allowed_ops`.
     pub token: Vec<u8>,

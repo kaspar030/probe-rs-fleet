@@ -2,7 +2,7 @@
 //!
 //! [`Coordinator`] ties together the shared state — the pure
 //! [`fleet_core::scheduler::Scheduler`] (behind a short-held mutex), the
-//! [`Db`], the [`AgentRegistry`]/[`ChannelTable`], the ed25519 token
+//! [`Db`], the [`NodeRegistry`]/[`ChannelTable`], the ed25519 token
 //! [`Ed25519Signer`], and the clock — and implements the decision logic for
 //! every control-plane message *without* any socket I/O. The [`crate::server`]
 //! module is the thin I/O shell that reads frames off TLS streams and calls
@@ -31,10 +31,10 @@ use tracing::{debug, warn};
 use fleet_core::access::Access;
 use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Promotion, RequesterId, Scheduler};
 use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::agent_api::AgentReport;
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{AgentId, BoardName, BoardRef, LeaseId, OrgId, Role, Subject, SubjectKey};
+use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, Role, Subject, SubjectKey};
 use fleet_proto::lease::LeaseRequest;
+use fleet_proto::node_api::NodeReport;
 
 use crate::auth::Ed25519Signer;
 use crate::authz::{self, AuthzError};
@@ -42,7 +42,7 @@ use crate::clock::SharedClock;
 use crate::config::CoordinatorConfig;
 use crate::error::Result;
 use crate::proto::{CoordToSidecar, SidecarToCoord};
-use crate::registry::{AgentRegistry, ChannelTable, SidecarRegistry};
+use crate::registry::{ChannelTable, NodeRegistry, SidecarRegistry};
 use crate::relay;
 use crate::state::{AuditEntry, Db};
 
@@ -52,7 +52,7 @@ pub struct Coordinator {
     scheduler: Mutex<Scheduler>,
     db: Db,
     signer: Ed25519Signer,
-    agents: AgentRegistry,
+    nodes: NodeRegistry,
     /// Live sidecar/ctl connections, so a promotion can be pushed to the
     /// connection that queued for it.
     sidecars: SidecarRegistry,
@@ -72,7 +72,7 @@ pub struct Coordinator {
 /// Two numbers rather than one because a deletion is the operator-visible half:
 /// the audit detail is the only trace that a board row was retired, and
 /// "5 boards, 3 removed" is the line that explains a dropped board count on the
-/// Agents page.
+/// Nodes page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ReconcileOutcome {
     /// Boards reported present and admitted — i.e. now leasable.
@@ -118,7 +118,7 @@ pub(crate) enum OpError {
     /// missing expiry. Wire: `Error { message }`; HTTP: 400 `invalid_request`.
     Invalid(String),
     /// The request is well-formed and permitted but cannot be satisfied in the
-    /// current state — an ambiguous prefix, a disconnected agent. Wire:
+    /// current state — an ambiguous prefix, a disconnected node. Wire:
     /// `Error { message }`; HTTP: 409.
     Conflict(String),
     /// A fault in the coordinator itself (database, token signing). Propagated
@@ -161,7 +161,7 @@ impl Coordinator {
             scheduler: Mutex::new(scheduler),
             db,
             signer,
-            agents: AgentRegistry::new(),
+            nodes: NodeRegistry::new(),
             sidecars: SidecarRegistry::new(),
             channels: ChannelTable::new(),
             clock,
@@ -192,10 +192,10 @@ impl Coordinator {
         &self.config
     }
 
-    /// The agent registry.
+    /// The node registry.
     #[must_use]
-    pub fn agents(&self) -> &AgentRegistry {
-        &self.agents
+    pub fn nodes(&self) -> &NodeRegistry {
+        &self.nodes
     }
 
     /// The registry of live sidecar/ctl connections.
@@ -264,7 +264,7 @@ impl Coordinator {
     /// the configured org silently lands a node in someone else's tenant the
     /// moment a second org exists, so the report is dropped instead — exactly
     /// as the `Err` arm does.
-    async fn org_and_policy_of_node(&self, node: &AgentId) -> Option<(OrgId, AdoptPolicy)> {
+    async fn org_and_policy_of_node(&self, node: &NodeId) -> Option<(OrgId, AdoptPolicy)> {
         match self.db.node_org_and_policy(node).await {
             Ok(Some(found)) => Some(found),
             Ok(None) => {
@@ -278,50 +278,50 @@ impl Coordinator {
         }
     }
 
-    /// Handle one [`AgentReport`] from a connected agent.
+    /// Handle one [`NodeReport`] from a connected node.
     ///
     /// # Errors
     ///
     /// Returns a [`crate::error::CoordinatorError`] only on a fatal DB error;
     /// routine report content is logged and tolerated.
-    pub async fn handle_agent_report(&self, agent_id: &AgentId, report: AgentReport) -> Result<()> {
-        let Some((org, adopt)) = self.org_and_policy_of_node(agent_id).await else {
-            warn!(%agent_id, "dropping report from a node with no resolvable org");
+    pub async fn handle_node_report(&self, node_id: &NodeId, report: NodeReport) -> Result<()> {
+        let Some((org, adopt)) = self.org_and_policy_of_node(node_id).await else {
+            warn!(%node_id, "dropping report from a node with no resolvable org");
             return Ok(());
         };
         match report {
-            AgentReport::Register {
-                agent,
+            NodeReport::Register {
+                node,
                 protocol_version,
             } => {
-                debug!(%agent, protocol_version, "agent register");
+                debug!(%node, protocol_version, "node register");
                 self.audit(
                     &org,
-                    "agent.register",
+                    "node.register",
                     None,
-                    Some(&agent.0),
+                    Some(&node.0),
                     None,
                     None,
-                    Some(&agent.0),
+                    Some(&node.0),
                 )
                 .await?;
             }
-            AgentReport::Inventory(inv) => {
-                // Reconcile the agent's inventory into the scheduler's board set
+            NodeReport::Inventory(inv) => {
+                // Reconcile the node's inventory into the scheduler's board set
                 // so the boards become leasable and `open_channel` can resolve
-                // board -> owning agent. Each present (online) declared board is
-                // upserted as a `Board` owned by this agent *within the node's
-                // org*; the agent is authoritative for its board metadata via
+                // board -> owning node. Each present (online) declared board is
+                // upserted as a `Board` owned by this node *within the node's
+                // org*; the node is authoritative for its board metadata via
                 // `boards.toml`, but never for the org. The scheduler preserves
                 // any live lease state on re-report (see
                 // `Scheduler::upsert_board`).
                 let ReconcileOutcome { online, pruned } =
-                    self.reconcile_inventory(&org, agent_id, adopt, &inv).await;
+                    self.reconcile_inventory(&org, node_id, adopt, &inv).await;
                 self.audit(
                     &org,
-                    "agent.inventory",
+                    "node.inventory",
                     None,
-                    Some(&agent_id.0),
+                    Some(&node_id.0),
                     None,
                     None,
                     Some(&format!(
@@ -331,72 +331,72 @@ impl Coordinator {
                 )
                 .await?;
             }
-            AgentReport::Heartbeat { uptime_secs } => {
-                debug!(%agent_id, uptime_secs, "heartbeat");
+            NodeReport::Heartbeat { uptime_secs } => {
+                debug!(%node_id, uptime_secs, "heartbeat");
             }
-            AgentReport::Fault { board, reason } => {
-                warn!(%agent_id, %board, %reason, "board fault");
-                let board_ref = BoardRef::new(org.clone(), agent_id.clone(), board.0.clone());
+            NodeReport::Fault { board, reason } => {
+                warn!(%node_id, %board, %reason, "board fault");
+                let board_ref = BoardRef::new(org.clone(), node_id.clone(), board.0.clone());
                 self.fault_board(&board_ref, &reason).await;
                 self.audit(
                     &org,
                     "board.fault",
                     None,
-                    Some(&agent_id.0),
+                    Some(&node_id.0),
                     Some(&board.0),
                     None,
                     Some(&reason),
                 )
                 .await?;
             }
-            AgentReport::Log {
+            NodeReport::Log {
                 level,
                 board,
                 message,
             } => {
-                debug!(%agent_id, ?level, ?board, %message, "agent log");
+                debug!(%node_id, ?level, ?board, %message, "node log");
                 self.audit(
                     &org,
-                    "agent.log",
+                    "node.log",
                     None,
-                    Some(&agent_id.0),
+                    Some(&node_id.0),
                     board.as_ref().map(|b| b.0.as_str()),
                     None,
                     Some(&message),
                 )
                 .await?;
             }
-            AgentReport::PowerEvent { board, action } => {
-                debug!(%agent_id, %board, ?action, "power event");
+            NodeReport::PowerEvent { board, action } => {
+                debug!(%node_id, %board, ?action, "power event");
                 self.audit(
                     &org,
                     "board.power",
                     None,
-                    Some(&agent_id.0),
+                    Some(&node_id.0),
                     Some(&board.0),
                     None,
                     Some(&format!("{action:?}")),
                 )
                 .await?;
             }
-            AgentReport::SessionClosed { channel, exit_code } => {
-                debug!(%agent_id, ?channel, ?exit_code, "session closed");
+            NodeReport::SessionClosed { channel, exit_code } => {
+                debug!(%node_id, ?channel, ?exit_code, "session closed");
                 relay::close_channel(&self.channels, None, channel).await;
             }
-            AgentReport::TokenRotated { rotation_id } => {
+            NodeReport::TokenRotated { rotation_id } => {
                 // Handled by the connection task, which owns the pending
                 // rotation; reaching `core` means the connection did not
                 // recognise it, which is worth a trace but nothing more.
-                debug!(%agent_id, rotation_id, "stray token-rotation ack");
+                debug!(%node_id, rotation_id, "stray token-rotation ack");
             }
         }
         Ok(())
     }
 
-    /// Reconcile an agent inventory snapshot into the scheduler's board set and
+    /// Reconcile a node inventory snapshot into the scheduler's board set and
     /// the `board` table.
     ///
-    /// A [`ProbeInventory`](fleet_proto::agent_api::ProbeInventory) is a full
+    /// A [`ProbeInventory`](fleet_proto::node_api::ProbeInventory) is a full
     /// snapshot, never a delta, so this is a **set** operation: what the report
     /// omits is retired from both stores.
     ///
@@ -416,7 +416,7 @@ impl Coordinator {
     ///   ([`crate::state::OrgDb::prune_boards`]).
     ///
     /// The invariant: **the DB set is the scheduler set plus declared-but-
-    /// offline boards, and nothing else.** "Agents shows 3, Devices shows 2"
+    /// offline boards, and nothing else.** "Nodes shows 3, Devices shows 2"
     /// is therefore a legitimate state (one declared board is unplugged), and
     /// after this it is the *only* way the two pages can differ.
     ///
@@ -436,7 +436,7 @@ impl Coordinator {
     /// whose tenant they land in.
     ///
     /// `adopt` is the node's policy from its `node` row, which is the
-    /// authoritative copy (the agent's `node.toml` setting only governs what it
+    /// authoritative copy (the node's `node.toml` setting only governs what it
     /// reports):
     ///
     /// * [`AdoptPolicy::Declared`] — a board the node flagged `adopted` is
@@ -444,24 +444,24 @@ impl Coordinator {
     ///   point is here, so a node whose local config drifted (or which is
     ///   simply lying) cannot widen its own policy.
     /// * [`AdoptPolicy::Auto`] — adopted boards are scheduled like declared
-    ///   ones. The synthesis itself lives on the agent, which is the only side
+    ///   ones. The synthesis itself lives on the node, which is the only side
     ///   that can see a probe's identity.
     async fn reconcile_inventory(
         &self,
         org: &OrgId,
-        agent_id: &AgentId,
+        node_id: &NodeId,
         adopt: AdoptPolicy,
-        inv: &fleet_proto::agent_api::ProbeInventory,
+        inv: &fleet_proto::node_api::ProbeInventory,
     ) -> ReconcileOutcome {
-        use fleet_proto::agent_api::BoardPresence;
+        use fleet_proto::node_api::BoardPresence;
         use std::collections::HashSet;
 
         let now = self.now_i64();
         let scoped = self.db.scoped(org.clone());
         // Boards reference their node row, so the node must exist first —
         // otherwise every board insert below fails the foreign key.
-        if let Err(e) = scoped.ensure_node(agent_id, now).await {
-            warn!(node = %agent_id, error = %e, "failed to record node; skipping inventory");
+        if let Err(e) = scoped.ensure_node(node_id, now).await {
+            warn!(node = %node_id, error = %e, "failed to record node; skipping inventory");
             // No prune in this path: without a node row we cannot tell an
             // unknown node from one whose write failed, and deleting its boards
             // on a transient DB error would be the worse answer.
@@ -508,19 +508,18 @@ impl Coordinator {
                 if !admitted {
                     if status.presence == BoardPresence::Online {
                         warn!(
-                            node = %agent_id,
+                            node = %node_id,
                             board = %status.board,
                             "ignoring an adopted board from a node whose policy is `declared`"
                         );
                     }
                     continue;
                 }
-                let board_ref =
-                    BoardRef::new(org.clone(), agent_id.clone(), status.board.0.clone());
+                let board_ref = BoardRef::new(org.clone(), node_id.clone(), status.board.0.clone());
                 keep.insert(status.board.0.clone());
                 let board = Board {
                     id: board_ref.clone(),
-                    agent: agent_id.clone(),
+                    node: node_id.clone(),
                     chip: status.chip.clone(),
                     model: status.model.clone(),
                     tags: status.tags.clone(),
@@ -554,14 +553,14 @@ impl Coordinator {
             // A live lease pins the board: dropping it here would strand an open
             // `leases` row against a board nothing can release. Known hole,
             // accepted for v1: the stale board is only re-pruned by the *next*
-            // inventory report, and `Agent::discovery_pass` suppresses reports
+            // inventory report, and `Node::discovery_pass` suppresses reports
             // whose inventory is unchanged — so a board renamed while leased
             // survives the lease's release until something else about the
             // inventory changes. Closing that needs a prune hooked into lease
             // release, which is a separate change.
             let stale: Vec<BoardRef> = sched
                 .boards()
-                .filter(|b| b.id.org == *org && b.id.node == *agent_id)
+                .filter(|b| b.id.org == *org && b.id.node == *node_id)
                 .filter(|b| !keep.contains(b.id.name.as_str()))
                 .filter_map(|b| {
                     if matches!(b.state, BoardState::Leased { .. }) {
@@ -586,14 +585,14 @@ impl Coordinator {
         }
         // …and retire the rows of boards the node stopped declaring. A board
         // held by a live lease keeps its row for the same reason it keeps its
-        // scheduler entry: the Agents page must not contradict a lease that is
+        // scheduler entry: the Nodes page must not contradict a lease that is
         // being actively used.
         let mut keep_names: Vec<String> = keep.into_iter().collect();
         keep_names.extend(leased_keep);
-        let pruned = match scoped.prune_boards(agent_id, &keep_names).await {
+        let pruned = match scoped.prune_boards(node_id, &keep_names).await {
             Ok(n) => n,
             Err(e) => {
-                warn!(node = %agent_id, error = %e, "failed to prune stale board rows");
+                warn!(node = %node_id, error = %e, "failed to prune stale board rows");
                 0
             }
         };
@@ -686,8 +685,8 @@ impl Coordinator {
                         return Ok(());
                     }
                 }
-                let agent = self.agents.get(&route.agent).await;
-                relay::close_channel(&self.channels, agent.as_ref(), channel).await;
+                let node = self.nodes.get(&route.node).await;
+                relay::close_channel(&self.channels, node.as_ref(), channel).await;
             }
             SidecarToCoord::ListBoards => {
                 let reply = self.list_boards(subject).await;
@@ -793,7 +792,7 @@ impl Coordinator {
             0 => BoardLookup::NotFound,
             1 => BoardLookup::Found(tier[0].id.clone()),
             _ => {
-                let mut nodes: Vec<AgentId> = tier.iter().map(|b| b.id.node.clone()).collect();
+                let mut nodes: Vec<NodeId> = tier.iter().map(|b| b.id.node.clone()).collect();
                 nodes.sort();
                 BoardLookup::Ambiguous(nodes)
             }
@@ -843,7 +842,7 @@ impl Coordinator {
                 };
                 BoardSummary {
                     board: b.id.clone(),
-                    agent: b.agent.clone(),
+                    node: b.node.clone(),
                     chip: b.chip.clone(),
                     model: b.model.clone(),
                     tags: b.tags.clone(),
@@ -917,7 +916,7 @@ impl Coordinator {
     /// able to say "this Pi is enrolled and online but is offering nothing".
     ///
     /// `online` is composed here rather than stored: liveness is the
-    /// [`crate::registry::AgentRegistry`]'s in-memory answer to "is the
+    /// [`crate::registry::NodeRegistry`]'s in-memory answer to "is the
     /// control-plane `WebSocket` up *right now*", and a database column
     /// tracking it would be wrong from the moment a process died. The cost is
     /// that the flag is per-coordinator-process, which is correct — there is
@@ -946,7 +945,7 @@ impl Coordinator {
             .map_err(OpError::Internal)?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let online = self.agents.get(&row.id).await.is_some();
+            let online = self.nodes.get(&row.id).await.is_some();
             out.push(NodeStatus { row, online });
         }
         Ok(out)
@@ -1034,7 +1033,7 @@ impl Coordinator {
         .await
         .map_err(OpError::Internal)?;
 
-        let online = self.agents.get(&updated.id).await.is_some();
+        let online = self.nodes.get(&updated.id).await.is_some();
         Ok(NodeStatus {
             row: updated,
             online,
@@ -1069,12 +1068,12 @@ impl Coordinator {
     /// 3. the `board` and `node` rows are deleted in one transaction
     ///    ([`crate::state::OrgDb::delete_node`]); the board rows *must* go
     ///    first, since `board.node_id` is an enforced foreign key;
-    /// 4. the node is dropped from the [`crate::registry::AgentRegistry`] **and
+    /// 4. the node is dropped from the [`crate::registry::NodeRegistry`] **and
     ///    its control-plane `WebSocket` is closed**
-    ///    ([`crate::registry::AgentRegistry::remove_and_close`]). Both halves
+    ///    ([`crate::registry::NodeRegistry::remove_and_close`]). Both halves
     ///    are needed and neither implies the other: removing the entry only
     ///    makes the node unroutable, because
-    ///    [`crate::server::handle_agent`] keeps its own sender alive for the
+    ///    [`crate::server::handle_node`] keeps its own sender alive for the
     ///    life of the read loop and the registry therefore holds a *clone*. An
     ///    already-open socket would linger until it dropped of its own accord,
     ///    leaving an operator who deleted a node with the machine still
@@ -1102,7 +1101,7 @@ impl Coordinator {
         &self,
         subject: &Subject,
         name: &str,
-    ) -> std::result::Result<AgentId, OpError> {
+    ) -> std::result::Result<NodeId, OpError> {
         let org = subject.org.clone();
         let row = self
             .authorize_node_mutation(subject, name, "node.delete.denied")
@@ -1135,7 +1134,7 @@ impl Coordinator {
                 let mut sched = self.scheduler.lock().await;
                 let held: Vec<_> = sched
                     .boards()
-                    .filter(|b| b.agent == node_id)
+                    .filter(|b| b.node == node_id)
                     .filter_map(|b| match &b.state {
                         BoardState::Leased { lease, by, .. } => {
                             Some((*lease, b.id.clone(), by.key()))
@@ -1148,7 +1147,7 @@ impl Coordinator {
                     // boards now, before anything can be granted on them.
                     let refs: Vec<BoardRef> = sched
                         .boards()
-                        .filter(|b| b.agent == node_id)
+                        .filter(|b| b.node == node_id)
                         .map(|b| b.id.clone())
                         .collect();
                     for board_ref in &refs {
@@ -1181,7 +1180,7 @@ impl Coordinator {
         }
 
         // (4) The live connection.
-        self.agents.remove_and_close(&node_id).await;
+        self.nodes.remove_and_close(&node_id).await;
 
         self.audit(
             &org,
@@ -1342,12 +1341,12 @@ impl Coordinator {
         }
     }
 
-    /// Operator power-cycle: command the owning agent to power-cycle the board.
+    /// Operator power-cycle: command the owning node to power-cycle the board.
     ///
     /// Scoped by [`Access`]: an unreachable board resolves to "no such board",
     /// exactly as an absent one does. A *grantee* additionally needs the
     /// [`AllowedOp::PowerCycle`] op — this is the one op enforced here rather
-    /// than by the agent, because the agent's power-cycle command carries no
+    /// than by the node, because the node's power-cycle command carries no
     /// capability token to check.
     ///
     /// Returns the board's node-local name, as echoed back to the operator.
@@ -1357,7 +1356,7 @@ impl Coordinator {
     /// [`OpError::Denied`] when the caller may not reach the board, or may see
     /// it but not cut its power; [`OpError::NotFound`] for an absent or
     /// unreachable board; [`OpError::Conflict`] for an ambiguous name and for
-    /// an agent that is not connected; [`OpError::Internal`] on a database
+    /// a node that is not connected; [`OpError::Internal`] on a database
     /// failure.
     pub(crate) async fn operator_power_cycle_core(
         &self,
@@ -1396,19 +1395,19 @@ impl Coordinator {
             return Err(OpError::Denied);
         }
         let org = board_ref.org.clone();
-        let agent_id = board_ref.node.clone();
-        // Both agent-connection failures are `Conflict`, not `Internal` and not
+        let node_id = board_ref.node.clone();
+        // Both node-connection failures are `Conflict`, not `Internal` and not
         // `NotFound`: the request was well-formed and authorized, the fleet is
         // just momentarily unable to serve it. The enum has no "temporarily
         // unavailable" bucket, and `Conflict` is the one whose HTTP mapping
         // (409) tells the caller to retry rather than to re-authorize or to
         // stop asking for that board.
-        let Some(agent) = self.agents.get(&agent_id).await else {
+        let Some(node) = self.nodes.get(&node_id).await else {
             return Err(OpError::Conflict(format!(
-                "agent {agent_id} for board {board} is not connected"
+                "node {node_id} for board {board} is not connected"
             )));
         };
-        if agent
+        if node
             .send_command(fleet_proto::CoordinatorCommand::PowerCycle {
                 board: board_ref.board_name(),
             })
@@ -1416,14 +1415,14 @@ impl Coordinator {
             .is_err()
         {
             return Err(OpError::Conflict(format!(
-                "agent {agent_id} connection closed"
+                "node {node_id} connection closed"
             )));
         }
         self.audit(
             &org,
             "board.power-cycle",
             Some(&subject.key().to_string()),
-            Some(&agent_id.0),
+            Some(&node_id.0),
             Some(&board_ref.name),
             None,
             Some("operator request"),
@@ -1942,7 +1941,7 @@ impl Coordinator {
     }
 
     /// `ctl delegate`: lease a board **as the caller** and hand back only the
-    /// lease's capability token, for a sandboxed agent.
+    /// lease's capability token, for a sandboxed node.
     ///
     /// Delegation is deliberately *not* a grant and creates **no principal**.
     /// The sandbox gets no fleet identity, no session token, cannot enumerate
@@ -2375,7 +2374,7 @@ impl Coordinator {
         kind: fleet_proto::ChannelKind,
         sidecar_tx: mpsc::Sender<CoordToSidecar>,
     ) -> Result<Option<CoordToSidecar>> {
-        let (holder, board, agent_id, expires) = {
+        let (holder, board, node_id, expires) = {
             let sched = self.scheduler.lock().await;
             let Ok(holder) = authz::require_lease_control(&self.db, &sched, subject, lease).await
             else {
@@ -2383,12 +2382,12 @@ impl Coordinator {
                     message: AuthzError::lease_message(),
                 }));
             };
-            let Some((board, agent_id)) = sched.lease_target(lease) else {
+            let Some((board, node_id)) = sched.lease_target(lease) else {
                 return Ok(Some(CoordToSidecar::Error {
                     message: AuthzError::lease_message(),
                 }));
             };
-            let (board, agent_id) = (board.clone(), agent_id.clone());
+            let (board, node_id) = (board.clone(), node_id.clone());
             let expires = sched
                 .board(&board)
                 .and_then(|b| match &b.state {
@@ -2396,7 +2395,7 @@ impl Coordinator {
                     _ => None,
                 })
                 .unwrap_or_else(|| self.now());
-            (holder, board, agent_id, expires)
+            (holder, board, node_id, expires)
         };
 
         // Belt and braces: the board itself must be reachable by whoever holds
@@ -2430,9 +2429,9 @@ impl Coordinator {
             }));
         }
 
-        let Some(agent) = self.agents.get(&agent_id).await else {
+        let Some(node) = self.nodes.get(&node_id).await else {
             return Ok(Some(CoordToSidecar::Error {
-                message: format!("agent {agent_id} not connected"),
+                message: format!("node {node_id} not connected"),
             }));
         };
 
@@ -2449,8 +2448,8 @@ impl Coordinator {
 
         let channel = relay::open_channel(
             &self.channels,
-            &agent,
-            agent_id,
+            &node,
+            node_id,
             sidecar_tx,
             relay::OpenRequest {
                 lease,
@@ -2476,7 +2475,7 @@ impl Coordinator {
             )),
         )
         .await?;
-        // Return the *exact* bytes the agent got, so the sidecar can hand the
+        // Return the *exact* bytes the node got, so the sidecar can hand the
         // genuine probe-rs client a credential `probe-rs serve` will accept.
         // Re-minting on the sidecar side is what used to break after an
         // `extend_lease`.
@@ -2486,16 +2485,16 @@ impl Coordinator {
         }))
     }
 
-    /// Forward a sidecar data frame to the owning agent.
+    /// Forward a sidecar data frame to the owning node.
     async fn relay_from_sidecar(&self, frame: fleet_proto::DataFrame) {
         let Some(route) = self.channels.get(frame.channel).await else {
             return;
         };
-        let Some(agent) = self.agents.get(&route.agent).await else {
+        let Some(node) = self.nodes.get(&route.node).await else {
             return;
         };
-        if let Err(e) = relay::forward_to_agent(&self.channels, &agent, frame).await {
-            debug!(error = %e, "relay to agent failed");
+        if let Err(e) = relay::forward_to_agent(&self.channels, &node, frame).await {
+            debug!(error = %e, "relay to node failed");
         }
     }
 
@@ -2524,15 +2523,15 @@ impl Coordinator {
         };
 
         let now = self.now();
-        let (holder, board, agent_id, expires) = {
+        let (holder, board, node_id, expires) = {
             let sched = self.scheduler.lock().await;
             let Some(holder) = sched.lease_holder(token.lease).cloned() else {
                 return Ok(refused());
             };
-            let Some((board, agent_id)) = sched.lease_target(token.lease) else {
+            let Some((board, node_id)) = sched.lease_target(token.lease) else {
                 return Ok(refused());
             };
-            let (board, agent_id) = (board.clone(), agent_id.clone());
+            let (board, node_id) = (board.clone(), node_id.clone());
             let expires = sched
                 .board(&board)
                 .and_then(|b| match &b.state {
@@ -2540,7 +2539,7 @@ impl Coordinator {
                     _ => None,
                 })
                 .unwrap_or(now);
-            (holder, board, agent_id, expires)
+            (holder, board, node_id, expires)
         };
 
         // The lease must still be on the board the token names. Boards can be
@@ -2572,9 +2571,9 @@ impl Coordinator {
             return Ok(refused());
         }
 
-        let Some(agent) = self.agents.get(&agent_id).await else {
+        let Some(node) = self.nodes.get(&node_id).await else {
             return Ok(CoordToSidecar::Error {
-                message: format!("agent {agent_id} not connected"),
+                message: format!("node {node_id} not connected"),
             });
         };
 
@@ -2588,8 +2587,8 @@ impl Coordinator {
 
         let channel = relay::open_channel(
             &self.channels,
-            &agent,
-            agent_id,
+            &node,
+            node_id,
             sidecar_tx,
             relay::OpenRequest {
                 lease: token.lease,
@@ -2642,11 +2641,11 @@ impl Coordinator {
         if route.lease != lease {
             return;
         }
-        let agent = self.agents.get(&route.agent).await;
-        relay::close_channel(&self.channels, agent.as_ref(), channel).await;
+        let node = self.nodes.get(&route.node).await;
+        relay::close_channel(&self.channels, node.as_ref(), channel).await;
     }
 
-    /// Forward an agent data frame to the owning sidecar.
+    /// Forward a node data frame to the owning sidecar.
     ///
     /// # Errors
     ///
@@ -2660,11 +2659,11 @@ impl Coordinator {
     async fn teardown_lease_channels(&self, lease: LeaseId) {
         for channel in self.channels.channels_for_lease(lease).await {
             let route = self.channels.get(channel).await;
-            let agent = match route {
-                Some(r) => self.agents.get(&r.agent).await,
+            let node = match route {
+                Some(r) => self.nodes.get(&r.node).await,
                 None => None,
             };
-            relay::close_channel(&self.channels, agent.as_ref(), channel).await;
+            relay::close_channel(&self.channels, node.as_ref(), channel).await;
         }
     }
 
@@ -2690,7 +2689,7 @@ impl Coordinator {
     /// its cleanup with it.
     ///
     /// Any relay channels the sidecar had open are torn down when its writer
-    /// task drops and the agent reports `SessionClosed`.
+    /// task drops and the node reports `SessionClosed`.
     pub async fn drop_sidecar(&self, subject: &Subject, requester: RequesterId) {
         let dropped = {
             let mut sched = self.scheduler.lock().await;
@@ -2932,7 +2931,7 @@ enum BoardLookup {
     /// No such board in the caller's org.
     NotFound,
     /// Several of the caller's own nodes carry a board of this name.
-    Ambiguous(Vec<AgentId>),
+    Ambiguous(Vec<NodeId>),
 }
 
 #[cfg(test)]
@@ -2943,10 +2942,10 @@ mod tests {
     use crate::state::DEFAULT_ORG_ID;
     use ed25519_dalek::{Verifier, VerifyingKey};
     use fleet_core::policy::Policy;
-    use fleet_proto::agent_api::BoardPresence;
     use fleet_proto::board::PowerKind;
-    use fleet_proto::ids::{AgentId, SubjectKind};
+    use fleet_proto::ids::{NodeId, SubjectKind};
     use fleet_proto::lease::{Constraint, Priority};
+    use fleet_proto::node_api::BoardPresence;
     use fleet_proto::token::SignedToken;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2982,27 +2981,27 @@ mod tests {
 
     /// A board's fleet key, with a **production-shaped** node id.
     ///
-    /// `state.rs::node_id_for` namespaces node ids by org, so a real `AgentId`
+    /// `state.rs::node_id_for` namespaces node ids by org, so a real `NodeId`
     /// is `"{org}/{name}"` and a real `BoardRef` therefore has four
     /// slash-separated segments. This helper used to build bare ids
     /// (`"node-a"`), which is exactly why the qualified-name resolution tests
     /// below passed while the parse they exercised could not address a single
     /// production board. A fixture that cannot produce production-shaped data
     /// cannot fail on production-shaped bugs — so it produces it.
-    fn board_ref(org_name: &str, agent: &str, name: &str) -> BoardRef {
-        BoardRef::new(org(org_name), node_id(org_name, agent), name)
+    fn board_ref(org_name: &str, node: &str, name: &str) -> BoardRef {
+        BoardRef::new(org(org_name), node_id(org_name, node), name)
     }
 
     /// The org-namespaced node id `state.rs::node_id_for` mints — by calling
     /// it, not by re-spelling its format string.
-    fn node_id(org_name: &str, agent: &str) -> AgentId {
-        crate::state::node_id_for(&org(org_name), agent)
+    fn node_id(org_name: &str, node: &str) -> NodeId {
+        crate::state::node_id_for(&org(org_name), node)
     }
 
-    fn board(org_name: &str, id: &str, agent: &str) -> Board {
+    fn board(org_name: &str, id: &str, node: &str) -> Board {
         Board {
-            id: board_ref(org_name, agent, id),
-            agent: node_id(org_name, agent),
+            id: board_ref(org_name, node, id),
+            node: node_id(org_name, node),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec!["nrf52".to_owned()],
@@ -3032,7 +3031,7 @@ mod tests {
             for b in boards {
                 if b.id.org.0 == *org_name {
                     db.scoped(org(org_name))
-                        .ensure_node(&b.agent, 1000)
+                        .ensure_node(&b.node, 1000)
                         .await
                         .unwrap();
                 }
@@ -3045,7 +3044,7 @@ mod tests {
     async fn coordinator(clock: Arc<TestClock>) -> Coordinator {
         coordinator_with(
             clock,
-            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
                 (DEFAULT_ORG_ID, "alice", Role::Member),
                 (DEFAULT_ORG_ID, "bob", Role::Member),
@@ -3085,7 +3084,7 @@ mod tests {
         }
     }
 
-    /// The token in `ChannelOpened` must be **exactly** the bytes the agent was
+    /// The token in `ChannelOpened` must be **exactly** the bytes the node was
     /// sent in `OpenSession` — and, in particular, must survive an `extend`.
     ///
     /// Before `ChannelOpened` carried the token, the sidecar exported
@@ -3096,14 +3095,14 @@ mod tests {
     /// opaque auth error. This test fails on the pre-fix tree.
     #[tokio::test]
     async fn channel_token_matches_the_agents_and_survives_an_extend() {
-        use crate::registry::{AgentHandle, AgentMessage};
+        use crate::registry::{NodeHandle, NodeMessage};
 
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator(clock.clone()).await;
-        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        let (atx, mut arx) = mpsc::channel::<NodeMessage>(16);
         coord
-            .agents()
-            .insert(node_id(DEFAULT_ORG_ID, "agent-a"), AgentHandle::new(atx))
+            .nodes()
+            .insert(node_id(DEFAULT_ORG_ID, "node-a"), NodeHandle::new(atx))
             .await;
 
         let alice = user(DEFAULT_ORG_ID, "alice");
@@ -3144,7 +3143,7 @@ mod tests {
         else {
             panic!("expected ChannelOpened");
         };
-        let AgentMessage::Command(fleet_proto::CoordinatorCommand::OpenSession {
+        let NodeMessage::Command(fleet_proto::CoordinatorCommand::OpenSession {
             token: to_agent,
             ..
         }) = arx.recv().await.unwrap()
@@ -3154,7 +3153,7 @@ mod tests {
 
         assert_eq!(
             to_sidecar, to_agent,
-            "the sidecar must get the very bytes the agent will check"
+            "the sidecar must get the very bytes the node will check"
         );
         assert_ne!(
             to_sidecar, grant.token,
@@ -3185,10 +3184,10 @@ mod tests {
             CoordToSidecar::Lease(g) => g,
             other => panic!("expected Lease, got {other:?}"),
         };
-        assert_eq!(grant.board, board_ref(DEFAULT_ORG_ID, "agent-a", "b1"));
+        assert_eq!(grant.board, board_ref(DEFAULT_ORG_ID, "node-a", "b1"));
         assert_eq!(grant.expires, 1000 + 600);
 
-        // The minted token verifies under the agent's public key.
+        // The minted token verifies under the node's public key.
         let pubkey = coord.signer().public_key_bytes();
         let key = VerifyingKey::from_bytes(&pubkey).unwrap();
         let signed = SignedToken::from_wire(&grant.token).unwrap();
@@ -3314,9 +3313,9 @@ mod tests {
         let coord = coordinator_with(
             clock,
             &[
-                board(DEFAULT_ORG_ID, "b1", "agent-a"),
-                board(DEFAULT_ORG_ID, "b2", "agent-a"),
-                board(DEFAULT_ORG_ID, "b3", "agent-a"),
+                board(DEFAULT_ORG_ID, "b1", "node-a"),
+                board(DEFAULT_ORG_ID, "b2", "node-a"),
+                board(DEFAULT_ORG_ID, "b3", "node-a"),
             ],
             &[(DEFAULT_ORG_ID, "alice", Role::Member)],
         )
@@ -3451,7 +3450,7 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
-            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
                 (DEFAULT_ORG_ID, "alice", Role::Member),
                 (DEFAULT_ORG_ID, "bob", Role::Member),
@@ -3584,7 +3583,7 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
-            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
                 (DEFAULT_ORG_ID, "alice", Role::Member),
                 (DEFAULT_ORG_ID, "bob", Role::Member),
@@ -3656,7 +3655,7 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
-            &[board(DEFAULT_ORG_ID, "b1", "agent-a")],
+            &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
                 (DEFAULT_ORG_ID, "alice", Role::Member),
                 (DEFAULT_ORG_ID, "bob", Role::Member),
@@ -3744,17 +3743,17 @@ mod tests {
     /// its principal and minted a full-ops capability token for any lease id,
     /// so any authenticated client got flash/debug on any board. Assert not
     /// merely that an error comes back, but that **no token was minted** — i.e.
-    /// the agent was never commanded to open a session.
+    /// the node was never commanded to open a session.
     #[tokio::test]
     async fn other_subject_cannot_open_channel_and_no_token_is_minted() {
-        use crate::registry::{AgentHandle, AgentMessage};
+        use crate::registry::{NodeHandle, NodeMessage};
 
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator(clock).await;
-        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        let (atx, mut arx) = mpsc::channel::<NodeMessage>(16);
         coord
-            .agents()
-            .insert(node_id(DEFAULT_ORG_ID, "agent-a"), AgentHandle::new(atx))
+            .nodes()
+            .insert(node_id(DEFAULT_ORG_ID, "node-a"), NodeHandle::new(atx))
             .await;
 
         let alice = user(DEFAULT_ORG_ID, "alice");
@@ -3778,7 +3777,7 @@ mod tests {
             CoordToSidecar::Error { message } => assert_eq!(message, "no such lease"),
             other => panic!("expected Error, got {other:?}"),
         }
-        // No OpenSession reached the agent => no capability token exists.
+        // No OpenSession reached the node => no capability token exists.
         assert!(
             arx.try_recv().is_err(),
             "a refused open_channel must not mint or deliver a token"
@@ -3804,7 +3803,7 @@ mod tests {
         ));
         assert!(matches!(
             arx.recv().await.unwrap(),
-            AgentMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
+            NodeMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
         ));
     }
 
@@ -3812,14 +3811,14 @@ mod tests {
     /// admin"), and the audit line records the override.
     #[tokio::test]
     async fn org_admin_may_open_channel_on_members_lease() {
-        use crate::registry::{AgentHandle, AgentMessage};
+        use crate::registry::{NodeHandle, NodeMessage};
 
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator(clock).await;
-        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        let (atx, mut arx) = mpsc::channel::<NodeMessage>(16);
         coord
-            .agents()
-            .insert(node_id(DEFAULT_ORG_ID, "agent-a"), AgentHandle::new(atx))
+            .nodes()
+            .insert(node_id(DEFAULT_ORG_ID, "node-a"), NodeHandle::new(atx))
             .await;
 
         let grant = grant_lease(&coord, &user(DEFAULT_ORG_ID, "alice"), "b1").await;
@@ -3842,7 +3841,7 @@ mod tests {
         ));
         assert!(matches!(
             arx.recv().await.unwrap(),
-            AgentMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
+            NodeMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
         ));
     }
 
@@ -3882,7 +3881,7 @@ mod tests {
         let sched = coord.scheduler().lock().await;
         assert_eq!(sched.lease_holder(grant.lease), Some(&alice));
         let BoardState::Leased { expires, .. } = &sched
-            .board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1"))
+            .board(&board_ref(DEFAULT_ORG_ID, "node-a", "b1"))
             .unwrap()
             .state
         else {
@@ -4230,7 +4229,7 @@ mod tests {
     /// board that does not exist.
     #[tokio::test]
     async fn cross_org_power_cycle_is_refused() {
-        use crate::registry::{AgentHandle, AgentMessage};
+        use crate::registry::{NodeHandle, NodeMessage};
 
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
@@ -4242,10 +4241,10 @@ mod tests {
             ],
         )
         .await;
-        let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
+        let (atx, mut arx) = mpsc::channel::<NodeMessage>(16);
         coord
-            .agents()
-            .insert(node_id("org-a", "node-a"), AgentHandle::new(atx))
+            .nodes()
+            .insert(node_id("org-a", "node-a"), NodeHandle::new(atx))
             .await;
 
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
@@ -4287,28 +4286,28 @@ mod tests {
         ));
         assert!(matches!(
             arx.recv().await.unwrap(),
-            AgentMessage::Command(fleet_proto::CoordinatorCommand::PowerCycle { .. })
+            NodeMessage::Command(fleet_proto::CoordinatorCommand::PowerCycle { .. })
         ));
     }
 
-    /// Inventory reconciliation: a registered agent's online board enters the
+    /// Inventory reconciliation: a registered node's online board enters the
     /// scheduler (becomes leasable + appears in `list`), an offline board is
     /// dropped, and the board row is **actually persisted** — asserting on the
     /// warn-swallowed persistence path is exactly where a foreign-key bug would
     /// otherwise hide.
     #[tokio::test]
     async fn inventory_populates_scheduler_db_and_list() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         // Fresh coordinator with NO pre-seeded boards.
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
-        let agent_id = node_id(DEFAULT_ORG_ID, "agent-a");
+        let node_id = node_id(DEFAULT_ORG_ID, "node-a");
         // The node row is what resolves the report's org: there is no default-org
         // fallback any more (see `org_and_policy_of_node`).
         coord
             .db()
             .scoped(org(DEFAULT_ORG_ID))
-            .ensure_node(&agent_id, 1000)
+            .ensure_node(&node_id, 1000)
             .await
             .unwrap();
 
@@ -4332,20 +4331,20 @@ mod tests {
             unknown: vec![],
         };
         coord
-            .handle_agent_report(&agent_id, AgentReport::Inventory(inv))
+            .handle_node_report(&node_id, NodeReport::Inventory(inv))
             .await
             .unwrap();
 
-        // The online board is in the scheduler, owned by the agent and keyed
+        // The online board is in the scheduler, owned by the node and keyed
         // into the default org; the offline one is not.
         {
             let sched = coord.scheduler().lock().await;
-            let key = board_ref(DEFAULT_ORG_ID, "agent-a", "online-1");
+            let key = board_ref(DEFAULT_ORG_ID, "node-a", "online-1");
             let board = sched.board(&key).unwrap();
-            assert_eq!(board.agent, agent_id);
+            assert_eq!(board.node, node_id);
             assert_eq!(board.chip, "nRF52840_xxAA");
             assert!(sched
-                .board(&board_ref(DEFAULT_ORG_ID, "agent-a", "offline-1"))
+                .board(&board_ref(DEFAULT_ORG_ID, "node-a", "offline-1"))
                 .is_none());
         }
 
@@ -4353,13 +4352,13 @@ mod tests {
         let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
         assert!(
             scoped
-                .has_board(&board_ref(DEFAULT_ORG_ID, "agent-a", "online-1"))
+                .has_board(&board_ref(DEFAULT_ORG_ID, "node-a", "online-1"))
                 .await
                 .unwrap(),
             "the board row must be persisted, not silently dropped by a FK failure"
         );
         assert_eq!(
-            coord.db().org_of_node(&agent_id).await.unwrap(),
+            coord.db().org_of_node(&node_id).await.unwrap(),
             Some(org(DEFAULT_ORG_ID))
         );
 
@@ -4379,7 +4378,7 @@ mod tests {
                 assert_eq!(boards.len(), 1);
                 assert_eq!(
                     boards[0].board,
-                    board_ref(DEFAULT_ORG_ID, "agent-a", "online-1")
+                    board_ref(DEFAULT_ORG_ID, "node-a", "online-1")
                 );
                 assert_eq!(
                     boards[0].availability,
@@ -4418,7 +4417,7 @@ mod tests {
     /// injection the moment there are two. The report must now be dropped.
     #[tokio::test]
     async fn a_report_from_a_node_with_no_row_is_dropped_not_defaulted() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         // Deliberately NOT calling `ensure_node`: this node is unknown. Its
@@ -4437,7 +4436,7 @@ mod tests {
             unknown: vec![],
         };
         coord
-            .handle_agent_report(&ghost, AgentReport::Inventory(inv))
+            .handle_node_report(&ghost, NodeReport::Inventory(inv))
             .await
             .unwrap();
 
@@ -4461,7 +4460,7 @@ mod tests {
     /// leasable".
     #[tokio::test]
     async fn an_auto_node_adopts_boards_a_declared_node_would_not() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         for (policy, expect_scheduled) in
             [(AdoptPolicy::Auto, true), (AdoptPolicy::Declared, false)]
         {
@@ -4487,7 +4486,7 @@ mod tests {
                 unknown: vec![],
             };
             coord
-                .handle_agent_report(&node, AgentReport::Inventory(inv))
+                .handle_node_report(&node, NodeReport::Inventory(inv))
                 .await
                 .unwrap();
 
@@ -4524,14 +4523,14 @@ mod tests {
     ///
     /// Historically this was the *only* thing that retired such a board:
     /// nothing pruned a board a report failed to mention, so without the
-    /// agent's tombstone it stayed `Idle` forever, `ctl list` showed it, and a
-    /// lease against it was *granted* and then failed at the agent with
+    /// node's tombstone it stayed `Idle` forever, `ctl list` showed it, and a
+    /// lease against it was *granted* and then failed at the node with
     /// `UnknownBoard`. The set difference now catches that case too, but the
     /// tombstone still carries the meaning — see `adopt_unknown`'s doc comment.
     /// On a laptop, where probes are unplugged daily, this is the common case.
     #[tokio::test]
     async fn an_unplugged_adopted_board_leaves_the_scheduler() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         coord
@@ -4552,9 +4551,9 @@ mod tests {
 
         // Plugged in.
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
                     unknown: vec![],
                 }),
@@ -4563,11 +4562,11 @@ mod tests {
             .unwrap();
         assert!(coord.scheduler().lock().await.board(&key).is_some());
 
-        // Unplugged: the agent tombstones it.
+        // Unplugged: the node tombstones it.
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status(
                         "j-link-zzz",
                         "ZZZ",
@@ -4589,21 +4588,21 @@ mod tests {
     /// The regression test for this whole change: a **renamed** board leaves
     /// nothing behind in either store.
     ///
-    /// A rename produces no tombstone — the agent reports only what is still in
+    /// A rename produces no tombstone — the node reports only what is still in
     /// `boards.toml`, so `b1` simply stops appearing. Before the set-difference
     /// pass it survived in the scheduler (a leasable phantom: `ctl list` showed
-    /// it, a lease was granted and tokenised, and the agent refused it at the
+    /// it, a lease was granted and tokenised, and the node refused it at the
     /// last hop with `UnknownBoard`) *and* in the `board` table, which is what
-    /// made the Agents page count two boards for a node that has one.
+    /// made the Nodes page count two boards for a node that has one.
     ///
     /// Both assertions matter. Without the scheduler half the phantom lease
     /// comes back; without the DB half the page count does.
     #[tokio::test]
     async fn a_renamed_board_leaves_no_stale_row() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
-        let node = node_id(DEFAULT_ORG_ID, "agent-a");
+        let node = node_id(DEFAULT_ORG_ID, "node-a");
         coord
             .db()
             .scoped(org(DEFAULT_ORG_ID))
@@ -4613,9 +4612,9 @@ mod tests {
 
         for name in ["b1", "b2"] {
             coord
-                .handle_agent_report(
+                .handle_node_report(
                     &node,
-                    AgentReport::Inventory(ProbeInventory {
+                    NodeReport::Inventory(ProbeInventory {
                         boards: vec![status(name, "S1", BoardPresence::Online, "chip", false)],
                         unknown: vec![],
                     }),
@@ -4647,21 +4646,21 @@ mod tests {
         assert_eq!(
             nodes[0].boards,
             vec!["b2".to_owned()],
-            "the renamed-away row must be pruned, or Agents disagrees with Devices"
+            "the renamed-away row must be pruned, or Nodes disagrees with Devices"
         );
     }
 
     /// A **declared** board reported `Offline` is unplugged, not undeclared: the
-    /// row stays (Agents keeps showing it) while the scheduler drops it (it
-    /// cannot be leased). Re-reporting must not churn the row — the agent
+    /// row stays (Nodes keeps showing it) while the scheduler drops it (it
+    /// cannot be leased). Re-reporting must not churn the row — the node
     /// re-reports every `discovery_secs`.
     #[tokio::test]
     async fn an_offline_board_is_retained_in_the_db_but_not_in_the_scheduler() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
-        let node = node_id(DEFAULT_ORG_ID, "agent-a");
-        let key = board_ref(DEFAULT_ORG_ID, "agent-a", "b1");
+        let node = node_id(DEFAULT_ORG_ID, "node-a");
+        let key = board_ref(DEFAULT_ORG_ID, "node-a", "b1");
         coord
             .db()
             .scoped(org(DEFAULT_ORG_ID))
@@ -4671,9 +4670,9 @@ mod tests {
 
         for _ in 0..3 {
             coord
-                .handle_agent_report(
+                .handle_node_report(
                     &node,
-                    AgentReport::Inventory(ProbeInventory {
+                    NodeReport::Inventory(ProbeInventory {
                         boards: vec![status("b1", "S1", BoardPresence::Offline, "chip", false)],
                         unknown: vec![],
                     }),
@@ -4702,11 +4701,11 @@ mod tests {
     /// `previously_adopted`, not a declaration — so unlike a declared offline
     /// board it must lose its row too. A laptop with `adopt = "auto"` is where
     /// probes get unplugged several times a day; retaining these rows would
-    /// inflate the Agents count for the most common case, which is the very
+    /// inflate the Nodes count for the most common case, which is the very
     /// symptom this change exists to fix.
     #[tokio::test]
     async fn an_unplugged_adopted_board_leaves_the_db_too() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         coord
@@ -4727,9 +4726,9 @@ mod tests {
         let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
 
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
                     unknown: vec![],
                 }),
@@ -4739,9 +4738,9 @@ mod tests {
         assert!(scoped.has_board(&key).await.unwrap());
 
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status(
                         "j-link-zzz",
                         "ZZZ",
@@ -4766,7 +4765,7 @@ mod tests {
     /// policy was still `auto`.
     #[tokio::test]
     async fn a_policy_violating_adopted_board_gets_no_row() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         let o = org(DEFAULT_ORG_ID);
@@ -4792,7 +4791,7 @@ mod tests {
 
         // While `auto`, the adopted board is admitted and gets a row.
         coord
-            .handle_agent_report(&node, AgentReport::Inventory(inv()))
+            .handle_node_report(&node, NodeReport::Inventory(inv()))
             .await
             .unwrap();
         assert!(coord.db().scoped(o.clone()).has_board(&key).await.unwrap());
@@ -4812,7 +4811,7 @@ mod tests {
             .await
             .unwrap();
         coord
-            .handle_agent_report(&node, AgentReport::Inventory(inv()))
+            .handle_node_report(&node, NodeReport::Inventory(inv()))
             .await
             .unwrap();
         assert!(
@@ -4824,15 +4823,15 @@ mod tests {
 
     /// A live lease pins the board in **both** stores even when the report stops
     /// declaring it: dropping the scheduler entry would strand an open lease
-    /// nothing can release, and dropping the row would make Agents contradict a
+    /// nothing can release, and dropping the row would make Nodes contradict a
     /// lease that is in active use.
     #[tokio::test]
     async fn a_leased_board_that_vanishes_from_a_report_is_not_deleted() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "alice", Role::Member)]).await;
-        let node = node_id(DEFAULT_ORG_ID, "agent-a");
-        let key = board_ref(DEFAULT_ORG_ID, "agent-a", "b1");
+        let node = node_id(DEFAULT_ORG_ID, "node-a");
+        let key = board_ref(DEFAULT_ORG_ID, "node-a", "b1");
         coord
             .db()
             .scoped(org(DEFAULT_ORG_ID))
@@ -4840,9 +4839,9 @@ mod tests {
             .await
             .unwrap();
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status("b1", "S1", BoardPresence::Online, "chip", false)],
                     unknown: vec![],
                 }),
@@ -4853,9 +4852,9 @@ mod tests {
 
         // A rename while the lease is live.
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status("b2", "S1", BoardPresence::Online, "chip", false)],
                     unknown: vec![],
                 }),
@@ -4887,7 +4886,7 @@ mod tests {
     /// entirely, are untouched.
     #[tokio::test]
     async fn an_empty_inventory_clears_only_that_nodes_rows() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
@@ -4899,9 +4898,9 @@ mod tests {
         )
         .await;
         let nodes = [
-            (org(DEFAULT_ORG_ID), node_id(DEFAULT_ORG_ID, "agent-a")),
-            (org(DEFAULT_ORG_ID), node_id(DEFAULT_ORG_ID, "agent-b")),
-            (org("other"), node_id("other", "agent-c")),
+            (org(DEFAULT_ORG_ID), node_id(DEFAULT_ORG_ID, "node-a")),
+            (org(DEFAULT_ORG_ID), node_id(DEFAULT_ORG_ID, "node-b")),
+            (org("other"), node_id("other", "node-c")),
         ];
         for (o, node) in &nodes {
             coord.db().ensure_org(o, "personal").await.unwrap();
@@ -4912,9 +4911,9 @@ mod tests {
                 .await
                 .unwrap();
             coord
-                .handle_agent_report(
+                .handle_node_report(
                     node,
-                    AgentReport::Inventory(ProbeInventory {
+                    NodeReport::Inventory(ProbeInventory {
                         boards: vec![status("b1", "S1", BoardPresence::Online, "chip", false)],
                         unknown: vec![],
                     }),
@@ -4932,11 +4931,11 @@ mod tests {
             2
         );
 
-        // Agent A's `boards.toml` was emptied.
+        // Node A's `boards.toml` was emptied.
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &nodes[0].1,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![],
                     unknown: vec![],
                 }),
@@ -4947,13 +4946,13 @@ mod tests {
         assert!(!coord
             .db()
             .scoped(org(DEFAULT_ORG_ID))
-            .has_board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1"))
+            .has_board(&board_ref(DEFAULT_ORG_ID, "node-a", "b1"))
             .await
             .unwrap());
         assert!(coord
             .db()
             .scoped(org(DEFAULT_ORG_ID))
-            .has_board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1"))
+            .has_board(&board_ref(DEFAULT_ORG_ID, "node-b", "b1"))
             .await
             .unwrap());
         assert_eq!(
@@ -4972,12 +4971,12 @@ mod tests {
 
         let sched = coord.scheduler().lock().await;
         assert!(sched
-            .board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1"))
+            .board(&board_ref(DEFAULT_ORG_ID, "node-a", "b1"))
             .is_none());
         assert!(sched
-            .board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1"))
+            .board(&board_ref(DEFAULT_ORG_ID, "node-b", "b1"))
             .is_some());
-        assert!(sched.board(&board_ref("other", "agent-c", "b1")).is_some());
+        assert!(sched.board(&board_ref("other", "node-c", "b1")).is_some());
     }
 
     /// The `declared`-policy guard must not swallow a **tombstone**. A node
@@ -4989,7 +4988,7 @@ mod tests {
     /// scoped to `Online` rather than to `adopted`.
     #[tokio::test]
     async fn a_declared_node_still_honours_a_tombstone_for_a_previously_adopted_board() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         let o = org(DEFAULT_ORG_ID);
@@ -5010,9 +5009,9 @@ mod tests {
         let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
 
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
                     unknown: vec![],
                 }),
@@ -5037,9 +5036,9 @@ mod tests {
             .unwrap();
 
         coord
-            .handle_agent_report(
+            .handle_node_report(
                 &node,
-                AgentReport::Inventory(ProbeInventory {
+                NodeReport::Inventory(ProbeInventory {
                     boards: vec![status(
                         "j-link-zzz",
                         "ZZZ",
@@ -5062,7 +5061,7 @@ mod tests {
     /// unchanged behaviour, not a lockdown.
     #[tokio::test]
     async fn a_declared_board_is_scheduled_under_either_policy() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         for policy in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
             let clock = Arc::new(TestClock(AtomicU64::new(1000)));
             let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
@@ -5078,7 +5077,7 @@ mod tests {
                 unknown: vec![],
             };
             coord
-                .handle_agent_report(&node, AgentReport::Inventory(inv))
+                .handle_node_report(&node, NodeReport::Inventory(inv))
                 .await
                 .unwrap();
 
@@ -5100,7 +5099,7 @@ mod tests {
     /// off for exactly the machines it exists for.
     #[tokio::test]
     async fn an_inventory_report_does_not_reset_the_adopt_policy() {
-        use fleet_proto::agent_api::ProbeInventory;
+        use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
         coord
@@ -5120,9 +5119,9 @@ mod tests {
 
         for _ in 0..3 {
             coord
-                .handle_agent_report(
+                .handle_node_report(
                     &node,
-                    AgentReport::Inventory(ProbeInventory {
+                    NodeReport::Inventory(ProbeInventory {
                         boards: vec![],
                         unknown: vec![],
                     }),

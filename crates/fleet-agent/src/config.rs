@@ -273,13 +273,13 @@ pub fn default_discovery_secs() -> u64 {
 /// [`NodeTokenStore`] the binary supplies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentConfig {
-    /// This node's id, as returned by the token exchange at `share` / `agent up`.
+    /// This node's id, as returned by the token exchange at `share` / `node up`.
     ///
     /// **Advisory.** The coordinator identifies this node by the token it
     /// presents, not by this field; it is carried here so logs and
-    /// `AgentReport::Register` are legible, and the coordinator refuses the
+    /// `NodeReport::Register` are legible, and the coordinator refuses the
     /// connection if it contradicts the token.
-    pub agent_id: String,
+    pub node_id: String,
     /// The coordinator's base URL (`https://fleet.example`), or a bare
     /// `host:port` (which defaults to `https`).
     pub fleet_url: String,
@@ -317,7 +317,7 @@ pub struct AgentConfig {
     /// **Advisory.** The coordinator's `node` row is authoritative for
     /// enforcement; this copy only governs whether the agent synthesises board
     /// metadata for undeclared probes at all. Editing it locally does not
-    /// change what the coordinator will adopt — re-run `share` / `agent up
+    /// change what the coordinator will adopt — re-run `share` / `node up
     /// --adopt …` for that.
     pub adopt: AdoptPolicy,
     /// Whether to erase the target's flash on lease release.
@@ -399,7 +399,7 @@ impl AgentConfig {
     /// is not 64 hex characters, or the pubkey is not valid 32-byte hex.
     pub fn validate(&self) -> Result<(), ConfigError> {
         for (name, value) in [
-            ("agent_id", &self.agent_id),
+            ("node_id", &self.node_id),
             ("fleet_url", &self.fleet_url),
             ("node_token", &self.node_token),
             ("coordinator_token_pubkey", &self.coordinator_token_pubkey),
@@ -666,7 +666,7 @@ chip = "c1"
 
     fn agent_cfg() -> AgentConfig {
         AgentConfig {
-            agent_id: "gh-4242/pi-lab-1".to_owned(),
+            node_id: "gh-4242/pi-lab-1".to_owned(),
             fleet_url: "https://fleet.example:7000".to_owned(),
             node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             previous_node_token: None,
@@ -707,11 +707,11 @@ chip = "c1"
     #[test]
     fn agent_config_rejects_empty_field() {
         let cfg = AgentConfig {
-            agent_id: String::new(),
+            node_id: String::new(),
             ..agent_cfg()
         };
         let err = cfg.validate().unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid(m) if m.contains("agent_id")));
+        assert!(matches!(err, ConfigError::Invalid(m) if m.contains("node_id")));
 
         let cfg = AgentConfig {
             boards_path: PathBuf::new(),

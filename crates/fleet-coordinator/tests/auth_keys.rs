@@ -526,7 +526,7 @@ async fn a_subject_name_is_echoed_on_create_and_listed() {
 /// The refusals, all `400`: a name on a `node` key (which confers no subject
 /// for one to attach to), a name that breaks the charset or length rule, and —
 /// the one a UI author would otherwise discover the hard way — `purpose:
-/// "agent"`, which is **CLI-only sugar and not a wire value**.
+/// "node"`, which is **CLI-only sugar and not a wire value**.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalid_identity_name_or_purpose_is_refused() {
     let fleet = TestCoordinator::start().await;
@@ -569,9 +569,9 @@ async fn an_invalid_identity_name_or_purpose_is_refused() {
                                "purpose": "ci", "subject_name": "x".repeat(65)}),
         ),
         (
-            "`agent` is CLI sugar, not a wire purpose",
+            "`node` is CLI sugar, not a wire purpose",
             serde_json::json!({"action": "create", "tags": ["nrf52"], "ttl_secs": DAY,
-                               "purpose": "agent", "subject_name": "builder"}),
+                               "purpose": "node", "subject_name": "builder"}),
         ),
     ] {
         let (status, body) = fleet

@@ -62,7 +62,7 @@ Key constraints that drove this shape:
   *user* (leasing fleet boards) and a *node* (offering its own probes). The
   credential model must express that without two disjoint enrollments (§6.4).
 - **Single multi-role binary** (`probe-rs-fleet`), role chosen by subcommand:
-  `agent`, `coordinator`, `sidecar`, `ctl`, plus the user verbs `login`,
+  `node`, `coordinator`, `sidecar`, `ctl`, plus the user verbs `login`,
   `share`, `grant`.
 
 ## 3. Transport: postcard data plane, typed control plane, over WSS (decided)
@@ -208,7 +208,7 @@ shrinks to client-side trust configuration: normal WebPKI roots by default,
 plus an optional pinned server-cert fingerprint for local/self-hosted
 deployments with no public DNS (§10). Everything to do with **client**
 certificates — CA loading, CSR signing, `PinnedServerCertVerifier` as a
-bootstrap mechanism, `principal_from_cert`, `agent_id_from_cert` — is deleted.
+bootstrap mechanism, `principal_from_cert`, `node_id_from_cert` — is deleted.
 
 ## 4. Roles
 
@@ -294,7 +294,7 @@ org = "gh-4242"        # the org **id**, not the login (see below)
 login = "kaspar"       # cached for display only
 expires = 1788600000
 
-[node]                 # present once `share` / `agent up` has run
+[node]                 # present once `share` / `node up` has run
 node_token = "…"       # long-lived machine bearer, auto-rotating
 node_id = "gh-4242/kaspar-laptop"
 coordinator_token_pubkey = "…"   # verifies per-lease capability tokens
@@ -316,7 +316,7 @@ is used otherwise. Credentials are stored `0600`; the two tokens stay **distinct
 by design (§6.4).
 
 This replaces `agent.toml` and `client.toml` entirely — both files are deleted.
-`AgentConfig` is no longer a file format at all: the `agent` role assembles it
+`AgentConfig` is no longer a file format at all: the `node run` role assembles it
 from the fleet file's `[node]` table plus node-local settings.
 
 Node-local, non-credential settings move to `~/.config/probe-rs-fleet/node/`
@@ -366,16 +366,16 @@ probe-rs-fleet ctl lease --select 'tag=nrf52'
 
 # 5. A headless Pi in the lab: prints a URL + code; a colleague approves it
 #    from a machine where they are logged in.
-#      probe-rs-fleet agent up --fleet-url <url>       (on the Pi)
+#      probe-rs-fleet node up --fleet-url <url>       (on the Pi)
 #      probe-rs-fleet node approve ABCD-1234           (on their laptop)
 #    Nothing long-lived is copy-pasted, and the credential is bound at
 #    approval time. For an unattended image, use 5b instead.
-probe-rs-fleet agent up --fleet-url https://fleet.example.com
+probe-rs-fleet node up --fleet-url https://fleet.example.com
 
 # 5b. …or, for an unattended image, a pre-minted auth key. Mint it on your
 #     laptop with the login from step 2 — no shell on the coordinator:
 probe-rs-fleet auth-key create --tag lab --tag nrf52 --ttl 24h
-probe-rs-fleet agent up --auth-key prffk1_…
+probe-rs-fleet node up --auth-key prffk1_…
 #     Self-hosted, or air-gapped, or for a key that never expires, the same
 #     thing from a shell on the coordinator host:
 probe-rs-fleet coordinator auth-key --org acme --tag lab --ttl 24h
@@ -399,8 +399,14 @@ probe-rs-fleet ctl delegate --select 'tag=nrf52' --ops flash,attach --ttl 2h
 > only as the auth-key minter.
 
 
-### 4.2 `agent` (Raspberry Pi)
+### 4.2 `node` (Raspberry Pi)
 Owns local probes. Reconciles discovered probes against `boards.toml`.
+
+> **Spelling.** The canonical verbs are `node up` (bootstrap, then run) and
+> `node run` (run with the credential this machine already has). The older
+> `agent` / `agent up` spelling still works — same argument shapes, same role
+> functions — but is hidden from `--help`, so deployed service units and
+> scripts keep running while `--help` advertises one vocabulary.
 
 > **Updated by investigation (tasks #1710, #1965 — verified against the real
 > probe-rs 0.31.0 source; re-verified line-by-line against v0.32.0 by #3322,
@@ -537,17 +543,17 @@ assertions in `probers.rs`'s `rendered_config_is_server_table_with_access` pin
 the decision in code.
 
 
-Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
+A node also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
 and exposed explicitly via `ctl`.
 
-#### Config & scaffolding (`agent up`, revision 2)
+#### Config & scaffolding (`node up`, revision 2)
 
 The node's credential lives in the **per-fleet config** (§4.1); `agent.toml` is
 deleted. Node-local settings live at `~/.config/probe-rs-fleet/node/`
 (`node.toml`, `boards.toml`) — they describe the machine, not the fleet.
 
-`probe-rs-fleet agent up` registers this machine as a node and starts serving.
+`probe-rs-fleet node up` registers this machine as a node and starts serving.
 It obtains a node token by whichever of these applies, in order:
 
 1. **An existing `[node]` credential** in the fleet config — just reconnect.
@@ -628,7 +634,7 @@ It obtains a node token by whichever of these applies, in order:
 > was told to, not the one the laptop's owner implies. An existing `[node]`
 > credential still wins over everything, and is reused rather than replaced.
 >
-> `share` is `agent up`'s rung 2 as a standalone verb, and does **not** start
+> `share` is `node up`'s rung 2 as a standalone verb, and does **not** start
 > the agent: it writes the credential and the node-local settings, and its
 > summary points at `probe-rs-fleet agent`.
 
@@ -656,7 +662,7 @@ is the enforcement point, and an adopted board reported by a node whose row says
 `declared` is dropped. The node's own `node.toml` copy is *advisory* — it
 governs only whether the agent bothers to synthesise board metadata for
 undeclared probes at all. Editing it locally therefore does not change what the
-coordinator will adopt; re-running `share` / `agent up --adopt …` does. (Having
+coordinator will adopt; re-running `share` / `node up --adopt …` does. (Having
 the coordinator push the policy down the established connection, as it does for
 node tokens, is an obvious follow-up and deliberately not built here.)
 
@@ -978,13 +984,13 @@ is no rate limiting in the coordinator yet):
 |---|---|---|
 | **User** (laptop) | `login` — GitHub device flow | browser, once |
 | **Node, user present** | `share` — reuses the session to self-register | zero extra steps |
-| **Node, headless** | `agent up` prints a URL + code; a member runs `node approve <code>` | no token copy-paste |
+| **Node, headless** | `node up` prints a URL + code; a member runs `node approve <code>` | no token copy-paste |
 | **Node, unattended** | pre-minted **auth key** (org-scoped, expiring, tagged) | one paste, revocable |
 | **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token`, plus a per-repo grant (§6.7) | zero secrets |
 | **CI worker, no workload identity** | a `--purpose ci` **auth key** redeemed at `/auth/token` (§6.7, the weak path) | one paste, revocable |
 | **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
 
-**Interactive node approval** (`agent up` rung 3, §4.2) reuses this ceremony's
+**Interactive node approval** (`node up` rung 3, §4.2) reuses this ceremony's
 shape for a machine rather than a human, and inherits a sharper version of its
 second risk. The mechanics: the machine posts to `/node/register/start`, prints
 a ~40-bit Crockford-base32 `user_code` (`ABCD-1234`) and polls; a member runs
@@ -1266,7 +1272,7 @@ for a tie *within* the winning tier.
 The escape hatch is a **qualified name**, and its grammar has one subtlety worth
 recording because getting it wrong made the escape hatch unreachable in the
 first implementation: a node id is **already org-namespaced**
-(`state.rs::node_id_for` builds `AgentId("{org}/{name}")`, so the same machine
+(`state.rs::node_id_for` builds `NodeId("{org}/{name}")`, so the same machine
 name in two tenants is two nodes), which means a `BoardRef` has *four*
 slash-separated segments, not three. Splitting a typed name into `[org, node,
 name]` therefore cannot address a single real board. Instead the board name is

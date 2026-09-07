@@ -4,7 +4,7 @@
 //! `wire_e2e.rs` proves the same property over in-memory pipes, which isolates
 //! the relay from the transport. This test does it over the transport that
 //! actually ships: a real axum router on a real socket, a real
-//! `tokio-tungstenite` agent client and sidecar client, both presenting bearer
+//! `tokio-tungstenite` node client and sidecar client, both presenting bearer
 //! tokens seeded into the database. Nothing between the two ends is stubbed.
 
 mod common;
@@ -91,7 +91,7 @@ fn agent_config(
     token_pubkey: &[u8; 32],
 ) -> fleet_agent::config::AgentConfig {
     fleet_agent::config::AgentConfig {
-        agent_id: node_id.to_owned(),
+        node_id: node_id.to_owned(),
         fleet_url: fleet_url.to_owned(),
         node_token: node_token.to_owned(),
         previous_node_token: None,
@@ -138,19 +138,19 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
     // --- The node: a real WS client presenting its node token on /agent ---
     let (node_token, node_id) = fleet.seed_node("default", "rpi-lab-1").await;
     let mut config = agent_config(&node_id.0, &fleet.base_url, &node_token, &token_pubkey);
-    let agent = Arc::new(Agent::new(config.clone(), boards(), Arc::new(EchoBackend)).unwrap());
-    agent.seed_inventory_from_boards().await;
+    let node = Arc::new(Agent::new(config.clone(), boards(), Arc::new(EchoBackend)).unwrap());
+    node.seed_inventory_from_boards().await;
 
     let (agent_tx, agent_rx) = fleet.dial("/agent", &node_token).await.unwrap();
     {
-        let agent = Arc::clone(&agent);
+        let node = Arc::clone(&node);
         tokio::spawn(async move {
             // A node that never persists its rotated token: these tests are
             // about the wire, and the storage half is covered in fleet-bin.
             let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
                 Arc::new(fleet_agent::config::NullTokenStore);
             let _ = fleet_agent::connection::serve_connection(
-                &agent,
+                &node,
                 &mut config,
                 &store,
                 Box::new(agent_tx),
@@ -160,7 +160,7 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
         });
     }
 
-    // The agent registers and reports inventory; the board becomes leasable.
+    // The node registers and reports inventory; the board becomes leasable.
     let board_name = BoardName("nrf52840-dk-1".to_owned());
     let board_id = BoardRef::new(
         OrgId("default".to_owned()),
@@ -201,14 +201,14 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);
-    assert_eq!(grant.agent, node_id);
+    assert_eq!(grant.node, node_id);
 
     let (channel, _channel_token) = session
         .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
         .await
         .unwrap();
 
-    // The byte-opaque path: client -> sidecar -> coordinator -> agent -> echo
+    // The byte-opaque path: client -> sidecar -> coordinator -> node -> echo
     // backend -> and all the way back.
     let (mut client, client_peer) = tokio::io::duplex(4096);
     {
@@ -258,15 +258,15 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
 
     let (node_token, node_id) = fleet.seed_node("acme", "rpi-1").await;
     let mut config = agent_config(&node_id.0, &fleet.base_url, &node_token, &token_pubkey);
-    let agent = Arc::new(Agent::new(config.clone(), boards(), Arc::new(EchoBackend)).unwrap());
-    agent.seed_inventory_from_boards().await;
+    let node = Arc::new(Agent::new(config.clone(), boards(), Arc::new(EchoBackend)).unwrap());
+    node.seed_inventory_from_boards().await;
 
     let (tx, rx) = fleet.dial("/agent", &node_token).await.unwrap();
     tokio::spawn(async move {
         let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
             Arc::new(fleet_agent::config::NullTokenStore);
         let _ = fleet_agent::connection::serve_connection(
-            &agent,
+            &node,
             &mut config,
             &store,
             Box::new(tx),

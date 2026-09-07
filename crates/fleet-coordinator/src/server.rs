@@ -15,7 +15,7 @@
 //! Both planes ping. A reverse proxy in front reaps idle `WebSocket`s on a
 //! timeout we do not control, and a node's connection is idle most of the time,
 //! so keepalive is not a nicety here: without it the fleet's control plane
-//! disappears every few minutes and the agent's reconnect backoff becomes the
+//! disappears every few minutes and the node's reconnect backoff becomes the
 //! primary mechanism rather than the fallback.
 //!
 //! # Node-token rotation (ack-then-retire)
@@ -23,7 +23,7 @@
 //! When a node's token is older than the policy allows, the coordinator mints a
 //! replacement, **holds it in memory**, and pushes it. The database keeps the
 //! *old* hash until the node acks with
-//! [`AgentReport::TokenRotated`]. See `fleet_auth::rotation` for why eagerly
+//! [`NodeReport::TokenRotated`]. See `fleet_auth::rotation` for why eagerly
 //! retiring the old token is the wrong trade on hardware nobody can walk up to.
 
 use std::sync::Arc;
@@ -34,15 +34,15 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_proto::agent_api::AgentReport;
-use fleet_proto::ids::{AgentId, Subject};
+use fleet_proto::ids::{NodeId, Subject};
+use fleet_proto::node_api::NodeReport;
 use fleet_proto::PROTOCOL_VERSION;
 use fleet_wire::{WireError, WireEvent, WireRx, WireTx};
 
 use crate::core::Coordinator;
 use crate::error::{CoordinatorError, Result};
-use crate::proto::{AgentToCoord, CoordToAgent, CoordToSidecar, SidecarToCoord};
-use crate::registry::{AgentHandle, AgentMessage};
+use crate::proto::{CoordToNode, CoordToSidecar, NodeToCoord, SidecarToCoord};
+use crate::registry::{NodeHandle, NodeMessage};
 use crate::state::AuditEntry;
 
 /// A boxed send half.
@@ -61,7 +61,7 @@ struct PendingRotation {
     sent_at: Instant,
 }
 
-/// Drive an agent connection: register a writer task, then pump inbound
+/// Drive a node connection: register a writer task, then pump inbound
 /// envelopes into the coordinator, pinging and rotating along the way.
 ///
 /// # Errors
@@ -69,23 +69,23 @@ struct PendingRotation {
 /// Returns a [`CoordinatorError`] when the connection ends. A benign peer close
 /// is reported as such (see [`fleet_wire::is_benign_close`]) so a node that
 /// simply went away is not logged as a fault.
-pub async fn handle_agent(
+pub async fn handle_node(
     coord: Arc<Coordinator>,
     tx: BoxTx,
     rx: BoxRx,
-    agent_id: AgentId,
+    node_id: NodeId,
     auth: fleet_auth::Authenticated,
 ) -> Result<()> {
-    let (out_tx, mut out_rx) = mpsc::channel::<AgentMessage>(64);
+    let (out_tx, mut out_rx) = mpsc::channel::<NodeMessage>(64);
     // The handle is built first and *then* registered, so this task holds the
     // same shutdown signal the registry hands out: `remove_and_close` fires it,
     // and the read loop below selects on it. Removing the registry entry alone
     // would close nothing — `out_tx` lives in this frame for the whole life of
     // the read loop (rotation pushes go through it), so the registry only ever
     // holds a clone.
-    let handle = AgentHandle::new(out_tx.clone());
+    let handle = NodeHandle::new(out_tx.clone());
     let shutdown = handle.shutdown_signal();
-    coord.agents().insert(agent_id.clone(), handle).await;
+    coord.nodes().insert(node_id.clone(), handle).await;
 
     // One task owns the write half; every producer (the relay, the sweep, the
     // keepalive, rotation) funnels through the mpsc.
@@ -97,8 +97,8 @@ pub async fn handle_agent(
                 msg = out_rx.recv() => {
                     let Some(msg) = msg else { break };
                     let envelope = match msg {
-                        AgentMessage::Command(cmd) => CoordToAgent::Command(cmd),
-                        AgentMessage::Data(frame) => CoordToAgent::Data(frame),
+                        NodeMessage::Command(cmd) => CoordToNode::Command(cmd),
+                        NodeMessage::Data(frame) => CoordToNode::Data(frame),
                     };
                     if fleet_wire::send(&mut *tx, &envelope).await.is_err() {
                         break;
@@ -114,20 +114,20 @@ pub async fn handle_agent(
         let _ = tx.close().await;
     });
 
-    let result = agent_read_loop(&coord, rx, &agent_id, &auth, &out_tx, &ping_tx, &shutdown).await;
+    let result = node_read_loop(&coord, rx, &node_id, &auth, &out_tx, &ping_tx, &shutdown).await;
 
-    coord.agents().remove(&agent_id).await;
+    coord.nodes().remove(&node_id).await;
     writer_task.abort();
     result
 }
 
-/// The agent plane's read loop, with keepalive and rotation folded in.
-async fn agent_read_loop(
+/// The node plane's read loop, with keepalive and rotation folded in.
+async fn node_read_loop(
     coord: &Coordinator,
     mut rx: BoxRx,
-    agent_id: &AgentId,
+    node_id: &NodeId,
     auth: &fleet_auth::Authenticated,
-    out_tx: &mpsc::Sender<AgentMessage>,
+    out_tx: &mpsc::Sender<NodeMessage>,
     ping_tx: &mpsc::Sender<()>,
     shutdown: &tokio::sync::Notify,
 ) -> Result<()> {
@@ -158,21 +158,21 @@ async fn agent_read_loop(
     // repeatedly. A `notified()` future built inside the loop would be polled
     // and then dropped every time another branch won, and a permit stored by
     // `notify_one` in that window would be consumed and lost — leaving a
-    // deleted node connected. See `AgentHandle::shutdown_signal`.
+    // deleted node connected. See `NodeHandle::shutdown_signal`.
     let closed = shutdown.notified();
     tokio::pin!(closed);
 
     loop {
         if rotation_due && pending.is_none() {
             rotation_due = false;
-            match push_rotation(agent_id, out_tx, next_rotation_id).await {
+            match push_rotation(node_id, out_tx, next_rotation_id).await {
                 Some(p) => {
                     pending = Some(p);
                     next_rotation_id = next_rotation_id.wrapping_add(1);
                 }
                 None => {
                     break Err(CoordinatorError::Protocol(
-                        "agent writer closed during rotation".to_owned(),
+                        "node writer closed during rotation".to_owned(),
                     ))
                 }
             }
@@ -192,7 +192,7 @@ async fn agent_read_loop(
         // `notify_one` landing in that window sets the future's own notified
         // state, so no permit is consumed or lost.
         if closed.as_mut().now_or_never().is_some() {
-            warn!(%agent_id, "closing the connection: the node was deleted");
+            warn!(%node_id, "closing the connection: the node was deleted");
             break Err(CoordinatorError::Protocol("node deleted".to_owned()));
         }
 
@@ -202,7 +202,7 @@ async fn agent_read_loop(
             // this `select!` would otherwise not learn of its deletion until
             // the next ping tick woke the loop — a whole ping interval late.
             () = &mut closed => {
-                warn!(%agent_id, "closing the connection: the node was deleted");
+                warn!(%node_id, "closing the connection: the node was deleted");
                 break Err(CoordinatorError::Protocol("node deleted".to_owned()));
             }
             event = rx.recv() => {
@@ -213,11 +213,11 @@ async fn agent_read_loop(
                     WireEvent::Pong => {}
                     WireEvent::Closed => break Err(CoordinatorError::Wire(WireError::Closed)),
                     WireEvent::Binary(bytes) => {
-                        match fleet_wire::decode::<AgentToCoord>(&bytes)? {
-                            AgentToCoord::Report(report) => {
-                                if let Some(outcome) = handle_agent_report(
+                        match fleet_wire::decode::<NodeToCoord>(&bytes)? {
+                            NodeToCoord::Report(report) => {
+                                if let Some(outcome) = handle_node_report(
                                     coord,
-                                    agent_id,
+                                    node_id,
                                     auth,
                                     &mut pending,
                                     &mut token_issued_at,
@@ -228,9 +228,9 @@ async fn agent_read_loop(
                                     break Err(outcome);
                                 }
                             }
-                            AgentToCoord::Data(frame) => {
+                            NodeToCoord::Data(frame) => {
                                 // Return-path relay: forward opaque bytes from
-                                // the agent to the sidecar owning the channel.
+                                // the node to the sidecar owning the channel.
                                 // An unknown channel is dropped.
                                 if let Err(e) = coord.relay_from_agent(frame).await {
                                     debug!(error = %e, "relay to sidecar failed");
@@ -242,7 +242,7 @@ async fn agent_read_loop(
             }
             _ = ping.tick() => {
                 if last_seen.elapsed() > pong_timeout {
-                    warn!(%agent_id, "no pong within the liveness deadline; dropping connection");
+                    warn!(%node_id, "no pong within the liveness deadline; dropping connection");
                     break Err(CoordinatorError::Protocol(
                         "keepalive timeout".to_owned(),
                     ));
@@ -254,7 +254,7 @@ async fn agent_read_loop(
                 // retried later, rather than pinning the replacement forever.
                 if let Some(p) = &pending {
                     if p.sent_at.elapsed() > policy.ack_timeout() {
-                        debug!(%agent_id, rotation_id = p.rotation_id, "rotation ack timed out; will retry");
+                        debug!(%node_id, rotation_id = p.rotation_id, "rotation ack timed out; will retry");
                         pending = None;
                     }
                 }
@@ -268,52 +268,52 @@ async fn agent_read_loop(
     }
 }
 
-/// Handle one report on the agent plane.
+/// Handle one report on the node plane.
 ///
 /// Returns `Ok(Some(error))` when the connection must be closed (currently only
 /// a self-declared id that contradicts the token).
-async fn handle_agent_report(
+async fn handle_node_report(
     coord: &Coordinator,
-    agent_id: &AgentId,
+    node_id: &NodeId,
     auth: &fleet_auth::Authenticated,
     pending: &mut Option<PendingRotation>,
     token_issued_at: &mut u64,
-    report: AgentReport,
+    report: NodeReport,
 ) -> Result<Option<CoordinatorError>> {
     match report {
-        AgentReport::Register { ref agent, .. } if agent.0 != auth.id => {
+        NodeReport::Register { ref node, .. } if node.0 != auth.id => {
             // Under bearer auth the self-declared id is attacker-controlled
             // text. Routing already uses the token-derived id, so ignoring the
             // field would be safe — but a node claiming another node's id is
             // not a benign typo, and letting it sit in the audit log as
             // ambiguous provenance is worse than refusing the connection.
             let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-            let detail = format!("claimed `{}`, token says `{}`", agent.0, auth.id);
+            let detail = format!("claimed `{}`, token says `{}`", node.0, auth.id);
             let _ = coord
                 .db()
                 .scoped(fleet_proto::ids::OrgId(auth.org_id.clone()))
                 .append_audit(&AuditEntry {
                     ts: now,
                     subject: Some(auth.id.as_str()),
-                    action: "agent.register.id_mismatch",
+                    action: "node.register.id_mismatch",
                     node: Some(auth.id.as_str()),
                     board: None,
                     lease: None,
                     detail: Some(&detail),
                 })
                 .await;
-            warn!(%agent_id, claimed = %agent.0, "node declared an id its token does not grant");
+            warn!(%node_id, claimed = %node.0, "node declared an id its token does not grant");
             Ok(Some(CoordinatorError::Protocol(format!(
                 "node declared id `{}` but its token authenticates `{}`",
-                agent.0, auth.id
+                node.0, auth.id
             ))))
         }
-        AgentReport::TokenRotated { rotation_id } => {
-            complete_rotation(coord, agent_id, auth, pending, token_issued_at, rotation_id).await;
+        NodeReport::TokenRotated { rotation_id } => {
+            complete_rotation(coord, node_id, auth, pending, token_issued_at, rotation_id).await;
             Ok(None)
         }
         other => {
-            coord.handle_agent_report(agent_id, other).await?;
+            coord.handle_node_report(node_id, other).await?;
             Ok(None)
         }
     }
@@ -321,20 +321,20 @@ async fn handle_agent_report(
 
 /// Mint a replacement token and push it, without touching the database.
 async fn push_rotation(
-    agent_id: &AgentId,
-    out_tx: &mpsc::Sender<AgentMessage>,
+    node_id: &NodeId,
+    out_tx: &mpsc::Sender<NodeMessage>,
     rotation_id: u64,
 ) -> Option<PendingRotation> {
     let token = OpaqueToken::mint(TokenKind::Node);
     let hash = token.hash();
-    let cmd = fleet_proto::agent_api::CoordinatorCommand::RotateNodeToken {
+    let cmd = fleet_proto::node_api::CoordinatorCommand::RotateNodeToken {
         token: token.to_secret_string(),
         rotation_id,
     };
-    if out_tx.send(AgentMessage::Command(cmd)).await.is_err() {
+    if out_tx.send(NodeMessage::Command(cmd)).await.is_err() {
         return None;
     }
-    debug!(%agent_id, rotation_id, "pushed a replacement node token; awaiting ack");
+    debug!(%node_id, rotation_id, "pushed a replacement node token; awaiting ack");
     Some(PendingRotation {
         rotation_id,
         token_hash: hash.as_str().to_owned(),
@@ -349,7 +349,7 @@ async fn push_rotation(
 /// the rotation policy against the pre-rotation age and re-fire on every ping.
 async fn complete_rotation(
     coord: &Coordinator,
-    agent_id: &AgentId,
+    node_id: &NodeId,
     auth: &fleet_auth::Authenticated,
     pending: &mut Option<PendingRotation>,
     token_issued_at: &mut u64,
@@ -376,19 +376,19 @@ async fn complete_rotation(
                 detail: None,
             })
             .await;
-        debug!(%agent_id, rotation_id, "ignored a stale rotation ack");
+        debug!(%node_id, rotation_id, "ignored a stale rotation ack");
         return;
     }
     let p = pending.take().expect("checked above");
     if let Err(e) = coord
         .db()
-        .set_node_token_hash(agent_id, &p.token_hash, now)
+        .set_node_token_hash(node_id, &p.token_hash, now)
         .await
     {
         // The node has already persisted the new token, and the database still
         // has the old one. The node's one-shot retry with its previous token
         // covers this; log it loudly because it means a write failed.
-        warn!(%agent_id, error = %e, "failed to promote a rotated node token");
+        warn!(%node_id, error = %e, "failed to promote a rotated node token");
         return;
     }
     // The promotion is committed: this connection's credential is now `now` old,
@@ -408,7 +408,7 @@ async fn complete_rotation(
             detail: None,
         })
         .await;
-    info!(%agent_id, rotation_id, "node token rotated");
+    info!(%node_id, rotation_id, "node token rotated");
 }
 
 /// Drive a sidecar/ctl connection: handshake, then service lease/relay requests.
@@ -450,7 +450,7 @@ pub async fn handle_sidecar(
     result
 }
 
-/// Drive a **delegated** connection: a sandboxed agent presenting nothing but a
+/// Drive a **delegated** connection: a sandboxed node presenting nothing but a
 /// capability token (architecture §6.5).
 ///
 /// This route is deliberately crippled. It shares the writer task, the
@@ -658,9 +658,9 @@ where
     }
 }
 
-/// Test-only door: drive the agent-side pumps over arbitrary wire halves.
+/// Test-only door: drive the node-side pumps over arbitrary wire halves.
 ///
-/// Exposed so integration tests can wire an agent and a coordinator over an
+/// Exposed so integration tests can wire a node and a coordinator over an
 /// in-memory pair, or over a real `WebSocket` with no HTTP layer in between.
 ///
 /// # Errors
@@ -671,19 +671,19 @@ pub async fn handle_agent_for_test(
     coord: Arc<Coordinator>,
     tx: BoxTx,
     rx: BoxRx,
-    agent_id: AgentId,
+    node_id: NodeId,
 ) -> Result<()> {
     let auth = fleet_auth::Authenticated {
         kind: TokenKind::Node,
         org_id: coord.config().default_org.0.clone(),
-        id: agent_id.0.clone(),
+        id: node_id.0.clone(),
         expires: None,
         hash: fleet_auth::TokenHash::from_hex(String::new()),
         // Freshly issued: no rotation is due, so a test that is not about
         // rotation does not accidentally exercise it.
         token_issued_at: Some(coord.now()),
     };
-    handle_agent(coord, tx, rx, agent_id, auth).await
+    handle_node(coord, tx, rx, node_id, auth).await
 }
 
 /// Test-only door: drive the sidecar-side handshake + pumps as `subject`.
@@ -717,21 +717,21 @@ mod tests {
     use crate::registry::{ChannelRoute, SidecarHandle};
     use fleet_core::policy::Policy;
     use fleet_core::scheduler::Scheduler;
-    use fleet_proto::agent_api::{AgentReport, CoordinatorCommand};
     use fleet_proto::ids::LeaseId;
+    use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
     use fleet_proto::DataFrame;
 
     const SEED: [u8; 32] = [5u8; 32];
 
-    /// The node id the coordinator would mint for this fixture's agent.
+    /// The node id the coordinator would mint for this fixture's node.
     ///
-    /// The server treats an `AgentId` as an opaque routing key, but the key it
+    /// The server treats an `NodeId` as an opaque routing key, but the key it
     /// routes in production is org-namespaced, so the fixture builds its own
     /// with the production constructor rather than inventing a bare literal.
-    fn test_agent_id() -> AgentId {
+    fn test_node_id() -> NodeId {
         crate::state::node_id_for(
             &fleet_proto::ids::OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
-            "agent-a",
+            "node-a",
         )
     }
 
@@ -755,14 +755,14 @@ mod tests {
         ))
     }
 
-    /// End-to-end return-path relay: a `DataFrame` written by the agent peer
-    /// travels through the *real* `handle_agent` read loop and is relayed to
-    /// the owning sidecar's channel. Covers the agent→sidecar direction the
+    /// End-to-end return-path relay: a `DataFrame` written by the node peer
+    /// travels through the *real* `handle_node` read loop and is relayed to
+    /// the owning sidecar's channel. Covers the node→sidecar direction the
     /// production server actually uses.
     #[tokio::test]
     async fn agent_to_sidecar_relay_end_to_end() {
         let coord = coordinator().await;
-        let agent_id = test_agent_id();
+        let node_id = test_node_id();
 
         // Pre-register an open channel routed to a sidecar receiver.
         let channel = coord.channels().allocate().await;
@@ -774,7 +774,7 @@ mod tests {
                 channel,
                 ChannelRoute {
                     lease: LeaseId(1),
-                    agent: agent_id.clone(),
+                    node: node_id.clone(),
                     sidecar: route_tx,
                     kind: fleet_proto::ChannelKind::Data,
                 },
@@ -783,7 +783,7 @@ mod tests {
 
         let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
-        let id = agent_id.clone();
+        let id = node_id.clone();
         let agent_task = tokio::spawn(async move {
             let _ =
                 handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id)
@@ -793,7 +793,7 @@ mod tests {
         // A control report (exercising the demux path) ...
         fleet_wire::send(
             &mut peer_tx,
-            &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+            &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )
         .await
         .unwrap();
@@ -802,7 +802,7 @@ mod tests {
             channel,
             bytes: vec![0xCA, 0xFE, 0xBA, 0xBE],
         };
-        fleet_wire::send(&mut peer_tx, &AgentToCoord::Data(payload.clone()))
+        fleet_wire::send(&mut peer_tx, &NodeToCoord::Data(payload.clone()))
             .await
             .unwrap();
 
@@ -816,26 +816,26 @@ mod tests {
         agent_task.abort();
     }
 
-    /// End-to-end command path: a `CoordinatorCommand` pushed through the agent
-    /// registry is framed as a `CoordToAgent` envelope and read back off the
-    /// agent's wire.
+    /// End-to-end command path: a `CoordinatorCommand` pushed through the node
+    /// registry is framed as a `CoordToNode` envelope and read back off the
+    /// node's wire.
     #[tokio::test]
     async fn coordinator_to_agent_command_end_to_end() {
         let coord = coordinator().await;
-        let agent_id = test_agent_id();
+        let node_id = test_node_id();
 
         let (server_tx, server_rx, _peer_tx, mut peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
-        let id = agent_id.clone();
+        let id = node_id.clone();
         let agent_task = tokio::spawn(async move {
             let _ =
                 handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id)
                     .await;
         });
 
-        // Wait for handle_agent to register the connection, then push a command.
+        // Wait for handle_node to register the connection, then push a command.
         let handle = loop {
-            if let Some(h) = coord.agents().get(&agent_id).await {
+            if let Some(h) = coord.nodes().get(&node_id).await {
                 break h;
             }
             tokio::task::yield_now().await;
@@ -845,11 +845,8 @@ mod tests {
             .await
             .unwrap();
 
-        match fleet_wire::recv::<CoordToAgent>(&mut peer_rx)
-            .await
-            .unwrap()
-        {
-            CoordToAgent::Command(CoordinatorCommand::QueryState) => {}
+        match fleet_wire::recv::<CoordToNode>(&mut peer_rx).await.unwrap() {
+            CoordToNode::Command(CoordinatorCommand::QueryState) => {}
             other => panic!("expected QueryState command, got {other:?}"),
         }
 
@@ -861,19 +858,19 @@ mod tests {
     #[tokio::test]
     async fn register_with_a_foreign_id_closes_the_connection() {
         let coord = coordinator().await;
-        let agent_id = test_agent_id();
+        let node_id = test_node_id();
 
         let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
-        let id = agent_id.clone();
+        let id = node_id.clone();
         let task = tokio::spawn(async move {
             handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id).await
         });
 
         fleet_wire::send(
             &mut peer_tx,
-            &AgentToCoord::Report(AgentReport::Register {
-                agent: AgentId("someone-else".to_owned()),
+            &NodeToCoord::Report(NodeReport::Register {
+                node: NodeId("someone-else".to_owned()),
                 protocol_version: PROTOCOL_VERSION,
             }),
         )
@@ -886,7 +883,7 @@ mod tests {
             "expected an id-mismatch protocol error, got {err:?}"
         );
         // ... and the connection is deregistered, so nothing can route to it.
-        assert!(coord.agents().get(&agent_id).await.is_none());
+        assert!(coord.nodes().get(&node_id).await.is_none());
     }
 
     /// The matching id is accepted, so the check above is not simply refusing
@@ -894,19 +891,19 @@ mod tests {
     #[tokio::test]
     async fn register_with_the_token_id_is_accepted() {
         let coord = coordinator().await;
-        let agent_id = test_agent_id();
+        let node_id = test_node_id();
 
         let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
-        let id = agent_id.clone();
+        let id = node_id.clone();
         let task = tokio::spawn(async move {
             handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id).await
         });
 
         fleet_wire::send(
             &mut peer_tx,
-            &AgentToCoord::Report(AgentReport::Register {
-                agent: agent_id.clone(),
+            &NodeToCoord::Report(NodeReport::Register {
+                node: node_id.clone(),
                 protocol_version: PROTOCOL_VERSION,
             }),
         )
@@ -914,14 +911,14 @@ mod tests {
         .unwrap();
         fleet_wire::send(
             &mut peer_tx,
-            &AgentToCoord::Report(AgentReport::Heartbeat { uptime_secs: 1 }),
+            &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )
         .await
         .unwrap();
 
         // Still connected after both reports.
         tokio::time::sleep(TEST_SETTLE).await;
-        assert!(coord.agents().get(&agent_id).await.is_some());
+        assert!(coord.nodes().get(&node_id).await.is_some());
         task.abort();
     }
 }

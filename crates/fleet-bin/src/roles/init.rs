@@ -119,7 +119,7 @@ fn render_coordinator_config(
 listen_addr = "{DEFAULT_LISTEN_ADDR}"
 
 # The externally reachable base URL agents and clients DIAL to reach this
-# coordinator — what you pass to `login --fleet-url` / `agent up --fleet-url`.
+# coordinator — what you pass to `login --fleet-url` / `node up --fleet-url`.
 #
 # Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
 # listens on loopback and the world reaches it at a name it never sees.
@@ -172,7 +172,7 @@ signing_key_path = {signing_key_path}
 #
 # With a self-signed certificate, clients need its SHA-256:
 #   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
-# and pass it as `--server-cert-sha256` to `login` / `agent up`.
+# and pass it as `--server-cert-sha256` to `login` / `node up`.
 
 # The GitHub OAuth app backing `probe-rs-fleet login` and the web UI.
 #
@@ -255,7 +255,7 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("       # on your laptop, after step 3:");
     println!("       probe-rs-fleet auth-key create --tag lab");
     println!("       # on the node:");
-    println!("       probe-rs-fleet agent up --fleet-url {public_url} --auth-key <key>");
+    println!("       probe-rs-fleet node up --fleet-url {public_url} --auth-key <key>");
     println!();
     println!("Without a GitHub app (air-gapped, or a quick trial), skip step 1 and");
     println!("bootstrap with the INTERIM verb instead:");

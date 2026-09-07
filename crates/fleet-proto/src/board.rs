@@ -1,15 +1,15 @@
-//! Board inventory types reported by agents and tracked by the coordinator.
+//! Board inventory types reported by nodes and tracked by the coordinator.
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{AgentId, BoardRef, LeaseId, Subject};
+use crate::ids::{BoardRef, LeaseId, NodeId, Subject};
 
-/// A leasable board, as known to the coordinator (reconciled from an agent's
+/// A leasable board, as known to the coordinator (reconciled from a node's
 /// `boards.toml` plus live probe discovery).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Board {
     pub id: BoardRef,
-    pub agent: AgentId,
+    pub node: NodeId,
     /// probe-rs target name (informational; the `--chip` the caller passes
     /// still flows through untouched).
     pub chip: String,
@@ -22,17 +22,17 @@ pub struct Board {
     pub tags: Vec<String>,
     /// Most boards are exclusive (one lease at a time).
     pub exclusive: bool,
-    /// How the agent can cut/restore USB power to this board.
+    /// How the node can cut/restore USB power to this board.
     pub power: PowerKind,
     pub state: BoardState,
 }
 
-/// USB power-control capability for a board, as wired on the agent.
+/// USB power-control capability for a board, as wired on the node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PowerKind {
     /// Per-port USB hub control via `uhubctl`.
     Uhubctl { hub: String, port: u8 },
-    /// A GPIO-driven relay on the agent.
+    /// A GPIO-driven relay on the node.
     Gpio { chip: String, line: u32 },
     /// No external power control; best-effort reset via the probe only.
     None,

@@ -146,7 +146,7 @@ mod unix_imp {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest as _, Sha256};
 
-    use fleet_proto::ids::{AgentId, BoardRef, Subject, SubjectKey, SubjectKind};
+    use fleet_proto::ids::{BoardRef, NodeId, Subject, SubjectKey, SubjectKind};
     use fleet_proto::lease::{Constraint, LeaseGrant};
     use fleet_proto::LeaseId;
 
@@ -155,7 +155,12 @@ mod unix_imp {
 
     /// On-disk format version. A file carrying anything else is treated as
     /// empty and overwritten — a cache is never worth an error.
-    const FORMAT_VERSION: u32 = 1;
+    ///
+    /// 1 → 2: the `agent` field of a [`Record`] is spelled `node`, following
+    /// the fleet-wide `AgentId` → `NodeId` rename. A version-1 file would fail
+    /// to deserialize anyway (the field is not optional); bumping makes the
+    /// miss deliberate and quiet rather than a "corrupt store" debug line.
+    const FORMAT_VERSION: u32 = 2;
 
     /// The runtime sub-directory everything lives in.
     const DIR_NAME: &str = "probe-rs-fleet";
@@ -178,8 +183,8 @@ mod unix_imp {
         /// The board the lease is on. Cross-checked against the channel token
         /// on a hit, so a coordinator restart cannot alias lease ids.
         pub board: BoardRef,
-        /// The agent hosting the board.
-        pub agent: AgentId,
+        /// The node hosting the board.
+        pub node: NodeId,
         /// The lease itself.
         pub lease: LeaseId,
         /// The grant's holder, as the stable [`SubjectKey`] (not the whole
@@ -208,7 +213,7 @@ mod unix_imp {
             LeaseGrant {
                 lease: self.lease,
                 board: self.board.clone(),
-                agent: self.agent.clone(),
+                node: self.node.clone(),
                 holder: Subject {
                     org: self.holder.org.clone(),
                     kind: self.holder.kind,
@@ -424,7 +429,7 @@ mod unix_imp {
                 token_fp: key.token_fp.clone(),
                 selector: key.selector.clone(),
                 board: grant.board.clone(),
-                agent: grant.agent.clone(),
+                node: grant.node.clone(),
                 lease: grant.lease,
                 holder: grant.holder.key(),
                 expires: grant.expires,
@@ -697,10 +702,10 @@ mod unix_imp {
                 lease: LeaseId(7),
                 board: BoardRef::new(
                     OrgId("default".to_owned()),
-                    AgentId("node-a".to_owned()),
+                    NodeId("node-a".to_owned()),
                     "b1",
                 ),
-                agent: AgentId("node-a".to_owned()),
+                node: NodeId("node-a".to_owned()),
                 holder: Subject::new(OrgId("default".to_owned()), kind, "alice"),
                 expires,
                 token: vec![0xde, 0xad, 0xbe, 0xef],
@@ -1079,7 +1084,7 @@ mod unix_imp {
 /// existed (lease and release per invocation).
 #[cfg(not(unix))]
 mod other_imp {
-    use fleet_proto::ids::{AgentId, BoardRef, Subject, SubjectKey};
+    use fleet_proto::ids::{BoardRef, NodeId, Subject, SubjectKey};
     use fleet_proto::lease::{Constraint, LeaseGrant};
     use fleet_proto::LeaseId;
 
@@ -1096,8 +1101,8 @@ mod other_imp {
         pub selector: String,
         /// The leased board.
         pub board: BoardRef,
-        /// The agent hosting it.
-        pub agent: AgentId,
+        /// The node hosting it.
+        pub node: NodeId,
         /// The lease.
         pub lease: LeaseId,
         /// The holder.
@@ -1121,7 +1126,7 @@ mod other_imp {
             LeaseGrant {
                 lease: self.lease,
                 board: self.board.clone(),
-                agent: self.agent.clone(),
+                node: self.node.clone(),
                 holder: Subject {
                     org: self.holder.org.clone(),
                     kind: self.holder.kind,

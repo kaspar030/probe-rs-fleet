@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use fleet_auth::{OpaqueToken, TokenKind};
 use fleet_bin::cli::{
-    AgentUpArgs, AuthKeyCreateArgs, AuthKeyListArgs, AuthKeyRevokeCliArgs, LoginArgs,
+    AuthKeyCreateArgs, AuthKeyListArgs, AuthKeyRevokeCliArgs, LoginArgs, NodeUpFlags,
 };
 use fleet_coordinator::auth::Ed25519Signer;
 use fleet_coordinator::clock::SystemClock;
@@ -173,8 +173,8 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     // The Pi: a *different* config dir, with no login of its own — exactly the
     // headless machine the ladder's rungs 1 and 3 cannot serve.
     let pi = tmp.path().join("pi");
-    fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(created.key.clone()),
             node_name: Some("rpi-lab-1".to_owned()),
@@ -192,7 +192,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
         Some(&pi),
     )
     .await
-    .expect("agent up --auth-key with a user-minted key");
+    .expect("node up --auth-key with a user-minted key");
 
     let node = fleet_bin::fleet_config::load(&pi.join("default.toml"))
         .unwrap()
@@ -212,7 +212,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     drop((tx, rx));
 
     // The key's tags reached the node, and the node is in alice's org.
-    let node_id = fleet_proto::ids::AgentId(node.node_id.clone());
+    let node_id = fleet_proto::ids::NodeId(node.node_id.clone());
     let (org, _) = fleet
         .coord
         .db()
@@ -257,8 +257,8 @@ async fn revoking_a_minted_key_stops_it_enrolling() {
     assert_eq!(revoked.revoked, vec![created.key_hash.clone()]);
 
     let pi = tmp.path().join("pi");
-    let err = fleet_bin::roles::agent_up::bootstrap(
-        &AgentUpArgs {
+    let err = fleet_bin::roles::node_up::bootstrap(
+        &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(created.key.clone()),
             node_name: Some("rpi-lab-2".to_owned()),

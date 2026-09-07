@@ -283,7 +283,7 @@ fn print_auth_key(
         println!("hash). Copy it now; anyone holding it can use it.");
     } else {
         println!("Enroll a node with it:");
-        println!("  probe-rs-fleet agent up --fleet-url <url> --auth-key <key>");
+        println!("  probe-rs-fleet node up --fleet-url <url> --auth-key <key>");
         println!();
         println!("This key is a bearer credential and is not stored anywhere (only its");
         println!("hash). Copy it now; anyone holding it can enroll a node into this org.");

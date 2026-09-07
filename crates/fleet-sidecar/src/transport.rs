@@ -112,7 +112,7 @@ impl CoordSession {
 
     /// Dial the coordinator's `/delegate` route with a **capability token**.
     ///
-    /// The sandboxed-agent path (architecture §6.5). The credential is the
+    /// The sandboxed-client path (architecture §6.5). The credential is the
     /// hex-encoded capability token `ctl delegate` printed; there is no session
     /// token and no fleet identity. The connection that comes back is
     /// deliberately crippled coordinator-side: it can open a channel on the
@@ -498,7 +498,7 @@ impl CoordSession {
 
     /// Open a relay channel of `kind` for `lease`, returning the channel id
     /// **and the data-plane capability token** the coordinator handed the
-    /// owning agent.
+    /// owning node.
     ///
     /// The token is the credential the genuine probe-rs client must present to
     /// `probe-rs serve` (`PROBE_RS_REMOTE_TOKEN`). It is deliberately *not*
@@ -530,7 +530,7 @@ impl CoordSession {
         *self.data_sink.lock().await = Some((channel, sink));
     }
 
-    /// Send opaque data bytes to the owning agent over `channel`.
+    /// Send opaque data bytes to the owning node over `channel`.
     async fn send_data(&self, frame: DataFrame) -> Result<(), TransportError> {
         self.send(SidecarToCoord::Data(frame)).await
     }
@@ -687,13 +687,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::too_many_lines)]
     async fn session_leases_opens_channel_and_splices() {
-        use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
+        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
         use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
         use fleet_proto::LeaseId;
 
         // The coordinator answers with a fleet-unique board key; the request
         // side stays node-local.
-        let board_ref = BoardRef::new(OrgId("default".to_owned()), AgentId("a".to_owned()), "b1");
+        let board_ref = BoardRef::new(OrgId("default".to_owned()), NodeId("a".to_owned()), "b1");
 
         let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
 
@@ -733,7 +733,7 @@ mod tests {
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
                     board: board_ref_for_peer.clone(),
-                    agent: AgentId("a".to_owned()),
+                    node: NodeId("a".to_owned()),
                     holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
                     expires: 9999,
                     token: vec![0xab, 0xcd],
@@ -763,7 +763,7 @@ mod tests {
             .await
             .unwrap();
 
-            // Echo the next Data frame back (relay agent stand-in).
+            // Echo the next Data frame back (relay node stand-in).
             match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
@@ -835,7 +835,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extend_reply_does_not_steal_the_control_channel() {
-        use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
+        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
         use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
         use fleet_proto::LeaseId;
 
@@ -877,12 +877,8 @@ mod tests {
                 &mut coord_tx,
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
-                    board: BoardRef::new(
-                        OrgId("default".to_owned()),
-                        AgentId("a".to_owned()),
-                        "b1",
-                    ),
-                    agent: AgentId("a".to_owned()),
+                    board: BoardRef::new(OrgId("default".to_owned()), NodeId("a".to_owned()), "b1"),
+                    node: NodeId("a".to_owned()),
                     holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
                     expires: 9999,
                     token: vec![0xab],

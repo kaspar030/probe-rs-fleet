@@ -1,4 +1,4 @@
-//! `ctl delegate` and `GET /delegate` end to end: a sandboxed agent can flash a
+//! `ctl delegate` and `GET /delegate` end to end: a sandboxed node can flash a
 //! board with a delegated token, and can do nothing else with it
 //! (architecture §6.5).
 //!
@@ -73,12 +73,12 @@ async fn delegated_session(
 /// token is the whole credential.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delegated_token_opens_a_channel_and_nothing_else_is_needed() {
-    use crate::common::AgentStub;
+    use crate::common::NodeStub;
 
     let fleet = TestCoordinator::start().await;
     let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
-    let mut agent = AgentStub::attach(&fleet, &board.node).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
 
     let grant = delegate(
         &fleet,
@@ -107,14 +107,14 @@ async fn a_delegated_token_opens_a_channel_and_nothing_else_is_needed() {
         .await
         .unwrap();
 
-    // The agent got a token, and it is byte-identical to the one the sandbox
+    // The node got a token, and it is byte-identical to the one the sandbox
     // will hand `probe-rs serve`. This is the property `ChannelOpened { token }`
     // exists for.
-    let (agent_channel, agent_token) = agent.expect_open_session().await;
+    let (agent_channel, agent_token) = node.expect_open_session().await;
     assert_eq!(agent_channel, channel);
     assert_eq!(
         channel_token, agent_token,
-        "the sandbox's data-plane credential must be the agent's"
+        "the sandbox's data-plane credential must be the node's"
     );
     // Note the channel token may or may not equal the capability the sandbox
     // presented — here it happens to, because nothing has narrowed the ops or
