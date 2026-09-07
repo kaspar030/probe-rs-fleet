@@ -1847,7 +1847,6 @@ impl OrgDb<'_> {
         .bind(node.0.as_str())
         .bind(self.org.0.as_str())
         .bind(node_name_for(&self.org, node))
-
         .bind(now)
         .execute(self.db.pool())
         .await?;
@@ -4221,7 +4220,6 @@ mod tests {
             "both rows must survive unchanged"
         );
     }
-
 
     #[tokio::test]
     async fn file_backed_db_round_trip() {
