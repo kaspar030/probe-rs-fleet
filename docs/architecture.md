@@ -481,6 +481,10 @@ Decided agent model (per #1710, corrected by #1965):
   gdb` attach through the RPC client, so this tunnel can likely be retired once
   0.33 ships — unreleased, so nothing changes yet; tracked as issue #298.)*
 
+A node also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
+port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
+and exposed explicitly via `ctl`.
+
 #### Rejected: `socket://` Unix-socket serve (issue #297, decided)
 
 probe-rs 0.32 added a Unix-socket server path (`[server] address =
@@ -541,11 +545,6 @@ where the socket path offers only an ambient one.
 handshake, or `SO_PEERCRED`). Until then, loopback TCP stands. The negative
 assertions in `probers.rs`'s `rendered_config_is_server_table_with_access` pin
 the decision in code.
-
-
-A node also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
-port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
-and exposed explicitly via `ctl`.
 
 #### Config & scaffolding (`node up`, revision 2)
 
