@@ -44,6 +44,9 @@ fn token_ops(wire: &[u8]) -> Vec<AllowedOp> {
 }
 
 /// The whole story-6 flow: grant → use → revoke → denied.
+// One end-to-end story told in order; splitting it would hide the sequence.
+// The rustfmt pass rewrapped it past the 100-line pedantic limit.
+#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
     let fleet = TestCoordinator::start().await;

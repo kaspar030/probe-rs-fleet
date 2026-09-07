@@ -230,6 +230,10 @@ mod tests {
 
     /// The (subject, object, op) → allow/deny matrix the spec asks for, as one
     /// table. Each row names the property it pins down.
+    // A table-driven test: the length is the point, and splitting it would
+    // scatter the matrix across functions. Tipped over the 100-line pedantic
+    // limit by the whole-tree rustfmt pass, which only rewrapped rows.
+    #[allow(clippy::too_many_lines)]
     #[test]
     fn access_matrix() {
         let a_board = board("a", "b1", "nRF52840_xxAA", &["nrf52", "lab"]);

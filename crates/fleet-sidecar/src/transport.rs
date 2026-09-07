@@ -829,6 +829,10 @@ mod tests {
     /// caller would consume it and read the stream off by one — here, `release`
     /// would drain the `Extended` and never see its `Released` ack. This test
     /// drives `lease -> extend -> release` and asserts the ack still arrives.
+    // One end-to-end sequence (lease → extend → release) that has to stay in
+    // one function to be readable; the rustfmt pass rewrapped it past the
+    // 100-line pedantic limit.
+    #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extend_reply_does_not_steal_the_control_channel() {
         use fleet_proto::ids::{AgentId, BoardName, BoardRef, OrgId, Subject, SubjectKind};
