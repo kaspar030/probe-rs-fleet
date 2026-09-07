@@ -1818,6 +1818,22 @@ impl OrgDb<'_> {
     /// **`ON CONFLICT` deliberately touches only `last_seen`.** This runs on
     /// every inventory report; updating `adopt_policy` here would silently
     /// reset a `share`-created node to `declared` the first time it connected.
+    /// The same goes for `name`: an existing row's name is not this path's
+    /// business, so it stays in the `VALUES` list only.
+    ///
+    /// The row is created with the **node-local** name ([`node_name_for`]),
+    /// the same spelling [`Db::register_node_full`] writes, so the two
+    /// creation paths are indistinguishable in the column the browser API
+    /// addresses nodes by ([`OrgDb::node_by_name`]).
+    ///
+    /// One consequence: the insert can now fail `UNIQUE (org_id, name)`, which
+    /// binding the prefixed id never could. It is unreachable in practice —
+    /// `register_node_full` derives `id = node_id_for(org, name)`, so any
+    /// same-org row with that name has that exact primary key and
+    /// `ON CONFLICT(id)` fires first — with one residue: a legacy prefixed row
+    /// that `0010_node_name_normalise.sql`'s collision guard skipped. The
+    /// caller already handles it (`core.rs` warns and reconciles nothing,
+    /// notably pruning no boards).
     ///
     /// # Errors
     ///
@@ -1830,7 +1846,8 @@ impl OrgDb<'_> {
         )
         .bind(node.0.as_str())
         .bind(self.org.0.as_str())
-        .bind(node.0.as_str())
+        .bind(node_name_for(&self.org, node))
+
         .bind(now)
         .execute(self.db.pool())
         .await?;
@@ -2324,17 +2341,6 @@ impl OrgDb<'_> {
     /// tried to track it would be wrong every time a process died. The caller
     /// composes the two.
     ///
-    /// One honest wart, reported rather than papered over: [`OrgDb::ensure_node`]
-    /// — the inventory-report path, which runs for a node that reports before
-    /// it is registered — writes the **full node id** into `name`, because at
-    /// that point it has an [`AgentId`] and nothing else. Every registration
-    /// path ([`Db::register_node`], [`Db::register_node_full`]) writes the
-    /// node-local name, and `ensure_node`'s `ON CONFLICT` leaves an existing
-    /// row's `name` alone, so a machine that enrolled properly is unaffected.
-    /// Normalising it here would be a listing that disagreed with the column;
-    /// fixing the column is a migration, and this listing is not the place to
-    /// smuggle one in.
-    ///
     /// # Errors
     ///
     /// Returns a database error if either query fails, or
@@ -2703,6 +2709,21 @@ async fn unique_personal_slug(
 #[must_use]
 pub fn node_id_for(org: &OrgId, name: &str) -> AgentId {
     AgentId(format!("{}/{name}", org.0))
+}
+
+/// The node-local name inside an org-namespaced node id: the inverse of
+/// [`node_id_for`].
+///
+/// Falls back to the whole id when the prefix is absent, rather than panicking
+/// or storing an empty name. Every production caller reaches
+/// [`OrgDb::ensure_node`] with an id minted by `node_id_for` for *this* org (it
+/// comes from the authenticated node subject), so the fallback is unreachable
+/// in practice — but a `NOT NULL` column that the browser API keys off is the
+/// wrong place to discover that assumption was wrong.
+fn node_name_for<'a>(org: &OrgId, node: &'a AgentId) -> &'a str {
+    node.0
+        .strip_prefix(&format!("{}/", org.0))
+        .unwrap_or(node.0.as_str())
 }
 
 /// A fresh, opaque grant id: 16 random bytes as 32 lowercase hex characters.
@@ -3868,19 +3889,14 @@ mod tests {
 
         let mine_nodes = db.scoped(mine.clone()).list_nodes().await.unwrap();
         assert_eq!(mine_nodes.len(), 1);
-        // A node the *inventory* path created carries its id as its name:
-        // `ensure_node` binds `node.0` to both columns, and only
-        // `register_node_full` (the `share` / `agent up` path) knows a short
-        // name to store. So the production-shaped fixture reports
-        // `default/rpi-1` here, not `rpi-1`.
-        assert_eq!(mine_nodes[0].name, node_id(DEFAULT_ORG_ID, "rpi-1").0);
+        assert_eq!(mine_nodes[0].name, "rpi-1");
         assert_eq!(mine_nodes[0].boards, Vec::<String>::new());
 
         // The other tenant's node is not merely filtered out of the listing:
         // it is unreachable through this handle at all.
         let their_nodes = db.scoped(theirs).list_nodes().await.unwrap();
         assert_eq!(their_nodes.len(), 1);
-        assert_eq!(their_nodes[0].name, node_id("other", "rpi-2").0);
+        assert_eq!(their_nodes[0].name, "rpi-2");
     }
 
     /// A node's boards come back with it, and a board of another org's node
@@ -4043,15 +4059,12 @@ mod tests {
             .await
             .unwrap();
 
-        // `ensure_node` writes the full id into `name` (see `list_nodes`), so
-        // that is what a node enrolled by the inventory path is addressed by —
-        // and with production-shaped ids that name is `default/rpi-1`.
-        let mine_name = node_id(DEFAULT_ORG_ID, "rpi-1").0;
-        let their_name = node_id("other", "rpi-2").0;
-        assert!(db.scoped(mine.clone()).delete_node(&mine_name).await.unwrap());
+        let mine_name = "rpi-1";
+        let their_name = "rpi-2";
+        assert!(db.scoped(mine.clone()).delete_node(mine_name).await.unwrap());
         assert!(db
             .scoped(mine.clone())
-            .node_by_name(&mine_name)
+            .node_by_name(mine_name)
             .await
             .unwrap()
             .is_none());
@@ -4059,19 +4072,156 @@ mod tests {
             .fetch_all(db.pool_for_test())
             .await
             .unwrap();
-        assert_eq!(boards, vec![(their_name.clone(),)], "only ours went");
+        assert_eq!(boards, vec![(node_id("other", "rpi-2").0,)], "only ours went");
 
         // Deleting again is `false`, not an error — and another org's node of
         // any name is not reachable through this handle.
-        assert!(!db.scoped(mine.clone()).delete_node(&mine_name).await.unwrap());
-        assert!(!db.scoped(mine).delete_node(&their_name).await.unwrap());
+        assert!(!db.scoped(mine.clone()).delete_node(mine_name).await.unwrap());
+        assert!(!db.scoped(mine).delete_node(their_name).await.unwrap());
         assert!(db
             .scoped(theirs)
-            .node_by_name(&their_name)
+            .node_by_name(their_name)
             .await
             .unwrap()
             .is_some());
     }
+
+    /// The two creation paths agree on `name`.
+    ///
+    /// [`Db::register_node_full`] (enrollment) and [`OrgDb::ensure_node`] (the
+    /// inventory report) are the only writers of the column the browser API
+    /// addresses nodes by, and one physical machine reaches the coordinator
+    /// through both. A node must be addressable by the same spelling whichever
+    /// got there first — the bug this pins is that it was not.
+    #[tokio::test]
+    async fn both_creation_paths_agree_on_the_node_name() {
+        let db = Db::connect_in_memory().await.unwrap();
+
+        // Org `a`: the inventory report arrives first, enrollment second.
+        let a = org("a");
+        db.ensure_org(&a, "personal").await.unwrap();
+        db.scoped(a.clone())
+            .ensure_node(&node_id("a", "rpi-1"), 1000)
+            .await
+            .unwrap();
+        db.register_node_full(&a, "rpi-1", "hash-a", &[], None, AdoptPolicy::Declared, 1001)
+            .await
+            .unwrap();
+
+        // Org `b`: the same two writes in the opposite order.
+        let b = org("b");
+        db.ensure_org(&b, "personal").await.unwrap();
+        db.register_node_full(&b, "rpi-1", "hash-b", &[], None, AdoptPolicy::Declared, 1000)
+            .await
+            .unwrap();
+        db.scoped(b.clone())
+            .ensure_node(&node_id("b", "rpi-1"), 1001)
+            .await
+            .unwrap();
+
+        for (org_id, scope) in [("a", &a), ("b", &b)] {
+            let scoped = db.scoped(scope.clone());
+            // Both writes landed on one row, not two.
+            let nodes = scoped.list_nodes().await.unwrap();
+            assert_eq!(nodes.len(), 1, "{org_id}: {nodes:?}");
+            assert_eq!(nodes[0].name, "rpi-1", "{org_id}");
+            assert_eq!(nodes[0].id, node_id(org_id, "rpi-1"), "{org_id}");
+
+            let found = scoped.node_by_name("rpi-1").await.unwrap().unwrap();
+            assert_eq!(found.id, node_id(org_id, "rpi-1"), "{org_id}");
+            // The prefixed spelling is no longer a legal address: name
+            // equality alone would not catch a lookup that accepted both.
+            assert!(
+                scoped
+                    .node_by_name(&node_id(org_id, "rpi-1").0)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{org_id}: the prefixed name still resolves"
+            );
+        }
+
+        // Same name, two tenants, two distinct ids.
+        assert_ne!(node_id("a", "rpi-1"), node_id("b", "rpi-1"));
+    }
+
+    /// `0010_node_name_normalise.sql` rewrites legacy prefixed names.
+    ///
+    /// The migration cannot be exercised by `connect_in_memory` alone — a
+    /// fresh database has no legacy rows — so seed one and replay the file.
+    /// Without this, an edit to (or deletion of) the migration would be caught
+    /// by nothing: `sqlx::migrate!` only notices what is there.
+    #[tokio::test]
+    async fn the_name_migration_normalises_legacy_rows() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let acme = org("acme");
+        db.ensure_org(&acme, "personal").await.unwrap();
+        // A row exactly as the pre-fix `ensure_node` wrote it.
+        sqlx::query(
+            "INSERT INTO node (id, org_id, name, adopt_policy, last_seen, created_at)
+             VALUES ('acme/rpi-1', 'acme', 'acme/rpi-1', 'declared', 1000, 1000)",
+        )
+        .execute(db.pool_for_test())
+        .await
+        .unwrap();
+
+        sqlx::query(include_str!("../migrations/0010_node_name_normalise.sql"))
+            .execute(db.pool_for_test())
+            .await
+            .unwrap();
+
+        let found = db
+            .scoped(acme.clone())
+            .node_by_name("rpi-1")
+            .await
+            .unwrap()
+            .expect("the legacy row is addressable by its node-local name");
+        assert_eq!(found.id, node_id("acme", "rpi-1"));
+    }
+
+    /// A `(org_id, name)` collision leaves both rows alone rather than failing.
+    ///
+    /// This is the arm that protects `Db::connect`: `UNIQUE (org_id, name)` is
+    /// live, and a migration that trips it aborts coordinator startup
+    /// permanently on the operator's real database. The `NOT EXISTS` guard in
+    /// `0010` reads redundant — it is not, and this pins it.
+    #[tokio::test]
+    async fn the_name_migration_skips_rows_that_would_collide() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let acme = org("acme");
+        db.ensure_org(&acme, "personal").await.unwrap();
+        // An artificial collision: a legacy prefixed row whose normalised name
+        // is already taken by a differently-keyed row.
+        sqlx::query(
+            "INSERT INTO node (id, org_id, name, adopt_policy, last_seen, created_at)
+             VALUES ('acme/rpi-1', 'acme', 'acme/rpi-1', 'declared', 1000, 1000),
+                    ('legacy-id', 'acme', 'rpi-1', 'declared', 1000, 1000)",
+        )
+        .execute(db.pool_for_test())
+        .await
+        .unwrap();
+
+        sqlx::query(include_str!("../migrations/0010_node_name_normalise.sql"))
+            .execute(db.pool_for_test())
+            .await
+            .expect("the migration must not fail a live UNIQUE constraint");
+
+        let mut names: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, name FROM node ORDER BY id")
+                .fetch_all(db.pool_for_test())
+                .await
+                .unwrap();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ("acme/rpi-1".to_owned(), "acme/rpi-1".to_owned()),
+                ("legacy-id".to_owned(), "rpi-1".to_owned()),
+            ],
+            "both rows must survive unchanged"
+        );
+    }
+
 
     #[tokio::test]
     async fn file_backed_db_round_trip() {

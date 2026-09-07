@@ -502,7 +502,7 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
     let (node_token, _) = fleet.seed_node("acme", "rpi-1").await;
     // The node has to be *owned* by the caller for the owner path; neither
     // `ensure_node` nor `register_node` records an owner.
-    sqlx::query("UPDATE node SET owner_user_id = 'alice', name = 'rpi-1' WHERE id = 'acme/rpi-1'")
+    sqlx::query("UPDATE node SET owner_user_id = 'alice' WHERE id = 'acme/rpi-1'")
         .execute(fleet.db().pool_for_test())
         .await
         .unwrap();
@@ -633,10 +633,6 @@ async fn a_waiter_promoted_during_the_teardown_is_not_stranded() {
     let alice = fleet.seed_session("acme", "alice", Role::Member).await;
     let bob = fleet.seed_session("acme", "bob", Role::Member).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
-    sqlx::query("UPDATE node SET name = 'rpi-1' WHERE id = 'acme/rpi-1'")
-        .execute(fleet.db().pool_for_test())
-        .await
-        .unwrap();
 
     let want = || {
         SidecarToCoord::Lease(LeaseRequest {
@@ -685,10 +681,6 @@ async fn deleting_a_node_with_boards_succeeds_and_the_boards_leave_the_scheduler
     let admin = fleet.seed_session("acme", "root", Role::Admin).await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let other = fleet.seed_board(&org, "rpi-2", "dk-9", &[]).await;
-    sqlx::query("UPDATE node SET name = 'rpi-1' WHERE id = 'acme/rpi-1'")
-        .execute(fleet.db().pool_for_test())
-        .await
-        .unwrap();
 
     let (status, body) = as_browser(&fleet, "DELETE", "/api/v1/nodes/rpi-1", &admin, None).await;
     assert_eq!(status, 204, "{body}");

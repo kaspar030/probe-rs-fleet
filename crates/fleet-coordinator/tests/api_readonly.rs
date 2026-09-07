@@ -171,11 +171,7 @@ async fn nodes_lists_machines_including_ones_offering_nothing() {
     let fleet = TestCoordinator::start().await;
     let alice = fleet.seed_session("acme", "alice", Role::Member).await;
     let org = OrgId("acme".to_owned());
-    // Registered before the board, so the row carries a node-local `name`.
-    // `OrgDb::ensure_node` — the inventory-report path `seed_board` uses —
-    // writes the *full* node id into `name`, which this listing faithfully
-    // reports; see `OrgDb::list_nodes`. Registering first is what a real node
-    // does, and it takes the `ON CONFLICT` branch that leaves `name` alone.
+    // `seed_node` registers before `seed_board` reports, as a real node does.
     fleet.seed_node("acme", "rpi-1").await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     // A second node with no boards at all.
