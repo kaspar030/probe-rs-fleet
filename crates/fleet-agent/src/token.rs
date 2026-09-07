@@ -110,20 +110,29 @@ mod tests {
     /// The fleet-unique board key a token is scoped to. The agent treats it as
     /// opaque for matching: it compares the whole `(org, node, name)` triple,
     /// so a token minted for another org's same-named board does not verify.
+    ///
+    /// The node half is org-namespaced, because a `BoardRef` is only ever
+    /// minted by the coordinator (`state.rs::node_id_for`). Kept identical to
+    /// `fleet-coordinator/src/auth.rs`'s `test_board()`: the two crates' token
+    /// tests are a shared vector, so a token signed there verifies here.
     fn board() -> BoardRef {
         BoardRef::new(
             OrgId("acme".to_owned()),
-            AgentId("rpi-1".to_owned()),
+            AgentId("acme/rpi-1".to_owned()),
             "nrf52840-dk-3",
         )
     }
 
     /// A board key that differs only in its org — the multi-tenancy case the
     /// flat `BoardId` could not express.
+    ///
+    /// Note the node half moves with the org, exactly as `node_id_for` would:
+    /// `evil` re-enrolling a machine called `rpi-1` gets `evil/rpi-1`, a
+    /// different node, not a shared one.
     fn other_org_board() -> BoardRef {
         BoardRef::new(
             OrgId("evil".to_owned()),
-            AgentId("rpi-1".to_owned()),
+            AgentId("evil/rpi-1".to_owned()),
             "nrf52840-dk-3",
         )
     }

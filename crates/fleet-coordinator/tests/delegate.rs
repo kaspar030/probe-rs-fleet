@@ -306,22 +306,28 @@ async fn a_token_stops_working_the_moment_its_lease_is_released() {
 /// signature the caller can learn from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_credentials_are_refused_uniformly() {
-    use fleet_proto::ids::{AgentId, BoardRef, OrgId};
+    use fleet_proto::ids::{BoardRef, OrgId};
     use fleet_proto::token::{CapabilityToken, TokenSigner as _};
 
     let fleet = TestCoordinator::start().await;
     let (session_token, _org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+
+    // A board key of the shape the coordinator mints. Nothing here resolves it
+    // — both tokens below are refused before the board is ever looked up — but
+    // a fixture that spells an unreachable shape teaches the next reader the
+    // wrong one.
+    let board = {
+        let org = OrgId("default".to_owned());
+        let node = fleet_coordinator::node_id_for(&org, "rpi-1");
+        BoardRef::new(org, node, "dk-3")
+    };
 
     // A well-formed token, signed by *another* coordinator's key.
     let impostor = fleet_coordinator::auth::Ed25519Signer::from_seed(&[9u8; 32]);
     let forged = impostor
         .sign(&CapabilityToken {
             lease: fleet_proto::LeaseId(1),
-            board: BoardRef::new(
-                OrgId("default".to_owned()),
-                AgentId("rpi-1".to_owned()),
-                "dk-3",
-            ),
+            board: board.clone(),
             allowed_ops: vec![AllowedOp::Flash],
             expires: fleet.coord.now() + 3_600,
         })
@@ -334,11 +340,7 @@ async fn bad_credentials_are_refused_uniformly() {
         .signer()
         .sign(&CapabilityToken {
             lease: fleet_proto::LeaseId(1),
-            board: BoardRef::new(
-                OrgId("default".to_owned()),
-                AgentId("rpi-1".to_owned()),
-                "dk-3",
-            ),
+            board,
             allowed_ops: vec![AllowedOp::Flash],
             expires: 1,
         })
@@ -449,7 +451,7 @@ async fn a_delegation_cannot_exceed_the_delegators_own_access() {
     let sched = fleet.coord.scheduler().lock().await;
     let dk4 = fleet_proto::ids::BoardRef::new(
         alice_org.clone(),
-        fleet_proto::ids::AgentId(format!("{}/rpi-1", alice_org.0)),
+        fleet_coordinator::node_id_for(&alice_org, "rpi-1"),
         "dk-4",
     );
     assert_eq!(

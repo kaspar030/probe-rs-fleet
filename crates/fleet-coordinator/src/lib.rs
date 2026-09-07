@@ -76,7 +76,7 @@ pub use crate::clock::{now_epoch_secs, Clock, SharedClock, SystemClock};
 pub use crate::config::{CoordinatorConfig, SigningKeySource, TlsConfig};
 pub use crate::core::{Coordinator, SharedCoordinator};
 pub use crate::error::{CoordinatorError, Result};
-pub use crate::state::{Db, OrgDb};
+pub use crate::state::{node_id_for, Db, OrgDb};
 
 use fleet_core::scheduler::Scheduler;
 

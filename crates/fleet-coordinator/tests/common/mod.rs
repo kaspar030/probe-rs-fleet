@@ -529,7 +529,10 @@ impl TestCoordinator {
         use fleet_proto::board::{Board, BoardState, PowerKind};
 
         self.db().ensure_org(org, "personal").await.unwrap();
-        let agent = AgentId(format!("{}/{node}", org.0));
+        // The node id production would mint for this `(org, node)`, built by
+        // calling the production constructor rather than re-spelling its
+        // format string — the one definition of the shape lives in `state.rs`.
+        let agent = fleet_coordinator::node_id_for(org, node);
         let now = i64::try_from(self.coord.now()).unwrap();
         self.db()
             .scoped(org.clone())

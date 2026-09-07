@@ -109,7 +109,7 @@ fn coordinator_config() -> CoordinatorConfig {
 
 fn agent_config(token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
     fleet_agent::config::AgentConfig {
-        agent_id: "agent-a".to_owned(),
+        agent_id: node_id().0,
         fleet_url: "https://coordinator.example:7000".to_owned(),
         node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
         previous_node_token: None,
@@ -139,6 +139,15 @@ kind = "none"
     .unwrap()
 }
 
+/// The node id the coordinator mints for this test's agent.
+///
+/// The agent's configured id, the `node` row and the board key must all be the
+/// same string, and in production that string comes from `node_id_for`. Built
+/// by calling it, so the fixture cannot drift from the shape production mints.
+fn node_id() -> AgentId {
+    fleet_coordinator::node_id_for(&OrgId("default".to_owned()), "agent-a")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn sidecar_to_agent_data_plane_round_trip() {
@@ -156,7 +165,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // there is no `default_org` fallback, so a report from a node with no row
     // is dropped rather than filed into the configured tenant.
     db.scoped(OrgId("default".to_owned()))
-        .ensure_node(&AgentId("agent-a".to_owned()), 1_000)
+        .ensure_node(&node_id(), 1_000)
         .await
         .unwrap();
     let dev = Subject::new(OrgId("default".to_owned()), SubjectKind::User, "dev");
@@ -180,7 +189,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
                 coord,
                 Box::new(coord_tx),
                 Box::new(coord_rx),
-                AgentId("agent-a".to_owned()),
+                node_id(),
             )
             .await;
         });
@@ -210,7 +219,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     let board_name = BoardName("nrf52840-dk-1".to_owned());
     let board_id = BoardRef::new(
         OrgId("default".to_owned()),
-        AgentId("agent-a".to_owned()),
+        node_id(),
         "nrf52840-dk-1",
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -254,7 +263,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);
-    assert_eq!(grant.agent, AgentId("agent-a".to_owned()));
+    assert_eq!(grant.agent, node_id());
 
     // Open a data relay channel.
     let (channel, _channel_token) = session

@@ -712,10 +712,15 @@ mod tests {
         s
     }
 
+    /// The node id the coordinator handed this agent at enrolment —
+    /// org-namespaced, as `state.rs::node_id_for` mints it and `node_setup`
+    /// persists it. See `agent.rs`'s constant of the same name.
+    const NODE_ID: &str = "default/pi-1";
+
     fn agent_config() -> AgentConfig {
         let pubkey_hex = hex_encode(&SigningKey::from_bytes(&SEED).verifying_key().to_bytes());
         AgentConfig {
-            agent_id: "pi-1".to_owned(),
+            agent_id: NODE_ID.to_owned(),
             fleet_url: "https://coordinator.example:7000".to_owned(),
             node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             previous_node_token: None,
@@ -774,10 +779,11 @@ kind = "none"
 
     /// The fleet-unique key the coordinator mints for one of this node's
     /// boards; the token is scoped to it and the agent matches it verbatim.
+    /// Its node half is the coordinator's org-namespaced id.
     fn board_ref(name: &str) -> fleet_proto::BoardRef {
         fleet_proto::BoardRef::new(
             fleet_proto::OrgId("default".to_owned()),
-            fleet_proto::AgentId("pi-1".to_owned()),
+            fleet_proto::AgentId(NODE_ID.to_owned()),
             name,
         )
     }
@@ -855,7 +861,7 @@ kind = "none"
                 agent,
                 protocol_version,
             }) => {
-                assert_eq!(agent.0, "pi-1");
+                assert_eq!(agent.0, NODE_ID);
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
             }
             other => panic!("expected Register, got {other:?}"),

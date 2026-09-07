@@ -664,9 +664,19 @@ mod tests {
         SigningKey::from_bytes(&SEED)
     }
 
+    /// The node id the coordinator handed this agent at enrolment.
+    ///
+    /// Org-namespaced, because that is what the coordinator mints
+    /// (`fleet-coordinator/src/state.rs::node_id_for`) and returns as
+    /// `TokenResponse::node_id`, which `fleet-bin`'s `node_setup` writes into
+    /// the config verbatim. The agent never builds this itself — it cannot,
+    /// not knowing its own org — so a fixture that invents a bare `"pi-1"`
+    /// describes a config production never writes.
+    const NODE_ID: &str = "default/pi-1";
+
     fn agent_config() -> AgentConfig {
         AgentConfig {
-            agent_id: "pi-1".to_owned(),
+            agent_id: NODE_ID.to_owned(),
             fleet_url: "https://coordinator.example:7000".to_owned(),
             node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             previous_node_token: None,
@@ -707,11 +717,12 @@ port = 2
 
     /// The fleet-unique key the coordinator would mint for one of this node's
     /// boards. The agent never constructs one in production — it only compares
-    /// the key the coordinator sent against the one inside the token.
+    /// the key the coordinator sent against the one inside the token — so the
+    /// node half is the coordinator's org-namespaced id, not a bare name.
     fn board_ref(name: &str) -> BoardRef {
         BoardRef::new(
             fleet_proto::ids::OrgId("default".to_owned()),
-            fleet_proto::ids::AgentId("pi-1".to_owned()),
+            fleet_proto::ids::AgentId(NODE_ID.to_owned()),
             name,
         )
     }
