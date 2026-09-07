@@ -10,16 +10,16 @@
 
 use serde::{Deserialize, Serialize};
 
-pub mod adopt;
 pub mod admin;
+pub mod adopt;
 pub mod agent_api;
 pub mod board;
 pub mod ids;
 pub mod lease;
 pub mod token;
 
-pub use adopt::AdoptPolicy;
 pub use admin::{BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine};
+pub use adopt::AdoptPolicy;
 pub use agent_api::{
     AgentReport, BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe,
     LogLevel, PowerAction, ProbeInventory,
@@ -29,9 +29,7 @@ pub use ids::{
     normalise_repo, workload_subject_key, AgentId, BoardName, BoardRef, Group, LeaseId, NodeId,
     OrgId, Role, Subject, SubjectKey, SubjectKind, UserId, WORKLOAD_NS_GHA,
 };
-pub use lease::{
-    parse_constraint, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest,
-};
+pub use lease::{parse_constraint, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest};
 pub use token::{
     normalize_ops, parse_ops, AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner,
     TokenVerifier, SIGNATURE_LEN,

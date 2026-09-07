@@ -138,9 +138,7 @@ impl BoardRef {
 }
 
 /// Which authentication path produced a [`Subject`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SubjectKind {
     /// A human, authenticated by a user session.
     User,
@@ -164,9 +162,7 @@ impl std::fmt::Display for SubjectKind {
 ///
 /// A `Member` may add a node and use the org's boards; an `Admin` additionally
 /// acts on other members' leases and reads the audit log (architecture §6.5).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Role {
     /// May use the org's boards and add nodes.
     Member,
@@ -422,7 +418,11 @@ pub fn normalise_repo(repo: &str) -> Option<String> {
     if !ok(owner) || !ok(name) {
         return None;
     }
-    Some(format!("{}/{}", owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+    Some(format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        name.to_ascii_lowercase()
+    ))
 }
 
 /// The [`SubjectKey`] a GitHub Actions job in `repo` authenticates as.
@@ -513,7 +513,6 @@ pub fn agent_subject_key(org: &OrgId, name: &str) -> SubjectKey {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,7 +537,10 @@ mod tests {
 
     #[test]
     fn subject_key_renders_org_kind_id() {
-        assert_eq!(subject("acme", "alice").key().to_string(), "acme/user:alice");
+        assert_eq!(
+            subject("acme", "alice").key().to_string(),
+            "acme/user:alice"
+        );
     }
 
     #[test]
@@ -597,7 +599,10 @@ mod tests {
             Some("ariel-os/ariel-os")
         );
         assert_eq!(normalise_repo("  a/b ").as_deref(), Some("a/b"));
-        assert_eq!(normalise_repo("a_b.c/d-e.f").as_deref(), Some("a_b.c/d-e.f"));
+        assert_eq!(
+            normalise_repo("a_b.c/d-e.f").as_deref(),
+            Some("a_b.c/d-e.f")
+        );
 
         for bad in [
             "",
@@ -624,10 +629,7 @@ mod tests {
     fn agent_name_normalisation_lowercases_and_validates() {
         assert_eq!(normalise_agent_name("Builder").as_deref(), Some("builder"));
         assert_eq!(normalise_agent_name("  ci-2 ").as_deref(), Some("ci-2"));
-        assert_eq!(
-            normalise_agent_name("a_b.c-9").as_deref(),
-            Some("a_b.c-9")
-        );
+        assert_eq!(normalise_agent_name("a_b.c-9").as_deref(), Some("a_b.c-9"));
 
         for bad in [
             "",
@@ -653,11 +655,13 @@ mod tests {
             );
         }
         assert_eq!(
-            normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN))
-                .as_deref(),
+            normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN)).as_deref(),
             Some("x".repeat(MAX_AGENT_NAME_LEN).as_str())
         );
-        assert_eq!(normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN + 1)), None);
+        assert_eq!(
+            normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN + 1)),
+            None
+        );
     }
 
     /// The named identity's shape, and that it round-trips through
@@ -670,7 +674,10 @@ mod tests {
         assert_eq!(SubjectKey::parse(&key.to_string()), Some(key.clone()));
         assert_eq!(key.kind, SubjectKind::Workload);
         // Org-scoped: the same name in two orgs is two subjects.
-        assert_ne!(key, agent_subject_key(&OrgId("other".to_owned()), "builder"));
+        assert_ne!(
+            key,
+            agent_subject_key(&OrgId("other".to_owned()), "builder")
+        );
         // And it cannot collide with the unnamed spelling, whose id starts
         // `key:` and which the charset rule makes unrepresentable as a name.
         assert_ne!(key.id, "key:deadbeef");

@@ -186,7 +186,10 @@ pub trait WireRx: Send {
 /// # Errors
 ///
 /// Returns [`WireError`] if encoding or the write fails.
-pub async fn send<T: Serialize + Sync>(tx: &mut (impl WireTx + ?Sized), value: &T) -> Result<(), WireError> {
+pub async fn send<T: Serialize + Sync>(
+    tx: &mut (impl WireTx + ?Sized),
+    value: &T,
+) -> Result<(), WireError> {
     let bytes = encode(value)?;
     tx.send_bytes(bytes).await
 }
@@ -210,7 +213,6 @@ pub async fn recv<T: DeserializeOwned>(rx: &mut (impl WireRx + ?Sized)) -> Resul
         }
     }
 }
-
 
 /// A framed message from an agent up to the coordinator.
 ///
@@ -321,7 +323,7 @@ pub enum SidecarToCoord {
     /// Revoke a grant by id prefix (`grant revoke <id>`). Creator or admin.
     GrantRevoke {
         /// The grant id, or a prefix of at least 8 hex characters (or `ci-`
-    /// followed by 8, for the grant a CI auth key synthesised).
+        /// followed by 8, for the grant a CI auth key synthesised).
         id: String,
     },
     /// Lease a board as yourself and hand back only its capability token, for
@@ -457,7 +459,6 @@ pub enum CoordToSidecar {
     },
 }
 
-
 /// An in-memory [`WireTx`] / [`WireRx`] pair, for tests.
 ///
 /// Exposed (behind `cfg(any(test, feature = "test-util"))`) because every crate
@@ -542,7 +543,11 @@ mod tests {
     use fleet_proto::lease::Priority;
 
     fn test_board_ref() -> BoardRef {
-        BoardRef::new(OrgId("default".to_owned()), AgentId("agent-a".to_owned()), "b1")
+        BoardRef::new(
+            OrgId("default".to_owned()),
+            AgentId("agent-a".to_owned()),
+            "b1",
+        )
     }
 
     #[tokio::test]

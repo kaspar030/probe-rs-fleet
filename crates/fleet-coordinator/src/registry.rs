@@ -345,7 +345,10 @@ mod tests {
         assert_eq!(reg.len().await, 1);
 
         let handle = reg.get(&agent).await.unwrap();
-        handle.send_command(CoordinatorCommand::QueryState).await.unwrap();
+        handle
+            .send_command(CoordinatorCommand::QueryState)
+            .await
+            .unwrap();
         let got = rx.recv().await.unwrap();
         assert!(matches!(
             got,

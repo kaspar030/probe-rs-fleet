@@ -178,8 +178,7 @@ pub trait ProbeRsBackend: Send + Sync {
     /// # Errors
     ///
     /// Returns an error string if the server could not be started.
-    async fn open(&self, board: &BoardSpec, serve_token: &str)
-        -> Result<Box<dyn Session>, String>;
+    async fn open(&self, board: &BoardSpec, serve_token: &str) -> Result<Box<dyn Session>, String>;
 }
 
 /// The real, process-spawning backend.
@@ -325,8 +324,7 @@ impl Session for ProcessSession {
     }
 
     async fn kill(&self) -> Result<(), String> {
-        self.killed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut child = self.child.lock().await;
         let _ = child.start_kill();
         let _ = child.wait().await;
@@ -350,11 +348,7 @@ impl Session for ProcessSession {
 
 #[async_trait]
 impl ProbeRsBackend for ProcessBackend {
-    async fn open(
-        &self,
-        board: &BoardSpec,
-        serve_token: &str,
-    ) -> Result<Box<dyn Session>, String> {
+    async fn open(&self, board: &BoardSpec, serve_token: &str) -> Result<Box<dyn Session>, String> {
         let spec = self.serve_spec(board).await?;
 
         // 1. Create a per-board working dir and write `.probe-rs.toml` into it

@@ -187,7 +187,8 @@ async fn list_grants(args: GrantListArgs) -> Result<ExitCode> {
                         g.subject,
                         g.selector,
                         render_ops(&g.ops),
-                        g.expires.map_or_else(|| "never".to_owned(), |e| e.to_string())
+                        g.expires
+                            .map_or_else(|| "never".to_owned(), |e| e.to_string())
                     );
                 }
             }
@@ -247,10 +248,7 @@ pub fn parse_ops_arg(s: &str) -> Result<Vec<AllowedOp>> {
 }
 
 fn render_ops(ops: &[AllowedOp]) -> String {
-    ops.iter()
-        .map(|o| o.as_str())
-        .collect::<Vec<_>>()
-        .join(",")
+    ops.iter().map(|o| o.as_str()).collect::<Vec<_>>().join(",")
 }
 
 /// Say which of the granted ops are actually enforced, and which are recorded
@@ -298,7 +296,10 @@ mod tests {
         );
         assert!(parse_ops_arg("").is_err(), "an empty op set is a mistake");
         let err = parse_ops_arg("flash,fly").unwrap_err().to_string();
-        assert!(err.contains("fly"), "the message names the bad label: {err}");
+        assert!(
+            err.contains("fly"),
+            "the message names the bad label: {err}"
+        );
     }
 
     #[test]

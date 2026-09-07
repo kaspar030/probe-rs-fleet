@@ -487,7 +487,6 @@ pub fn parse_access_token_response(body: &[u8]) -> Result<String, GithubError> {
     Ok(token)
 }
 
-
 /// Parse a `GET /user` response.
 ///
 /// # Errors
@@ -812,7 +811,6 @@ pub async fn exchange_code(
     }
     parse_access_token_response(&body)
 }
-
 
 /// Resolve an access token to the GitHub account that authorised it.
 ///

@@ -40,12 +40,12 @@ use anyhow::{Context, Result};
 use tracing::warn;
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_coordinator::state::{AUTH_KEY_PURPOSE_CI, AUTH_KEY_PURPOSE_NODE, Db};
+use fleet_coordinator::state::{Db, AUTH_KEY_PURPOSE_CI, AUTH_KEY_PURPOSE_NODE};
 use fleet_proto::ids::{OrgId, Role};
 
 use crate::cli::{AuthKeyArgs, UserTokenArgs};
 use crate::paths;
-use crate::roles::auth_key::{PURPOSE_AGENT_ALIAS, identity_epilogue, normalise_identity_name};
+use crate::roles::auth_key::{identity_epilogue, normalise_identity_name, PURPOSE_AGENT_ALIAS};
 
 /// Open the coordinator's database from its config file.
 async fn open_db(config_dir: Option<std::path::PathBuf>) -> Result<(Db, OrgId, u64)> {
@@ -455,7 +455,10 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
         .await
         .context("recording the session")?;
 
-    println!("Session token for '{}' in org '{org}' ({role}):", args.login);
+    println!(
+        "Session token for '{}' in org '{org}' ({role}):",
+        args.login
+    );
     println!();
     println!("  {}", token.to_secret_string());
     println!();
@@ -660,7 +663,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(meta.ops.is_empty(), "empty ops let DEFAULT_CI_KEY_OPS apply");
+        assert!(
+            meta.ops.is_empty(),
+            "empty ops let DEFAULT_CI_KEY_OPS apply"
+        );
     }
 
     /// A tagless CI key could never redeem — and its empty tag set would be an

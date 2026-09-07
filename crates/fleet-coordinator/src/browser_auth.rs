@@ -308,11 +308,8 @@ fn with_cookies(mut response: Response, cookies: &[String]) -> Response {
 
 /// A 302 to `location`, carrying `cookies`.
 fn redirect(location: &str, cookies: &[String]) -> Response {
-    let mut response = (
-        StatusCode::FOUND,
-        [(header::LOCATION, location.to_owned())],
-    )
-        .into_response();
+    let mut response =
+        (StatusCode::FOUND, [(header::LOCATION, location.to_owned())]).into_response();
     for cookie in cookies {
         if let Ok(value) = axum::http::HeaderValue::from_str(cookie) {
             response.headers_mut().append(header::SET_COOKIE, value);
@@ -523,7 +520,8 @@ async fn github_callback(
     };
 
     let query = query.unwrap_or_default();
-    let (Some(code), Some(state)) = (query_pair(&query, "code"), query_pair(&query, "state")) else {
+    let (Some(code), Some(state)) = (query_pair(&query, "code"), query_pair(&query, "state"))
+    else {
         warn!("an authorization-code callback arrived without both `code` and `state`");
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
@@ -549,14 +547,14 @@ async fn github_callback(
     // replayed callback finds no cookie and is refused by the branch above.
     let spent = clear_cookie(OAUTH_COOKIE, true);
 
-    let access_token = match github::exchange_code(&app, code, &redirect_uri(&coord), &verifier).await
-    {
-        Ok(token) => token,
-        Err(e) => {
-            warn!(error = %e, "the GitHub authorization-code exchange failed");
-            return with_cookies(reject(StatusCode::UNAUTHORIZED, "invalid_grant"), &[spent]);
-        }
-    };
+    let access_token =
+        match github::exchange_code(&app, code, &redirect_uri(&coord), &verifier).await {
+            Ok(token) => token,
+            Err(e) => {
+                warn!(error = %e, "the GitHub authorization-code exchange failed");
+                return with_cookies(reject(StatusCode::UNAUTHORIZED, "invalid_grant"), &[spent]);
+            }
+        };
 
     match complete_github_login(&coord, &app, &access_token, "github authorization code").await {
         Ok(cookies) => {
@@ -623,14 +621,14 @@ async fn complete_github_login(
     }
 
     let ttl = coord.config().session_ttl_secs;
-    let (token, expires) = match mint_session_for_user(coord, &org, &user_id, ttl, audit_detail).await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(error = %e, "failed to mint a session token after a browser login");
-            return Err(reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error"));
-        }
-    };
+    let (token, expires) =
+        match mint_session_for_user(coord, &org, &user_id, ttl, audit_detail).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to mint a session token after a browser login");
+                return Err(reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error"));
+            }
+        };
     Ok(session_cookies(coord, &token, expires))
 }
 
@@ -683,9 +681,7 @@ async fn device_start(State(coord): State<Arc<Coordinator>>) -> Response {
             // conservative direction: a code outside it means GitHub changed
             // its wire format, and the operator should hear that as a failed
             // login rather than as a cookie behaving strangely.
-            if grant.device_code.is_empty()
-                || !grant.device_code.bytes().all(is_cookie_byte)
-            {
+            if grant.device_code.is_empty() || !grant.device_code.bytes().all(is_cookie_byte) {
                 warn!(
                     "GitHub returned a device code outside the cookie token charset; \
                      refusing to broker it"

@@ -169,15 +169,11 @@ async fn every_non_relay_verb_is_refused_on_the_delegated_route() {
         ),
         (
             "extending the lease it was lent",
-            SidecarToCoord::Extend {
-                lease: grant.lease,
-            },
+            SidecarToCoord::Extend { lease: grant.lease },
         ),
         (
             "releasing the lease it was lent",
-            SidecarToCoord::Release {
-                lease: grant.lease,
-            },
+            SidecarToCoord::Release { lease: grant.lease },
         ),
         ("listing the org's grants", SidecarToCoord::GrantList),
         (
@@ -277,16 +273,16 @@ async fn a_token_stops_working_the_moment_its_lease_is_released() {
     .await;
     // It works before the release.
     assert_eq!(
-        fleet.upgrade_status("/delegate", Some(&hex(&grant.token))).await,
+        fleet
+            .upgrade_status("/delegate", Some(&hex(&grant.token)))
+            .await,
         101
     );
 
     // Alice, the delegator, takes the board back.
     let alice = fleet.client_session(&alice_token).await;
     match alice
-        .request(SidecarToCoord::Release {
-            lease: grant.lease,
-        })
+        .request(SidecarToCoord::Release { lease: grant.lease })
         .await
         .unwrap()
     {
@@ -296,7 +292,9 @@ async fn a_token_stops_working_the_moment_its_lease_is_released() {
 
     // The token is cryptographically valid and unexpired — and useless.
     assert_eq!(
-        fleet.upgrade_status("/delegate", Some(&hex(&grant.token))).await,
+        fleet
+            .upgrade_status("/delegate", Some(&hex(&grant.token)))
+            .await,
         401,
         "releasing the lease is how a delegation is revoked"
     );
@@ -350,7 +348,10 @@ async fn bad_credentials_are_refused_uniformly() {
     let cases: &[(&str, Option<String>)] = &[
         ("no credential at all", None),
         ("not hex", Some("hello, world".to_owned())),
-        ("hex but too short to be a token", Some("deadbeef".to_owned())),
+        (
+            "hex but too short to be a token",
+            Some("deadbeef".to_owned()),
+        ),
         ("a token signed by another key", Some(hex(&forged))),
         ("a token that has expired", Some(hex(&expired))),
         // The two credential types must not cross.
@@ -380,7 +381,9 @@ async fn a_capability_token_is_not_accepted_on_the_client_route() {
     )
     .await;
     assert_eq!(
-        fleet.upgrade_status("/client", Some(&hex(&grant.token))).await,
+        fleet
+            .upgrade_status("/client", Some(&hex(&grant.token)))
+            .await,
         401,
         "a capability token confers no fleet identity"
     );

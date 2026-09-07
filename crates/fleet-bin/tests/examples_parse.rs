@@ -73,8 +73,7 @@ fn the_node_example_documents_both_adopt_policies_and_they_parse() {
         let uncommented = text
             .replace("# adopt = ", "adopt = ")
             .replace("adopt = \"declared\"", &format!("adopt = \"{policy}\""));
-        let settings: fleet_bin::roles::agent::NodeSettings =
-            toml::from_str(&uncommented).unwrap();
+        let settings: fleet_bin::roles::agent::NodeSettings = toml::from_str(&uncommented).unwrap();
         assert_eq!(
             settings.adopt.map(fleet_proto::AdoptPolicy::as_str),
             Some(policy),

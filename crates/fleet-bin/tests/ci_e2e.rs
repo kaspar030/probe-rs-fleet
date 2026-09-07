@@ -55,7 +55,9 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 /// reason that has nothing to do with it, which turns one failure into a
 /// cascade and hides the real one.
 fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 const SEED: [u8; 32] = [31u8; 32];
@@ -392,10 +394,7 @@ async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
             "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
             github.state.request_token.clone(),
         ),
-        (
-            "GITHUB_ENV",
-            github_env.to_string_lossy().into_owned(),
-        ),
+        ("GITHUB_ENV", github_env.to_string_lossy().into_owned()),
     ]);
 
     fleet_bin::roles::ci::run(args(&fleet, dir.path()))
@@ -411,10 +410,7 @@ async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
         token_line.starts_with("prfw1_"),
         "a workload token, not something else: {token_line}"
     );
-    assert!(written.contains(&format!(
-        "PROBE_RS_FLEET_COORDINATOR={}\n",
-        fleet.base_url
-    )));
+    assert!(written.contains(&format!("PROBE_RS_FLEET_COORDINATOR={}\n", fleet.base_url)));
 
     // The CLI forwarded the audience it was given, rather than inventing one.
     assert_eq!(
@@ -539,7 +535,9 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
 
     let mut a = args(&fleet, dir.path());
     a.auth_key = Some(key.to_secret_string());
-    fleet_bin::roles::ci::run(a).await.expect("ci login --auth-key");
+    fleet_bin::roles::ci::run(a)
+        .await
+        .expect("ci login --auth-key");
 
     let written = std::fs::read_to_string(&github_env).unwrap();
     let token = written
@@ -550,13 +548,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
 
     // Redemption synthesised an ordinary grant, which is what makes the key
     // revocable through the normal path rather than a special case.
-    let grants = fleet
-        .coord
-        .db()
-        .scoped(org)
-        .list_grants()
-        .await
-        .unwrap();
+    let grants = fleet.coord.db().scoped(org).list_grants().await.unwrap();
     assert_eq!(grants.len(), 1);
     assert!(grants[0].id.starts_with("ci-"));
     assert_eq!(grants[0].selector, "tag=nrf52");
@@ -598,7 +590,9 @@ async fn a_named_ci_auth_key_authenticates_as_its_identity() {
 
     let mut a = args(&fleet, dir.path());
     a.auth_key = Some(key.to_secret_string());
-    fleet_bin::roles::ci::run(a).await.expect("ci login --auth-key");
+    fleet_bin::roles::ci::run(a)
+        .await
+        .expect("ci login --auth-key");
 
     let written = std::fs::read_to_string(&github_env).unwrap();
     assert!(written.contains("PROBE_RS_FLEET_TOKEN=prfw1_"), "{written}");

@@ -20,8 +20,8 @@ mod common;
 use common::TestCoordinator;
 
 use fleet_auth::{OpaqueToken, TokenKind};
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 use fleet_proto::ids::Role;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 #[tokio::test]
 async fn no_credential_is_rejected_on_both_planes() {
@@ -51,7 +51,10 @@ async fn a_well_formed_but_unknown_token_is_rejected() {
     let fleet = TestCoordinator::start().await;
     let orphan_node = OpaqueToken::mint(TokenKind::Node).to_secret_string();
     let orphan_session = OpaqueToken::mint(TokenKind::Session).to_secret_string();
-    assert_eq!(fleet.upgrade_status("/agent", Some(&orphan_node)).await, 401);
+    assert_eq!(
+        fleet.upgrade_status("/agent", Some(&orphan_node)).await,
+        401
+    );
     assert_eq!(
         fleet.upgrade_status("/client", Some(&orphan_session)).await,
         401
@@ -149,7 +152,11 @@ async fn other_authorization_schemes_do_not_authenticate() {
             .insert(http::header::AUTHORIZATION, value.parse().unwrap());
         match tokio_tungstenite::connect_async(request).await {
             Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
-                assert_eq!(resp.status().as_u16(), 401, "`{value}` must not authenticate");
+                assert_eq!(
+                    resp.status().as_u16(),
+                    401,
+                    "`{value}` must not authenticate"
+                );
             }
             Ok(_) => panic!("`{value}` must not authenticate"),
             Err(e) => panic!("unexpected dial failure: {e}"),

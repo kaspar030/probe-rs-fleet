@@ -63,9 +63,8 @@ pub fn parse_until(s: &str, now: u64) -> Result<u64, String> {
     } else if s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
         parse_civil_date(s)?
     } else {
-        s.parse::<u64>().map_err(|_| {
-            format!("invalid deadline `{s}`: expected YYYY-MM-DD or epoch seconds")
-        })?
+        s.parse::<u64>()
+            .map_err(|_| format!("invalid deadline `{s}`: expected YYYY-MM-DD or epoch seconds"))?
     };
     if epoch <= now {
         return Err(format!("deadline `{s}` is in the past"));
@@ -160,7 +159,10 @@ mod tests {
     fn a_deadline_in_the_past_is_refused() {
         let now = 1_798_675_200; // 2026-12-31
         assert!(parse_until("2020-01-01", now).is_err());
-        assert!(parse_until("2026-12-31", now).is_err(), "exactly now is past");
+        assert!(
+            parse_until("2026-12-31", now).is_err(),
+            "exactly now is past"
+        );
         assert!(parse_until("2027-01-01", now).is_ok());
     }
 

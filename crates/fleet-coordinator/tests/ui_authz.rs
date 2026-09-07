@@ -176,7 +176,9 @@ async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
 async fn a_board_in_another_org_is_indistinguishable_from_one_that_does_not_exist() {
     let fleet = TestCoordinator::start().await;
     let other = OrgId("other".to_owned());
-    fleet.seed_board(&other, "rpi-9", "secret-dk", &["nrf52"]).await;
+    fleet
+        .seed_board(&other, "rpi-9", "secret-dk", &["nrf52"])
+        .await;
     let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
 
     let (cross, cross_body) = as_browser(
@@ -220,7 +222,11 @@ async fn every_action_the_ui_performs_needs_the_csrf_header() {
         ("DELETE", "/api/v1/leases/1", "{}"),
         ("PATCH", "/api/v1/nodes/rpi-1", r#"{"tags":[]}"#),
         ("DELETE", "/api/v1/nodes/rpi-1", "{}"),
-        ("POST", "/api/v1/nodes/pending/ABCD-1234", r#"{"decision":"inspect"}"#),
+        (
+            "POST",
+            "/api/v1/nodes/pending/ABCD-1234",
+            r#"{"decision":"inspect"}"#,
+        ),
         ("POST", "/api/v1/grants", "{}"),
         ("DELETE", "/api/v1/grants/abcdef0123456789", "{}"),
         ("POST", "/api/v1/auth-keys", r#"{"ttl_secs":3600}"#),
@@ -231,6 +237,9 @@ async fn every_action_the_ui_performs_needs_the_csrf_header() {
             .http_full(method, path, &[("cookie", &cookie)], Some(body.to_owned()))
             .await;
         assert_eq!(status, 403, "{method} {path} without CSRF: {response}");
-        assert!(response.contains("forbidden"), "{method} {path}: {response}");
+        assert!(
+            response.contains("forbidden"),
+            "{method} {path}: {response}"
+        );
     }
 }

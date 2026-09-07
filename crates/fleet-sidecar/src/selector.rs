@@ -320,9 +320,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     let coordinator = env.get(env::COORDINATOR).filter(|s| !s.is_empty());
     let token = env.get(env::TOKEN).filter(|s| !s.is_empty());
     let capability = env.get(env::CAPABILITY).filter(|s| !s.is_empty());
-    let pin = env
-        .get(env::SERVER_CERT_SHA256)
-        .filter(|s| !s.is_empty());
+    let pin = env.get(env::SERVER_CERT_SHA256).filter(|s| !s.is_empty());
     // A malformed value falls back to the default rather than failing the
     // invocation: this tunes patience, and refusing to run over it would be a
     // worse outcome than waiting the default five minutes.
@@ -403,10 +401,8 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
 /// board; `PROBE_RS_FLEET_BOARD` / `PROBE_RS_FLEET_ID` are the shorthands for
 /// those two.
 fn parse_select(expr: &str) -> Result<Constraint, SelectorError> {
-    fleet_proto::lease::parse_constraint(expr).map_err(|e| {
-        SelectorError::InvalidSelect {
-            reason: e.to_string(),
-        }
+    fleet_proto::lease::parse_constraint(expr).map_err(|e| SelectorError::InvalidSelect {
+        reason: e.to_string(),
     })
 }
 

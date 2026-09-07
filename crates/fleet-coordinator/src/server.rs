@@ -170,9 +170,11 @@ async fn agent_read_loop(
                     pending = Some(p);
                     next_rotation_id = next_rotation_id.wrapping_add(1);
                 }
-                None => break Err(CoordinatorError::Protocol(
-                    "agent writer closed during rotation".to_owned(),
-                )),
+                None => {
+                    break Err(CoordinatorError::Protocol(
+                        "agent writer closed during rotation".to_owned(),
+                    ))
+                }
             }
         }
 
@@ -355,7 +357,9 @@ async fn complete_rotation(
 ) {
     let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
     let org = fleet_proto::ids::OrgId(auth.org_id.clone());
-    let matches = pending.as_ref().is_some_and(|p| p.rotation_id == rotation_id);
+    let matches = pending
+        .as_ref()
+        .is_some_and(|p| p.rotation_id == rotation_id);
     if !matches {
         // A late ack for a rotation we already abandoned, or one we never sent.
         // Ignored — promoting an unknown hash would lock the node out.
@@ -412,7 +416,12 @@ async fn complete_rotation(
 /// # Errors
 ///
 /// Returns a [`CoordinatorError`] when the connection ends.
-pub async fn handle_sidecar(coord: Arc<Coordinator>, tx: BoxTx, rx: BoxRx, subject: Subject) -> Result<()> {
+pub async fn handle_sidecar(
+    coord: Arc<Coordinator>,
+    tx: BoxTx,
+    rx: BoxRx,
+    subject: Subject,
+) -> Result<()> {
     let (out_tx, ping_tx, writer_task) = spawn_sidecar_writer(tx);
 
     // One `RequesterId` per connection, not per subject: it tags this
@@ -776,13 +785,9 @@ mod tests {
         let coord_clone = Arc::clone(&coord);
         let id = agent_id.clone();
         let agent_task = tokio::spawn(async move {
-            let _ = handle_agent_for_test(
-                coord_clone,
-                Box::new(server_tx),
-                Box::new(server_rx),
-                id,
-            )
-            .await;
+            let _ =
+                handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id)
+                    .await;
         });
 
         // A control report (exercising the demux path) ...
@@ -823,13 +828,9 @@ mod tests {
         let coord_clone = Arc::clone(&coord);
         let id = agent_id.clone();
         let agent_task = tokio::spawn(async move {
-            let _ = handle_agent_for_test(
-                coord_clone,
-                Box::new(server_tx),
-                Box::new(server_rx),
-                id,
-            )
-            .await;
+            let _ =
+                handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id)
+                    .await;
         });
 
         // Wait for handle_agent to register the connection, then push a command.
@@ -844,7 +845,10 @@ mod tests {
             .await
             .unwrap();
 
-        match fleet_wire::recv::<CoordToAgent>(&mut peer_rx).await.unwrap() {
+        match fleet_wire::recv::<CoordToAgent>(&mut peer_rx)
+            .await
+            .unwrap()
+        {
             CoordToAgent::Command(CoordinatorCommand::QueryState) => {}
             other => panic!("expected QueryState command, got {other:?}"),
         }

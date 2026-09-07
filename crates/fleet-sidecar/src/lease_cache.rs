@@ -100,10 +100,7 @@ impl CachedLease {
     /// accounting for the refresh margin.
     #[must_use]
     pub fn is_valid(&self, now_secs: u64) -> bool {
-        self.grant
-            .expires
-            .saturating_sub(self.refresh_margin_secs)
-            > now_secs
+        self.grant.expires.saturating_sub(self.refresh_margin_secs) > now_secs
     }
 }
 
@@ -250,7 +247,11 @@ mod tests {
         let mut cache = LeaseCache::new();
         let alice_a = subject_in("org-a", "alice").key();
         let alice_b = subject_in("org-b", "alice").key();
-        cache.insert(&board_sel(), &alice_a, CachedLease::new(grant(1000, "alice")));
+        cache.insert(
+            &board_sel(),
+            &alice_a,
+            CachedLease::new(grant(1000, "alice")),
+        );
         assert!(cache.get(&board_sel(), &alice_b, 500).is_none());
         assert!(cache.get(&board_sel(), &alice_a, 500).is_some());
     }
@@ -310,6 +311,8 @@ mod tests {
         );
         cache.evict_expired(1500);
         assert_eq!(cache.len(), 1);
-        assert!(cache.get(&Constraint::Chip("c".to_owned()), &p, 1500).is_some());
+        assert!(cache
+            .get(&Constraint::Chip("c".to_owned()), &p, 1500)
+            .is_some());
     }
 }

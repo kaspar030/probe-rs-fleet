@@ -28,7 +28,10 @@ async fn operator_request(
     token: &str,
     msg: SidecarToCoord,
 ) -> CoordToSidecar {
-    let (tx, rx) = fleet.dial("/client", token).await.expect("upgrade accepted");
+    let (tx, rx) = fleet
+        .dial("/client", token)
+        .await
+        .expect("upgrade accepted");
     let session = fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
         .await
         .expect("handshake");
@@ -132,7 +135,10 @@ async fn a_credential_resolves_into_its_own_org_not_the_configured_default() {
     );
 
     let (node_token, node) = fleet.seed_node("acme", "rpi-1").await;
-    assert_eq!(fleet.upgrade_status("/client", Some(&node_token)).await, 403);
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(&node_token)).await,
+        403
+    );
 
     let rows: Vec<(String, Option<String>, String)> =
         sqlx::query_as("SELECT org_id, subject, action FROM audit_log")

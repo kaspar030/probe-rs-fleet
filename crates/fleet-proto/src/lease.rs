@@ -42,7 +42,6 @@ pub enum Constraint {
     Chip(String),
 }
 
-
 /// Why a selector expression could not be parsed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConstraintParseError {
@@ -255,7 +254,9 @@ pub enum Priority {
 pub enum LeaseOutcome {
     Granted(LeaseGrant),
     /// No board free; position in the queue (0-based).
-    Queued { position: u32 },
+    Queued {
+        position: u32,
+    },
 }
 
 /// A granted lease. The capability `token` is verified locally by the agent;
@@ -377,7 +378,9 @@ mod tests {
         );
         assert_eq!(
             parse_constraint("colour=red"),
-            Err(ConstraintParseError::UnsupportedTerm("colour=red".to_owned()))
+            Err(ConstraintParseError::UnsupportedTerm(
+                "colour=red".to_owned()
+            ))
         );
     }
 
@@ -451,10 +454,7 @@ mod tests {
             parse_constraint("nrf52 && tag=lab").unwrap().to_string(),
             "tag=nrf52 && tag=lab"
         );
-        assert_eq!(
-            parse_constraint("id=b1").unwrap().to_string(),
-            "id=b1"
-        );
+        assert_eq!(parse_constraint("id=b1").unwrap().to_string(), "id=b1");
         assert_eq!(
             parse_constraint("board=nrf52840dk").unwrap().to_string(),
             "board=nrf52840dk"

@@ -207,7 +207,12 @@ mod tests {
         }
     }
 
-    fn grant(org_name: &str, selector: Constraint, ops: &[AllowedOp], expires: Option<u64>) -> GrantScope {
+    fn grant(
+        org_name: &str,
+        selector: Constraint,
+        ops: &[AllowedOp],
+        expires: Option<u64>,
+    ) -> GrantScope {
         GrantScope {
             id: format!("g-{org_name}"),
             org: org(org_name),
@@ -249,7 +254,12 @@ mod tests {
         };
         let expired = Access {
             own_org: Some(org("b")),
-            grants: vec![grant("a", tags(&["nrf52"]), &[AllowedOp::Attach], Some(NOW))],
+            grants: vec![grant(
+                "a",
+                tags(&["nrf52"]),
+                &[AllowedOp::Attach],
+                Some(NOW),
+            )],
         };
         let selector_miss = Access {
             own_org: Some(org("b")),
@@ -289,34 +299,148 @@ mod tests {
         #[allow(clippy::type_complexity)]
         let cases: &[(&str, &Access, &Board, AllowedOp, bool)] = &[
             // Ownership confers everything, including ops no grant listed.
-            ("member of the board's org may attach", &member_of_a, &a_board, AllowedOp::Attach, true),
-            ("member of the board's org may power-cycle", &member_of_a, &a_board, AllowedOp::PowerCycle, true),
+            (
+                "member of the board's org may attach",
+                &member_of_a,
+                &a_board,
+                AllowedOp::Attach,
+                true,
+            ),
+            (
+                "member of the board's org may power-cycle",
+                &member_of_a,
+                &a_board,
+                AllowedOp::PowerCycle,
+                true,
+            ),
             // A member of another org is not admitted by membership.
-            ("non-member, no grant, is denied", &outsider, &a_board, AllowedOp::Attach, false),
+            (
+                "non-member, no grant, is denied",
+                &outsider,
+                &a_board,
+                AllowedOp::Attach,
+                false,
+            ),
             // A grant confers exactly its ops, and no more.
-            ("grantee may use a granted op", &granted_flash, &a_board, AllowedOp::Flash, true),
-            ("grantee may not use an ungranted op", &granted_flash, &a_board, AllowedOp::Gdb, false),
-            ("grantee may not power-cycle without the op", &granted_flash, &a_board, AllowedOp::PowerCycle, false),
+            (
+                "grantee may use a granted op",
+                &granted_flash,
+                &a_board,
+                AllowedOp::Flash,
+                true,
+            ),
+            (
+                "grantee may not use an ungranted op",
+                &granted_flash,
+                &a_board,
+                AllowedOp::Gdb,
+                false,
+            ),
+            (
+                "grantee may not power-cycle without the op",
+                &granted_flash,
+                &a_board,
+                AllowedOp::PowerCycle,
+                false,
+            ),
             // Time and selector.
-            ("an expired grant confers nothing", &expired, &a_board, AllowedOp::Attach, false),
-            ("a grant whose selector misses confers nothing", &selector_miss, &a_board, AllowedOp::Attach, false),
+            (
+                "an expired grant confers nothing",
+                &expired,
+                &a_board,
+                AllowedOp::Attach,
+                false,
+            ),
+            (
+                "a grant whose selector misses confers nothing",
+                &selector_miss,
+                &a_board,
+                AllowedOp::Attach,
+                false,
+            ),
             // The degenerate individual-board grant.
-            ("id= is a normal selector", &by_board_name, &a_board, AllowedOp::Attach, true),
-            ("chip= is a normal selector", &by_chip, &a_board, AllowedOp::Gdb, true),
+            (
+                "id= is a normal selector",
+                &by_board_name,
+                &a_board,
+                AllowedOp::Attach,
+                true,
+            ),
+            (
+                "chip= is a normal selector",
+                &by_chip,
+                &a_board,
+                AllowedOp::Gdb,
+                true,
+            ),
             // board= is the MODEL selector: it covers EVERY board of that
             // model in the granting org, and nothing else.
-            ("board= covers one board of the model", &by_model, &a_dk_1, AllowedOp::Attach, true),
-            ("board= covers every board of the model", &by_model, &a_dk_2, AllowedOp::Attach, true),
-            ("board= does not cover another model", &by_model, &a_other_model, AllowedOp::Attach, false),
-            ("board= never matches a board with no model", &by_model, &a_no_model, AllowedOp::Attach, false),
-            ("board= confers only its ops", &by_model, &a_dk_1, AllowedOp::Flash, false),
+            (
+                "board= covers one board of the model",
+                &by_model,
+                &a_dk_1,
+                AllowedOp::Attach,
+                true,
+            ),
+            (
+                "board= covers every board of the model",
+                &by_model,
+                &a_dk_2,
+                AllowedOp::Attach,
+                true,
+            ),
+            (
+                "board= does not cover another model",
+                &by_model,
+                &a_other_model,
+                AllowedOp::Attach,
+                false,
+            ),
+            (
+                "board= never matches a board with no model",
+                &by_model,
+                &a_no_model,
+                AllowedOp::Attach,
+                false,
+            ),
+            (
+                "board= confers only its ops",
+                &by_model,
+                &a_dk_1,
+                AllowedOp::Flash,
+                false,
+            ),
             // THE ORG FENCE: a grant issued by org A must not reach org C's
             // identically tagged board, even though the selector matches it.
-            ("a grant never crosses into a third org", &granted_flash, &c_board, AllowedOp::Flash, false),
-            ("an id= grant never crosses either", &by_board_name, &c_board, AllowedOp::Attach, false),
-            ("a model grant never crosses either", &by_model, &c_dk, AllowedOp::Attach, false),
+            (
+                "a grant never crosses into a third org",
+                &granted_flash,
+                &c_board,
+                AllowedOp::Flash,
+                false,
+            ),
+            (
+                "an id= grant never crosses either",
+                &by_board_name,
+                &c_board,
+                AllowedOp::Attach,
+                false,
+            ),
+            (
+                "a model grant never crosses either",
+                &by_model,
+                &c_dk,
+                AllowedOp::Attach,
+                false,
+            ),
             // Deny by default.
-            ("empty access allows nothing", &Access::none(), &a_board, AllowedOp::Attach, false),
+            (
+                "empty access allows nothing",
+                &Access::none(),
+                &a_board,
+                AllowedOp::Attach,
+                false,
+            ),
         ];
 
         for (why, access, board, op, expected) in cases {

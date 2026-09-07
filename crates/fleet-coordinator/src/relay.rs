@@ -160,7 +160,10 @@ pub async fn close_channel(
             .send_command(CoordinatorCommand::KillSession { channel })
             .await;
     }
-    let _ = route.sidecar.send(CoordToSidecar::ChannelClosed { channel }).await;
+    let _ = route
+        .sidecar
+        .send(CoordToSidecar::ChannelClosed { channel })
+        .await;
     true
 }
 

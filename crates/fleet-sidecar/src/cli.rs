@@ -120,7 +120,10 @@ impl ProbeRsInvocation {
     /// promptly; streaming ones hold the session open and stream stdout.
     #[must_use]
     pub fn is_streaming(&self) -> bool {
-        matches!(self, Self::Run { .. } | Self::Attach { .. } | Self::Gdb { .. })
+        matches!(
+            self,
+            Self::Run { .. } | Self::Attach { .. } | Self::Gdb { .. }
+        )
     }
 }
 
@@ -361,10 +364,15 @@ fn extract_value_flag(args: &[String], flag: &str) -> (Option<String>, Vec<Strin
 /// invocations and keeps every other token in `extra` for a faithful argv
 /// round-trip.
 fn split_elf(positionals: Vec<String>) -> (Option<String>, Vec<String>) {
-    let elf_idx = positionals
-        .iter()
-        .position(|p| looks_like_elf(p))
-        .or(if positionals.is_empty() { None } else { Some(0) });
+    let elf_idx =
+        positionals
+            .iter()
+            .position(|p| looks_like_elf(p))
+            .or(if positionals.is_empty() {
+                None
+            } else {
+                Some(0)
+            });
     match elf_idx {
         Some(idx) => {
             let mut rest = positionals;
@@ -464,13 +472,7 @@ mod tests {
 
     #[test]
     fn parses_erase_with_allow_erase_all() {
-        let inv = parse_str(&[
-            "probe-rs",
-            "erase",
-            "--chip",
-            "nrf52",
-            "--allow-erase-all",
-        ]);
+        let inv = parse_str(&["probe-rs", "erase", "--chip", "nrf52", "--allow-erase-all"]);
         assert_eq!(
             inv,
             ProbeRsInvocation::Erase {

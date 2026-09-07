@@ -156,7 +156,11 @@ mod tests {
         db.insert_auth_key(&org, key.hash().as_str(), &[], true, None, None, 1_000)
             .await
             .unwrap();
-        assert!(db.consume_auth_key(key.hash().as_str(), 1_500).await.unwrap().is_some());
+        assert!(db
+            .consume_auth_key(key.hash().as_str(), 1_500)
+            .await
+            .unwrap()
+            .is_some());
         assert!(db.lookup_auth_key(&key.hash()).await.unwrap().is_none());
     }
 
@@ -300,9 +304,15 @@ mod tests {
     #[tokio::test]
     async fn no_login_can_produce_the_reserved_slug() {
         let db = Db::connect_in_memory().await.unwrap();
-        for (i, login) in ["system:gha", "system gha", "SYSTEM:GHA", "gha", "system-gha"]
-            .into_iter()
-            .enumerate()
+        for (i, login) in [
+            "system:gha",
+            "system gha",
+            "SYSTEM:GHA",
+            "gha",
+            "system-gha",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let gh_id = 1000 + i64::try_from(i).unwrap();
             let (_user, org, _created) = db
@@ -314,7 +324,10 @@ mod tests {
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
-            assert_ne!(slug, "system:gha", "login {login:?} reached the reserved slug");
+            assert_ne!(
+                slug, "system:gha",
+                "login {login:?} reached the reserved slug"
+            );
             assert!(!slug.contains(':'), "login {login:?} produced {slug:?}");
         }
     }

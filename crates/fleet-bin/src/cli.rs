@@ -940,11 +940,7 @@ pub struct CtlClientArgs {
     pub token: Option<String>,
     /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
     /// self-hosted deployment with no publicly trusted certificate.
-    #[arg(
-        long,
-        env = "PROBE_RS_FLEET_SERVER_CERT_SHA256",
-        global = true
-    )]
+    #[arg(long, env = "PROBE_RS_FLEET_SERVER_CERT_SHA256", global = true)]
     pub server_cert_sha256: Option<String>,
     /// The fleet to talk to. An explicit credential flag takes precedence over
     /// what the fleet file holds.
@@ -1340,8 +1336,14 @@ mod tests {
     #[test]
     fn argv0_other_names_use_clap() {
         let rest = os(&["ctl", "list"]);
-        assert_eq!(dispatch_from_argv0(OsStr::new("fleet"), &rest), Dispatch::Clap);
-        assert_eq!(dispatch_from_argv0(OsStr::new("probe-rsx"), &rest), Dispatch::Clap);
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("fleet"), &rest),
+            Dispatch::Clap
+        );
+        assert_eq!(
+            dispatch_from_argv0(OsStr::new("probe-rsx"), &rest),
+            Dispatch::Clap
+        );
         assert_eq!(dispatch_from_argv0(OsStr::new(""), &rest), Dispatch::Clap);
     }
 
@@ -1838,7 +1840,10 @@ mod tests {
         ]));
         match cli.command {
             Command::Sidecar(a) => {
-                assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
+                assert_eq!(
+                    a.probe_rs_args,
+                    os(&["run", "--chip", "nRF52840_xxAA", "app.elf"])
+                );
                 assert_eq!(a.board, None);
                 assert_eq!(a.id, None);
                 assert_eq!(a.select, None);
@@ -1864,7 +1869,10 @@ mod tests {
             Command::Sidecar(a) => {
                 assert_eq!(a.select.as_deref(), Some("tag=nrf52"));
                 assert_eq!(a.board, None);
-                assert_eq!(a.probe_rs_args, os(&["run", "--chip", "nRF52840_xxAA", "app.elf"]));
+                assert_eq!(
+                    a.probe_rs_args,
+                    os(&["run", "--chip", "nRF52840_xxAA", "app.elf"])
+                );
             }
             other => panic!("expected sidecar, got {other:?}"),
         }
@@ -1994,10 +2002,15 @@ mod tests {
     #[test]
     fn parses_ctl_delegate() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "ctl", "delegate",
-            "--select", "tag=nrf52",
-            "--ops", "flash,attach",
-            "--ttl", "2h",
+            "probe-rs-fleet",
+            "ctl",
+            "delegate",
+            "--select",
+            "tag=nrf52",
+            "--ops",
+            "flash,attach",
+            "--ttl",
+            "2h",
         ]));
         match cli.command {
             Command::Ctl(a) => match a.command {
@@ -2017,7 +2030,11 @@ mod tests {
     #[test]
     fn ctl_delegate_defaults_to_flash_attach_for_two_hours() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "ctl", "delegate", "--select", "id=b1",
+            "probe-rs-fleet",
+            "ctl",
+            "delegate",
+            "--select",
+            "id=b1",
         ]));
         match cli.command {
             Command::Ctl(a) => match a.command {
@@ -2034,10 +2051,15 @@ mod tests {
     #[test]
     fn parses_grant_create() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "grant", "bob",
-            "--select", "tag=nrf52",
-            "--ops", "flash,attach",
-            "--until", "2026-12-31",
+            "probe-rs-fleet",
+            "grant",
+            "bob",
+            "--select",
+            "tag=nrf52",
+            "--ops",
+            "flash,attach",
+            "--until",
+            "2026-12-31",
         ]));
         match cli.command {
             Command::Grant(a) => {
@@ -2075,10 +2097,15 @@ mod tests {
     #[test]
     fn grant_until_and_ttl_conflict() {
         let e = Cli::try_parse_from(os(&[
-            "probe-rs-fleet", "grant", "bob",
-            "--select", "tag=nrf52",
-            "--until", "2026-12-31",
-            "--ttl", "30d",
+            "probe-rs-fleet",
+            "grant",
+            "bob",
+            "--select",
+            "tag=nrf52",
+            "--until",
+            "2026-12-31",
+            "--ttl",
+            "30d",
         ]));
         assert!(e.is_err(), "--until and --ttl must not be combinable");
     }
@@ -2099,7 +2126,11 @@ mod tests {
         }
         // The unambiguous spellings still reach the creation form.
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "grant", "gh-1234", "--select", "tag=nrf52",
+            "probe-rs-fleet",
+            "grant",
+            "gh-1234",
+            "--select",
+            "tag=nrf52",
         ]));
         match cli.command {
             Command::Grant(a) => assert_eq!(a.subject.as_deref(), Some("gh-1234")),
@@ -2113,7 +2144,12 @@ mod tests {
         assert!(matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List)));
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "ctl", "lease", "nrf52840-dk-3", "--duration", "600",
+            "probe-rs-fleet",
+            "ctl",
+            "lease",
+            "nrf52840-dk-3",
+            "--duration",
+            "600",
         ]));
         match cli.command {
             Command::Ctl(a) => match a.command {
@@ -2140,15 +2176,22 @@ mod tests {
     fn ctl_client_flags_parse() {
         let pin = "ab".repeat(32);
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "ctl",
-            "--coordinator", "https://coord.example",
-            "--token", "prfs1_abc",
-            "--server-cert-sha256", &pin,
+            "probe-rs-fleet",
+            "ctl",
+            "--coordinator",
+            "https://coord.example",
+            "--token",
+            "prfs1_abc",
+            "--server-cert-sha256",
+            &pin,
             "who",
         ]));
         match cli.command {
             Command::Ctl(a) => {
-                assert_eq!(a.client.coordinator.as_deref(), Some("https://coord.example"));
+                assert_eq!(
+                    a.client.coordinator.as_deref(),
+                    Some("https://coord.example")
+                );
                 assert_eq!(a.client.token.as_deref(), Some("prfs1_abc"));
                 assert_eq!(a.client.server_cert_sha256.as_deref(), Some(pin.as_str()));
                 assert!(matches!(a.command, CtlCommand::Who));
@@ -2184,7 +2227,11 @@ mod tests {
 
         // The person form still works untouched.
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "grant", "bob", "--select", "tag=nrf52",
+            "probe-rs-fleet",
+            "grant",
+            "bob",
+            "--select",
+            "tag=nrf52",
         ]));
         match cli.command {
             Command::Grant(a) => {
@@ -2196,7 +2243,13 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(os(&[
-                "probe-rs-fleet", "grant", "bob", "--repo", "a/b", "--select", "tag=x",
+                "probe-rs-fleet",
+                "grant",
+                "bob",
+                "--repo",
+                "a/b",
+                "--select",
+                "tag=x",
             ]))
             .is_err(),
             "a person and a repo at once must be refused, not silently resolved"
@@ -2229,7 +2282,13 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "ci", "login", "--fleet-url", "https://f", "--auth-key", "prffk1_x",
+            "probe-rs-fleet",
+            "ci",
+            "login",
+            "--fleet-url",
+            "https://f",
+            "--auth-key",
+            "prffk1_x",
         ]));
         match cli.command {
             Command::Ci(a) => match a.command {
@@ -2257,8 +2316,15 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "auth-key", "create", "--purpose", "ci", "--tag", "nrf52",
-            "--ops", "flash,attach",
+            "probe-rs-fleet",
+            "auth-key",
+            "create",
+            "--purpose",
+            "ci",
+            "--tag",
+            "nrf52",
+            "--ops",
+            "flash,attach",
         ]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
@@ -2274,7 +2340,11 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(os(&[
-                "probe-rs-fleet", "auth-key", "create", "--purpose", "wat",
+                "probe-rs-fleet",
+                "auth-key",
+                "create",
+                "--purpose",
+                "wat",
             ]))
             .is_err(),
             "an unrecognised purpose must be a parse error, never a silent default"
@@ -2287,8 +2357,15 @@ mod tests {
     #[test]
     fn auth_key_create_parses_an_identity_name_and_the_agent_purpose() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "auth-key", "create", "--purpose", "agent", "--tag", "nrf52",
-            "--as", "builder",
+            "probe-rs-fleet",
+            "auth-key",
+            "create",
+            "--purpose",
+            "agent",
+            "--tag",
+            "nrf52",
+            "--as",
+            "builder",
         ]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
@@ -2317,8 +2394,17 @@ mod tests {
     #[test]
     fn coordinator_auth_key_parses_an_identity_name_and_the_agent_purpose() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet", "coordinator", "auth-key", "--purpose", "agent", "--tag", "desk",
-            "--as", "builder", "--ttl", "0",
+            "probe-rs-fleet",
+            "coordinator",
+            "auth-key",
+            "--purpose",
+            "agent",
+            "--tag",
+            "desk",
+            "--as",
+            "builder",
+            "--ttl",
+            "0",
         ]));
         match cli.command {
             Command::Coordinator(a) => match a.command {

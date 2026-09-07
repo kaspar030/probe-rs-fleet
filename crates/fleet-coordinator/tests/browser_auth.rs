@@ -132,7 +132,10 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn access_token(State(state): State<Arc<StubState>>, body: String) -> Json<serde_json::Value> {
+async fn access_token(
+    State(state): State<Arc<StubState>>,
+    body: String,
+) -> Json<serde_json::Value> {
     for (k, v) in form_pairs(&body) {
         match k.as_str() {
             "client_id" => state.seen_client_ids.lock().unwrap().push(v),
@@ -151,7 +154,10 @@ async fn access_token(State(state): State<Arc<StubState>>, body: String) -> Json
     }))
 }
 
-async fn device_code(State(state): State<Arc<StubState>>, _body: String) -> Json<serde_json::Value> {
+async fn device_code(
+    State(state): State<Arc<StubState>>,
+    _body: String,
+) -> Json<serde_json::Value> {
     state.polls.store(0, Ordering::SeqCst);
     Json(json!({
         "device_code": "dc-abc123",
@@ -193,7 +199,9 @@ fn header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
 
 /// Drive `/auth/github/start` and return `(state parameter, flow cookie)`.
 async fn begin_authorization_code(fleet: &TestCoordinator) -> (String, String) {
-    let (status, headers, _) = fleet.http_full("GET", "/auth/github/start", &[], None).await;
+    let (status, headers, _) = fleet
+        .http_full("GET", "/auth/github/start", &[], None)
+        .await;
     assert_eq!(status, 302, "start must redirect to GitHub");
     let location = header(&headers, "location").expect("a Location header");
     let state = location
@@ -217,7 +225,9 @@ async fn an_authorization_code_login_yields_a_working_cookie_session() {
     })
     .await;
 
-    let (status, headers, _) = fleet.http_full("GET", "/auth/github/start", &[], None).await;
+    let (status, headers, _) = fleet
+        .http_full("GET", "/auth/github/start", &[], None)
+        .await;
     assert_eq!(status, 302);
     let location = header(&headers, "location").unwrap().to_owned();
     assert!(
@@ -226,7 +236,10 @@ async fn an_authorization_code_login_yields_a_working_cookie_session() {
     );
     // PKCE parameters are sent even though GitHub ignores them; `state` and the
     // client secret are what actually protect the callback.
-    assert!(location.contains("code_challenge_method=S256"), "{location}");
+    assert!(
+        location.contains("code_challenge_method=S256"),
+        "{location}"
+    );
     assert!(location.contains("client_id=Iv1.test-client"), "{location}");
 
     let flow_cookie = set_cookie(&headers, "prfs_oauth").expect("a login-flow cookie");
@@ -241,7 +254,10 @@ async fn an_authorization_code_login_yields_a_working_cookie_session() {
         .http_full(
             "GET",
             &format!("/auth/github/callback?code=abc&state={state}"),
-            &[("cookie", &format!("prfs_oauth={}", cookie_body(flow_cookie)))],
+            &[(
+                "cookie",
+                &format!("prfs_oauth={}", cookie_body(flow_cookie)),
+            )],
             None,
         )
         .await;
@@ -305,7 +321,10 @@ async fn the_session_cookie_carries_the_promised_attributes() {
 
     let session = set_cookie(&headers, "prfs_session").unwrap();
     for attribute in ["HttpOnly", "Secure", "SameSite=Lax", "Path=/"] {
-        assert!(session.contains(attribute), "{attribute} missing: {session}");
+        assert!(
+            session.contains(attribute),
+            "{attribute} missing: {session}"
+        );
     }
     let max_age: i64 = session
         .split(';')
@@ -315,7 +334,10 @@ async fn the_session_cookie_carries_the_promised_attributes() {
         .unwrap();
     // Never longer than the row's own lifetime; a browser holding a cookie the
     // database has already dropped is the state D1 rules out.
-    assert!(max_age > 0 && max_age <= i64::try_from(ttl).unwrap(), "{max_age}");
+    assert!(
+        max_age > 0 && max_age <= i64::try_from(ttl).unwrap(),
+        "{max_age}"
+    );
 
     // The CSRF cookie is deliberately readable by the page.
     let csrf = set_cookie(&headers, "prfs_csrf").unwrap();
@@ -542,7 +564,12 @@ async fn the_brokered_device_flow_puts_no_secret_in_a_body() {
     let fleet = TestCoordinator::start_with(move |c| c.github = Some(gh_config)).await;
 
     let (status, headers, body) = fleet
-        .http_full("POST", "/api/v1/session/device/start", &[], Some("{}".into()))
+        .http_full(
+            "POST",
+            "/api/v1/session/device/start",
+            &[],
+            Some("{}".into()),
+        )
         .await;
     assert_eq!(status, 200, "{body}");
     let start: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -695,7 +722,11 @@ async fn logout_requires_the_csrf_header_when_the_credential_is_a_cookie() {
         )
         .await;
     assert_eq!(status, 403);
-    assert_eq!(live(&fleet).await, 1, "a refused logout must change nothing");
+    assert_eq!(
+        live(&fleet).await,
+        1,
+        "a refused logout must change nothing"
+    );
 
     // A header, but the wrong value.
     let (status, _, _) = fleet

@@ -432,10 +432,7 @@ signing_key_hex = "{seed}"
         assert_eq!(cfg.ping_interval_secs, default_ping_interval_secs());
         assert_eq!(cfg.pong_timeout_secs, default_pong_timeout_secs());
         assert_eq!(cfg.session_ttl_secs, default_session_ttl_secs());
-        assert_eq!(
-            cfg.node_token_rotate_secs,
-            default_node_token_rotate_secs()
-        );
+        assert_eq!(cfg.node_token_rotate_secs, default_node_token_rotate_secs());
         assert_eq!(cfg.policy, Policy::default());
         cfg.validate().unwrap();
     }
@@ -464,5 +461,4 @@ signing_key_hex = "{seed}"
         let f = write_tmp(&toml);
         assert!(load_coordinator_config(f.path()).is_err());
     }
-
 }

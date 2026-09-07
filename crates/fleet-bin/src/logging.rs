@@ -12,8 +12,7 @@ use tracing_subscriber::EnvFilter;
 /// Idempotent in spirit: it uses `try_init` and silently ignores the error if
 /// a subscriber is already installed (e.g. in tests).
 pub fn init() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

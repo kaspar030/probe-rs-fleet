@@ -325,9 +325,14 @@ pub(crate) fn reject(status: StatusCode, code: &str) -> Response {
 
 /// Extract the bearer credential from an `Authorization` header.
 fn bearer_of(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let value = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let (scheme, credential) = value.split_once(' ')?;
-    scheme.eq_ignore_ascii_case("bearer").then_some(credential.trim())
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(credential.trim())
 }
 
 /// Which carriers a route accepts the credential in.
@@ -547,16 +552,13 @@ async fn client_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let (_auth, subject) = match authenticate_request(
-        &coord,
-        &headers,
-        &[TokenKind::Session, TokenKind::Workload],
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let (_auth, subject) =
+        match authenticate_request(&coord, &headers, &[TokenKind::Session, TokenKind::Workload])
+            .await
+        {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     debug!(%subject, "client connected");
 
     ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
@@ -713,7 +715,8 @@ async fn redeem_auth_key(
 
     // The single atomic consume is what makes "single use" true under
     // concurrent redemption; the check above is a courtesy, not the guard.
-    let Ok(Some((org, key_tags))) = coord.db().consume_auth_key(hash.as_str(), now_i64).await else {
+    let Ok(Some((org, key_tags))) = coord.db().consume_auth_key(hash.as_str(), now_i64).await
+    else {
         warn!(key = %hash.short(), "auth key could not be consumed");
         return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
     };
@@ -868,9 +871,8 @@ async fn exchange_github_oidc(coord: &Coordinator, jwt: &str) -> Response {
     }
 
     let token = OpaqueToken::mint(TokenKind::Workload);
-    let expires = now_i64.saturating_add(
-        i64::try_from(gha.workload_token_ttl_secs).unwrap_or(i64::from(i32::MAX)),
-    );
+    let expires = now_i64
+        .saturating_add(i64::try_from(gha.workload_token_ttl_secs).unwrap_or(i64::from(i32::MAX)));
     let columns = crate::state::WorkloadClaimColumns {
         repository: Some(claims.repository.clone()),
         repository_owner: Some(claims.repository_owner.clone()),
@@ -1071,19 +1073,18 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
         .map(|t| format!("tag={t}"))
         .collect::<Vec<_>>()
         .join(" && ");
-    let selector =
-        match fleet_proto::lease::parse_constraint(&selector) {
-            Ok(c) => c.to_string(),
-            Err(e) => {
-                warn!(error = %e, "a CI auth key's tags do not form a valid selector");
-                // A *caller* fault, not a coordinator one: the tags came in at
-                // mint time (and `auth-key create` can be driven from a shell,
-                // which historically skipped `valid_tags`), so a `server_error`
-                // here would be a lie that pages someone for a typo. Refuse the
-                // redemption the way the tagless-`ci` case above does.
-                return reject(StatusCode::FORBIDDEN, "forbidden");
-            }
-        };
+    let selector = match fleet_proto::lease::parse_constraint(&selector) {
+        Ok(c) => c.to_string(),
+        Err(e) => {
+            warn!(error = %e, "a CI auth key's tags do not form a valid selector");
+            // A *caller* fault, not a coordinator one: the tags came in at
+            // mint time (and `auth-key create` can be driven from a shell,
+            // which historically skipped `valid_tags`), so a `server_error`
+            // here would be a lie that pages someone for a typo. Refuse the
+            // redemption the way the tagless-`ci` case above does.
+            return reject(StatusCode::FORBIDDEN, "forbidden");
+        }
+    };
     let ops = if meta.ops.is_empty() {
         DEFAULT_CI_KEY_OPS.to_vec()
     } else {
@@ -1528,7 +1529,8 @@ async fn auth_keys(
     headers: HeaderMap,
     Json(request): Json<AuthKeyRequest>,
 ) -> Response {
-    let (auth, subject) = match authenticate_request(&coord, &headers, &[TokenKind::Session]).await {
+    let (auth, subject) = match authenticate_request(&coord, &headers, &[TokenKind::Session]).await
+    {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -1660,9 +1662,7 @@ pub(crate) async fn create_auth_key(
     // thing and only fail at redemption, far from the mistake.
     let purpose = match purpose {
         None => crate::state::AUTH_KEY_PURPOSE_NODE,
-        Some(p) if p == crate::state::AUTH_KEY_PURPOSE_NODE => {
-            crate::state::AUTH_KEY_PURPOSE_NODE
-        }
+        Some(p) if p == crate::state::AUTH_KEY_PURPOSE_NODE => crate::state::AUTH_KEY_PURPOSE_NODE,
         Some(p) if p == crate::state::AUTH_KEY_PURPOSE_CI => crate::state::AUTH_KEY_PURPOSE_CI,
         Some(_) => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
     };
@@ -1961,7 +1961,6 @@ pub(crate) async fn revoke_auth_key(
     })
     .into_response()
 }
-
 
 /// Provision the org/user/member chain and mint a user session token.
 ///

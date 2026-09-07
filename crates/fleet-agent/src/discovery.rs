@@ -613,7 +613,10 @@ chip = "c2"
     #[test]
     fn no_probes_means_all_offline_and_no_unknown() {
         let inv = reconcile(&boards(), &[]);
-        assert!(inv.boards.iter().all(|b| b.presence == BoardPresence::Offline));
+        assert!(inv
+            .boards
+            .iter()
+            .all(|b| b.presence == BoardPresence::Offline));
         assert!(inv.unknown.is_empty());
     }
 
@@ -666,7 +669,10 @@ chip = "c2"
         let mut boards = boards();
         enrich_boards_with_discovery(
             &mut boards,
-            &[probe_ids("AAA", 0x1366, 0x1015), probe_ids("ZZZ", 0xdead, 0xbeef)],
+            &[
+                probe_ids("AAA", 0x1366, 0x1015),
+                probe_ids("ZZZ", 0xdead, 0xbeef),
+            ],
         );
         let b1 = boards.boards.iter().find(|b| b.id == "b1").unwrap();
         assert_eq!((b1.vid, b1.pid), (0x1366, 0x1015));
@@ -679,13 +685,19 @@ chip = "c2"
     fn parses_real_probe_list_lines() {
         // J-Link with serial (the nRF52840-DK's onboard J-Link OB).
         let p = parse_probe_list_line("[0]: J-Link -- 1366:0101:000776543210 (J-Link)").unwrap();
-        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "000776543210"));
+        assert_eq!(
+            (p.vid, p.pid, p.serial.as_str()),
+            (0x1366, 0x0101, "000776543210")
+        );
         assert!(!p.inaccessible);
 
         // CMSIS-DAP with serial.
-        let p = parse_probe_list_line("[1]: Foo CMSIS-DAP -- 0d28:0204:0123ABCD (CMSIS-DAP)")
-            .unwrap();
-        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x0d28, 0x0204, "0123ABCD"));
+        let p =
+            parse_probe_list_line("[1]: Foo CMSIS-DAP -- 0d28:0204:0123ABCD (CMSIS-DAP)").unwrap();
+        assert_eq!(
+            (p.vid, p.pid, p.serial.as_str()),
+            (0x0d28, 0x0204, "0123ABCD")
+        );
         assert!(!p.inaccessible);
     }
 
@@ -695,7 +707,10 @@ chip = "c2"
         let p =
             parse_probe_list_line("[0]: J-Link -- 1366:0101:000776543210 (J-Link) (inaccessible)")
                 .unwrap();
-        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "000776543210"));
+        assert_eq!(
+            (p.vid, p.pid, p.serial.as_str()),
+            (0x1366, 0x0101, "000776543210")
+        );
         assert!(p.inaccessible);
 
         // Same, with the interface-index suffix on the pid.
@@ -703,16 +718,22 @@ chip = "c2"
             "[0]: HID Probe -- 1366:0101-0:001050257890 (J-Link) (inaccessible)",
         )
         .unwrap();
-        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "001050257890"));
+        assert_eq!(
+            (p.vid, p.pid, p.serial.as_str()),
+            (0x1366, 0x0101, "001050257890")
+        );
         assert!(p.inaccessible);
     }
 
     #[test]
     fn parser_tolerates_interface_suffix_and_missing_serial() {
         // Interface index suffix on the pid (`-N`).
-        let p = parse_probe_list_line("[0]: HID Probe -- 1366:0101-0:001050257890 (J-Link)")
-            .unwrap();
-        assert_eq!((p.vid, p.pid, p.serial.as_str()), (0x1366, 0x0101, "001050257890"));
+        let p =
+            parse_probe_list_line("[0]: HID Probe -- 1366:0101-0:001050257890 (J-Link)").unwrap();
+        assert_eq!(
+            (p.vid, p.pid, p.serial.as_str()),
+            (0x1366, 0x0101, "001050257890")
+        );
         assert!(!p.inaccessible);
 
         // No serial reported: empty between the last `:` and ` (`.
@@ -827,7 +848,10 @@ chip = "c2"
         assert!(status.adopted);
         assert!(status.tags.contains(&"auto".to_owned()));
         assert!(status.tags.contains(&"j-link".to_owned()));
-        assert!(status.chip.is_empty(), "the agent cannot know the target chip");
+        assert!(
+            status.chip.is_empty(),
+            "the agent cannot know the target chip"
+        );
         assert_eq!(status.serial, "ZZZ");
     }
 
@@ -1040,7 +1064,11 @@ chip = "c1"
             "the colliding probe must not be adopted"
         );
         let statuses: Vec<_> = inv.boards.iter().filter(|b| b.board == name).collect();
-        assert_eq!(statuses.len(), 1, "exactly one board may carry a given name");
+        assert_eq!(
+            statuses.len(),
+            1,
+            "exactly one board may carry a given name"
+        );
         assert!(!statuses[0].adopted);
         assert_eq!(
             statuses[0].serial, "AAA",

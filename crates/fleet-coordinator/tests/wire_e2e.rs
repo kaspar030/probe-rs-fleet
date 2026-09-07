@@ -178,7 +178,8 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     ));
 
     // --- Agent dial-out over duplex A ---
-    let agent = Arc::new(Agent::new(agent_config(&token_pubkey), boards(), Arc::new(EchoBackend)).unwrap());
+    let agent =
+        Arc::new(Agent::new(agent_config(&token_pubkey), boards(), Arc::new(EchoBackend)).unwrap());
     agent.seed_inventory_from_boards().await;
 
     let (coord_tx, coord_rx, agent_tx, agent_rx) = fleet_wire::mock::pair();
@@ -217,11 +218,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // The coordinator keys the board by (org, node, name); the sidecar asks for
     // it by node-local name.
     let board_name = BoardName("nrf52840-dk-1".to_owned());
-    let board_id = BoardRef::new(
-        OrgId("default".to_owned()),
-        node_id(),
-        "nrf52840-dk-1",
-    );
+    let board_id = BoardRef::new(OrgId("default".to_owned()), node_id(), "nrf52840-dk-1");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         {
@@ -230,7 +227,10 @@ async fn sidecar_to_agent_data_plane_round_trip() {
                 break;
             }
         }
-        assert!(std::time::Instant::now() < deadline, "board never registered");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "board never registered"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
@@ -255,11 +255,14 @@ async fn sidecar_to_agent_data_plane_round_trip() {
 
     // Lease the board.
     let grant = session
-        .lease(&LeaseRequest {
-            select: Constraint::Id(board_name.clone()),
-            duration_secs: 600,
-            priority: Priority::Interactive,
-        }, std::time::Duration::ZERO)
+        .lease(
+            &LeaseRequest {
+                select: Constraint::Id(board_name.clone()),
+                duration_secs: 600,
+                priority: Priority::Interactive,
+            },
+            std::time::Duration::ZERO,
+        )
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);

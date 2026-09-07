@@ -275,10 +275,9 @@ impl TestCoordinator {
         let normalised = fleet_proto::ids::normalise_repo(repo)
             .unwrap_or_else(|| panic!("{repo} is not a valid owner/name"));
         let key = fleet_proto::ids::workload_subject_key(&normalised);
-        let selector =
-            fleet_proto::lease::parse_constraint(selector)
-                .unwrap()
-                .to_string();
+        let selector = fleet_proto::lease::parse_constraint(selector)
+            .unwrap()
+            .to_string();
         // Unique per call: the id is the revocation handle and two grants in one
         // test must not collide.
         let id = format!("{:032x}", NEXT_GRANT_ID.fetch_add(1, Ordering::Relaxed));
@@ -513,7 +512,8 @@ impl TestCoordinator {
     /// got there; standing up a real agent for each one would drown the
     /// property being tested.
     pub async fn seed_board(&self, org: &OrgId, node: &str, name: &str, tags: &[&str]) -> BoardRef {
-        self.seed_board_with_model(org, node, name, tags, None).await
+        self.seed_board_with_model(org, node, name, tags, None)
+            .await
     }
 
     /// As [`seed_board`](Self::seed_board), but declaring a board **model** —

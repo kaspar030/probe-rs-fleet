@@ -208,10 +208,7 @@ mod tests {
         db.ensure_user_member(&org(), "alice", Role::Member)
             .await
             .unwrap();
-        db.scoped(org())
-            .ensure_node(&node(), 1000)
-            .await
-            .unwrap();
+        db.scoped(org()).ensure_node(&node(), 1000).await.unwrap();
         Coordinator::new(
             config(),
             sched,
@@ -228,10 +225,7 @@ mod tests {
 
         // Register an agent so cleanup is delivered.
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
-        coord
-            .agents()
-            .insert(node(), AgentHandle::new(atx))
-            .await;
+        coord.agents().insert(node(), AgentHandle::new(atx)).await;
 
         // alice grabs a short lease.
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
@@ -242,7 +236,12 @@ mod tests {
         };
         let alice = Subject::new(org(), SubjectKind::User, "alice");
         coord
-            .handle_sidecar_message(&alice, SidecarToCoord::Lease(req), &tx, RequesterId::DETACHED)
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Lease(req),
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
@@ -291,7 +290,12 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
-            .handle_sidecar_message(&alice, SidecarToCoord::Lease(req()), &tx, RequesterId::DETACHED)
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Lease(req()),
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));

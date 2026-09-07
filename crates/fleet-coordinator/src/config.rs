@@ -337,7 +337,9 @@ impl CoordinatorConfig {
                 ("github.authorize_url", &gh.authorize_url),
             ] {
                 if value.trim().is_empty() {
-                    return Err(CoordinatorError::Config(format!("{label} must be non-empty")));
+                    return Err(CoordinatorError::Config(format!(
+                        "{label} must be non-empty"
+                    )));
                 }
             }
             // Opting into browser login without a secret is a login that always

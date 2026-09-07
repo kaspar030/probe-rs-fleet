@@ -171,7 +171,10 @@ where
                 .enable_all()
                 .build()
                 .map_err(|e| transport::TransportError::Io(format!("building runtime: {e}")))?;
-            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            let original_argv: Vec<String> = tokens
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .collect();
             rt.block_on(run_fleet(cfg, invocation, original_argv))
         }
         Resolution::Delegated(cfg) => {
@@ -179,7 +182,10 @@ where
                 .enable_all()
                 .build()
                 .map_err(|e| transport::TransportError::Io(format!("building runtime: {e}")))?;
-            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            let original_argv: Vec<String> = tokens
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .collect();
             rt.block_on(run_delegated(cfg, invocation, original_argv))
         }
     }
@@ -217,11 +223,17 @@ where
         }
         Resolution::Fleet(cfg) => {
             // Drive the fleet path directly on the caller's runtime.
-            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            let original_argv: Vec<String> = tokens
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .collect();
             run_fleet(cfg, invocation, original_argv).await
         }
         Resolution::Delegated(cfg) => {
-            let original_argv: Vec<String> = tokens.iter().map(|t| t.to_string_lossy().into_owned()).collect();
+            let original_argv: Vec<String> = tokens
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .collect();
             run_delegated(cfg, invocation, original_argv).await
         }
     }

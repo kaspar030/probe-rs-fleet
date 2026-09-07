@@ -120,7 +120,11 @@ async fn hashed_assets_are_immutable_and_typed_by_extension() {
         let url = format!("{prefix}/{path}");
         let (status, headers, body) = fleet.http_full("GET", &url, &[], None).await;
         assert_eq!(status, 200, "{url}: {body}");
-        assert_eq!(header(&headers, "content-type"), Some(content_type), "{url}");
+        assert_eq!(
+            header(&headers, "content-type"),
+            Some(content_type),
+            "{url}"
+        );
         assert_eq!(
             header(&headers, "cache-control"),
             Some("public, max-age=31536000, immutable"),
@@ -168,7 +172,11 @@ async fn client_side_routes_all_render_the_shell() {
         for path in [format!("/ui/{page}"), format!("/ui/{page}/")] {
             let (status, headers, body) = fleet.http_full("GET", &path, &[], None).await;
             assert_eq!(status, 200, "{path}");
-            assert_eq!(header(&headers, "cache-control"), Some("no-cache"), "{path}");
+            assert_eq!(
+                header(&headers, "cache-control"),
+                Some("no-cache"),
+                "{path}"
+            );
             assert_hardened(&headers, &path);
             assert_eq!(header(&headers, "set-cookie"), None, "{path}");
             assert_eq!(body, canonical, "{path} must be byte-identical to /ui/");
@@ -380,7 +388,12 @@ fn nothing_in_the_tree_can_write_html_or_evaluate_a_string() {
 #[test]
 fn the_tree_touches_no_client_side_storage() {
     for (path, text) in assets() {
-        for needle in ["localStorage", "sessionStorage", "indexedDB", "openDatabase"] {
+        for needle in [
+            "localStorage",
+            "sessionStorage",
+            "indexedDB",
+            "openDatabase",
+        ] {
             assert!(!text.contains(needle), "{path} contains `{needle}`");
         }
     }

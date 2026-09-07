@@ -503,8 +503,7 @@ mod cache {
                 .https_or_http()
                 .enable_http1()
                 .build();
-            let client: Client<_, Full<Bytes>> =
-                Client::builder(TokioExecutor::new()).build(https);
+            let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
             let req = http::Request::builder()
                 .method(http::Method::GET)
                 .uri(uri)
@@ -622,7 +621,9 @@ mod tests {
     const AUDIENCE: &str = "https://fleet.example";
 
     fn der(b64: &str) -> Vec<u8> {
-        base64::engine::general_purpose::STANDARD.decode(b64).unwrap()
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap()
     }
 
     fn policy() -> OidcPolicy {
@@ -672,7 +673,12 @@ mod tests {
     fn sign(kid: &str, key_der_b64: &str, claims: &serde_json::Value) -> String {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_owned());
-        jsonwebtoken::encode(&header, claims, &EncodingKey::from_rsa_der(&der(key_der_b64))).unwrap()
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &EncodingKey::from_rsa_der(&der(key_der_b64)),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -700,8 +706,8 @@ mod tests {
         let mut header = Header::new(Algorithm::HS256);
         header.kid = Some("k1".to_owned());
         let secret = KEY_A_N.as_bytes();
-        let jwt = jsonwebtoken::encode(&header, &claims(), &EncodingKey::from_secret(secret))
-            .unwrap();
+        let jwt =
+            jsonwebtoken::encode(&header, &claims(), &EncodingKey::from_secret(secret)).unwrap();
         let err = verify(&jwt, &jwks(&[("k1", KEY_A_N)]), &policy(), 1_000).unwrap_err();
         assert!(
             matches!(err, OidcError::UnsupportedAlg(_)),
@@ -824,9 +830,12 @@ mod tests {
         );
 
         let header = Header::new(Algorithm::RS256); // no kid
-        let jwt =
-            jsonwebtoken::encode(&header, &claims(), &EncodingKey::from_rsa_der(&der(KEY_A_DER_B64)))
-                .unwrap();
+        let jwt = jsonwebtoken::encode(
+            &header,
+            &claims(),
+            &EncodingKey::from_rsa_der(&der(KEY_A_DER_B64)),
+        )
+        .unwrap();
         assert_eq!(
             verify(&jwt, &keys, &policy(), 1_000).unwrap_err(),
             OidcError::MissingClaim("kid")
@@ -839,11 +848,29 @@ mod tests {
     #[test]
     fn a_rotated_key_set_resolves_by_kid() {
         let rotated = jwks(&[("k1", KEY_A_N), ("k2", KEY_B_N)]);
-        assert!(verify(&sign("k1", KEY_A_DER_B64, &claims()), &rotated, &policy(), 1_000).is_ok());
-        assert!(verify(&sign("k2", KEY_B_DER_B64, &claims()), &rotated, &policy(), 1_000).is_ok());
+        assert!(verify(
+            &sign("k1", KEY_A_DER_B64, &claims()),
+            &rotated,
+            &policy(),
+            1_000
+        )
+        .is_ok());
+        assert!(verify(
+            &sign("k2", KEY_B_DER_B64, &claims()),
+            &rotated,
+            &policy(),
+            1_000
+        )
+        .is_ok());
         // …and the keys are not interchangeable within the set.
         assert_eq!(
-            verify(&sign("k2", KEY_A_DER_B64, &claims()), &rotated, &policy(), 1_000).unwrap_err(),
+            verify(
+                &sign("k2", KEY_A_DER_B64, &claims()),
+                &rotated,
+                &policy(),
+                1_000
+            )
+            .unwrap_err(),
             OidcError::BadSignature
         );
     }

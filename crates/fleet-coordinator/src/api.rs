@@ -1522,7 +1522,10 @@ mod tests {
         assert_eq!(query_value("a=1", "board"), None);
         assert_eq!(query_value("", "board"), None);
         // A repeated key resolves to the first, never the last.
-        assert_eq!(query_value("board=a&board=b", "board").as_deref(), Some("a"));
+        assert_eq!(
+            query_value("board=a&board=b", "board").as_deref(),
+            Some("a")
+        );
     }
 
     /// A percent-decoder that sliced the `&str` by byte index would panic here,
@@ -1532,9 +1535,15 @@ mod tests {
     fn a_malformed_escape_decodes_rather_than_panicking() {
         // `%` immediately before a multi-byte character: bytes `i+1`/`i+2` land
         // inside it, which is the char-boundary panic.
-        assert_eq!(query_value("board=%\u{20ac}x", "board").as_deref(), Some("%\u{20ac}x"));
+        assert_eq!(
+            query_value("board=%\u{20ac}x", "board").as_deref(),
+            Some("%\u{20ac}x")
+        );
         // The same shape in the *key*, which is decoded for every pair.
-        assert_eq!(query_value("%\u{20ac}x=1&board=ok", "board").as_deref(), Some("ok"));
+        assert_eq!(
+            query_value("%\u{20ac}x=1&board=ok", "board").as_deref(),
+            Some("ok")
+        );
         // Stray `%`s, truncated escapes and non-hex digits are literals.
         assert_eq!(query_value("board=%", "board").as_deref(), Some("%"));
         assert_eq!(query_value("board=%4", "board").as_deref(), Some("%4"));
@@ -1546,7 +1555,10 @@ mod tests {
         // A percent-escaped byte sequence that is not valid UTF-8 is repaired,
         // not rejected: this is a board name that will match nothing, which is
         // the right outcome for a lookup.
-        assert_eq!(query_value("board=%ff", "board").as_deref(), Some("\u{fffd}"));
+        assert_eq!(
+            query_value("board=%ff", "board").as_deref(),
+            Some("\u{fffd}")
+        );
     }
 
     /// A `BoardRef` is four segments, so the flattened key is what a body field

@@ -124,7 +124,11 @@ async fn an_unknown_or_wrong_kind_key_is_refused() {
 
     let orphan = OpaqueToken::mint(TokenKind::AuthKey).to_secret_string();
     let (status, _) = fleet
-        .http("POST", "/auth/token", Some(auth_key_body(&orphan, "a", &[])))
+        .http(
+            "POST",
+            "/auth/token",
+            Some(auth_key_body(&orphan, "a", &[])),
+        )
         .await;
     assert_eq!(status, 401);
 
@@ -168,7 +172,10 @@ async fn re_enrolling_the_same_node_replaces_its_token() {
 
     assert_eq!(first.node_id, second.node_id, "same machine, same node id");
     assert_ne!(first.token, second.token);
-    assert_eq!(fleet.upgrade_status("/agent", Some(&second.token)).await, 101);
+    assert_eq!(
+        fleet.upgrade_status("/agent", Some(&second.token)).await,
+        101
+    );
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&first.token)).await,
         401,
@@ -190,7 +197,10 @@ async fn a_session_can_be_refreshed_and_the_old_token_is_retired() {
     assert!(resp.expires.is_some());
     assert_eq!(resp.org, "default");
 
-    assert_eq!(fleet.upgrade_status("/client", Some(&resp.token)).await, 101);
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(&resp.token)).await,
+        101
+    );
     // Refresh replaces: a stolen old token has a strictly bounded life even if
     // the theft is never noticed.
     assert_eq!(fleet.upgrade_status("/client", Some(&old)).await, 401);
@@ -280,7 +290,10 @@ async fn a_session_self_registers_a_working_node_owned_by_the_caller() {
     assert_eq!(fleet.upgrade_status("/agent", Some(&resp.token)).await, 101);
     // ...and only there: the two credentials stay distinct, which is what stops
     // a compromised laptop-as-node from being a compromised account.
-    assert_eq!(fleet.upgrade_status("/client", Some(&resp.token)).await, 403);
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(&resp.token)).await,
+        403
+    );
     assert_ne!(resp.token, session);
 
     let node = AgentId(node_id);
@@ -317,7 +330,13 @@ async fn an_explicit_adopt_policy_is_recorded() {
     let node = AgentId(resp.node_id.unwrap());
 
     assert_eq!(
-        fleet.db().node_org_and_policy(&node).await.unwrap().unwrap().1,
+        fleet
+            .db()
+            .node_org_and_policy(&node)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
         fleet_proto::AdoptPolicy::Declared
     );
 }
@@ -438,7 +457,10 @@ async fn re_sharing_the_same_machine_converges() {
 
     assert_eq!(first.node_id, second.node_id, "same machine, same node id");
     assert_ne!(first.token, second.token);
-    assert_eq!(fleet.upgrade_status("/agent", Some(&second.token)).await, 101);
+    assert_eq!(
+        fleet.upgrade_status("/agent", Some(&second.token)).await,
+        101
+    );
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&first.token)).await,
         401,
@@ -477,7 +499,13 @@ async fn an_auth_key_node_later_shared_converges_on_the_share_defaults() {
     let enrolled: TokenResponse = serde_json::from_str(&body).unwrap();
     let node = AgentId(enrolled.node_id.clone().unwrap());
     assert_eq!(
-        fleet.db().node_org_and_policy(&node).await.unwrap().unwrap().1,
+        fleet
+            .db()
+            .node_org_and_policy(&node)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
         fleet_proto::AdoptPolicy::Declared,
         "an auth-key node is a lab node by default"
     );
@@ -493,7 +521,13 @@ async fn an_auth_key_node_later_shared_converges_on_the_share_defaults() {
     assert_eq!(status, 200, "body: {body}");
 
     assert_eq!(
-        fleet.db().node_org_and_policy(&node).await.unwrap().unwrap().1,
+        fleet
+            .db()
+            .node_org_and_policy(&node)
+            .await
+            .unwrap()
+            .unwrap()
+            .1,
         fleet_proto::AdoptPolicy::Auto
     );
     assert_eq!(

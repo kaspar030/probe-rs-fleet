@@ -565,9 +565,8 @@ mod tests {
 
     #[test]
     fn connection_resolves_when_both_present() {
-        let conn =
-            CtlConnection::resolve(args(Some("https://coord"), Some("prfs1_t")), None, None)
-                .unwrap();
+        let conn = CtlConnection::resolve(args(Some("https://coord"), Some("prfs1_t")), None, None)
+            .unwrap();
         assert_eq!(conn.fleet_url, "https://coord");
         assert_eq!(conn.token, "prfs1_t");
         assert!(conn.pin().is_none());

@@ -11,9 +11,7 @@
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use fleet_proto::token::{
-    AllowedOp, CapabilityToken, SignedToken, TokenError, TokenVerifier,
-};
+use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken, TokenError, TokenVerifier};
 use fleet_proto::{BoardRef, LeaseId};
 
 /// Verifies capability tokens against the coordinator's ed25519 public key.
@@ -279,7 +277,12 @@ mod tests {
                 1_000_000_000,
             )
             .unwrap_err();
-        assert_eq!(err, TokenError::OpNotAllowed { op: AllowedOp::Erase });
+        assert_eq!(
+            err,
+            TokenError::OpNotAllowed {
+                op: AllowedOp::Erase
+            }
+        );
     }
 
     #[test]

@@ -163,7 +163,10 @@ async fn auth_key_to_agent_up_yields_a_working_node_token() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&config_path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(
             mode & 0o777,
             0o600,
@@ -228,7 +231,10 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&config_path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(
             mode & 0o777,
             0o600,

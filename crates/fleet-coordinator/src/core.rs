@@ -33,9 +33,7 @@ use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Promotion, RequesterI
 use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::agent_api::AgentReport;
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{
-    AgentId, BoardName, BoardRef, LeaseId, OrgId, Role, Subject, SubjectKey,
-};
+use fleet_proto::ids::{AgentId, BoardName, BoardRef, LeaseId, OrgId, Role, Subject, SubjectKey};
 use fleet_proto::lease::LeaseRequest;
 
 use crate::auth::Ed25519Signer;
@@ -286,11 +284,7 @@ impl Coordinator {
     ///
     /// Returns a [`crate::error::CoordinatorError`] only on a fatal DB error;
     /// routine report content is logged and tolerated.
-    pub async fn handle_agent_report(
-        &self,
-        agent_id: &AgentId,
-        report: AgentReport,
-    ) -> Result<()> {
+    pub async fn handle_agent_report(&self, agent_id: &AgentId, report: AgentReport) -> Result<()> {
         let Some((org, adopt)) = self.org_and_policy_of_node(agent_id).await else {
             warn!(%agent_id, "dropping report from a node with no resolvable org");
             return Ok(());
@@ -779,12 +773,7 @@ impl Coordinator {
     /// unreachable one — deliberately indistinguishable. `Ambiguous` is
     /// reported only for a tie *within* the winning tier, where every candidate
     /// is already reachable by the caller so naming the nodes leaks nothing.
-    async fn resolve_board(
-        &self,
-        access: &Access,
-        name: &BoardName,
-        now: u64,
-    ) -> BoardLookup {
+    async fn resolve_board(&self, access: &Access, name: &BoardName, now: u64) -> BoardLookup {
         let sched = self.scheduler.lock().await;
         let candidates: Vec<&fleet_proto::board::Board> = sched
             .boards()
@@ -793,8 +782,11 @@ impl Coordinator {
             .collect();
 
         // Tier 1: the caller's own org. Tier 2: everything else they may reach.
-        let own: Vec<&fleet_proto::board::Board> =
-            candidates.iter().copied().filter(|b| access.owns(b)).collect();
+        let own: Vec<&fleet_proto::board::Board> = candidates
+            .iter()
+            .copied()
+            .filter(|b| access.owns(b))
+            .collect();
         let tier = if own.is_empty() { &candidates } else { &own };
 
         match tier.len() {
@@ -2022,18 +2014,14 @@ impl Coordinator {
             // The caller decides what to do with a queue slip; `ctl delegate`
             // fails fast rather than blocking a sandbox handoff on it, and now
             // leaves nothing queued behind it.
-            LeaseDecision::Queued { position } => {
-                return Ok(CoordToSidecar::Queued { position })
-            }
+            LeaseDecision::Queued { position } => return Ok(CoordToSidecar::Queued { position }),
             LeaseDecision::NoCandidate { reachable } => {
                 return Ok(CoordToSidecar::NoCandidate {
                     selector: select_display,
                     reachable,
                 })
             }
-            LeaseDecision::AtCap { held, cap } => {
-                return Ok(CoordToSidecar::AtCap { held, cap })
-            }
+            LeaseDecision::AtCap { held, cap } => return Ok(CoordToSidecar::AtCap { held, cap }),
         };
 
         // Never hand out more than the delegator holds.
@@ -2643,7 +2631,11 @@ impl Coordinator {
 
     /// Close a channel from a delegated connection, refusing any channel not
     /// belonging to the token's lease.
-    pub(crate) async fn close_delegated_channel(&self, lease: LeaseId, channel: fleet_proto::ChannelId) {
+    pub(crate) async fn close_delegated_channel(
+        &self,
+        lease: LeaseId,
+        channel: fleet_proto::ChannelId,
+    ) {
         let Some(route) = self.channels.get(channel).await else {
             return;
         };
@@ -3079,7 +3071,12 @@ mod tests {
     ) -> fleet_proto::lease::LeaseGrant {
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
-            .handle_sidecar_message(subject, SidecarToCoord::Lease(lease_req(board)), &tx, RequesterId::DETACHED)
+            .handle_sidecar_message(
+                subject,
+                SidecarToCoord::Lease(lease_req(board)),
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -3118,9 +3115,7 @@ mod tests {
         coord
             .handle_sidecar_message(
                 &alice,
-                SidecarToCoord::Extend {
-                    lease: grant.lease,
-                },
+                SidecarToCoord::Extend { lease: grant.lease },
                 &tx,
                 RequesterId::DETACHED,
             )
@@ -3143,7 +3138,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let CoordToSidecar::ChannelOpened { token: to_sidecar, .. } = rx.recv().await.unwrap()
+        let CoordToSidecar::ChannelOpened {
+            token: to_sidecar, ..
+        } = rx.recv().await.unwrap()
         else {
             panic!("expected ChannelOpened");
         };
@@ -3176,7 +3173,12 @@ mod tests {
 
         // Request -> Granted.
         coord
-            .handle_sidecar_message(&alice, SidecarToCoord::Lease(lease_req("b1")), &tx, RequesterId::DETACHED)
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::Lease(lease_req("b1")),
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         let grant = match rx.recv().await.unwrap() {
@@ -3399,7 +3401,12 @@ mod tests {
         let bob_id = coord.sidecars().mint();
         coord.sidecars().insert(bob_id, bob_tx.clone()).await;
         coord
-            .handle_sidecar_message(&bob, SidecarToCoord::Lease(lease_req("b1")), &bob_tx, bob_id)
+            .handle_sidecar_message(
+                &bob,
+                SidecarToCoord::Lease(lease_req("b1")),
+                &bob_tx,
+                bob_id,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -3412,9 +3419,7 @@ mod tests {
         coord
             .handle_sidecar_message(
                 &alice,
-                SidecarToCoord::Release {
-                    lease: grant.lease,
-                },
+                SidecarToCoord::Release { lease: grant.lease },
                 &tx,
                 RequesterId::DETACHED,
             )
@@ -3428,7 +3433,12 @@ mod tests {
             other => panic!("expected a promotion push, got {other:?}"),
         }
         assert_eq!(
-            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .open_lease_count()
+                .await
+                .unwrap(),
             1,
             "the promoted lease is persisted"
         );
@@ -3459,7 +3469,12 @@ mod tests {
         let bob_id = coord.sidecars().mint();
         coord.sidecars().insert(bob_id, bob_tx.clone()).await;
         coord
-            .handle_sidecar_message(&bob, SidecarToCoord::Lease(lease_req("b1")), &bob_tx, bob_id)
+            .handle_sidecar_message(
+                &bob,
+                SidecarToCoord::Lease(lease_req("b1")),
+                &bob_tx,
+                bob_id,
+            )
             .await
             .unwrap();
 
@@ -3487,9 +3502,7 @@ mod tests {
         coord
             .handle_sidecar_message(
                 &alice,
-                SidecarToCoord::Release {
-                    lease: grant.lease,
-                },
+                SidecarToCoord::Release { lease: grant.lease },
                 &tx,
                 RequesterId::DETACHED,
             )
@@ -3519,7 +3532,12 @@ mod tests {
             "a lease outlives the connection that requested it"
         );
         assert_eq!(
-            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .open_lease_count()
+                .await
+                .unwrap(),
             1
         );
     }
@@ -3608,9 +3626,7 @@ mod tests {
         coord
             .handle_sidecar_message(
                 &alice,
-                SidecarToCoord::Release {
-                    lease: grant.lease,
-                },
+                SidecarToCoord::Release { lease: grant.lease },
                 &tx,
                 RequesterId::DETACHED,
             )
@@ -3622,7 +3638,12 @@ mod tests {
             other => panic!("expected carol's promotion, got {other:?}"),
         }
         assert_eq!(
-            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .open_lease_count()
+                .await
+                .unwrap(),
             1,
             "bob's stillborn lease was recorded and then closed; only carol's is open"
         );
@@ -3664,7 +3685,12 @@ mod tests {
         let dave_id = coord.sidecars().mint();
         coord.sidecars().insert(dave_id, dave_tx.clone()).await;
         coord
-            .handle_sidecar_message(&dave, SidecarToCoord::Lease(lease_req("b1")), &dave_tx, dave_id)
+            .handle_sidecar_message(
+                &dave,
+                SidecarToCoord::Lease(lease_req("b1")),
+                &dave_tx,
+                dave_id,
+            )
             .await
             .unwrap();
         let _ = dave_rx.recv().await.unwrap();
@@ -3673,9 +3699,7 @@ mod tests {
         coord
             .handle_sidecar_message(
                 &alice,
-                SidecarToCoord::Release {
-                    lease: grant.lease,
-                },
+                SidecarToCoord::Release { lease: grant.lease },
                 &tx,
                 RequesterId::DETACHED,
             )
@@ -3686,7 +3710,12 @@ mod tests {
             other => panic!("expected dave's promotion, got {other:?}"),
         }
         assert_eq!(
-            coord.db().scoped(org(DEFAULT_ORG_ID)).open_lease_count().await.unwrap(),
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .open_lease_count()
+                .await
+                .unwrap(),
             1
         );
     }
@@ -3830,7 +3859,10 @@ mod tests {
             SidecarToCoord::Extend { lease: grant.lease },
             SidecarToCoord::Release { lease: grant.lease },
         ] {
-            coord.handle_sidecar_message(&bob, msg, &tx, RequesterId::DETACHED).await.unwrap();
+            coord
+                .handle_sidecar_message(&bob, msg, &tx, RequesterId::DETACHED)
+                .await
+                .unwrap();
             match rx.recv().await.unwrap() {
                 CoordToSidecar::Error { message } => assert_eq!(message, "no such lease"),
                 other => panic!("expected Error, got {other:?}"),
@@ -3870,7 +3902,10 @@ mod tests {
         let coord = coordinator_with(
             clock,
             &[board("org-a", "b1", "node-a")],
-            &[("org-a", "alice", Role::Member), ("org-b", "mallory", Role::Admin)],
+            &[
+                ("org-a", "alice", Role::Member),
+                ("org-b", "mallory", Role::Admin),
+            ],
         )
         .await;
 
@@ -3925,7 +3960,10 @@ mod tests {
         {
             let sched = coord.scheduler().lock().await;
             assert_eq!(
-                sched.board(&board_ref("org-a", "node-a", "b1")).unwrap().state,
+                sched
+                    .board(&board_ref("org-a", "node-a", "b1"))
+                    .unwrap()
+                    .state,
                 BoardState::Idle
             );
         }
@@ -3959,7 +3997,12 @@ mod tests {
 
         // `ctl list` shows only org B's board to org B's alice.
         coord
-            .handle_sidecar_message(&alice_b, SidecarToCoord::ListBoards, &tx, RequesterId::DETACHED)
+            .handle_sidecar_message(
+                &alice_b,
+                SidecarToCoord::ListBoards,
+                &tx,
+                RequesterId::DETACHED,
+            )
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
@@ -4090,7 +4133,10 @@ mod tests {
                     board: BoardName("b1".to_owned()),
                 },
             ] {
-                coord.handle_sidecar_message(&s, msg, &tx, RequesterId::DETACHED).await.unwrap();
+                coord
+                    .handle_sidecar_message(&s, msg, &tx, RequesterId::DETACHED)
+                    .await
+                    .unwrap();
                 match rx.recv().await.unwrap() {
                     CoordToSidecar::Error { message } => assert_eq!(message, "not authorized"),
                     other => panic!("expected Error for {s}, got {other:?}"),
@@ -4190,7 +4236,10 @@ mod tests {
         let coord = coordinator_with(
             clock,
             &[board("org-a", "b1", "node-a")],
-            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Admin)],
+            &[
+                ("org-a", "alice", Role::Member),
+                ("org-b", "bob", Role::Admin),
+            ],
         )
         .await;
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
@@ -4265,8 +4314,20 @@ mod tests {
 
         let inv = ProbeInventory {
             boards: vec![
-                status("online-1", "S-ON", BoardPresence::Online, "nRF52840_xxAA", false),
-                status("offline-1", "S-OFF", BoardPresence::Offline, "STM32F4", false),
+                status(
+                    "online-1",
+                    "S-ON",
+                    BoardPresence::Online,
+                    "nRF52840_xxAA",
+                    false,
+                ),
+                status(
+                    "offline-1",
+                    "S-OFF",
+                    BoardPresence::Offline,
+                    "STM32F4",
+                    false,
+                ),
             ],
             unknown: vec![],
         };
@@ -4401,7 +4462,8 @@ mod tests {
     #[tokio::test]
     async fn an_auto_node_adopts_boards_a_declared_node_would_not() {
         use fleet_proto::agent_api::ProbeInventory;
-        for (policy, expect_scheduled) in [(AdoptPolicy::Auto, true), (AdoptPolicy::Declared, false)]
+        for (policy, expect_scheduled) in
+            [(AdoptPolicy::Auto, true), (AdoptPolicy::Declared, false)]
         {
             let clock = Arc::new(TestClock(AtomicU64::new(1000)));
             let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
@@ -4421,13 +4483,7 @@ mod tests {
                 .unwrap();
 
             let inv = ProbeInventory {
-                boards: vec![status(
-                    "j-link-abc",
-                    "ABC",
-                    BoardPresence::Online,
-                    "",
-                    true,
-                )],
+                boards: vec![status("j-link-abc", "ABC", BoardPresence::Online, "", true)],
                 unknown: vec![],
             };
             coord
@@ -4439,10 +4495,15 @@ mod tests {
                 .scheduler()
                 .lock()
                 .await
-                .board(&BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-abc"))
+                .board(&BoardRef::new(
+                    org(DEFAULT_ORG_ID),
+                    node.clone(),
+                    "j-link-abc",
+                ))
                 .is_some();
             assert_eq!(
-                scheduled, expect_scheduled,
+                scheduled,
+                expect_scheduled,
                 "policy {policy} should {}have scheduled the adopted board",
                 if expect_scheduled { "" } else { "not " }
             );
@@ -4507,7 +4568,13 @@ mod tests {
             .handle_agent_report(
                 &node,
                 AgentReport::Inventory(ProbeInventory {
-                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Offline, "", true)],
+                    boards: vec![status(
+                        "j-link-zzz",
+                        "ZZZ",
+                        BoardPresence::Offline,
+                        "",
+                        true,
+                    )],
                     unknown: vec![],
                 }),
             )
@@ -4564,9 +4631,18 @@ mod tests {
             .boards()
             .map(|b| b.id.name.clone())
             .collect();
-        assert_eq!(sched_names, vec!["b2".to_owned()], "the old name must not stay leasable");
+        assert_eq!(
+            sched_names,
+            vec!["b2".to_owned()],
+            "the old name must not stay leasable"
+        );
 
-        let nodes = coord.db().scoped(org(DEFAULT_ORG_ID)).list_nodes().await.unwrap();
+        let nodes = coord
+            .db()
+            .scoped(org(DEFAULT_ORG_ID))
+            .list_nodes()
+            .await
+            .unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(
             nodes[0].boards,
@@ -4666,7 +4742,13 @@ mod tests {
             .handle_agent_report(
                 &node,
                 AgentReport::Inventory(ProbeInventory {
-                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Offline, "", true)],
+                    boards: vec![status(
+                        "j-link-zzz",
+                        "ZZZ",
+                        BoardPresence::Offline,
+                        "",
+                        true,
+                    )],
                     unknown: vec![],
                 }),
             )
@@ -4690,7 +4772,15 @@ mod tests {
         let o = org(DEFAULT_ORG_ID);
         coord
             .db()
-            .register_node_full(&o, "laptop", "hash", &[], Some("op"), AdoptPolicy::Auto, 1000)
+            .register_node_full(
+                &o,
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Auto,
+                1000,
+            )
             .await
             .unwrap();
         let node = node_id(DEFAULT_ORG_ID, "laptop");
@@ -4802,7 +4892,10 @@ mod tests {
         let coord = coordinator_with(
             clock,
             &[],
-            &[(DEFAULT_ORG_ID, "op", Role::Admin), ("other", "op", Role::Admin)],
+            &[
+                (DEFAULT_ORG_ID, "op", Role::Admin),
+                ("other", "op", Role::Admin),
+            ],
         )
         .await;
         let nodes = [
@@ -4812,7 +4905,12 @@ mod tests {
         ];
         for (o, node) in &nodes {
             coord.db().ensure_org(o, "personal").await.unwrap();
-            coord.db().scoped(o.clone()).ensure_node(node, 1000).await.unwrap();
+            coord
+                .db()
+                .scoped(o.clone())
+                .ensure_node(node, 1000)
+                .await
+                .unwrap();
             coord
                 .handle_agent_report(
                     node,
@@ -4824,7 +4922,15 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(coord.db().scoped(org(DEFAULT_ORG_ID)).board_count().await.unwrap(), 2);
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .board_count()
+                .await
+                .unwrap(),
+            2
+        );
 
         // Agent A's `boards.toml` was emptied.
         coord
@@ -4850,12 +4956,27 @@ mod tests {
             .has_board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1"))
             .await
             .unwrap());
-        assert_eq!(coord.db().scoped(org(DEFAULT_ORG_ID)).board_count().await.unwrap(), 1);
-        assert_eq!(coord.db().scoped(org("other")).board_count().await.unwrap(), 1);
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org(DEFAULT_ORG_ID))
+                .board_count()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            coord.db().scoped(org("other")).board_count().await.unwrap(),
+            1
+        );
 
         let sched = coord.scheduler().lock().await;
-        assert!(sched.board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1")).is_none());
-        assert!(sched.board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1")).is_some());
+        assert!(sched
+            .board(&board_ref(DEFAULT_ORG_ID, "agent-a", "b1"))
+            .is_none());
+        assert!(sched
+            .board(&board_ref(DEFAULT_ORG_ID, "agent-b", "b1"))
+            .is_some());
         assert!(sched.board(&board_ref("other", "agent-c", "b1")).is_some());
     }
 
@@ -4874,7 +4995,15 @@ mod tests {
         let o = org(DEFAULT_ORG_ID);
         coord
             .db()
-            .register_node_full(&o, "laptop", "hash", &[], Some("op"), AdoptPolicy::Auto, 1000)
+            .register_node_full(
+                &o,
+                "laptop",
+                "hash",
+                &[],
+                Some("op"),
+                AdoptPolicy::Auto,
+                1000,
+            )
             .await
             .unwrap();
         let node = node_id(DEFAULT_ORG_ID, "laptop");
@@ -4911,7 +5040,13 @@ mod tests {
             .handle_agent_report(
                 &node,
                 AgentReport::Inventory(ProbeInventory {
-                    boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Offline, "", true)],
+                    boards: vec![status(
+                        "j-link-zzz",
+                        "ZZZ",
+                        BoardPresence::Offline,
+                        "",
+                        true,
+                    )],
                     unknown: vec![],
                 }),
             )
@@ -4933,15 +5068,7 @@ mod tests {
             let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
             coord
                 .db()
-                .register_node_full(
-                    &org(DEFAULT_ORG_ID),
-                    "pi",
-                    "hash",
-                    &[],
-                    None,
-                    policy,
-                    1000,
-                )
+                .register_node_full(&org(DEFAULT_ORG_ID), "pi", "hash", &[], None, policy, 1000)
                 .await
                 .unwrap();
             let node = node_id(DEFAULT_ORG_ID, "pi");
@@ -5037,8 +5164,14 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
-            &[board("org-b", "dk", "node-b"), board("org-a", "dk", "node-a")],
-            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Member)],
+            &[
+                board("org-b", "dk", "node-b"),
+                board("org-a", "dk", "node-a"),
+            ],
+            &[
+                ("org-a", "alice", Role::Member),
+                ("org-b", "bob", Role::Member),
+            ],
         )
         .await;
 
@@ -5060,8 +5193,14 @@ mod tests {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
-            &[board("org-b", "dk", "node-b"), board("org-a", "dk", "node-a")],
-            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Member)],
+            &[
+                board("org-b", "dk", "node-b"),
+                board("org-a", "dk", "node-a"),
+            ],
+            &[
+                ("org-a", "alice", Role::Member),
+                ("org-b", "bob", Role::Member),
+            ],
         )
         .await;
         let access = shared_access("org-b", "org-a");
@@ -5069,11 +5208,7 @@ mod tests {
         // Every qualified spelling, against a production-shaped node id
         // (`org-a/node-a`) — including the BoardRef's own Display, which is
         // what a user copies out of `ctl list`.
-        for spelling in [
-            "node-a/dk",
-            "org-a/node-a/dk",
-            "org-a/org-a/node-a/dk",
-        ] {
+        for spelling in ["node-a/dk", "org-a/node-a/dk", "org-a/org-a/node-a/dk"] {
             assert_eq!(
                 coord
                     .resolve_board(&access, &BoardName(spelling.to_owned()), 1000)
@@ -5104,7 +5239,10 @@ mod tests {
                 board("org-b", "dk", "node-2"),
                 board("org-a", "dk", "node-a"),
             ],
-            &[("org-a", "alice", Role::Member), ("org-b", "bob", Role::Member)],
+            &[
+                ("org-a", "alice", Role::Member),
+                ("org-b", "bob", Role::Member),
+            ],
         )
         .await;
         let access = shared_access("org-b", "org-a");
@@ -5136,7 +5274,11 @@ mod tests {
         .await;
         assert_eq!(
             coord
-                .resolve_board(&Access::own_org(org("org-b")), &BoardName("dk".to_owned()), 1000)
+                .resolve_board(
+                    &Access::own_org(org("org-b")),
+                    &BoardName("dk".to_owned()),
+                    1000
+                )
                 .await,
             BoardLookup::NotFound
         );
@@ -5160,7 +5302,10 @@ mod tests {
         let coord = coordinator_with(
             clock,
             &[board("org-a", "dk", "node-a")],
-            &[("org-a", "alice", Role::Admin), ("org-b", "bob", Role::Member)],
+            &[
+                ("org-a", "alice", Role::Admin),
+                ("org-b", "bob", Role::Member),
+            ],
         )
         .await;
         let alice = user("org-a", "alice");
@@ -5207,7 +5352,9 @@ mod tests {
         coord
             .handle_sidecar_message(
                 &alice,
-                SidecarToCoord::GrantRevoke { id: id[..8].to_owned() },
+                SidecarToCoord::GrantRevoke {
+                    id: id[..8].to_owned(),
+                },
                 &tx,
                 RequesterId::DETACHED,
             )

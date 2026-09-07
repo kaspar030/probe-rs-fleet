@@ -228,7 +228,10 @@ async fn an_unacked_rotation_times_out_and_is_retried() {
     // throughout and no replacement is promoted without an ack.
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(fleet.upgrade_status("/agent", Some(&old_token)).await, 101);
-    assert_eq!(fleet.upgrade_status("/agent", Some(&first_token)).await, 401);
+    assert_eq!(
+        fleet.upgrade_status("/agent", Some(&first_token)).await,
+        401
+    );
     assert!(first_id > 0);
 
     keepalive.abort();

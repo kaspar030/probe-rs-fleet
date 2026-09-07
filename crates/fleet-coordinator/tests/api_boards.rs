@@ -70,10 +70,7 @@ fn power_cycle_body(board: &str) -> String {
 
 /// Take a lease on `board_name` through the real wire surface, so the
 /// scheduler, the `leases` table and the audit log all agree it exists.
-async fn take_lease(
-    session: &fleet_sidecar::transport::CoordSession,
-    board_name: &str,
-) -> LeaseId {
+async fn take_lease(session: &fleet_sidecar::transport::CoordSession, board_name: &str) -> LeaseId {
     use fleet_proto::ids::BoardName;
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
     use fleet_wire::{CoordToSidecar, SidecarToCoord};
@@ -155,7 +152,10 @@ async fn a_cookie_authenticated_mutation_needs_the_csrf_header() {
                 Some(power_cycle_body("dk-3")),
             )
             .await;
-        assert_ne!(status, 403, "{method} {path} demanded CSRF of a bearer: {body}");
+        assert_ne!(
+            status, 403,
+            "{method} {path} demanded CSRF of a bearer: {body}"
+        );
     }
 }
 
@@ -284,7 +284,10 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
         Some(&power_cycle_body("dk-3")),
     )
     .await;
-    assert_eq!(status, 403, "a grantee without the op must be refused: {body}");
+    assert_eq!(
+        status, 403,
+        "a grantee without the op must be refused: {body}"
+    );
     assert!(body.contains("forbidden"), "{body}");
     assert!(
         agent.is_idle(),
@@ -332,7 +335,9 @@ async fn a_cross_org_board_is_no_such_board() {
     let other = OrgId("other".to_owned());
     let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
     fleet.seed_board(&acme, "rpi-1", "mine", &["nrf52"]).await;
-    let theirs = fleet.seed_board(&other, "rpi-9", "theirs", &["nrf52"]).await;
+    let theirs = fleet
+        .seed_board(&other, "rpi-9", "theirs", &["nrf52"])
+        .await;
     let mut agent = AgentStub::attach(&fleet, &theirs.node).await;
 
     let (cross_status, cross_body) = as_browser(
@@ -452,13 +457,17 @@ async fn the_holder_releases_their_own_lease() {
             .await
             .unwrap();
     assert_eq!(closed.len(), 1);
-    assert!(closed[0].0.is_some(), "the lease row is still open: {closed:?}");
+    assert!(
+        closed[0].0.is_some(),
+        "the lease row is still open: {closed:?}"
+    );
     assert_eq!(closed[0].1.as_deref(), Some("released"));
 
     // The same `lease.release` row the wire path writes.
     let rows = audit_rows(&fleet).await;
     assert!(
-        rows.iter().any(|(o, _, a)| o == "acme" && a == "lease.release"),
+        rows.iter()
+            .any(|(o, _, a)| o == "acme" && a == "lease.release"),
         "{rows:?}"
     );
 

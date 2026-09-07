@@ -215,9 +215,7 @@ impl GrantRow {
     /// than quietly ignored.
     #[must_use]
     pub fn to_scope(&self) -> Option<GrantScope> {
-        let selector =
-            fleet_proto::lease::parse_constraint(&self.selector)
-                .ok()?;
+        let selector = fleet_proto::lease::parse_constraint(&self.selector).ok()?;
         let ops = self.parsed_ops();
         if ops.is_empty() {
             return None;
@@ -922,12 +920,14 @@ impl Db {
         .bind(key_hash)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(purpose, ops, expires, subject_name)| CiAuthKeyMeta {
-            purpose,
-            ops: split_tags(&ops),
-            expires,
-            subject_name,
-        }))
+        Ok(
+            row.map(|(purpose, ops, expires, subject_name)| CiAuthKeyMeta {
+                purpose,
+                ops: split_tags(&ops),
+                expires,
+                subject_name,
+            }),
+        )
     }
 
     /// Insert a node-enrollment auth key (stored by hash).
@@ -1113,7 +1113,6 @@ impl Db {
         .await?;
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
-
 
     /// Atomically consume an auth key: single-use + TTL, in one statement.
     ///
@@ -1714,11 +1713,10 @@ impl Db {
     ///
     /// Returns a database error if the query fails.
     pub async fn user_login(&self, user_id: &str) -> Result<Option<String>> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT login FROM user WHERE id = ?1")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT login FROM user WHERE id = ?1")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.and_then(|r| r.0))
     }
 
@@ -1968,8 +1966,7 @@ impl OrgDb<'_> {
     pub async fn prune_boards(&self, node: &AgentId, keep: &[String]) -> Result<u64> {
         // sqlx has no list binding, so the placeholder list is built here; the
         // names are still bound, never interpolated.
-        let mut qb =
-            sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM board WHERE org_id = ");
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("DELETE FROM board WHERE org_id = ");
         qb.push_bind(self.org.0.as_str());
         qb.push(" AND node_id = ");
         qb.push_bind(node.0.as_str());
@@ -2689,7 +2686,6 @@ async fn unique_personal_slug(
     Ok(org_id.to_owned())
 }
 
-
 /// Derive a node's id from `(org, name)`.
 ///
 /// Deterministic on purpose: re-running `share` / `agent up` on the same
@@ -2743,7 +2739,6 @@ pub fn new_grant_id() -> String {
     }
     out
 }
-
 
 fn board_state_label(state: &BoardState) -> &'static str {
     match state {
@@ -2844,7 +2839,11 @@ mod tests {
         // accepted — this is what makes `ensure_node` load-bearing.
         let err = db
             .scoped(org(DEFAULT_ORG_ID))
-            .record_board(&board_in(DEFAULT_ORG_ID, "ghost", "b1"), BoardPresence::Online, 1000)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "ghost", "b1"),
+                BoardPresence::Online,
+                1000,
+            )
             .await;
         assert!(err.is_err(), "FK must reject a board with no node row");
     }
@@ -2855,12 +2854,20 @@ mod tests {
         let o = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         let scoped = db.scoped(o);
         scoped
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "b1"), BoardPresence::Online, 1000)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "rpi-1", "b1"),
+                BoardPresence::Online,
+                1000,
+            )
             .await
             .unwrap();
         // Upsert: same key again with a later timestamp.
         scoped
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "b1"), BoardPresence::Online, 2000)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "rpi-1", "b1"),
+                BoardPresence::Online,
+                2000,
+            )
             .await
             .unwrap();
         assert_eq!(scoped.board_count().await.unwrap(), 1);
@@ -2937,7 +2944,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(deleted, 1);
-        assert_eq!(db.scoped(mine).board_count().await.unwrap(), 1, "rpi-2's row survives");
+        assert_eq!(
+            db.scoped(mine).board_count().await.unwrap(),
+            1,
+            "rpi-2's row survives"
+        );
         assert_eq!(db.scoped(theirs).board_count().await.unwrap(), 1);
     }
 
@@ -2948,7 +2959,11 @@ mod tests {
         seeded(&db, "org-b", "rpi-2").await;
         let err = db
             .scoped(a)
-            .record_board(&board_in("org-b", "rpi-2", "b1"), BoardPresence::Online, 1000)
+            .record_board(
+                &board_in("org-b", "rpi-2", "b1"),
+                BoardPresence::Online,
+                1000,
+            )
             .await;
         assert!(err.is_err(), "cross-org board write must be refused");
     }
@@ -2962,12 +2977,20 @@ mod tests {
         let b = seeded(&db, "org-b", "node-b").await;
         let (da, db_) = (db.scoped(a.clone()), db.scoped(b.clone()));
 
-        da.record_board(&board_in("org-a", "node-a", "dk"), BoardPresence::Online, 1000)
-            .await
-            .unwrap();
-        db_.record_board(&board_in("org-b", "node-b", "dk"), BoardPresence::Online, 1000)
-            .await
-            .unwrap();
+        da.record_board(
+            &board_in("org-a", "node-a", "dk"),
+            BoardPresence::Online,
+            1000,
+        )
+        .await
+        .unwrap();
+        db_.record_board(
+            &board_in("org-b", "node-b", "dk"),
+            BoardPresence::Online,
+            1000,
+        )
+        .await
+        .unwrap();
         da.record_lease(
             LeaseId(1),
             &board_ref("org-a", "node-a", "dk"),
@@ -3028,7 +3051,11 @@ mod tests {
         let a = seeded(&db, "org-a", "node-a").await;
         let b = seeded(&db, "org-b", "node-b").await;
         db.scoped(a.clone())
-            .record_board(&board_in("org-a", "node-a", "dk"), BoardPresence::Online, 1000)
+            .record_board(
+                &board_in("org-a", "node-a", "dk"),
+                BoardPresence::Online,
+                1000,
+            )
             .await
             .unwrap();
         db.scoped(a.clone())
@@ -3041,13 +3068,19 @@ mod tests {
             )
             .await
             .unwrap();
-        db.scoped(b).update_lease_expiry(LeaseId(1), 9999).await.unwrap();
+        db.scoped(b)
+            .update_lease_expiry(LeaseId(1), 9999)
+            .await
+            .unwrap();
         let row: (i64,) = sqlx::query_as("SELECT expires FROM leases WHERE lease = 1")
             .fetch_one(db.pool())
             .await
             .unwrap();
         assert_eq!(row.0, 2000, "another org must not extend this lease");
-        db.scoped(a).update_lease_expiry(LeaseId(1), 3000).await.unwrap();
+        db.scoped(a)
+            .update_lease_expiry(LeaseId(1), 3000)
+            .await
+            .unwrap();
         let row: (i64,) = sqlx::query_as("SELECT expires FROM leases WHERE lease = 1")
             .fetch_one(db.pool())
             .await
@@ -3060,10 +3093,14 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
         assert_eq!(db.role_of(&o, "alice").await.unwrap(), None);
-        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Admin)
+            .await
+            .unwrap();
         assert_eq!(db.role_of(&o, "alice").await.unwrap(), Some(Role::Admin));
         // Idempotent; does not downgrade.
-        db.ensure_user_member(&o, "alice", Role::Member).await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Member)
+            .await
+            .unwrap();
         assert_eq!(db.role_of(&o, "alice").await.unwrap(), Some(Role::Admin));
         // Membership is per org.
         db.ensure_org(&org("other"), "team").await.unwrap();
@@ -3160,8 +3197,14 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         db.ensure_org(&org("org-a"), "team").await.unwrap();
         db.ensure_org(&org("org-b"), "team").await.unwrap();
-        let a = db.register_node(&org("org-a"), "rpi", "h-a", &[], 1).await.unwrap();
-        let b = db.register_node(&org("org-b"), "rpi", "h-b", &[], 1).await.unwrap();
+        let a = db
+            .register_node(&org("org-a"), "rpi", "h-a", &[], 1)
+            .await
+            .unwrap();
+        let b = db
+            .register_node(&org("org-b"), "rpi", "h-b", &[], 1)
+            .await
+            .unwrap();
         assert_ne!(a, b);
         assert_eq!(db.org_of_node(&a).await.unwrap(), Some(org("org-a")));
         assert_eq!(db.org_of_node(&b).await.unwrap(), Some(org("org-b")));
@@ -3171,16 +3214,22 @@ mod tests {
     async fn session_round_trip_and_expiry_sweep() {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
-        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Admin)
+            .await
+            .unwrap();
 
         assert!(db.session_by_token_hash("s1").await.unwrap().is_none());
-        db.insert_session("s1", &o, "alice", 1000, 2000).await.unwrap();
+        db.insert_session("s1", &o, "alice", 1000, 2000)
+            .await
+            .unwrap();
         assert_eq!(
             db.session_by_token_hash("s1").await.unwrap(),
             Some(("alice".to_owned(), o.clone(), 2000))
         );
 
-        db.insert_session("s2", &o, "alice", 1000, 9000).await.unwrap();
+        db.insert_session("s2", &o, "alice", 1000, 9000)
+            .await
+            .unwrap();
         // The sweep removes only what has actually expired.
         assert_eq!(db.delete_expired_sessions(2000).await.unwrap(), 1);
         assert!(db.session_by_token_hash("s1").await.unwrap().is_none());
@@ -3197,7 +3246,10 @@ mod tests {
     async fn session_for_an_unknown_user_is_refused() {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
-        assert!(db.insert_session("s1", &o, "ghost", 1000, 2000).await.is_err());
+        assert!(db
+            .insert_session("s1", &o, "ghost", 1000, 2000)
+            .await
+            .is_err());
     }
 
     /// First login creates the user, its personal org and the admin membership;
@@ -3213,7 +3265,10 @@ mod tests {
         assert!(created);
         assert_eq!(user, "gh-4242");
         assert_eq!(personal, OrgId("gh-4242".to_owned()));
-        assert_eq!(db.org_slug(&personal).await.unwrap().as_deref(), Some("kaspar"));
+        assert_eq!(
+            db.org_slug(&personal).await.unwrap().as_deref(),
+            Some("kaspar")
+        );
         // Admin of your own org-of-one: there is no user-owned branch, so this
         // membership is what makes "my boards" expressible at all.
         assert_eq!(
@@ -3227,10 +3282,11 @@ mod tests {
             .unwrap();
         assert!(!created2);
         assert_eq!((user2, personal2), (user, personal));
-        let orgs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org WHERE kind = 'personal' AND id LIKE 'gh-%'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+        let orgs: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM org WHERE kind = 'personal' AND id LIKE 'gh-%'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(orgs.0, 1);
     }
 
@@ -3246,10 +3302,15 @@ mod tests {
         let (bob, bob_org, _) = db.upsert_github_user(1, "bob", None, 1_000).await.unwrap();
 
         // bob renames to `bob-old` on GitHub; same numeric id.
-        let (bob_again, bob_org_again, created) =
-            db.upsert_github_user(1, "bob-old", None, 1_100).await.unwrap();
+        let (bob_again, bob_org_again, created) = db
+            .upsert_github_user(1, "bob-old", None, 1_100)
+            .await
+            .unwrap();
         assert!(!created);
-        assert_eq!((bob_again, bob_org_again.clone()), (bob.clone(), bob_org.clone()));
+        assert_eq!(
+            (bob_again, bob_org_again.clone()),
+            (bob.clone(), bob_org.clone())
+        );
 
         // alice now claims the freed `bob` login. Different numeric id, so a
         // different user and a different org — and a distinct slug, since
@@ -3259,7 +3320,10 @@ mod tests {
         assert!(created);
         assert_ne!(alice, bob);
         assert_ne!(alice_org, bob_org);
-        assert_eq!(db.org_slug(&alice_org).await.unwrap().as_deref(), Some("bob-2"));
+        assert_eq!(
+            db.org_slug(&alice_org).await.unwrap().as_deref(),
+            Some("bob-2")
+        );
         // alice is not a member of bob's org.
         assert_eq!(db.role_of(&bob_org, &alice).await.unwrap(), None);
     }
@@ -3285,7 +3349,10 @@ mod tests {
     async fn an_unsluggable_login_falls_back_to_the_org_id() {
         let db = Db::connect_in_memory().await.unwrap();
         let (_, personal, _) = db.upsert_github_user(9, "", None, 1_000).await.unwrap();
-        assert_eq!(db.org_slug(&personal).await.unwrap().as_deref(), Some("gh-9"));
+        assert_eq!(
+            db.org_slug(&personal).await.unwrap().as_deref(),
+            Some("gh-9")
+        );
     }
 
     #[tokio::test]
@@ -3303,7 +3370,11 @@ mod tests {
         let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
         let scoped = db.scoped(o);
         scoped
-            .record_board(&board_in(DEFAULT_ORG_ID, "agent-a", "b1"), BoardPresence::Online, 1000)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "agent-a", "b1"),
+                BoardPresence::Online,
+                1000,
+            )
             .await
             .unwrap();
         let lease = LeaseId(1);
@@ -3420,7 +3491,10 @@ mod tests {
             db.node_org_and_policy(&node).await.unwrap(),
             Some((o, AdoptPolicy::Auto))
         );
-        assert_eq!(db.node_owner(&node).await.unwrap().as_deref(), Some("alice"));
+        assert_eq!(
+            db.node_owner(&node).await.unwrap().as_deref(),
+            Some("alice")
+        );
     }
 
     /// A machine enrolled from an image and later shared by its owner must
@@ -3431,7 +3505,9 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let o = org(DEFAULT_ORG_ID);
         db.ensure_org(&o, "personal").await.unwrap();
-        db.ensure_user_member(&o, "alice", Role::Admin).await.unwrap();
+        db.ensure_user_member(&o, "alice", Role::Admin)
+            .await
+            .unwrap();
 
         // Auth-key enrollment: unowned, `declared`.
         let node = db
@@ -3906,15 +3982,27 @@ mod tests {
         let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         let theirs = seeded(&db, "other", "rpi-2").await;
         db.scoped(mine.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), BoardPresence::Online, 10)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"),
+                BoardPresence::Online,
+                10,
+            )
             .await
             .unwrap();
         db.scoped(mine.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-2"), BoardPresence::Online, 10)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "rpi-1", "dk-2"),
+                BoardPresence::Online,
+                10,
+            )
             .await
             .unwrap();
         db.scoped(theirs)
-            .record_board(&board_in("other", "rpi-2", "dk-1"), BoardPresence::Online, 10)
+            .record_board(
+                &board_in("other", "rpi-2", "dk-1"),
+                BoardPresence::Online,
+                10,
+            )
             .await
             .unwrap();
 
@@ -4050,17 +4138,29 @@ mod tests {
         let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         let theirs = seeded(&db, "other", "rpi-2").await;
         db.scoped(mine.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"), BoardPresence::Online, 10)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "rpi-1", "dk-1"),
+                BoardPresence::Online,
+                10,
+            )
             .await
             .unwrap();
         db.scoped(theirs.clone())
-            .record_board(&board_in("other", "rpi-2", "dk-1"), BoardPresence::Online, 10)
+            .record_board(
+                &board_in("other", "rpi-2", "dk-1"),
+                BoardPresence::Online,
+                10,
+            )
             .await
             .unwrap();
 
         let mine_name = "rpi-1";
         let their_name = "rpi-2";
-        assert!(db.scoped(mine.clone()).delete_node(mine_name).await.unwrap());
+        assert!(db
+            .scoped(mine.clone())
+            .delete_node(mine_name)
+            .await
+            .unwrap());
         assert!(db
             .scoped(mine.clone())
             .node_by_name(mine_name)
@@ -4071,11 +4171,19 @@ mod tests {
             .fetch_all(db.pool_for_test())
             .await
             .unwrap();
-        assert_eq!(boards, vec![(node_id("other", "rpi-2").0,)], "only ours went");
+        assert_eq!(
+            boards,
+            vec![(node_id("other", "rpi-2").0,)],
+            "only ours went"
+        );
 
         // Deleting again is `false`, not an error — and another org's node of
         // any name is not reachable through this handle.
-        assert!(!db.scoped(mine.clone()).delete_node(mine_name).await.unwrap());
+        assert!(!db
+            .scoped(mine.clone())
+            .delete_node(mine_name)
+            .await
+            .unwrap());
         assert!(!db.scoped(mine).delete_node(their_name).await.unwrap());
         assert!(db
             .scoped(theirs)
@@ -4103,16 +4211,32 @@ mod tests {
             .ensure_node(&node_id("a", "rpi-1"), 1000)
             .await
             .unwrap();
-        db.register_node_full(&a, "rpi-1", "hash-a", &[], None, AdoptPolicy::Declared, 1001)
-            .await
-            .unwrap();
+        db.register_node_full(
+            &a,
+            "rpi-1",
+            "hash-a",
+            &[],
+            None,
+            AdoptPolicy::Declared,
+            1001,
+        )
+        .await
+        .unwrap();
 
         // Org `b`: the same two writes in the opposite order.
         let b = org("b");
         db.ensure_org(&b, "personal").await.unwrap();
-        db.register_node_full(&b, "rpi-1", "hash-b", &[], None, AdoptPolicy::Declared, 1000)
-            .await
-            .unwrap();
+        db.register_node_full(
+            &b,
+            "rpi-1",
+            "hash-b",
+            &[],
+            None,
+            AdoptPolicy::Declared,
+            1000,
+        )
+        .await
+        .unwrap();
         db.scoped(b.clone())
             .ensure_node(&node_id("b", "rpi-1"), 1001)
             .await
@@ -4229,7 +4353,11 @@ mod tests {
         let db = Db::connect(path_str).await.unwrap();
         let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
         db.scoped(o.clone())
-            .record_board(&board_in(DEFAULT_ORG_ID, "agent-a", "b1"), BoardPresence::Online, 1000)
+            .record_board(
+                &board_in(DEFAULT_ORG_ID, "agent-a", "b1"),
+                BoardPresence::Online,
+                1000,
+            )
             .await
             .unwrap();
         drop(db);
@@ -4274,12 +4402,28 @@ mod tests {
             .await
             .unwrap();
         db.scoped(a.clone())
-            .insert_grant("bbbb2222", &bob, "chip=nRF52840_xxAA", &[AllowedOp::Gdb], None, None, 1_001)
+            .insert_grant(
+                "bbbb2222",
+                &bob,
+                "chip=nRF52840_xxAA",
+                &[AllowedOp::Gdb],
+                None,
+                None,
+                1_001,
+            )
             .await
             .unwrap();
         // Another org's grant must neither list nor revoke from here.
         db.scoped(other.clone())
-            .insert_grant("aaaa9999", &bob, "tag=nrf52", &[AllowedOp::Attach], None, None, 1_002)
+            .insert_grant(
+                "aaaa9999",
+                &bob,
+                "tag=nrf52",
+                &[AllowedOp::Attach],
+                None,
+                None,
+                1_002,
+            )
             .await
             .unwrap();
 
@@ -4328,7 +4472,15 @@ mod tests {
             .await
             .unwrap();
         db.scoped(org("org-a"))
-            .insert_grant("g3", &mallory, "tag=nrf52", &[AllowedOp::Attach], None, None, 3)
+            .insert_grant(
+                "g3",
+                &mallory,
+                "tag=nrf52",
+                &[AllowedOp::Attach],
+                None,
+                None,
+                3,
+            )
             .await
             .unwrap();
 
@@ -4340,7 +4492,11 @@ mod tests {
             .map(|g| g.id)
             .collect();
         ids.sort();
-        assert_eq!(ids, vec!["g1".to_owned(), "g2".to_owned()], "both orgs, one subject");
+        assert_eq!(
+            ids,
+            vec!["g1".to_owned(), "g2".to_owned()],
+            "both orgs, one subject"
+        );
 
         assert_eq!(db.grants_for_subject(&mallory, 100).await.unwrap().len(), 1);
         assert!(db
@@ -4366,7 +4522,15 @@ mod tests {
         db.ensure_org(&org("org-a"), "team").await.unwrap();
         let bob = subject_key("gh-2", "gh-2");
         db.scoped(org("org-a"))
-            .insert_grant("g1", &bob, "tag=nrf52", &[AllowedOp::Attach], Some(500), None, 1)
+            .insert_grant(
+                "g1",
+                &bob,
+                "tag=nrf52",
+                &[AllowedOp::Attach],
+                Some(500),
+                None,
+                1,
+            )
             .await
             .unwrap();
         db.scoped(org("org-a"))
@@ -4393,7 +4557,15 @@ mod tests {
         let scoped = db.scoped(org("org-a"));
 
         scoped
-            .insert_grant("good", &bob, "tag=nrf52", &[AllowedOp::Attach], None, None, 1)
+            .insert_grant(
+                "good",
+                &bob,
+                "tag=nrf52",
+                &[AllowedOp::Attach],
+                None,
+                None,
+                1,
+            )
             .await
             .unwrap();
         // Written the way a bad migration or a hand-edit would leave it.
@@ -4429,7 +4601,9 @@ mod tests {
         let a = new_grant_id();
         let b = new_grant_id();
         assert_eq!(a.len(), 32);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
     }
 }

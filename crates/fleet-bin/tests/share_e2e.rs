@@ -149,7 +149,10 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(&config_path).unwrap().permissions().mode();
+        let mode = std::fs::metadata(&config_path)
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(
             mode & 0o777,
             0o600,
@@ -179,7 +182,13 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
     // boards" is expressible, and auto-adoption is on.
     let node_id = AgentId(node.node_id.clone());
     assert_eq!(
-        fleet.coord.db().node_owner(&node_id).await.unwrap().as_deref(),
+        fleet
+            .coord
+            .db()
+            .node_owner(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("alice")
     );
     assert_eq!(
@@ -355,7 +364,13 @@ async fn agent_up_self_registers_from_an_existing_session() {
     assert!(file.user.is_some(), "[user] must survive");
     let node_id = AgentId(node.node_id);
     assert_eq!(
-        fleet.coord.db().node_owner(&node_id).await.unwrap().as_deref(),
+        fleet
+            .coord
+            .db()
+            .node_owner(&node_id)
+            .await
+            .unwrap()
+            .as_deref(),
         Some("alice")
     );
     assert_eq!(
@@ -510,7 +525,13 @@ async fn an_explicit_auth_key_beats_an_incidental_session() {
     let node_id = AgentId(file.node.unwrap().node_id);
     // The auth-key path leaves the node unowned and `declared` — which is how
     // you can tell which rung ran.
-    assert!(fleet.coord.db().node_owner(&node_id).await.unwrap().is_none());
+    assert!(fleet
+        .coord
+        .db()
+        .node_owner(&node_id)
+        .await
+        .unwrap()
+        .is_none());
     assert_eq!(
         fleet
             .coord

@@ -205,12 +205,17 @@ pub async fn require_lease_control(
     subject: &Subject,
     lease: LeaseId,
 ) -> Result<SubjectKey, AuthzError> {
-    let holder = sched.lease_holder(lease).ok_or(AuthzError::NotFound)?.clone();
+    let holder = sched
+        .lease_holder(lease)
+        .ok_or(AuthzError::NotFound)?
+        .clone();
     if holder.key() == subject.key() {
         return Ok(holder.key());
     }
 
-    let board_org = sched.lease_target(lease).map(|(board, _)| board.org.clone());
+    let board_org = sched
+        .lease_target(lease)
+        .map(|(board, _)| board.org.clone());
     let related = holder.org == subject.org || board_org.as_ref() == Some(&subject.org);
     if !related {
         // Neither the holder's org nor the hardware's: the lease is invisible,
@@ -269,7 +274,9 @@ mod tests {
     async fn db_with(members: &[(&str, &str, Role)]) -> Db {
         let db = Db::connect_in_memory().await.unwrap();
         for (org_name, id, role) in members {
-            db.ensure_user_member(&org(org_name), id, *role).await.unwrap();
+            db.ensure_user_member(&org(org_name), id, *role)
+                .await
+                .unwrap();
         }
         db
     }
@@ -301,9 +308,13 @@ mod tests {
                 }],
             }
         };
-        let fleet_core::scheduler::LeaseDecision::Granted(g) =
-            s.request_lease(holder.clone(), fleet_core::scheduler::RequesterId::DETACHED, &access, lease_req("b1"), 1000)
-        else {
+        let fleet_core::scheduler::LeaseDecision::Granted(g) = s.request_lease(
+            holder.clone(),
+            fleet_core::scheduler::RequesterId::DETACHED,
+            &access,
+            lease_req("b1"),
+            1000,
+        ) else {
             panic!("expected grant");
         };
         (s, g.lease)
@@ -321,17 +332,21 @@ mod tests {
     #[tokio::test]
     async fn require_role_denies_non_member_and_lesser_role() {
         let db = db_with(&[("a", "alice", Role::Member), ("a", "root", Role::Admin)]).await;
-        assert!(require_role(&db, &user("a", "alice"), &org("a"), Role::Member)
-            .await
-            .is_ok());
+        assert!(
+            require_role(&db, &user("a", "alice"), &org("a"), Role::Member)
+                .await
+                .is_ok()
+        );
         assert_eq!(
             require_role(&db, &user("a", "alice"), &org("a"), Role::Admin).await,
             Err(AuthzError::Denied),
             "a member is not an admin"
         );
-        assert!(require_role(&db, &user("a", "root"), &org("a"), Role::Admin)
-            .await
-            .is_ok());
+        assert!(
+            require_role(&db, &user("a", "root"), &org("a"), Role::Admin)
+                .await
+                .is_ok()
+        );
         assert_eq!(
             require_role(&db, &user("a", "mallory"), &org("a"), Role::Member).await,
             Err(AuthzError::Denied),
@@ -447,7 +462,15 @@ mod tests {
 
         let db = db_with(&[("a", "alice", Role::Admin), ("b", "bob", Role::Member)]).await;
         let bob = user("b", "bob");
-        seed_grant(&db, "a", &bob, "tag=nrf52", &[AllowedOp::Attach], Some(5_000)).await;
+        seed_grant(
+            &db,
+            "a",
+            &bob,
+            "tag=nrf52",
+            &[AllowedOp::Attach],
+            Some(5_000),
+        )
+        .await;
 
         let access = board_access(&db, &bob, 1_000).await;
         assert_eq!(access.own_org, Some(org("b")), "membership leg");
@@ -476,10 +499,27 @@ mod tests {
         use fleet_proto::token::AllowedOp;
 
         let db = db_with(&[("b", "alice", Role::Member), ("c", "alice", Role::Member)]).await;
-        seed_grant(&db, "a", &user("b", "alice"), "tag=nrf52", &[AllowedOp::Attach], None).await;
+        seed_grant(
+            &db,
+            "a",
+            &user("b", "alice"),
+            "tag=nrf52",
+            &[AllowedOp::Attach],
+            None,
+        )
+        .await;
 
-        assert_eq!(board_access(&db, &user("b", "alice"), 1_000).await.grants.len(), 1);
-        assert!(board_access(&db, &user("c", "alice"), 1_000).await.grants.is_empty());
+        assert_eq!(
+            board_access(&db, &user("b", "alice"), 1_000)
+                .await
+                .grants
+                .len(),
+            1
+        );
+        assert!(board_access(&db, &user("c", "alice"), 1_000)
+            .await
+            .grants
+            .is_empty());
     }
 
     #[tokio::test]
@@ -530,7 +570,9 @@ mod tests {
     #[tokio::test]
     async fn a_stranger_gets_an_empty_access() {
         let db = db_with(&[("a", "alice", Role::Member)]).await;
-        assert!(board_access(&db, &user("a", "mallory"), 1_000).await.is_empty());
+        assert!(board_access(&db, &user("a", "mallory"), 1_000)
+            .await
+            .is_empty());
     }
 
     /// A node or workload subject has no membership row by construction (§6.1),
@@ -543,7 +585,15 @@ mod tests {
         let ci = Subject::new(org("b"), SubjectKind::Workload, "ci");
         assert!(board_access(&db, &ci, 1_000).await.is_empty());
 
-        seed_grant(&db, "a", &ci, "tag=nrf52", &[AllowedOp::Flash, AllowedOp::Attach], None).await;
+        seed_grant(
+            &db,
+            "a",
+            &ci,
+            "tag=nrf52",
+            &[AllowedOp::Flash, AllowedOp::Attach],
+            None,
+        )
+        .await;
         let access = board_access(&db, &ci, 1_000).await;
         assert!(access.own_org.is_none(), "no membership, by construction");
         assert_eq!(access.grants.len(), 1);

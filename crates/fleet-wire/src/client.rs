@@ -128,16 +128,15 @@ pub async fn dial_stream(
     let value = format!("Bearer {}", opts.bearer.trim());
     request.headers_mut().insert(
         http::header::AUTHORIZATION,
-        value
-            .parse()
-            .map_err(|_| WireError::Protocol("credential is not a valid header value".to_owned()))?,
+        value.parse().map_err(|_| {
+            WireError::Protocol("credential is not a valid header value".to_owned())
+        })?,
     );
 
     // One trust path, shared with the `/auth/token` HTTP client: see
     // `fleet_tls::client_trust_config`.
-    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(
-        fleet_tls::client_trust_config(opts.pin),
-    ));
+    let connector =
+        tokio_tungstenite::Connector::Rustls(Arc::new(fleet_tls::client_trust_config(opts.pin)));
 
     let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
         request,

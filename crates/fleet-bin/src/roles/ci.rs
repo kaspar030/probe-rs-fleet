@@ -186,7 +186,10 @@ fn emit(
             .append(true)
             .open(path)
             .with_context(|| {
-                format!("appending to ${ENV_GITHUB_ENV} ({})", path.to_string_lossy())
+                format!(
+                    "appending to ${ENV_GITHUB_ENV} ({})",
+                    path.to_string_lossy()
+                )
             })?;
         for (key, value) in &vars {
             // A token has no newline in it (base64url), so the plain `K=V`

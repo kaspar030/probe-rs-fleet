@@ -409,6 +409,9 @@ mod tests {
     fn the_shell_has_no_unrendered_token() {
         let shell = rendered_shell();
         assert!(!shell.contains(ASSET_TOKEN), "{shell}");
-        assert!(shell.contains(&format!("/ui/a/{}", assets_hash())), "{shell}");
+        assert!(
+            shell.contains(&format!("/ui/a/{}", assets_hash())),
+            "{shell}"
+        );
     }
 }

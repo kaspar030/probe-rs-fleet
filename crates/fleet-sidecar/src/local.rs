@@ -59,10 +59,7 @@ pub enum LocalError {
 /// # Errors
 ///
 /// Returns [`LocalError::NotFound`] if no suitable binary exists on `PATH`.
-pub fn find_real_probe_rs(
-    path_var: &str,
-    self_exe: Option<&Path>,
-) -> Result<PathBuf, LocalError> {
+pub fn find_real_probe_rs(path_var: &str, self_exe: Option<&Path>) -> Result<PathBuf, LocalError> {
     let exe_name = if cfg!(windows) {
         "probe-rs.exe"
     } else {
@@ -280,19 +277,14 @@ mod tests {
     #[test]
     fn exit_code_from_signal() {
         // Kill self with SIGKILL (9) → 128 + 9 = 137.
-        let code =
-            run_real_probe_rs(Path::new("/bin/sh"), ["-c", "kill -9 $$"], &[]).unwrap();
+        let code = run_real_probe_rs(Path::new("/bin/sh"), ["-c", "kill -9 $$"], &[]).unwrap();
         assert_eq!(code, 137);
     }
 
     #[test]
     fn spawn_error_for_missing_binary() {
-        let err = run_real_probe_rs(
-            Path::new("/nonexistent/probe-rs-xyz"),
-            ["run"],
-            &[],
-        )
-        .unwrap_err();
+        let err =
+            run_real_probe_rs(Path::new("/nonexistent/probe-rs-xyz"), ["run"], &[]).unwrap_err();
         assert!(matches!(err, LocalError::Spawn { .. }));
     }
 }

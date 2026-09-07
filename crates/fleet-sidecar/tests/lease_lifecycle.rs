@@ -75,7 +75,10 @@ async fn the_lease_request_carries_no_hardcoded_duration() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let req = match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+        let req = match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             SidecarToCoord::Lease(req) => req,
             other => panic!("expected Lease, got {other:?}"),
         };
@@ -96,7 +99,10 @@ async fn the_lease_request_carries_no_hardcoded_duration() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    session.lease(&lease_request(), Duration::ZERO).await.unwrap();
+    session
+        .lease(&lease_request(), Duration::ZERO)
+        .await
+        .unwrap();
     peer.await.unwrap();
 }
 
@@ -113,7 +119,10 @@ async fn a_shutdown_signal_releases_the_lease() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
@@ -152,7 +161,10 @@ async fn a_shutdown_signal_releases_the_lease() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let granted = session.lease(&lease_request(), Duration::ZERO).await.unwrap();
+    let granted = session
+        .lease(&lease_request(), Duration::ZERO)
+        .await
+        .unwrap();
 
     // Work that never finishes — an `attach` session, say — plus a shutdown
     // future we fire by hand. `hold_and_run` must pick the shutdown arm,
@@ -203,7 +215,10 @@ async fn a_shutdown_signal_keeps_a_shareable_lease() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
@@ -236,7 +251,10 @@ async fn a_shutdown_signal_keeps_a_shareable_lease() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let granted = session.lease(&lease_request(), Duration::ZERO).await.unwrap();
+    let granted = session
+        .lease(&lease_request(), Duration::ZERO)
+        .await
+        .unwrap();
 
     let (fire_tx, mut fire_rx) = mpsc::channel::<i32>(1);
     let work = async {
@@ -287,7 +305,10 @@ async fn a_long_session_is_kept_alive() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
@@ -321,8 +342,8 @@ async fn a_long_session_is_kept_alive() {
                     }
                 }
                 SidecarToCoord::Release { lease } => {
-                    let _ = fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease })
-                        .await;
+                    let _ =
+                        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease }).await;
                     break;
                 }
                 other => panic!("unexpected frame {other:?}"),
@@ -333,7 +354,10 @@ async fn a_long_session_is_kept_alive() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let granted = session.lease(&lease_request(), Duration::ZERO).await.unwrap();
+    let granted = session
+        .lease(&lease_request(), Duration::ZERO)
+        .await
+        .unwrap();
 
     // Work that runs well past one heartbeat interval: a 900s TTL yields a
     // 300s interval, so this sees two renewals before finishing.
@@ -356,7 +380,11 @@ async fn a_long_session_is_kept_alive() {
     assert_eq!(code, 7, "the work's exit code is propagated");
     let first = seen_rx.recv().await.expect("a first heartbeat");
     let second = seen_rx.recv().await.expect("a second heartbeat");
-    assert_eq!((first, second), (1, 2), "the session is heartbeat repeatedly");
+    assert_eq!(
+        (first, second),
+        (1, 2),
+        "the session is heartbeat repeatedly"
+    );
     peer.await.unwrap();
 }
 
@@ -372,7 +400,10 @@ async fn a_queued_request_returns_the_grant_when_it_is_promoted() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
@@ -408,7 +439,10 @@ async fn a_queued_request_gives_up_at_its_deadline() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
@@ -443,7 +477,9 @@ async fn a_zero_wait_fails_fast_on_contention() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap();
+        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
         fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 2 })
             .await
             .unwrap();
@@ -468,7 +504,9 @@ async fn no_candidate_fails_fast_with_a_useful_message() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap();
+        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
         fleet_wire::send(
             &mut coord_tx,
             &CoordToSidecar::NoCandidate {
@@ -502,7 +540,9 @@ async fn at_cap_fails_fast_and_blames_the_right_thing() {
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap();
+        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
         fleet_wire::send(&mut coord_tx, &CoordToSidecar::AtCap { held: 2, cap: 2 })
             .await
             .unwrap();

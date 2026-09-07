@@ -371,7 +371,10 @@ async fn a_grants_expiry_is_required_and_bounded_on_both_ends() {
         "the reported now ({reported}) must be the coordinator's clock"
     );
     assert_eq!(limits["min_revoke_prefix"], serde_json::json!(8));
-    assert_eq!(limits["auth_key_max_ttl_secs"], serde_json::json!(30 * 24 * 3600));
+    assert_eq!(
+        limits["auth_key_max_ttl_secs"],
+        serde_json::json!(30 * 24 * 3600)
+    );
 }
 
 /// **The selector round-trips to its canonical form**, and an empty one is
@@ -413,7 +416,10 @@ async fn a_selector_is_canonicalised_and_an_empty_one_is_refused() {
             Some(&grant_body(&fleet, "bob", empty, &["attach"])),
         )
         .await;
-        assert_eq!(status, 400, "an empty selector ({empty:?}) must be refused: {body}");
+        assert_eq!(
+            status, 400,
+            "an empty selector ({empty:?}) must be refused: {body}"
+        );
     }
 
     // A wildcard-looking selector is refused too, and for a different reason:
@@ -505,7 +511,13 @@ async fn an_unknown_grantee_is_refused() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    assert!(fleet.db().scoped(org).list_grants().await.unwrap().is_empty());
+    assert!(fleet
+        .db()
+        .scoped(org)
+        .list_grants()
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +564,13 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
 
     // A row with no recorded creator, as a shell would leave.
     let orphan = fleet
-        .seed_workload_grant(&org.0, "acme/runner", "tag=stm32", &[AllowedOp::Attach], None)
+        .seed_workload_grant(
+            &org.0,
+            "acme/runner",
+            "tag=stm32",
+            &[AllowedOp::Attach],
+            None,
+        )
         .await;
 
     // Dave — a member, neither creator nor admin — may revoke neither.
@@ -591,7 +609,13 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
         assert_eq!(status, 200, "{id}: {body}");
         assert_eq!(parse(&body)["revoked"], serde_json::json!([id]));
     }
-    assert!(fleet.db().scoped(org).list_grants().await.unwrap().is_empty());
+    assert!(fleet
+        .db()
+        .scoped(org)
+        .list_grants()
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// A too-short or non-hex prefix is refused: `delete_grants_by_prefix("")` is
@@ -726,7 +750,10 @@ async fn a_member_mints_a_key_and_the_listing_is_hash_only() {
     // The listing names the hash and never the secret — it is stored nowhere.
     let (status, body) = as_browser(&fleet, "GET", "/api/v1/auth-keys", &alice, None).await;
     assert_eq!(status, 200, "{body}");
-    assert!(!body.contains(&secret), "the listing leaked the secret: {body}");
+    assert!(
+        !body.contains(&secret),
+        "the listing leaked the secret: {body}"
+    );
     assert!(body.contains(&hash), "{body}");
     let listed = parse(&body);
     assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
@@ -771,7 +798,10 @@ async fn auth_key_validation_is_the_shared_validation() {
     let alice = fleet.seed_session("acme", "alice", Role::Member).await;
 
     let cases = [
-        ("a forever key", serde_json::json!({ "tags": [], "ttl_secs": 0 })),
+        (
+            "a forever key",
+            serde_json::json!({ "tags": [], "ttl_secs": 0 }),
+        ),
         (
             "beyond the 30-day cap",
             serde_json::json!({ "tags": [], "ttl_secs": 31 * 24 * 3600 }),
@@ -997,7 +1027,13 @@ async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
         "revoking a CI key must release what it was holding, not wait out the TTL"
     );
     assert!(
-        fleet.db().scoped(org).list_grants().await.unwrap().is_empty(),
+        fleet
+            .db()
+            .scoped(org)
+            .list_grants()
+            .await
+            .unwrap()
+            .is_empty(),
         "the synthesised grant survived the key"
     );
 }
@@ -1346,11 +1382,12 @@ async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
     // The grant id is random per run, so it is normalised out; everything else
     // — the action names, the subject rendering, the op list, the selector —
     // must match byte for byte.
-    let normalise = |rows: Vec<(String, Option<String>)>, id: &str| -> Vec<(String, Option<String>)> {
-        rows.into_iter()
-            .map(|(a, d)| (a, d.map(|d| d.replace(id, "<id>"))))
-            .collect()
-    };
+    let normalise =
+        |rows: Vec<(String, Option<String>)>, id: &str| -> Vec<(String, Option<String>)> {
+            rows.into_iter()
+                .map(|(a, d)| (a, d.map(|d| d.replace(id, "<id>"))))
+                .collect()
+        };
     let wire_rows = normalise(wire_rows, &wire_id);
     // Guard against the comparison passing because both sides logged nothing:
     // the two verbs write one row each, and `grant.revoke` is the one a
@@ -1400,9 +1437,7 @@ async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
             "POST",
             "/auth/keys",
             Some(&alice_c),
-            Some(
-                serde_json::json!({ "action": "revoke", "prefix": &cli_hash[..16] }).to_string(),
-            ),
+            Some(serde_json::json!({ "action": "revoke", "prefix": &cli_hash[..16] }).to_string()),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -1432,11 +1467,12 @@ async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
     assert_eq!(status, 200, "{body}");
     let web_rows = detailed_rows(&web).await;
 
-    let normalise = |rows: Vec<(String, Option<String>)>, hash: &str| -> Vec<(String, Option<String>)> {
-        rows.into_iter()
-            .map(|(a, d)| (a, d.map(|d| d.replace(hash, "<hash>"))))
-            .collect()
-    };
+    let normalise =
+        |rows: Vec<(String, Option<String>)>, hash: &str| -> Vec<(String, Option<String>)> {
+            rows.into_iter()
+                .map(|(a, d)| (a, d.map(|d| d.replace(hash, "<hash>"))))
+                .collect()
+        };
     let cli_rows = normalise(cli_rows, &cli_hash);
     assert!(
         cli_rows.iter().any(|(a, _)| a == "auth_key.mint")

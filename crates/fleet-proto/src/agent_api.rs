@@ -311,11 +311,7 @@ mod tests {
     use crate::ids::OrgId;
 
     fn test_board_ref() -> BoardRef {
-        BoardRef::new(
-            OrgId("acme".to_owned()),
-            AgentId("rpi-1".to_owned()),
-            "b1",
-        )
+        BoardRef::new(OrgId("acme".to_owned()), AgentId("rpi-1".to_owned()), "b1")
     }
 
     #[test]

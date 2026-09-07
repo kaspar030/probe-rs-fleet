@@ -153,7 +153,10 @@ async fn org_and_members_are_member_gated_and_org_scoped() {
         .map(|m| m["user_id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, ["alice", "bob"]);
-    assert!(!body.contains("mallory"), "another org's member leaked: {body}");
+    assert!(
+        !body.contains("mallory"),
+        "another org's member leaked: {body}"
+    );
     // A member with no GitHub identity has no login to show, and it is not
     // defaulted to the id.
     assert!(members[0]["login"].is_null(), "{body}");
@@ -312,12 +315,12 @@ async fn a_malformed_query_is_answered_not_a_dropped_connection() {
     let member = fleet.seed_session("acme", "bob", Role::Member).await;
 
     for query in [
-        "?board=%\u{20ac}x",   // `%` before a multi-byte char: the panic case
-        "?%\u{20ac}x=1",       // the same shape in a key, which is decoded too
+        "?board=%\u{20ac}x", // `%` before a multi-byte char: the panic case
+        "?%\u{20ac}x=1",     // the same shape in a key, which is decoded too
         "?board=%",
         "?board=%4",
         "?board=%zz",
-        "?board=%ff",          // decodes to invalid UTF-8, repaired not refused
+        "?board=%ff", // decodes to invalid UTF-8, repaired not refused
         "?board=",
         "?",
     ] {

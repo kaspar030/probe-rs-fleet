@@ -174,7 +174,9 @@ impl CoordSession {
             }
             Ok(CoordToSidecar::Error { message }) => return Err(TransportError::Declined(message)),
             Ok(other) => {
-                return Err(TransportError::Wire(format!("expected Welcome, got {other:?}")))
+                return Err(TransportError::Wire(format!(
+                    "expected Welcome, got {other:?}"
+                )))
             }
             Err(e) => return Err(TransportError::Wire(format!("reading Welcome: {e}"))),
         }
@@ -258,10 +260,7 @@ impl CoordSession {
     /// # Errors
     ///
     /// Returns [`TransportError`] if the connection fails.
-    pub async fn request(
-        &self,
-        msg: SidecarToCoord,
-    ) -> Result<CoordToSidecar, TransportError> {
+    pub async fn request(&self, msg: SidecarToCoord) -> Result<CoordToSidecar, TransportError> {
         self.send(msg).await?;
         self.next_ctrl().await
     }
@@ -514,7 +513,8 @@ impl CoordSession {
         lease: fleet_proto::LeaseId,
         kind: ChannelKind,
     ) -> Result<(ChannelId, Vec<u8>), TransportError> {
-        self.send(SidecarToCoord::OpenChannel { lease, kind }).await?;
+        self.send(SidecarToCoord::OpenChannel { lease, kind })
+            .await?;
         match self.next_ctrl().await? {
             CoordToSidecar::ChannelOpened { channel, token } => Ok((channel, token)),
             CoordToSidecar::Error { message } => Err(TransportError::Declined(message)),
@@ -668,9 +668,7 @@ mod tests {
         let cfg = FleetConfig {
             coordinator: "https://c:1".to_owned(),
             token: "prfs1_t".to_owned(),
-            select: fleet_proto::lease::Constraint::Id(fleet_proto::ids::BoardName(
-                "b".to_owned(),
-            )),
+            select: fleet_proto::lease::Constraint::Id(fleet_proto::ids::BoardName("b".to_owned())),
             server_cert_sha256: Some("cd".repeat(32)),
             queue_wait_secs: 0,
         };
@@ -695,11 +693,7 @@ mod tests {
 
         // The coordinator answers with a fleet-unique board key; the request
         // side stays node-local.
-        let board_ref = BoardRef::new(
-            OrgId("default".to_owned()),
-            AgentId("a".to_owned()),
-            "b1",
-        );
+        let board_ref = BoardRef::new(OrgId("default".to_owned()), AgentId("a".to_owned()), "b1");
 
         let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
 
@@ -708,7 +702,10 @@ mod tests {
         let board_ref_for_peer = board_ref.clone();
         let coord = tokio::spawn(async move {
             // Hello -> Welcome.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Hello { protocol_version } => {
                     assert_eq!(protocol_version, PROTOCOL_VERSION);
                 }
@@ -724,7 +721,10 @@ mod tests {
             .unwrap();
 
             // Lease.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Lease(_) => {}
                 other => panic!("expected Lease, got {other:?}"),
             }
@@ -734,11 +734,7 @@ mod tests {
                     lease: LeaseId(1),
                     board: board_ref_for_peer.clone(),
                     agent: AgentId("a".to_owned()),
-                    holder: Subject::new(
-                        OrgId("default".to_owned()),
-                        SubjectKind::User,
-                        "p",
-                    ),
+                    holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
                     expires: 9999,
                     token: vec![0xab, 0xcd],
                 }),
@@ -747,7 +743,10 @@ mod tests {
             .unwrap();
 
             // OpenChannel -> ChannelOpened(7).
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::OpenChannel { lease, kind } => {
                     assert_eq!(lease, LeaseId(1));
                     assert_eq!(kind, ChannelKind::Data);
@@ -765,7 +764,10 @@ mod tests {
             .unwrap();
 
             // Echo the next Data frame back (relay agent stand-in).
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Data(frame) => {
                     assert_eq!(frame.channel, ChannelId(7));
                     fleet_wire::send(&mut coord_tx, &CoordToSidecar::Data(frame))
@@ -839,7 +841,10 @@ mod tests {
 
         let coord = tokio::spawn(async move {
             // Hello -> Welcome.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Hello { .. } => {}
                 other => panic!("expected Hello, got {other:?}"),
             }
@@ -853,7 +858,10 @@ mod tests {
             .unwrap();
 
             // Lease -> grant.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Lease(req) => {
                     // The sidecar must not smuggle a hardcoded TTL past the
                     // operator's policy (task 3595).
@@ -865,7 +873,11 @@ mod tests {
                 &mut coord_tx,
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
-                    board: BoardRef::new(OrgId("default".to_owned()), AgentId("a".to_owned()), "b1"),
+                    board: BoardRef::new(
+                        OrgId("default".to_owned()),
+                        AgentId("a".to_owned()),
+                        "b1",
+                    ),
                     agent: AgentId("a".to_owned()),
                     holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
                     expires: 9999,
@@ -876,7 +888,10 @@ mod tests {
             .unwrap();
 
             // Extend -> Extended.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Extend { lease } => assert_eq!(lease, LeaseId(1)),
                 other => panic!("expected Extend, got {other:?}"),
             }
@@ -891,16 +906,22 @@ mod tests {
             .unwrap();
 
             // Release -> Released.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await.unwrap() {
+            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+                .await
+                .unwrap()
+            {
                 SidecarToCoord::Release { lease } => {
                     assert_eq!(lease, LeaseId(1));
                     *saw_release_peer.lock().await = true;
                 }
                 other => panic!("expected Release, got {other:?}"),
             }
-            fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease: LeaseId(1) })
-                .await
-                .unwrap();
+            fleet_wire::send(
+                &mut coord_tx,
+                &CoordToSidecar::Released { lease: LeaseId(1) },
+            )
+            .await
+            .unwrap();
             let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
         });
 

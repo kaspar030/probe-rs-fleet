@@ -989,8 +989,13 @@ kind = "none"
         };
 
         // Register, then the seeded inventory (declared boards only).
-        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
-        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
+        match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap()
+        {
             AgentToCoord::Report(AgentReport::Inventory(inv)) => {
                 assert!(inv.boards.iter().all(|b| !b.adopted));
             }
@@ -1000,7 +1005,10 @@ kind = "none"
         // The first discovery tick finds the undeclared probe and reports it.
         let adopted = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap() {
+                match fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+                    .await
+                    .unwrap()
+                {
                     AgentToCoord::Report(AgentReport::Inventory(inv)) => break inv,
                     // Heartbeats are expected traffic; anything else is not.
                     AgentToCoord::Report(AgentReport::Heartbeat { .. }) => {}
@@ -1018,7 +1026,9 @@ kind = "none"
         let quiet = tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 if let AgentToCoord::Report(AgentReport::Inventory(_)) =
-                    fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap()
+                    fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+                        .await
+                        .unwrap()
                 {
                     break;
                 }
@@ -1070,8 +1080,12 @@ kind = "none"
             })
         };
 
-        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
-        let _seed = fleet_wire::recv::<AgentToCoord>(&mut coord_rx).await.unwrap();
+        let _register = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
+        let _seed = fleet_wire::recv::<AgentToCoord>(&mut coord_rx)
+            .await
+            .unwrap();
 
         // Several discovery ticks fail in this window; the connection must
         // still be producing heartbeats afterwards.

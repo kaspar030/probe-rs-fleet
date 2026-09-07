@@ -117,7 +117,12 @@ async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
 
     // The lease is recorded in *alice's* org — it is her hardware.
     assert_eq!(
-        fleet.db().scoped(alice_org.clone()).open_lease_count().await.unwrap(),
+        fleet
+            .db()
+            .scoped(alice_org.clone())
+            .open_lease_count()
+            .await
+            .unwrap(),
         1,
         "a cross-org lease belongs to the board's tenant"
     );
@@ -144,7 +149,12 @@ async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
         );
     }
     assert_eq!(
-        fleet.db().scoped(alice_org).open_lease_count().await.unwrap(),
+        fleet
+            .db()
+            .scoped(alice_org)
+            .open_lease_count()
+            .await
+            .unwrap(),
         0,
         "and close it in the database, not just in memory"
     );
@@ -497,7 +507,13 @@ async fn revoking_by_a_dangerous_prefix_is_refused() {
         }
     }
     assert_eq!(
-        fleet.db().scoped(alice_org).list_grants().await.unwrap().len(),
+        fleet
+            .db()
+            .scoped(alice_org)
+            .list_grants()
+            .await
+            .unwrap()
+            .len(),
         1,
         "nothing was deleted"
     );
@@ -560,7 +576,9 @@ async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
     let alices = fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
-    let bobs = fleet.seed_board(&bob_org, "lab-pi", "dk-3", &["nrf52"]).await;
+    let bobs = fleet
+        .seed_board(&bob_org, "lab-pi", "dk-3", &["nrf52"])
+        .await;
     // The shape this test exists to exercise.
     assert_eq!(alices.node.0, format!("{}/rpi-1", alice_org.0));
 
@@ -598,8 +616,8 @@ async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
     // Every qualified spelling reaches alice's board instead — including the
     // full `BoardRef` rendering a user copies out of `ctl list`.
     for spelling in [
-        format!("rpi-1/{}", alices.name),                       // node short name
-        format!("{}/{}", alices.node.0, alices.name),           // full node id
+        format!("rpi-1/{}", alices.name),             // node short name
+        format!("{}/{}", alices.node.0, alices.name), // full node id
         format!("{}/{}/{}", alices.org.0, alices.node.0, alices.name), // Display
         alices.to_string(),
     ] {

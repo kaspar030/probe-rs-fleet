@@ -19,8 +19,7 @@ use tokio::sync::Mutex;
 use fleet_proto::token::AllowedOp;
 use fleet_proto::{
     AgentReport, BoardName, BoardRef, ChannelId, ChannelKind, CoordinatorCommand, LeaseId,
-    PowerAction,
-    PowerKind, ProbeInventory,
+    PowerAction, PowerKind, ProbeInventory,
 };
 
 use crate::config::{AgentConfig, BoardSpec, BoardsConfig};
@@ -139,11 +138,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     ///
     /// Returns [`AgentError::Token`] if the coordinator public key in `config`
     /// is not a valid ed25519 key.
-    pub fn new(
-        config: AgentConfig,
-        boards: BoardsConfig,
-        backend: Arc<B>,
-    ) -> Result<Self> {
+    pub fn new(config: AgentConfig, boards: BoardsConfig, backend: Arc<B>) -> Result<Self> {
         let key = config.coordinator_token_pubkey_bytes()?;
         let verifier = Ed25519Verifier::from_public_key_bytes(&key)?;
         Ok(Self {
@@ -333,7 +328,10 @@ impl<B: ProbeRsBackend> Agent<B> {
                 token,
                 channel,
                 kind,
-            } => self.on_open_session(lease, &board, &token, channel, kind).await,
+            } => {
+                self.on_open_session(lease, &board, &token, channel, kind)
+                    .await
+            }
             CoordinatorCommand::KillSession { channel } => self.on_kill_session(channel).await,
             CoordinatorCommand::ReleaseLease {
                 lease,
@@ -421,7 +419,10 @@ impl<B: ProbeRsBackend> Agent<B> {
         self.emit(AgentReport::Log {
             level: fleet_proto::LogLevel::Info,
             board: Some(board.clone()),
-            message: format!("opened session on channel {} for lease {}", channel.0, lease.0),
+            message: format!(
+                "opened session on channel {} for lease {}",
+                channel.0, lease.0
+            ),
         })
         .await;
         Ok(())
@@ -466,11 +467,7 @@ impl<B: ProbeRsBackend> Agent<B> {
     async fn on_kill_session(&self, channel: ChannelId) -> Result<()> {
         let removed = self.sessions.lock().await.remove(&channel);
         if let Some(active) = removed {
-            active
-                .session
-                .kill()
-                .await
-                .map_err(AgentError::Probers)?;
+            active.session.kill().await.map_err(AgentError::Probers)?;
             self.emit(AgentReport::SessionClosed {
                 channel,
                 exit_code: None,
@@ -492,12 +489,7 @@ impl<B: ProbeRsBackend> Agent<B> {
 
     /// Release a lease: kill its session, then power-cycle (and optionally
     /// erase) the board for cleanup.
-    async fn on_release_lease(
-        &self,
-        lease: LeaseId,
-        board: &BoardName,
-        erase: bool,
-    ) -> Result<()> {
+    async fn on_release_lease(&self, lease: LeaseId, board: &BoardName, erase: bool) -> Result<()> {
         // Kill any session(s) tied to this lease (data plane and gdb tunnels).
         let channels = self.channels_for_lease(lease).await;
         for channel in channels {
@@ -623,7 +615,10 @@ impl<B: ProbeRsBackend> Agent<B> {
     /// connection layer can byte-splice it onto the relay channel. Returns
     /// `None` if no session is open on `channel` or its stream was already
     /// taken.
-    pub async fn take_data_io(&self, channel: ChannelId) -> Option<Box<dyn crate::probers::SpliceIo>> {
+    pub async fn take_data_io(
+        &self,
+        channel: ChannelId,
+    ) -> Option<Box<dyn crate::probers::SpliceIo>> {
         let sessions = self.sessions.lock().await;
         let active = sessions.get(&channel)?;
         active.session.take_io().await
@@ -1340,7 +1335,10 @@ port = 2
         agent.set_clock(|| 1_000);
         let agent = agent.with_lister(Arc::new(StubLister(probes)));
 
-        assert!(agent.discovery_pass().await.is_some(), "the first pass changed it");
+        assert!(
+            agent.discovery_pass().await.is_some(),
+            "the first pass changed it"
+        );
         assert!(agent.discovery_pass().await.is_none(), "nothing changed");
     }
 }

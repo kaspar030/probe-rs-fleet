@@ -124,7 +124,9 @@ const ISSUER: &str = "https://token.actions.githubusercontent.com";
 const AUDIENCE: &str = "https://fleet.test";
 
 fn der(b64: &str) -> Vec<u8> {
-    base64::engine::general_purpose::STANDARD.decode(b64).unwrap()
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +452,13 @@ async fn repo_matching_is_case_insensitive_on_both_sides() {
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     // Granted in one spelling…
     fleet
-        .seed_workload_grant(&org.0, "Ariel-OS/Ariel-OS", "tag=nrf52", &[AllowedOp::Flash], None)
+        .seed_workload_grant(
+            &org.0,
+            "Ariel-OS/Ariel-OS",
+            "tag=nrf52",
+            &[AllowedOp::Flash],
+            None,
+        )
         .await;
 
     // …claimed in another.
@@ -473,7 +481,13 @@ async fn every_invalid_token_is_refused_with_one_indistinguishable_body() {
     let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     fleet
-        .seed_workload_grant(&org.0, "ariel-os/ariel-os", "tag=nrf52", &[AllowedOp::Flash], None)
+        .seed_workload_grant(
+            &org.0,
+            "ariel-os/ariel-os",
+            "tag=nrf52",
+            &[AllowedOp::Flash],
+            None,
+        )
         .await;
     let repo = "ariel-os/ariel-os";
 
@@ -526,7 +540,10 @@ async fn every_invalid_token_is_refused_with_one_indistinguishable_body() {
         ("missing repository", sign("k1", KEY_A_DER_B64, &no_repo)),
         // A `kid` the JWKS does not have and never will. The forced refetch
         // fires and finds the same set, so the token is still refused.
-        ("unknown kid", sign("k9", KEY_A_DER_B64, &claims(&fleet, repo))),
+        (
+            "unknown kid",
+            sign("k9", KEY_A_DER_B64, &claims(&fleet, repo)),
+        ),
         ("wrong signing key", wrong_key),
         ("algorithm confusion", hs256),
         ("tampered payload", tampered),
@@ -573,7 +590,13 @@ async fn a_rotated_signing_key_is_picked_up_after_one_refetch() {
     let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     fleet
-        .seed_workload_grant(&org.0, "ariel-os/ariel-os", "tag=nrf52", &[AllowedOp::Flash], None)
+        .seed_workload_grant(
+            &org.0,
+            "ariel-os/ariel-os",
+            "tag=nrf52",
+            &[AllowedOp::Flash],
+            None,
+        )
         .await;
     let repo = "ariel-os/ariel-os";
 
@@ -719,7 +742,9 @@ async fn a_warm_cache_survives_an_issuer_outage() {
 async fn a_workload_token_is_refused_on_the_node_and_key_surfaces() {
     let fleet = TestCoordinator::start().await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 3_600;
-    let token = fleet.seed_workload_token("ariel-os/ariel-os", expires).await;
+    let token = fleet
+        .seed_workload_token("ariel-os/ariel-os", expires)
+        .await;
 
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&token)).await,
@@ -746,7 +771,9 @@ async fn a_workload_token_is_refused_on_the_node_and_key_surfaces() {
 async fn an_expired_workload_token_is_refused_and_swept() {
     let fleet = TestCoordinator::start().await;
     let now = i64::try_from(fleet.coord.now()).unwrap();
-    let token = fleet.seed_workload_token("ariel-os/ariel-os", now - 1).await;
+    let token = fleet
+        .seed_workload_token("ariel-os/ariel-os", now - 1)
+        .await;
     assert_eq!(fleet.upgrade_status("/client", Some(&token)).await, 401);
 
     fleet_coordinator::sweep::sweep_once(&fleet.coord).await;
@@ -778,7 +805,9 @@ async fn a_workload_may_lease_but_not_delegate_or_administer() {
         )
         .await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 3_600;
-    let token = fleet.seed_workload_token("ariel-os/ariel-os", expires).await;
+    let token = fleet
+        .seed_workload_token("ariel-os/ariel-os", expires)
+        .await;
     let ci = fleet.client_session(&token).await;
 
     // Allowed: it can see and lease the granted board.
@@ -853,7 +882,9 @@ async fn revoking_a_repo_grant_releases_the_live_lease() {
         )
         .await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 3_600;
-    let token = fleet.seed_workload_token("ariel-os/ariel-os", expires).await;
+    let token = fleet
+        .seed_workload_token("ariel-os/ariel-os", expires)
+        .await;
 
     let ci = fleet.client_session(&token).await;
     let lease = match ci
@@ -879,7 +910,13 @@ async fn revoking_a_repo_grant_releases_the_live_lease() {
 
     // The lease is gone from the scheduler, not merely marked.
     assert!(
-        fleet.coord.scheduler().lock().await.lease_holder(lease).is_none(),
+        fleet
+            .coord
+            .scheduler()
+            .lock()
+            .await
+            .lease_holder(lease)
+            .is_none(),
         "revocation must release the lease, not wait out its TTL"
     );
     // And the next request from the same credential gets nothing.
@@ -903,10 +940,18 @@ async fn a_released_workload_lease_stays_in_the_ledger() {
     let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     fleet
-        .seed_workload_grant(&org.0, "ariel-os/ariel-os", "tag=nrf52", &[AllowedOp::Flash], None)
+        .seed_workload_grant(
+            &org.0,
+            "ariel-os/ariel-os",
+            "tag=nrf52",
+            &[AllowedOp::Flash],
+            None,
+        )
         .await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 3_600;
-    let token = fleet.seed_workload_token("ariel-os/ariel-os", expires).await;
+    let token = fleet
+        .seed_workload_token("ariel-os/ariel-os", expires)
+        .await;
 
     let ci = fleet.client_session(&token).await;
     let lease = match ci
@@ -934,7 +979,10 @@ async fn a_released_workload_lease_stays_in_the_ledger() {
         "the holder is the repo, so a bill can be addressed to it"
     );
     assert!(row.1 > 0, "granted_at is set");
-    assert!(row.2.is_some(), "closed_at is set: the row is never deleted");
+    assert!(
+        row.2.is_some(),
+        "closed_at is set: the row is never deleted"
+    );
     assert!(row.3.is_some());
 }
 
@@ -950,10 +998,18 @@ async fn a_workloads_lease_is_clamped_to_ci_priority() {
     let (_alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     fleet
-        .seed_workload_grant(&org.0, "ariel-os/ariel-os", "tag=nrf52", &[AllowedOp::Flash], None)
+        .seed_workload_grant(
+            &org.0,
+            "ariel-os/ariel-os",
+            "tag=nrf52",
+            &[AllowedOp::Flash],
+            None,
+        )
         .await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 3_600;
-    let token = fleet.seed_workload_token("ariel-os/ariel-os", expires).await;
+    let token = fleet
+        .seed_workload_token("ariel-os/ariel-os", expires)
+        .await;
 
     let ci = fleet.client_session(&token).await;
     // Ask for the *longest* interactive duration; the CI cap is shorter, so the
@@ -976,7 +1032,10 @@ async fn a_workloads_lease_is_clamped_to_ci_priority() {
         "a workload asking for 4h of Interactive got {held}s; \
          Policy::max_duration_ci is 3600 and the clamp should bind it"
     );
-    assert!(held > 3_000, "…but it should still get the CI maximum: {held}s");
+    assert!(
+        held > 3_000,
+        "…but it should still get the CI maximum: {held}s"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,7 +1067,10 @@ async fn a_self_hosted_runner_can_authenticate_with_a_ci_auth_key() {
     // `purpose` exists, since migration 0007 must not reinterpret existing keys.
     let node_key = fleet.seed_auth_key(&org.0, &[], false, Some(expires)).await;
     let (status, body) = redeem(&fleet, &node_key).await;
-    assert_eq!(status, 403, "a node key must not mint a workload token: {body}");
+    assert_eq!(
+        status, 403,
+        "a node key must not mint a workload token: {body}"
+    );
 
     let (status, body) = redeem(&fleet, &key).await;
     assert_eq!(status, 200, "{body}");
@@ -1021,7 +1083,11 @@ async fn a_self_hosted_runner_can_authenticate_with_a_ci_auth_key() {
     let ci = fleet.client_session(&token).await;
     match ci.request(SidecarToCoord::ListBoards).await.unwrap() {
         CoordToSidecar::BoardList(boards) => {
-            assert_eq!(boards.len(), 1, "the selector is real: only the tagged board");
+            assert_eq!(
+                boards.len(),
+                1,
+                "the selector is real: only the tagged board"
+            );
             assert_eq!(boards[0].board, board);
         }
         other => panic!("expected BoardList, got {other:?}"),
@@ -1057,16 +1123,24 @@ async fn a_self_hosted_runner_can_authenticate_with_a_ci_auth_key() {
             "POST",
             "/auth/keys",
             Some(&alice_token),
-            Some(serde_json::to_string(&json!({
-                "action": "revoke",
-                "prefix": hash_prefix,
-            }))
-            .unwrap()),
+            Some(
+                serde_json::to_string(&json!({
+                    "action": "revoke",
+                    "prefix": hash_prefix,
+                }))
+                .unwrap(),
+            ),
         )
         .await;
     assert_eq!(status, 200, "{body}");
     assert!(
-        fleet.coord.scheduler().lock().await.lease_holder(lease).is_none(),
+        fleet
+            .coord
+            .scheduler()
+            .lock()
+            .await
+            .lease_holder(lease)
+            .is_none(),
         "revoking a CI key must release what it was holding, not wait out the TTL"
     );
     assert!(fleet
@@ -1133,9 +1207,7 @@ async fn a_ci_keys_grant_is_revocable_through_grant_revoke() {
     // ordinary grant id: `ci-` buys a namespace, not a way round the floor.
     for bad in ["", "ci-", "ci-abc", "ci-nothex01", "abc", "nothexbutlong"] {
         match alice
-            .request(SidecarToCoord::GrantRevoke {
-                id: bad.to_owned(),
-            })
+            .request(SidecarToCoord::GrantRevoke { id: bad.to_owned() })
             .await
             .unwrap()
         {
@@ -1252,7 +1324,12 @@ async fn a_named_keys_identity_survives_rotating_the_key() {
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
 
     let key_a = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
     let (status, body) = redeem(&fleet, &key_a).await;
     assert_eq!(status, 200, "{body}");
@@ -1289,7 +1366,12 @@ async fn a_named_keys_identity_survives_rotating_the_key() {
 
     // The rotation: a *different secret*, the same `--as`.
     let key_b = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
     assert_ne!(key_a, key_b, "a rotation is a new secret");
     let (status, body) = redeem(&fleet, &key_b).await;
@@ -1302,12 +1384,20 @@ async fn a_named_keys_identity_survives_rotating_the_key() {
         "the rotated key re-upserts the identity's row rather than adding one"
     );
     assert_eq!(grants[0].id, grant_id, "same grant id across the rotation");
-    assert_eq!(grants[0].subject, subject, "same subject across the rotation");
+    assert_eq!(
+        grants[0].subject, subject,
+        "same subject across the rotation"
+    );
 
     // And the identity is on the token rows too, so the audit trail does not
     // fork: both workload tokens speak as the same subject.
     let key_c = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("BUILDER"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("BUILDER"),
+        )
         .await;
     let (status, body) = redeem(&fleet, &key_c).await;
     assert_eq!(status, 200, "{body}");
@@ -1340,10 +1430,20 @@ async fn revoking_one_key_of_a_shared_identity_is_a_disruption_not_a_revocation(
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
 
     let key_a = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
     let key_b = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
 
     let (status, body) = redeem(&fleet, &key_a).await;
@@ -1379,11 +1479,13 @@ async fn revoking_one_key_of_a_shared_identity_is_a_disruption_not_a_revocation(
             "POST",
             "/auth/keys",
             Some(&alice_token),
-            Some(serde_json::to_string(&json!({
-                "action": "revoke",
-                "prefix": hash_prefix,
-            }))
-            .unwrap()),
+            Some(
+                serde_json::to_string(&json!({
+                    "action": "revoke",
+                    "prefix": hash_prefix,
+                }))
+                .unwrap(),
+            ),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -1462,24 +1564,58 @@ async fn the_same_identity_name_in_two_orgs_is_two_grants() {
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
 
     let key_a = fleet
-        .seed_named_ci_auth_key(&org_a.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org_a.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
     let key_b = fleet
-        .seed_named_ci_auth_key(&org_b.0, &["stm32".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org_b.0,
+            &["stm32".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
     assert_eq!(redeem(&fleet, &key_a).await.0, 200);
     assert_eq!(redeem(&fleet, &key_b).await.0, 200);
 
-    let grants_a = fleet.db().scoped(org_a.clone()).list_grants().await.unwrap();
-    let grants_b = fleet.db().scoped(org_b.clone()).list_grants().await.unwrap();
+    let grants_a = fleet
+        .db()
+        .scoped(org_a.clone())
+        .list_grants()
+        .await
+        .unwrap();
+    let grants_b = fleet
+        .db()
+        .scoped(org_b.clone())
+        .list_grants()
+        .await
+        .unwrap();
     assert_eq!(grants_a.len(), 1);
     assert_eq!(grants_b.len(), 1);
     assert_ne!(grants_a[0].id, grants_b[0].id, "two orgs, two grant rows");
-    assert_eq!(grants_a[0].subject, format!("{}/workload:agent:builder", org_a.0));
-    assert_eq!(grants_b[0].subject, format!("{}/workload:agent:builder", org_b.0));
+    assert_eq!(
+        grants_a[0].subject,
+        format!("{}/workload:agent:builder", org_a.0)
+    );
+    assert_eq!(
+        grants_b[0].subject,
+        format!("{}/workload:agent:builder", org_b.0)
+    );
     // Neither redemption rewrote the other's selector or ops.
-    assert!(grants_a[0].selector.contains("nrf52"), "{}", grants_a[0].selector);
-    assert!(grants_b[0].selector.contains("stm32"), "{}", grants_b[0].selector);
+    assert!(
+        grants_a[0].selector.contains("nrf52"),
+        "{}",
+        grants_a[0].selector
+    );
+    assert!(
+        grants_b[0].selector.contains("stm32"),
+        "{}",
+        grants_b[0].selector
+    );
 
     // Redeeming A again must still not touch B.
     assert_eq!(redeem(&fleet, &key_a).await.0, 200);
@@ -1497,7 +1633,12 @@ async fn revoking_a_named_key_cascades_to_the_name_derived_grant() {
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
     let key = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
 
     let (status, body) = redeem(&fleet, &key).await;
@@ -1524,11 +1665,13 @@ async fn revoking_a_named_key_cascades_to_the_name_derived_grant() {
             "POST",
             "/auth/keys",
             Some(&alice_token),
-            Some(serde_json::to_string(&json!({
-                "action": "revoke",
-                "prefix": hash_prefix,
-            }))
-            .unwrap()),
+            Some(
+                serde_json::to_string(&json!({
+                    "action": "revoke",
+                    "prefix": hash_prefix,
+                }))
+                .unwrap(),
+            ),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -1542,7 +1685,13 @@ async fn revoking_a_named_key_cascades_to_the_name_derived_grant() {
             .is_none(),
         "the cascade must find the name-derived grant, not `ci-<hash>`"
     );
-    assert!(fleet.db().scoped(org).list_grants().await.unwrap().is_empty());
+    assert!(fleet
+        .db()
+        .scoped(org)
+        .list_grants()
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 /// A name-derived grant id stays inside the shape `grant revoke` accepts: the
@@ -1555,7 +1704,12 @@ async fn a_named_grant_id_is_revocable_by_id_and_by_prefix() {
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let expires = i64::try_from(fleet.coord.now()).unwrap() + 86_400;
     let key = fleet
-        .seed_named_ci_auth_key(&org.0, &["nrf52".to_owned()], Some(expires), Some("builder"))
+        .seed_named_ci_auth_key(
+            &org.0,
+            &["nrf52".to_owned()],
+            Some(expires),
+            Some("builder"),
+        )
         .await;
     assert_eq!(redeem(&fleet, &key).await.0, 200);
 

@@ -411,13 +411,7 @@ fn print_list(list: &AuthKeyList) {
     println!();
     println!(
         "  {:<16}  {:<8}  {:<10}  {:<12}  {:<12}  {:<16}  {:<16}  TAGS",
-        "HASH PREFIX",
-        "PURPOSE",
-        "SINGLE-USE",
-        "EXPIRES",
-        "STATE",
-        "CREATED BY",
-        "IDENTITY"
+        "HASH PREFIX", "PURPOSE", "SINGLE-USE", "EXPIRES", "STATE", "CREATED BY", "IDENTITY"
     );
     for key in &list.keys {
         let expires = key
@@ -528,7 +522,14 @@ mod tests {
     /// off a coarse `400` that cannot say which rule was broken.
     #[test]
     fn an_invalid_identity_name_names_the_rule() {
-        for bad in ["key:deadbeef", "owner/repo", "", "-builder", "..", &"x".repeat(65)] {
+        for bad in [
+            "key:deadbeef",
+            "owner/repo",
+            "",
+            "-builder",
+            "..",
+            &"x".repeat(65),
+        ] {
             let err = normalise_identity_name(bad).unwrap_err().to_string();
             assert!(err.contains("[a-z0-9._-]"), "{bad:?}: {err}");
             assert!(err.contains(bad) || bad.is_empty(), "{bad:?}: {err}");
@@ -539,7 +540,10 @@ mod tests {
     /// that makes a rotation typed months later the same identity.
     #[test]
     fn a_valid_identity_name_is_lowercased() {
-        assert_eq!(normalise_identity_name("  Builder-1 ").unwrap(), "builder-1");
+        assert_eq!(
+            normalise_identity_name("  Builder-1 ").unwrap(),
+            "builder-1"
+        );
     }
 
     /// The mandatory epilogue carries the three facts an operator needs about

@@ -369,9 +369,15 @@ mod tests {
     fn op_labels_round_trip_and_reject_junk() {
         for op in AllowedOp::all() {
             assert_eq!(AllowedOp::from_label(op.as_str()), Some(op));
-            assert_eq!(AllowedOp::from_label(&op.to_string().to_uppercase()), Some(op));
+            assert_eq!(
+                AllowedOp::from_label(&op.to_string().to_uppercase()),
+                Some(op)
+            );
         }
-        assert_eq!(AllowedOp::from_label("power_cycle"), Some(AllowedOp::PowerCycle));
+        assert_eq!(
+            AllowedOp::from_label("power_cycle"),
+            Some(AllowedOp::PowerCycle)
+        );
         assert_eq!(AllowedOp::from_label("root"), None);
     }
 

@@ -197,8 +197,7 @@ mod tests {
         let channel = ChannelId(11);
         let (to_relay_tx, mut to_relay_rx) = mpsc::channel::<DataFrame>(16);
         let (from_relay_tx, from_relay_rx) = mpsc::channel::<DataFrame>(16);
-        let splice_task =
-            tokio::spawn(splice(channel, accepted, to_relay_tx, from_relay_rx));
+        let splice_task = tokio::spawn(splice(channel, accepted, to_relay_tx, from_relay_rx));
 
         // client -> relay
         client.write_all(b"$g#67").await.unwrap();

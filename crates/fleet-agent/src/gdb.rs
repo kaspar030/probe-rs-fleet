@@ -426,8 +426,7 @@ chip = "nRF52840_xxAA"
         let (to_relay_tx, mut to_relay_rx) = mpsc::channel::<DataFrame>(16);
         let (from_relay_tx, from_relay_rx) = mpsc::channel::<DataFrame>(16);
 
-        let splice_task =
-            tokio::spawn(splice(channel, agent_side, to_relay_tx, from_relay_rx));
+        let splice_task = tokio::spawn(splice(channel, agent_side, to_relay_tx, from_relay_rx));
 
         // stub -> agent -> relay: the stub writes gdb bytes; they arrive on the
         // relay channel verbatim, tagged with the right channel id.
