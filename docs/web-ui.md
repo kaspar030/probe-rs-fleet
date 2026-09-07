@@ -235,7 +235,12 @@ site):
    `/healthz` or `/node/approve`" a property of the router's *shape* rather than
    of a test that samples it, and it is why an unknown top-level path is an
    empty 404. The instinct when a new client-side route 404s is to add
-   `.fallback(shell)`; the answer is to add the route to `SHELL_ROUTES`.
+   `.fallback(shell)`; the answer is to add the page to `PAGES` in
+   `src/assets.rs`, from which the router derives both the bare `/ui/<page>` and
+   the trailing-slash `/ui/<page>/` spelling. Both are registered because the
+   client router strips a trailing slash, so serving only the bare form made a
+   *cold* load of `/ui/devices/` a 404 that navigation within the shell never
+   reproduced.
 3. **Every frontend module is `.mjs`, and there is no `package.json`.** A `.js`
    module is resolved as CommonJS by node < 22.7 and by any node whose upward
    walk finds a package scope it dislikes — including an unparseable
@@ -546,7 +551,7 @@ first reviewer of the UI does not read "audit log" and expect one.
 | Method + path | Response |
 |---|---|
 | `GET /` , `GET /ui` | `302` → `/ui/`, so relative asset URLs resolve against the canonical path |
-| `GET /ui/` and each client-side route (`/ui/devices`, `/ui/agents`, `/ui/approve`, `/ui/access`, `/ui/keys`, `/ui/audit`) | the shell, `Cache-Control: no-cache` |
+| `GET /ui/` and each client-side route, with or without a trailing slash (`/ui/devices`, `/ui/devices/`, … for `devices`, `agents`, `approve`, `access`, `keys`, `audit`) | the shell, `Cache-Control: no-cache` |
 | `GET /ui/a/{tree-hash}/{path}` | one embedded asset, `public, max-age=31536000, immutable` |
 | `GET /node/approve` | unchanged URL, unchanged reflection-free page, plus one static link to `/ui/approve` |
 

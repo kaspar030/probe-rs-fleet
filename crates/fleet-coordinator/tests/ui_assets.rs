@@ -149,26 +149,69 @@ async fn a_stale_hash_still_serves_current_bytes() {
 }
 
 /// Every client-side route answers with the *same* shell, so a deep link and a
-/// reload both work.
+/// reload both work — in **both** spellings.
+///
+/// `web/router.mjs` strips a trailing slash, so once the shell is loaded
+/// `/ui/devices/` is the devices page; the bug this pins is that a *cold* load
+/// of the slashed form never reached the shell that would have normalised it.
+/// The two spellings are one page and must be indistinguishable over the wire,
+/// headers included.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_side_routes_all_render_the_shell() {
     let fleet = TestCoordinator::start().await;
 
     let (_, _, canonical) = fleet.http_full("GET", "/ui/", &[], None).await;
-    for path in [
-        "/ui/devices",
-        "/ui/agents",
-        "/ui/approve",
-        "/ui/access",
-        "/ui/keys",
-        "/ui/audit",
-    ] {
-        let (status, headers, body) = fleet.http_full("GET", path, &[], None).await;
-        assert_eq!(status, 200, "{path}");
-        assert_eq!(header(&headers, "cache-control"), Some("no-cache"), "{path}");
-        assert_hardened(&headers, path);
-        assert_eq!(body, canonical, "{path} must be byte-identical to /ui/");
+    let pages = fleet_coordinator::assets::shell_pages();
+    assert!(!pages.is_empty(), "there is at least one client-side page");
+
+    for page in pages {
+        for path in [format!("/ui/{page}"), format!("/ui/{page}/")] {
+            let (status, headers, body) = fleet.http_full("GET", &path, &[], None).await;
+            assert_eq!(status, 200, "{path}");
+            assert_eq!(header(&headers, "cache-control"), Some("no-cache"), "{path}");
+            assert_hardened(&headers, &path);
+            assert_eq!(header(&headers, "set-cookie"), None, "{path}");
+            assert_eq!(body, canonical, "{path} must be byte-identical to /ui/");
+        }
     }
+}
+
+/// The Rust page list and `web/router.mjs`'s `PAGES` are hand-maintained in two
+/// files, and this bug is exactly what their drift looks like: the server
+/// serving a set of paths the client router does not agree with.
+///
+/// Scraped out of the shipped bytes rather than imported: there is no build
+/// step and `cargo test` must not require a JS toolchain (`docs/web-ui.md` D3).
+/// The array literal is one line of string literals, so splitting it is enough,
+/// and the `expect`s below fail loudly if it ever stops being that.
+#[test]
+fn the_rust_and_javascript_page_lists_agree() {
+    let source = String::from_utf8(
+        fleet_coordinator::assets::asset_bytes("router.mjs")
+            .expect("web/router.mjs is embedded")
+            .to_vec(),
+    )
+    .expect("web/router.mjs is UTF-8");
+
+    let (_, rest) = source
+        .split_once("export const PAGES = [")
+        .expect("web/router.mjs declares `export const PAGES = [...]` on one line");
+    let (list, _) = rest
+        .split_once(']')
+        .expect("the PAGES array literal is closed");
+    let js: Vec<&str> = list
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('\'').trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    assert_eq!(
+        js,
+        fleet_coordinator::assets::shell_pages(),
+        "web/router.mjs's PAGES and src/assets.rs's PAGES have drifted; \
+         the server would serve pages the client router does not know, or refuse \
+         pages it does"
+    );
 }
 
 /// A path with an extension is never answered with the shell.
@@ -186,6 +229,12 @@ async fn an_unknown_asset_path_is_a_404_and_never_the_shell() {
     for path in [
         "/ui/nope.mjs".to_owned(),
         "/ui/pages/nope.mjs".to_owned(),
+        // Serving both spellings of a *known* page does not widen the surface:
+        // an unknown one still 404s either way.
+        "/ui/nope".to_owned(),
+        "/ui/nope/".to_owned(),
+        "/ui/devices/extra".to_owned(),
+        "/ui/devices//".to_owned(),
         format!("{prefix}/nope.mjs"),
         format!("{prefix}/pages/nope.mjs"),
     ] {

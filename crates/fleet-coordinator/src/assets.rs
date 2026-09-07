@@ -56,7 +56,8 @@
 //! `/node/approve` — not merely "does not today", but *cannot*, which is a
 //! property a test can only sample and a router shape can guarantee. The
 //! instinct when a client-side route 404s is to add `.fallback(shell)`; the
-//! answer is to add the path to [`SHELL_ROUTES`] instead.
+//! answer is to add the page to [`PAGES`] instead, which registers both its
+//! bare and its trailing-slash spelling.
 //!
 //! # Headers
 //!
@@ -98,21 +99,19 @@ use crate::core::Coordinator;
 /// because the bytes are right here.
 static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web");
 
-/// The client-side routes the shell answers.
+/// The client-side pages the shell answers, as bare page names.
 ///
 /// Listed explicitly rather than "anything under `/ui/`" so that a typo'd asset
-/// URL is a 404 rather than an HTML document parsed as JavaScript. Adding a page
-/// means adding it here and in `web/router.mjs`; `web-tests/router.test.mjs`
-/// asserts the router knows each of them.
-const SHELL_ROUTES: &[&str] = &[
-    "/ui/",
-    "/ui/devices",
-    "/ui/agents",
-    "/ui/approve",
-    "/ui/access",
-    "/ui/keys",
-    "/ui/audit",
-];
+/// URL is a 404 rather than an HTML document parsed as JavaScript. [`router`]
+/// derives *both* spellings of each page — `/ui/devices` and `/ui/devices/` —
+/// from this one list, because `web/router.mjs` treats them as the same page
+/// (it strips trailing slashes) and a cold load of the slashed form must not
+/// 404 before the shell that would have normalised it is even served.
+///
+/// Adding a page means adding it here and to `PAGES` in `web/router.mjs`;
+/// `web-tests/router.test.mjs` asserts the client router knows each of them and
+/// `tests/ui_assets.rs` asserts the two lists have not drifted.
+const PAGES: &[&str] = &["devices", "agents", "approve", "access", "keys", "audit"];
 
 /// The Content-Security-Policy every `/ui*` response carries (D3).
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
@@ -139,9 +138,15 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
         // relative asset URLs resolve against `/ui/` rather than against `/`.
         .route("/", get(|| async { redirect_to_ui() }))
         .route("/ui", get(|| async { redirect_to_ui() }))
-        .route("/ui/a/{hash}/{*path}", get(asset));
-    for route in SHELL_ROUTES {
-        router = router.route(route, get(shell));
+        .route("/ui/a/{hash}/{*path}", get(asset))
+        .route("/ui/", get(shell));
+    for page in PAGES {
+        // Both spellings, from one list: axum matches paths literally, so
+        // `/ui/devices` and `/ui/devices/` are distinct routes, and only the
+        // pair keeps a hand-typed or link-mangled trailing slash working on a
+        // cold load.
+        router = router.route(&format!("/ui/{page}"), get(shell));
+        router = router.route(&format!("/ui/{page}/"), get(shell));
     }
     router
 }
@@ -311,6 +316,15 @@ pub fn asset_paths() -> Vec<String> {
         .collect();
     paths.sort();
     paths
+}
+
+/// The client-side page names, for the drift check in `tests/ui_assets.rs`.
+///
+/// The Rust and JavaScript lists are hand-maintained in two files; this is what
+/// lets a test assert they agree rather than a reviewer notice they do not.
+#[must_use]
+pub fn shell_pages() -> &'static [&'static str] {
+    PAGES
 }
 
 /// One embedded file's contents, for the static analysis in

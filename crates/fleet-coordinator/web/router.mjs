@@ -1,11 +1,13 @@
 // Path -> {page, params}. A pure function, so `web-tests/router.test.mjs` can
 // assert the whole table without a DOM.
 //
-// The set of pages here must match `SHELL_ROUTES` in `src/assets.rs`: the
-// server answers exactly those paths with the shell, and a path it does not
-// know is a 404 rather than an HTML document. That is deliberate — it is what
-// makes a typo'd asset URL surface as a broken import instead of as HTML parsed
-// as JavaScript.
+// The set of pages here must match `PAGES` in `src/assets.rs`: the server
+// answers exactly those pages with the shell — in both their bare and their
+// trailing-slash spelling, since `route` below treats them as one page — and a
+// path it does not know is a 404 rather than an HTML document. That is
+// deliberate: it is what makes a typo'd asset URL surface as a broken import
+// instead of as HTML parsed as JavaScript. `tests/ui_assets.rs` asserts the two
+// lists have not drifted.
 
 export const PAGES = ['devices', 'agents', 'approve', 'access', 'keys', 'audit'];
 

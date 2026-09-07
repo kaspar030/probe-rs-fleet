@@ -144,7 +144,7 @@ Routes:
 | `GET /auth/github/callback` | a browser holding a valid `state` | exchange the code, set the session cookies, 302 `/ui` |
 | `GET /api/v1/*` | a browser session, or a bearer | the browser-facing JSON API (`docs/web-ui.md` §3) |
 | `GET /` , `GET /ui` | a browser | 302 to `/ui/` |
-| `GET /ui/` and each client-side route | a browser | the web UI's shell, embedded in the binary (`docs/web-ui.md` D3) |
+| `GET /ui/` and each client-side route, with or without a trailing slash | a browser | the web UI's shell, embedded in the binary (`docs/web-ui.md` D3) |
 | `GET /ui/a/{hash}/*` | a browser | one embedded asset, immutably cacheable |
 | `GET /healthz` | proxy | liveness |
 
@@ -175,7 +175,9 @@ here rather than only in that document:
   under `/ui/`, which is what makes "the UI cannot swallow another prefix" a
   property of the router's shape rather than of a test — an unknown top-level
   path is an empty 404. Please do not add `.fallback(...)` to fix a
-  client-side route that 404s; add the route.
+  client-side route that 404s; add the page to `PAGES` in
+  `crates/fleet-coordinator/src/assets.rs`, which registers both its bare and
+  its trailing-slash spelling.
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
 reaped on a timeout we do not control, so the node connection must run
