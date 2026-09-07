@@ -4486,7 +4486,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let node = node_id(DEFAULT_ORG_ID, "laptop");
         let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
 
         // Plugged in.
@@ -4646,7 +4646,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let node = node_id(DEFAULT_ORG_ID, "laptop");
         let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
         let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
 
@@ -4693,7 +4693,7 @@ mod tests {
             .register_node_full(&o, "laptop", "hash", &[], Some("op"), AdoptPolicy::Auto, 1000)
             .await
             .unwrap();
-        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let node = node_id(DEFAULT_ORG_ID, "laptop");
         let key = BoardRef::new(o.clone(), node.clone(), "j-link-zzz");
         let inv = || ProbeInventory {
             boards: vec![status("j-link-zzz", "ZZZ", BoardPresence::Online, "", true)],
@@ -4877,7 +4877,7 @@ mod tests {
             .register_node_full(&o, "laptop", "hash", &[], Some("op"), AdoptPolicy::Auto, 1000)
             .await
             .unwrap();
-        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let node = node_id(DEFAULT_ORG_ID, "laptop");
         let key = BoardRef::new(org(DEFAULT_ORG_ID), node.clone(), "j-link-zzz");
 
         coord
@@ -4944,7 +4944,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let node = AgentId(format!("{DEFAULT_ORG_ID}/pi"));
+            let node = node_id(DEFAULT_ORG_ID, "pi");
 
             let inv = ProbeInventory {
                 boards: vec![status("b1", "S1", BoardPresence::Online, "chip", false)],
@@ -4989,7 +4989,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
+        let node = node_id(DEFAULT_ORG_ID, "laptop");
 
         for _ in 0..3 {
             coord
