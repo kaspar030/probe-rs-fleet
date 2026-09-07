@@ -183,11 +183,20 @@ mod tests {
         }
     }
 
+    /// The node id the coordinator would mint for one of this org's nodes.
+    ///
+    /// Built by the production constructor: the agent registry, the board key
+    /// and the `node` row must all agree on one id, and the only way to be
+    /// sure a fixture agrees with production is to call what production calls.
+    fn node() -> AgentId {
+        crate::state::node_id_for(&org(), "agent-a")
+    }
+
     async fn coord_with_board(time: Arc<AtomicU64>) -> Coordinator {
         let mut sched = Scheduler::new(Policy::default());
         sched.upsert_board(Board {
-            id: BoardRef::new(org(), AgentId("agent-a".to_owned()), "b1"),
-            agent: AgentId("agent-a".to_owned()),
+            id: BoardRef::new(org(), node(), "b1"),
+            agent: node(),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec![],
@@ -200,7 +209,7 @@ mod tests {
             .await
             .unwrap();
         db.scoped(org())
-            .ensure_node(&AgentId("agent-a".to_owned()), 1000)
+            .ensure_node(&node(), 1000)
             .await
             .unwrap();
         Coordinator::new(
@@ -221,7 +230,7 @@ mod tests {
         let (atx, mut arx) = mpsc::channel::<AgentMessage>(16);
         coord
             .agents()
-            .insert(AgentId("agent-a".to_owned()), AgentHandle::new(atx))
+            .insert(node(), AgentHandle::new(atx))
             .await;
 
         // alice grabs a short lease.

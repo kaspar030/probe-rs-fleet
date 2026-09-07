@@ -2741,14 +2741,21 @@ mod tests {
         OrgId(name.to_owned())
     }
 
+    /// The node id production would mint for `(org, name)` — by calling the
+    /// production constructor rather than re-spelling its format string, so a
+    /// fixture cannot quietly describe a node shape the fleet never produces.
+    fn node_id(org_name: &str, node: &str) -> AgentId {
+        node_id_for(&org(org_name), node)
+    }
+
     fn board_ref(org_name: &str, node: &str, name: &str) -> BoardRef {
-        BoardRef::new(org(org_name), AgentId(node.to_owned()), name)
+        BoardRef::new(org(org_name), node_id(org_name, node), name)
     }
 
     fn board_in(org_name: &str, node: &str, name: &str) -> Board {
         Board {
             id: board_ref(org_name, node, name),
-            agent: AgentId(node.to_owned()),
+            agent: node_id(org_name, node),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec!["nrf52".to_owned(), "ble".to_owned()],
@@ -2767,11 +2774,15 @@ mod tests {
     }
 
     /// Prepare an org with a node so board/lease foreign keys resolve.
+    ///
+    /// The node is enrolled under the id [`node_id_for`] mints, which is what
+    /// `core.rs`'s inventory path passes to [`OrgDb::ensure_node`] in
+    /// production — the fixture's node is addressable exactly as a real one is.
     async fn seeded(db: &Db, org_name: &str, node: &str) -> OrgId {
         let o = org(org_name);
         db.ensure_org(&o, "personal").await.unwrap();
         db.scoped(o.clone())
-            .ensure_node(&AgentId(node.to_owned()), 1000)
+            .ensure_node(&node_id(org_name, node), 1000)
             .await
             .unwrap();
         o
@@ -2855,7 +2866,7 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let mine = seeded(&db, DEFAULT_ORG_ID, "rpi-1").await;
         db.scoped(mine.clone())
-            .ensure_node(&AgentId("rpi-2".to_owned()), 1000)
+            .ensure_node(&node_id(DEFAULT_ORG_ID, "rpi-2"), 1000)
             .await
             .unwrap();
         let theirs = seeded(&db, "other", "rpi-9").await;
@@ -2874,7 +2885,7 @@ mod tests {
         // A rename: `rpi-1` now declares only `b2`.
         let deleted = db
             .scoped(mine.clone())
-            .prune_boards(&AgentId("rpi-1".to_owned()), &["b2".to_owned()])
+            .prune_boards(&node_id(DEFAULT_ORG_ID, "rpi-1"), &["b2".to_owned()])
             .await
             .unwrap();
         assert_eq!(deleted, 1);
@@ -2899,7 +2910,7 @@ mod tests {
         // Empty keep-set: every row of that node goes, and only that node's.
         let deleted = db
             .scoped(mine.clone())
-            .prune_boards(&AgentId("rpi-1".to_owned()), &[])
+            .prune_boards(&node_id(DEFAULT_ORG_ID, "rpi-1"), &[])
             .await
             .unwrap();
         assert_eq!(deleted, 1);
@@ -3257,7 +3268,7 @@ mod tests {
     #[tokio::test]
     async fn node_org_lookup() {
         let db = Db::connect_in_memory().await.unwrap();
-        let node = AgentId("rpi-1".to_owned());
+        let node = node_id("org-a", "rpi-1");
         assert!(db.org_of_node(&node).await.unwrap().is_none());
         seeded(&db, "org-a", "rpi-1").await;
         assert_eq!(db.org_of_node(&node).await.unwrap(), Some(org("org-a")));
@@ -3346,7 +3357,7 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
         assert_eq!(
-            db.node_org_and_policy(&AgentId("agent-a".to_owned()))
+            db.node_org_and_policy(&node_id(DEFAULT_ORG_ID, "agent-a"))
                 .await
                 .unwrap(),
             Some((o, AdoptPolicy::Declared)),
@@ -3443,14 +3454,14 @@ mod tests {
         let db = Db::connect_in_memory().await.unwrap();
         let o = seeded(&db, DEFAULT_ORG_ID, "agent-a").await;
         sqlx::query("UPDATE node SET adopt_policy = 'manual' WHERE id = ?1")
-            .bind("agent-a")
+            .bind(node_id(DEFAULT_ORG_ID, "agent-a").0)
             .execute(db.pool())
             .await
             .unwrap();
         let _ = o;
 
         let err = db
-            .node_org_and_policy(&AgentId("agent-a".to_owned()))
+            .node_org_and_policy(&node_id(DEFAULT_ORG_ID, "agent-a"))
             .await
             .unwrap_err();
         assert!(
@@ -3854,14 +3865,19 @@ mod tests {
 
         let mine_nodes = db.scoped(mine.clone()).list_nodes().await.unwrap();
         assert_eq!(mine_nodes.len(), 1);
-        assert_eq!(mine_nodes[0].name, "rpi-1");
+        // A node the *inventory* path created carries its id as its name:
+        // `ensure_node` binds `node.0` to both columns, and only
+        // `register_node_full` (the `share` / `agent up` path) knows a short
+        // name to store. So the production-shaped fixture reports
+        // `default/rpi-1` here, not `rpi-1`.
+        assert_eq!(mine_nodes[0].name, node_id(DEFAULT_ORG_ID, "rpi-1").0);
         assert_eq!(mine_nodes[0].boards, Vec::<String>::new());
 
         // The other tenant's node is not merely filtered out of the listing:
         // it is unreachable through this handle at all.
         let their_nodes = db.scoped(theirs).list_nodes().await.unwrap();
         assert_eq!(their_nodes.len(), 1);
-        assert_eq!(their_nodes[0].name, "rpi-2");
+        assert_eq!(their_nodes[0].name, node_id("other", "rpi-2").0);
     }
 
     /// A node's boards come back with it, and a board of another org's node
@@ -4025,11 +4041,14 @@ mod tests {
             .unwrap();
 
         // `ensure_node` writes the full id into `name` (see `list_nodes`), so
-        // that is what this node is addressed by here.
-        assert!(db.scoped(mine.clone()).delete_node("rpi-1").await.unwrap());
+        // that is what a node enrolled by the inventory path is addressed by —
+        // and with production-shaped ids that name is `default/rpi-1`.
+        let mine_name = node_id(DEFAULT_ORG_ID, "rpi-1").0;
+        let their_name = node_id("other", "rpi-2").0;
+        assert!(db.scoped(mine.clone()).delete_node(&mine_name).await.unwrap());
         assert!(db
             .scoped(mine.clone())
-            .node_by_name("rpi-1")
+            .node_by_name(&mine_name)
             .await
             .unwrap()
             .is_none());
@@ -4037,15 +4056,15 @@ mod tests {
             .fetch_all(db.pool_for_test())
             .await
             .unwrap();
-        assert_eq!(boards, vec![("rpi-2".to_owned(),)], "only ours went");
+        assert_eq!(boards, vec![(their_name.clone(),)], "only ours went");
 
         // Deleting again is `false`, not an error — and another org's node of
         // any name is not reachable through this handle.
-        assert!(!db.scoped(mine.clone()).delete_node("rpi-1").await.unwrap());
-        assert!(!db.scoped(mine).delete_node("rpi-2").await.unwrap());
+        assert!(!db.scoped(mine.clone()).delete_node(&mine_name).await.unwrap());
+        assert!(!db.scoped(mine).delete_node(&their_name).await.unwrap());
         assert!(db
             .scoped(theirs)
-            .node_by_name("rpi-2")
+            .node_by_name(&their_name)
             .await
             .unwrap()
             .is_some());

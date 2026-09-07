@@ -171,12 +171,22 @@ mod tests {
     use fleet_proto::ids::{AgentId, OrgId};
     use tokio::sync::mpsc;
 
+    /// The org this fixture's node and boards live in.
+    fn test_org() -> OrgId {
+        OrgId(crate::state::DEFAULT_ORG_ID.to_owned())
+    }
+
+    /// The node id the coordinator would mint for this fixture's agent.
+    ///
+    /// The relay itself treats an `AgentId` as an opaque routing key, but the
+    /// key it routes on in production is an org-namespaced one, so that is
+    /// what the fixture routes on — built by the production constructor.
+    fn test_agent_id() -> AgentId {
+        crate::state::node_id_for(&test_org(), "agent-a")
+    }
+
     fn test_board_ref() -> BoardRef {
-        BoardRef::new(
-            OrgId("default".to_owned()),
-            AgentId("agent-a".to_owned()),
-            "b1",
-        )
+        BoardRef::new(test_org(), test_agent_id(), "b1")
     }
 
     /// Build an agent handle and a receiver standing in for the agent's writer
@@ -198,7 +208,7 @@ mod tests {
         let channel = open_channel(
             &table,
             &agent,
-            AgentId("agent-a".to_owned()),
+            test_agent_id(),
             sidecar_tx.clone(),
             OpenRequest {
                 lease: LeaseId(1),
@@ -274,7 +284,7 @@ mod tests {
         let channel = open_channel(
             &table,
             &agent,
-            AgentId("agent-a".to_owned()),
+            test_agent_id(),
             sidecar_tx,
             OpenRequest {
                 lease: LeaseId(1),
@@ -336,7 +346,7 @@ mod tests {
                 channel,
                 ChannelRoute {
                     lease: LeaseId(1),
-                    agent: AgentId("agent-a".to_owned()),
+                    agent: test_agent_id(),
                     sidecar: sidecar_tx,
                     kind: fleet_proto::ChannelKind::Data,
                 },

@@ -152,7 +152,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use fleet_proto::ids::{AgentId, BoardRef, LeaseId, OrgId, Subject, SubjectKind};
+    use fleet_proto::ids::{BoardRef, LeaseId, OrgId, Subject, SubjectKind};
 
     /// RFC 8032 ed25519 test-vector seed. The agent's verifier tests
     /// (`fleet-agent/src/token.rs`) use the same seed, so a token signed here
@@ -167,12 +167,17 @@ mod tests {
         Ed25519Signer::from_seed(&TEST_SEED)
     }
 
+    /// The fleet-unique board key a token is scoped to, with a
+    /// **production-shaped** node id.
+    ///
+    /// `state.rs::node_id_for` namespaces node ids by org, so the node half is
+    /// `"{org}/{name}"`. Built via that constructor rather than a literal, and
+    /// kept in step with `fleet-agent/src/token.rs`'s `board()` — the two are a
+    /// shared cross-crate vector, so a token signed here verifies there.
     fn test_board() -> BoardRef {
-        BoardRef::new(
-            OrgId("acme".to_owned()),
-            AgentId("rpi-1".to_owned()),
-            "nrf52840-dk-3",
-        )
+        let org = OrgId("acme".to_owned());
+        let node = crate::state::node_id_for(&org, "rpi-1");
+        BoardRef::new(org, node, "nrf52840-dk-3")
     }
 
     fn token() -> CapabilityToken {
@@ -233,15 +238,13 @@ mod tests {
     #[test]
     fn grant_to_wire_produces_verifiable_token() {
         let s = signer();
+        let org = OrgId("acme".to_owned());
+        let node = crate::state::node_id_for(&org, "agent-a");
         let granted = GrantedLease {
             lease: LeaseId(11),
-            board: BoardRef::new(
-                OrgId("acme".to_owned()),
-                AgentId("agent-a".to_owned()),
-                "b1",
-            ),
-            agent: AgentId("agent-a".to_owned()),
-            holder: Subject::new(OrgId("acme".to_owned()), SubjectKind::User, "alice"),
+            board: BoardRef::new(org.clone(), node.clone(), "b1"),
+            agent: node,
+            holder: Subject::new(org, SubjectKind::User, "alice"),
             expires: 2_000_000_000,
         };
         let grant = s.grant_to_wire(&granted, all_allowed_ops()).unwrap();

@@ -239,10 +239,16 @@ mod tests {
         Subject::new(org(org_name), SubjectKind::User, id)
     }
 
+    /// The node id the coordinator would mint for this org's node, via the
+    /// production constructor rather than a hand-rolled literal.
+    fn node(org_name: &str) -> AgentId {
+        crate::state::node_id_for(&org(org_name), "node-1")
+    }
+
     fn board(org_name: &str, name: &str) -> Board {
         Board {
-            id: BoardRef::new(org(org_name), AgentId("node-1".to_owned()), name),
-            agent: AgentId("node-1".to_owned()),
+            id: BoardRef::new(org(org_name), node(org_name), name),
+            agent: node(org_name),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec![],
