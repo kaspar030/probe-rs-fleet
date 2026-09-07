@@ -68,6 +68,30 @@ pub enum ConstraintParseError {
     /// A term used an unknown `key=value` form.
     #[error("unsupported term `{0}`")]
     UnsupportedTerm(String),
+    /// A term value made *only* of glob/regex metacharacters — `*`, `?`, `%`,
+    /// `.*` and friends.
+    ///
+    /// There is deliberately no match-everything selector (see
+    /// [`parse_constraint`]), so such a term is not "unsupported syntax" but a
+    /// user reaching for a feature that does not and will not exist; the
+    /// message therefore names the real answer instead of the grammar.
+    #[error(
+        "there is no wildcard selector. To reach a set of boards, tag them and \
+         select the tag (`--select lab`); `probe-rs-fleet ctl list` shows what \
+         you can reach."
+    )]
+    NoWildcard,
+}
+
+/// Whether a term value is made *only* of glob/regex metacharacters — `*`,
+/// `?`, `%`, `.*`, `**`, `.+` and other such shapes.
+///
+/// "Every character is a metacharacter" is the whole rule, which is what keeps
+/// it from touching legitimate tags: `nrf52840-dk-3`, `v1.2` and `lab.eu` all
+/// contain ordinary characters and parse unchanged. A value of only `.` is
+/// refused too — it could never name a board either.
+fn looks_like_a_wildcard(value: &str) -> bool {
+    value.chars().all(|c| "*?%.[]{}()|\\^$+".contains(c))
 }
 
 /// Parse a selector expression into a [`Constraint`].
@@ -93,10 +117,32 @@ pub enum ConstraintParseError {
 /// cannot express it, and quietly dropping the extra terms would widen a
 /// grant.
 ///
+/// # There is no wildcard, by design
+///
+/// [`Constraint`] has no any-board variant, an empty tag set (which *would*
+/// match every board) is refused at every entry point, and a delegation's
+/// `CapabilityToken` binds one `BoardRef` — so "the whole fleet" is not
+/// expressible, deliberately. A term whose value is made entirely of
+/// glob/regex metacharacters is therefore refused with
+/// [`ConstraintParseError::NoWildcard`], whose message names the actual answer
+/// (tag the boards, select the tag). Without that check `--select '*'` parses
+/// into a tag nothing carries and the user gets a message about board
+/// contention — a diagnostic about the fleet, for a typo.
+///
+/// Tag values are *not* charset-validated in general, and that is a decision,
+/// not an omission: board tags come from `boards.toml`, which the agent never
+/// charset-validates, so an alnum/`.`/`_`/`-` rule would reject tags that work
+/// today, and would do it at selection time, far from the file. An unmatchable
+/// tag is not dangerous either — it fails closed. Only the syntactically
+/// wildcard-shaped case is refused, because only there is the diagnostic
+/// actively misleading. `all` is left alone: it is a plausible literal tag,
+/// and unlike `*` it is not syntactically a wildcard.
+///
 /// # Errors
 ///
 /// Returns a [`ConstraintParseError`] for an empty expression, an empty term
-/// value, a non-conjoinable term in a conjunction, or an unknown `key=value`.
+/// value, a non-conjoinable term in a conjunction, an unknown `key=value`, or
+/// a wildcard-looking term value.
 pub fn parse_constraint(expr: &str) -> Result<Constraint, ConstraintParseError> {
     let terms: Vec<&str> = expr
         .split("&&")
@@ -115,6 +161,9 @@ pub fn parse_constraint(expr: &str) -> Result<Constraint, ConstraintParseError> 
             if name.is_empty() {
                 return Err(ConstraintParseError::EmptyValue { term: "id" });
             }
+            if looks_like_a_wildcard(name) {
+                return Err(ConstraintParseError::NoWildcard);
+            }
             return Ok(Constraint::Id(BoardName(name.to_owned())));
         }
         if let Some(model) = terms[0].strip_prefix("board=") {
@@ -122,12 +171,18 @@ pub fn parse_constraint(expr: &str) -> Result<Constraint, ConstraintParseError> 
             if model.is_empty() {
                 return Err(ConstraintParseError::EmptyValue { term: "board" });
             }
+            if looks_like_a_wildcard(model) {
+                return Err(ConstraintParseError::NoWildcard);
+            }
             return Ok(Constraint::Model(model.to_owned()));
         }
         if let Some(chip) = terms[0].strip_prefix("chip=") {
             let chip = chip.trim();
             if chip.is_empty() {
                 return Err(ConstraintParseError::EmptyValue { term: "chip" });
+            }
+            if looks_like_a_wildcard(chip) {
+                return Err(ConstraintParseError::NoWildcard);
             }
             return Ok(Constraint::Chip(chip.to_owned()));
         }
@@ -146,6 +201,13 @@ pub fn parse_constraint(expr: &str) -> Result<Constraint, ConstraintParseError> 
         }
         if tag.contains('=') {
             return Err(ConstraintParseError::UnsupportedTerm(term.to_owned()));
+        }
+        // *After* the `=` check: `*=*` is an unknown-key typo, and
+        // `unsupported term` is the better message for it. `tag=*` and a bare
+        // `*` both still reach here — the `tag=` prefix is stripped above, so
+        // what is left carries no `=`.
+        if looks_like_a_wildcard(tag) {
+            return Err(ConstraintParseError::NoWildcard);
         }
         tags.push(tag.to_owned());
     }
@@ -316,6 +378,50 @@ mod tests {
         assert_eq!(
             parse_constraint("colour=red"),
             Err(ConstraintParseError::UnsupportedTerm("colour=red".to_owned()))
+        );
+    }
+
+    /// `--select '*'` is the obvious first guess for "everything", and before
+    /// this check it parsed into a tag no board carries: the user then got a
+    /// message about board contention, i.e. a diagnostic about the fleet for
+    /// what is a typo. The message must name the real answer.
+    #[test]
+    fn a_wildcard_looking_term_is_refused_with_the_real_answer() {
+        for expr in [
+            "*", "?", "%", ".*", "**", ".+", ".", "tag=*", "lab && *", "board=*", "id=*", "chip=.*",
+        ] {
+            assert_eq!(
+                parse_constraint(expr),
+                Err(ConstraintParseError::NoWildcard),
+                "{expr} should be refused as a wildcard"
+            );
+        }
+        let msg = ConstraintParseError::NoWildcard.to_string();
+        assert!(msg.contains("no wildcard selector"), "{msg}");
+        assert!(msg.contains("ctl list"), "{msg}");
+    }
+
+    /// The check is "every character is a metacharacter", so ordinary tags with
+    /// dots and dashes are untouched — general charset validation was declined
+    /// deliberately (see `parse_constraint`'s doc comment).
+    #[test]
+    fn tags_with_dots_and_dashes_still_parse() {
+        for expr in ["nrf52840-dk-3", "v1.2", "lab.eu", "tag=a.b-c_d"] {
+            assert!(parse_constraint(expr).is_ok(), "{expr} should parse");
+        }
+        // Deliberately *not* rejected: a literal `all` tag is plausible, and
+        // `all` is not syntactically a wildcard.
+        assert_eq!(parse_constraint("all"), Ok(tags(&["all"])));
+    }
+
+    /// `*=*` is an unknown-key typo, not a wildcard, and the unsupported-term
+    /// message is the better one for it: the wildcard check runs *after* the
+    /// `=` check for exactly this reason.
+    #[test]
+    fn a_metacharacter_key_keeps_the_unsupported_term_message() {
+        assert_eq!(
+            parse_constraint("*=*"),
+            Err(ConstraintParseError::UnsupportedTerm("*=*".to_owned()))
         );
     }
 

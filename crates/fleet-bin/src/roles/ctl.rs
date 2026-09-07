@@ -546,6 +546,16 @@ mod tests {
         assert!(parse_selector("").is_err());
     }
 
+    /// `ctl lease '*'` and `ctl delegate --select '*'` both funnel through
+    /// [`parse_selector`], so the shared grammar's refusal is what these
+    /// surfaces show — assert it here rather than assume the funnelling.
+    #[test]
+    fn a_wildcard_selector_names_the_real_answer() {
+        let e = parse_selector("*").unwrap_err();
+        assert!(e.contains("no wildcard selector"), "{e}");
+        assert!(parse_selector("tag=*").is_err());
+    }
+
     #[test]
     fn connection_requires_a_url_and_a_token() {
         assert!(CtlConnection::resolve(args(None, None), None, None).is_err());

@@ -678,6 +678,23 @@ mod tests {
         ));
     }
 
+    /// The `PROBE_RS_FLEET_SELECT` surface: the wildcard refusal must reach
+    /// the user through `SelectorError::InvalidSelect`'s reason, not be
+    /// flattened into a generic "invalid selector".
+    #[test]
+    fn a_wildcard_select_names_the_real_answer() {
+        let Err(SelectorError::InvalidSelect { reason }) = parse_select("*") else {
+            panic!("`*` should be refused");
+        };
+        assert!(reason.contains("no wildcard"), "{reason}");
+
+        let env = MapEnv::new(&[("PROBE_RS_FLEET_SELECT", "*")]);
+        let Err(SelectorError::InvalidSelect { reason }) = resolve(&env) else {
+            panic!("`PROBE_RS_FLEET_SELECT=*` should be refused");
+        };
+        assert!(reason.contains("no wildcard"), "{reason}");
+    }
+
     #[test]
     fn chip_mixed_with_tags_is_error() {
         assert!(matches!(

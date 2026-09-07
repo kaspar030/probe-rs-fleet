@@ -1076,7 +1076,12 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
             Ok(c) => c.to_string(),
             Err(e) => {
                 warn!(error = %e, "a CI auth key's tags do not form a valid selector");
-                return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+                // A *caller* fault, not a coordinator one: the tags came in at
+                // mint time (and `auth-key create` can be driven from a shell,
+                // which historically skipped `valid_tags`), so a `server_error`
+                // here would be a lie that pages someone for a typo. Refuse the
+                // redemption the way the tagless-`ci` case above does.
+                return reject(StatusCode::FORBIDDEN, "forbidden");
             }
         };
     let ops = if meta.ops.is_empty() {
@@ -1691,6 +1696,15 @@ pub(crate) async fn create_auth_key(
     // (§6.5); refusing it here keeps that rule from having an exception nobody
     // would find until a runner had the whole fleet.
     if purpose == crate::state::AUTH_KEY_PURPOSE_CI && tags.is_empty() {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    // For the same reason, the tags must survive the trip *through* the
+    // selector grammar: a tag like `*` now parses to `NoWildcard` and would
+    // turn a mint-time typo into a failed redemption far from its cause.
+    // `valid_tags` is the rule node registration and the browser's node `PATCH`
+    // already apply, so this removes an exception rather than adding a rule --
+    // and with it, "validated at mint" implies "parses at redemption".
+    if !tags.is_empty() && !valid_tags(&tags) {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     }
     // Ops are validated here so a typo is a 400 rather than an op silently

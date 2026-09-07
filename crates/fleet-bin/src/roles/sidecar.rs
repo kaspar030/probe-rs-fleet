@@ -422,6 +422,19 @@ mod tests {
         assert!(!msg.contains("PROBE_RS_FLEET_SELECT"), "{msg}");
     }
 
+    /// `sidecar --select '*'` is its own surface (its error names the *flag*,
+    /// not the environment variable), so assert the wildcard answer reaches it
+    /// too rather than assuming the shared parser is enough.
+    #[test]
+    fn a_wildcard_select_flag_names_the_real_answer() {
+        let err = SelectorFlags::new(None, None, Some("*".to_owned()))
+            .validate()
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no wildcard selector"), "{msg}");
+        assert!(msg.contains("--select"), "{msg}");
+    }
+
     #[test]
     fn valid_select_expression_passes_validation() {
         let expr = SelectorFlags::new(None, None, Some("tag=nrf52 && bluetooth".to_owned()));

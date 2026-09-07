@@ -1100,6 +1100,18 @@ meaning never depends on which CLI wrote it; a row that will not re-parse is
 dropped **closed**, never widened into a match-anything. An empty expression is
 refused at every entry point, because an empty tag set matches every board.
 
+There is deliberately **no wildcard**: `Constraint` has no any-board variant, and
+a delegation could not express one anyway, since a `CapabilityToken` binds one
+`BoardRef`. So a term made only of glob/regex metacharacters (`*`, `?`, `%`,
+`.*`) is refused at parse time with a message that names the real answer — tag
+the boards and select the tag (`--select lab`); `ctl list` shows what you can
+reach — instead of parsing into a tag nothing carries and surfacing as a message
+about board contention. Tag values are otherwise free-form: general charset
+validation was declined because `boards.toml` tags are unvalidated agent-side, so
+such a rule would reject working configs at selection time, far from the file. A
+CI auth key's tags *are* charset-validated at mint, since redemption turns them
+into a selector.
+
 **Evaluation is a pure value object** (`fleet_core::access::Access`): ownership
 (a member of the board's org) or a live grant, deny by default, with `now`
 always a parameter — so the whole (subject, object, op) matrix is a

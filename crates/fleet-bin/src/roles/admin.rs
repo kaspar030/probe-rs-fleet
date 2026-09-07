@@ -132,6 +132,22 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
          selector of the grant it creates, and an empty selector matches every \
          board in the org"
     );
+    // And the tags must survive the trip *through* the selector grammar, since
+    // that is literally what redemption does with them (it synthesises
+    // `tag=a && tag=b` and parses it). A tag like `*` is refused there — there
+    // is no wildcard selector — so checking here turns what would be a bare
+    // `403` at redemption into a message naming the mistake at mint time. The
+    // shared parser is used rather than a second copy of the rule.
+    if !args.tag.is_empty() {
+        let selector = args
+            .tag
+            .iter()
+            .map(|t| format!("tag={t}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        fleet_proto::lease::parse_constraint(&selector)
+            .map_err(|e| anyhow::anyhow!("invalid `--tag`: {e}"))?;
+    }
     let ops: Vec<String> = match &args.ops {
         // Validated locally so a typo names the unknown op rather than being
         // silently dropped and discovered at redemption. `normalize_ops`
@@ -663,6 +679,25 @@ mod tests {
         assert!(
             err.contains("empty selector"),
             "the refusal must say why, got: {err}"
+        );
+    }
+
+    /// A wildcard `--tag` is refused at mint too: the tags become a selector at
+    /// redemption, where there is deliberately no wildcard, so a key with tag
+    /// `*` could never redeem.
+    #[tokio::test]
+    async fn a_wildcard_tag_is_refused_before_touching_the_database() {
+        let args = AuthKeyArgs {
+            purpose: AUTH_KEY_PURPOSE_CI.to_owned(),
+            tag: vec!["*".to_owned()],
+            ..args_for(Some(std::path::PathBuf::from(
+                "/nonexistent/coordinator/config/dir",
+            )))
+        };
+        let err = auth_key(args).await.unwrap_err().to_string();
+        assert!(
+            err.contains("no wildcard selector"),
+            "the refusal must name the real answer, got: {err}"
         );
     }
 

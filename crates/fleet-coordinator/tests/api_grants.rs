@@ -415,6 +415,25 @@ async fn a_selector_is_canonicalised_and_an_empty_one_is_refused() {
         .await;
         assert_eq!(status, 400, "an empty selector ({empty:?}) must be refused: {body}");
     }
+
+    // A wildcard-looking selector is refused too, and for a different reason:
+    // there is deliberately no match-everything selector, so `*` parsed into a
+    // tag no board carries and the caller got a contention message for a typo.
+    for wildcard in ["*", ".*", "tag=*"] {
+        let (status, body) = as_browser(
+            &fleet,
+            "POST",
+            "/api/v1/grants",
+            &alice,
+            Some(&grant_body(&fleet, "bob", wildcard, &["attach"])),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "a wildcard selector ({wildcard:?}) must be refused: {body}"
+        );
+        assert_eq!(parse(&body)["error"], "invalid_request", "{body}");
+    }
 }
 
 /// **An empty op set is refused, and a data-plane op implies `attach`** in the
@@ -733,11 +752,19 @@ async fn a_member_mints_a_key_and_the_listing_is_hash_only() {
 
 /// The validation is `POST /auth/keys`'s, because it is the same function:
 /// `ttl_secs = 0` is a `400`, the TTL is capped, an unrecognised `purpose` is a
-/// `400`, and a `ci` key with no tags is a `400`.
+/// `400`, a `ci` key with no tags is a `400`, and the tags must pass
+/// `valid_tags` (charset, `MAX_TAGS`, `MAX_TAG_LEN`).
 ///
 /// Forking any of these would be worse than it looks. The tagless-`ci` rule is
 /// the one that stops a key from synthesising a grant over the whole fleet: an
 /// empty tag set is an empty selector, which matches every board in the org.
+/// The `valid_tags` rule is what makes "validated at mint" imply "parses at
+/// redemption": a CI key's tags become a *selector* when it is redeemed, and a
+/// tag like `*` is refused by the selector grammar (there is no wildcard), so
+/// without this gate a mint-time typo would only surface as a failed
+/// redemption. It also imposes `MAX_TAGS`/`MAX_TAG_LEN` on this path for the
+/// first time — a deliberate widening to a path that had escaped the shared
+/// rule node registration and the node `PATCH` already apply.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_key_validation_is_the_shared_validation() {
     let fleet = TestCoordinator::start().await;
@@ -762,6 +789,10 @@ async fn auth_key_validation_is_the_shared_validation() {
             serde_json::json!({
                 "tags": ["nrf52"], "ttl_secs": 3600, "purpose": "ci", "ops": ["teleport"]
             }),
+        ),
+        (
+            "a wildcard tag",
+            serde_json::json!({ "tags": ["*"], "ttl_secs": 3600, "purpose": "ci" }),
         ),
         (
             "an unknown field",
