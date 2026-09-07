@@ -765,6 +765,42 @@ longer the only mechanism: `sidecar --board` / `--id` / `--select` override them
 lease-bound capability token instead (`ctl delegate`, §6.5).
 
 
+### 4.4 Shell completion (dynamic)
+
+The binary completes its own command line. `clap_complete`'s **dynamic** engine
+(`COMPLETE=<shell> probe-rs-fleet`) installs a small shell stub that calls back
+into the binary on every Tab; the binary answers with candidates computed *at
+that moment*. `probe-rs-fleet completions <shell>` prints the one line that
+installs the stub.
+
+A statically generated script was rejected: the completions that matter here
+are not static. `--fleet` completes the fleets this machine has a config file
+for, `ctl release` / `--id` complete the board ids in this node's
+`boards.toml`, `--select` completes `id=` / `board=` / `chip=` / `tag=` and then
+the local values for the prefix typed, and `--ops` completes the labels
+`AllowedOp` actually defines — so adding an op cannot leave a stale script
+behind. Hidden verbs (the deprecated `agent` spelling, §4.2) are not offered:
+Tab teaches the vocabulary, so it should teach the current one.
+
+Two constraints follow from a completer running inside a keypress, and both are
+load-bearing:
+
+* **Local state only, never the coordinator.** A completer that dialled the
+  network would hang the user's terminal on an unreachable fleet. Board
+  completion is therefore node-local and knowingly partial — it cannot see
+  boards on other nodes or ones shared with you.
+* **Every failure is an empty candidate list.** A missing, malformed or
+  unreadable file yields nothing rather than an error; a diagnostic printed
+  here would corrupt the completion stream. The one completer that shells out
+  (`node board add --serial`, which needs `probe-rs list`) is hard-bounded by a
+  short timeout.
+
+The completion hook runs **before** logging, the runtime, and any write to
+stdout, and only on the clap path: invoked as `probe-rs`, the binary forwards
+argv verbatim to the real probe-rs (§4.3), so those words are not ours to
+complete.
+
+
 ## 5. The dial-out connection (NAT traversal)
 
 The node opens **one persistent WSS connection out** to the coordinator

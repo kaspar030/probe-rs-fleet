@@ -13,6 +13,7 @@
 //! - [`auth_key`] → mint/list/revoke this org's auth keys with that same login
 //! - [`grant`] → share a subset of this org's boards with another person
 //! - [`ci`] → exchange a CI job's workload identity for a per-job fleet token
+//! - [`completions`] → print how to switch shell completion on
 //! - [`node_approve`] → approve a headless machine that printed a short code
 //! - [`node_board`] → declare a board (discover probes, append to
 //!   `boards.toml`) instead of hand-editing it
@@ -29,6 +30,7 @@
 pub mod admin;
 pub mod auth_key;
 pub mod ci;
+pub mod completions;
 pub mod coordinator;
 pub mod ctl;
 pub mod grant;

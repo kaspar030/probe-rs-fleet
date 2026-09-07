@@ -67,6 +67,28 @@ pub enum Command {
     Node(NodeArgs),
     /// List the fleets this machine has a config for.
     Fleets,
+    /// Print how to switch on shell completion for this binary.
+    Completions(CompletionsArgs),
+}
+
+/// Arguments for `probe-rs-fleet completions`.
+///
+/// Completion is **dynamic** — the shell calls back into this binary on every
+/// Tab — so this verb prints the one line that installs the stub rather than a
+/// completion script. See [`crate::completion`] for why.
+#[derive(Debug, Args)]
+pub struct CompletionsArgs {
+    /// The shell to print instructions for.
+    #[arg(value_enum)]
+    pub shell: crate::completion::CompletionShell,
+    /// Print the shell stub itself instead of the instructions, for a packager
+    /// installing it into a system completion directory.
+    ///
+    /// Discouraged: the protocol between the stub and this binary is not
+    /// stable, so a stub shipped in a file can drift out of step with the
+    /// binary that answers it. Sourcing it at shell startup is self-correcting.
+    #[arg(long)]
+    pub print: bool,
 }
 
 /// Arguments for `probe-rs-fleet login`.
@@ -99,11 +121,12 @@ pub struct LoginArgs {
     #[arg(long)]
     pub no_browser: bool,
     /// The fleet to log in to.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the fleets directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -114,7 +137,7 @@ pub struct CoordinatorArgs {
     ///
     /// When unset, defaults to the XDG path
     /// `$XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET_CONFIG")]
+    #[arg(long, env = "PROBE_RS_FLEET_CONFIG", value_hint = clap::ValueHint::FilePath)]
     pub config: Option<std::path::PathBuf>,
     /// Optional nested subcommand (e.g. `init`). When absent, the coordinator
     /// daemon runs.
@@ -142,10 +165,10 @@ pub enum CoordinatorCommand {
 #[derive(Debug, Args)]
 pub struct InitArgs {
     /// Override the config directory (default: XDG config dir).
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
     /// Override the data directory for keys/seed/db (default: XDG data dir).
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub data_dir: Option<std::path::PathBuf>,
     /// The externally reachable base URL clients and nodes will dial
     /// (`https://fleet.example`).
@@ -186,7 +209,7 @@ pub struct AuthKeyArgs {
     #[arg(long)]
     pub org: Option<String>,
     /// Selection tag to stamp onto enrolled nodes (repeatable).
-    #[arg(long)]
+    #[arg(long, add = crate::completion::tag_candidates())]
     pub tag: Vec<String>,
     /// Time-to-live in seconds (default 24h). 0 means no expiry.
     ///
@@ -241,11 +264,11 @@ pub struct AuthKeyArgs {
     ///
     /// `power-cycle` is deliberately not in that default: an unattended runner
     /// cutting power to a lab board should be an explicit choice.
-    #[arg(long)]
+    #[arg(long, add = crate::completion::ops_candidates())]
     pub ops: Option<String>,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -274,7 +297,7 @@ pub struct UserTokenArgs {
     pub ttl: Option<u64>,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -309,7 +332,7 @@ pub struct AuthKeysArgs {
     pub org: Option<String>,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -327,7 +350,7 @@ pub struct AuthKeyRevokeArgs {
     pub org: Option<String>,
     /// Override the config directory (default: XDG config dir). Used to locate
     /// `coordinator.toml`.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -340,7 +363,8 @@ pub struct AuthKeyRevokeArgs {
 #[derive(Debug, Args)]
 pub struct ShareArgs {
     /// The fleet to share this machine with.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// This node's name within its org. Defaults to the machine's hostname.
     ///
@@ -348,7 +372,7 @@ pub struct ShareArgs {
     #[arg(long)]
     pub node_name: Option<String>,
     /// Selection tag to report for this node (repeatable).
-    #[arg(long)]
+    #[arg(long, add = crate::completion::tag_candidates())]
     pub tag: Vec<String>,
     /// Probe adoption policy for this node. Defaults to `auto` for `share`.
     #[arg(long, value_enum)]
@@ -358,7 +382,7 @@ pub struct ShareArgs {
     pub force: bool,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -405,7 +429,7 @@ pub enum AuthKeyCommand {
 pub struct AuthKeyCreateArgs {
     /// Selection tag to stamp onto nodes enrolled with this key (repeatable;
     /// not comma-split — pass `--tag` twice).
-    #[arg(long, visible_alias = "tags")]
+    #[arg(long, visible_alias = "tags", add = crate::completion::tag_candidates())]
     pub tag: Vec<String>,
     /// Time-to-live: bare seconds, or a suffixed duration (`30m`, `24h`, `7d`).
     ///
@@ -462,14 +486,15 @@ pub struct AuthKeyCreateArgs {
     ///
     /// `power-cycle` is deliberately not in that default: an unattended runner
     /// cutting power to a lab board should be an explicit choice.
-    #[arg(long)]
+    #[arg(long, add = crate::completion::ops_candidates())]
     pub ops: Option<String>,
     /// The fleet whose `[user]` session authorises the mint.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -477,11 +502,12 @@ pub struct AuthKeyCreateArgs {
 #[derive(Debug, Args)]
 pub struct AuthKeyListArgs {
     /// The fleet whose `[user]` session authorises the listing.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -495,11 +521,12 @@ pub struct AuthKeyRevokeCliArgs {
     /// (at least 8 hex characters).
     pub prefix: String,
     /// The fleet whose `[user]` session authorises the revocation.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -535,11 +562,12 @@ pub struct NodeUpArgs {
     #[command(flatten)]
     pub flags: NodeUpFlags,
     /// The fleet whose `[node]` credential this node connects with.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -550,11 +578,12 @@ pub struct NodeRunArgs {
     ///
     /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`; the
     /// node-local settings live in `node/node.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -600,29 +629,29 @@ pub struct NodeBoardAddArgs {
     ///
     /// Without it: a picker interactively, an error naming the attached serials
     /// otherwise.
-    #[arg(long)]
+    #[arg(long, add = crate::completion::probe_serial_candidates())]
     pub serial: Option<String>,
     /// Stable board id (`ctl lease id=<name>`, and what grants are written
     /// against). Required when not prompting.
     ///
     /// Never invented for you: it is the name other people's commands depend
     /// on. Interactively it is offered as a default derived from the probe.
-    #[arg(long)]
+    #[arg(long, add = crate::completion::board_id_candidates())]
     pub id: Option<String>,
     /// probe-rs target/chip name, e.g. `nRF52840_xxAA` (`ctl lease chip=<c>`).
     ///
     /// Cannot be discovered: `probe-rs list` reports the probe, never the
     /// target wired to it. May be left empty, at the cost of `chip=`.
-    #[arg(long)]
+    #[arg(long, add = crate::completion::chip_candidates())]
     pub chip: Option<String>,
     /// Board MODEL / board type, e.g. `nrf52840dk` (`ctl lease board=<model>`).
     ///
     /// Also undiscoverable, and distinct from `--chip`: a Nordic DK and a
     /// custom nRF52840 board share `nRF52840_xxAA` and are not interchangeable.
-    #[arg(long)]
+    #[arg(long, add = crate::completion::model_candidates())]
     pub model: Option<String>,
     /// Free-form selection tag (`ctl lease tag=<t>`); repeatable.
-    #[arg(long = "tag")]
+    #[arg(long = "tag", add = crate::completion::tag_candidates())]
     pub tags: Vec<String>,
     /// Let the board hold more than one lease at a time (default: exclusive).
     #[arg(long)]
@@ -638,11 +667,11 @@ pub struct NodeBoardAddArgs {
     pub no_interactive: bool,
     /// Write to this `boards.toml` instead of the one `node.toml` resolves.
     /// A leading `~/` is expanded.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub boards_path: Option<std::path::PathBuf>,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
     /// The `probe-rs` binary used to enumerate probes.
     #[arg(long, hide = true, default_value = "probe-rs")]
@@ -671,11 +700,11 @@ impl NodeBoardAddArgs {
 pub struct NodeBoardListArgs {
     /// Read this `boards.toml` instead of the one `node.toml` resolves.
     /// A leading `~/` is expanded.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub boards_path: Option<std::path::PathBuf>,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
     /// The `probe-rs` binary used to enumerate probes.
     #[arg(long, hide = true, default_value = "probe-rs")]
@@ -747,7 +776,8 @@ pub struct CiLoginArgs {
     #[arg(long)]
     pub export: bool,
     /// The fleet name, for the `PROBE_RS_FLEET` variable it exports.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the fleets directory (default: XDG config dir). Test and
     /// packaging support.
@@ -755,7 +785,7 @@ pub struct CiLoginArgs {
     /// Note this verb **writes no fleet file**: a CI runner's token lives in
     /// the environment for one job. The flag exists only so a test can prove
     /// that.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -795,11 +825,12 @@ pub struct NodeApproveArgs {
     #[arg(long)]
     pub replace: bool,
     /// The fleet whose `[user]` session authorises the approval.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
 }
 
@@ -833,11 +864,12 @@ pub struct AgentArgs {
     /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`. There is no
     /// `--config` any more: `agent.toml` is gone, the credential lives in the
     /// fleet file and the node-local settings in `node/node.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
     /// packaging support.
-    #[arg(long, hide = true, global = true)]
+    #[arg(long, hide = true, global = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
     /// Optional nested subcommand (e.g. `up`). When absent, the node runs.
     #[command(subcommand)]
@@ -882,7 +914,7 @@ pub struct NodeUpFlags {
     #[arg(long)]
     pub node_name: Option<String>,
     /// Selection tag to report for this node (repeatable).
-    #[arg(long)]
+    #[arg(long, add = crate::completion::tag_candidates())]
     pub tag: Vec<String>,
     /// Probe adoption policy for this node.
     ///
@@ -946,28 +978,32 @@ impl NodeUpFlags {
 #[derive(Debug, Args)]
 pub struct SidecarArgs {
     /// The fleet whose `[user]` credential the shim connects with.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Board **model** to lease (e.g. `nrf52840dk`): any idle board of that
     /// type. This is the generic selector — use `--id` for one specific board.
     ///
     /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
     /// environment. An empty value is treated as if the flag were absent.
-    #[arg(long, conflicts_with_all = ["id", "select"])]
+    #[arg(long, conflicts_with_all = ["id", "select"],
+        add = crate::completion::model_candidates())]
     pub board: Option<String>,
     /// Explicit board **id** to lease (e.g. `nrf52840-dk-1`): exactly one
     /// board, by its node-local name.
     ///
     /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
     /// environment. An empty value is treated as if the flag were absent.
-    #[arg(long, conflicts_with_all = ["board", "select"])]
+    #[arg(long, conflicts_with_all = ["board", "select"],
+        add = crate::completion::board_id_candidates())]
     pub id: Option<String>,
     /// Board selector expression: `id=<name>`, `board=<model>`, `chip=<c>`,
     /// `tag=<t> && <t>`, or a bare term (a tag).
     ///
     /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
     /// environment. An empty value is treated as if the flag were absent.
-    #[arg(long, conflicts_with_all = ["board", "id"])]
+    #[arg(long, conflicts_with_all = ["board", "id"],
+        add = crate::completion::selector_candidates())]
     pub select: Option<String>,
     /// The probe-rs subcommand and its arguments, forwarded verbatim.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -989,7 +1025,8 @@ pub struct CtlClientArgs {
     pub server_cert_sha256: Option<String>,
     /// The fleet to talk to. An explicit credential flag takes precedence over
     /// what the fleet file holds.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true)]
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true,
+        add = crate::completion::fleet_candidates())]
     pub fleet: String,
 }
 
@@ -1012,6 +1049,7 @@ pub enum CtlCommand {
         /// Board selector: `id=<name>` for one board, `board=<model>` for any
         /// board of a model, `chip=<c>`, `tag=<t> && <t>`, or a bare word
         /// (which is a tag).
+        #[arg(add = crate::completion::selector_candidates())]
         selector: String,
         /// Requested hold duration in seconds (0 = policy default).
         #[arg(long, default_value_t = 0)]
@@ -1025,6 +1063,7 @@ pub enum CtlCommand {
         /// board shared with you never shadows your own hardware. To reach a
         /// shared one, qualify it: `<node>/<name>`, `<org>/<node>/<name>`, or
         /// paste the full key `ctl list` prints.
+        #[arg(add = crate::completion::board_id_candidates())]
         board: String,
     },
     /// Power-cycle a board.
@@ -1034,6 +1073,7 @@ pub enum CtlCommand {
         /// As for `release`: a bare name prefers your own org's board; qualify
         /// it (`<node>/<name>`, `<org>/<node>/<name>`, or the full key from
         /// `ctl list`) to reach one shared with you.
+        #[arg(add = crate::completion::board_id_candidates())]
         board: String,
     },
     /// Show who holds which boards.
@@ -1041,6 +1081,7 @@ pub enum CtlCommand {
     /// Tail / fetch coordinator-side logs.
     Logs {
         /// Optional board id to scope the logs to.
+        #[arg(add = crate::completion::board_id_candidates())]
         board: Option<String>,
         /// Follow the log stream.
         #[arg(long)]
@@ -1055,7 +1096,7 @@ pub enum CtlCommand {
     Delegate {
         /// Which board to lease: `id=<name>`, `board=<model>`, `chip=<c>`,
         /// `tag=<t> && <t>`, or a bare word (a tag).
-        #[arg(long)]
+        #[arg(long, add = crate::completion::selector_candidates())]
         select: String,
         /// Operations to delegate, comma-separated
         /// (`flash,attach,gdb,reset,erase,power-cycle`).
@@ -1063,7 +1104,7 @@ pub enum CtlCommand {
         /// Never more than you hold. A data-plane op (flash/erase/reset)
         /// implies `attach`, without which the token could not open a data
         /// channel at all.
-        #[arg(long, default_value = "flash,attach")]
+        #[arg(long, default_value = "flash,attach", add = crate::completion::ops_candidates())]
         ops: String,
         /// How long to hold the lease (`90s`, `30m`, `2h`, `7d`, or seconds).
         #[arg(long, default_value = "2h")]
@@ -1101,7 +1142,7 @@ pub struct GrantArgs {
     /// Which boards to share: `board=<model>` for every board of a type,
     /// `tag=<t> && <t>`, `chip=<c>`, or `id=<name>` for a single board (a
     /// degenerate selector, not a special case).
-    #[arg(long)]
+    #[arg(long, add = crate::completion::selector_candidates())]
     pub select: Option<String>,
     /// Operations to confer, comma-separated
     /// (`flash,attach,gdb,reset,erase,power-cycle`).
@@ -1109,7 +1150,7 @@ pub struct GrantArgs {
     /// A data-plane op (flash/erase/reset) implies `attach`; without it the
     /// grantee's token could not open a data channel, so the grant would be a
     /// silent dud.
-    #[arg(long, default_value = "flash,attach")]
+    #[arg(long, default_value = "flash,attach", add = crate::completion::ops_candidates())]
     pub ops: String,
     /// Expiry as a date (`2026-12-31`, UTC midnight) or epoch seconds.
     #[arg(long, conflicts_with = "ttl")]
@@ -1194,6 +1235,19 @@ pub fn main() -> ExitCode {
     let argv0 = argv.first().cloned().unwrap_or_default();
     let rest = &argv[1.min(argv.len())..];
 
+    let dispatch = dispatch_from_argv0(&argv0, rest);
+
+    // Answer a shell completion request before anything else: before logging,
+    // before the runtime, and above all before a single byte reaches stdout,
+    // which in this mode belongs to the shell's completion stream.
+    //
+    // Only on the clap path. Invoked as `probe-rs`, this binary forwards every
+    // argument verbatim to the real probe-rs, so the words the shell is asking
+    // about are not ours to complete.
+    if dispatch == Dispatch::Clap && crate::completion::try_complete(argv.clone()) {
+        return ExitCode::SUCCESS;
+    }
+
     crate::logging::init();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -1207,7 +1261,6 @@ pub fn main() -> ExitCode {
         }
     };
 
-    let dispatch = dispatch_from_argv0(&argv0, rest);
     let result = runtime.block_on(run(dispatch, argv.clone()));
 
     match result {
@@ -1336,6 +1389,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 },
                 Command::Fleets => {
                     roles::list_fleets()?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Completions(args) => {
+                    roles::completions::run(&args)?;
                     Ok(ExitCode::SUCCESS)
                 }
             }

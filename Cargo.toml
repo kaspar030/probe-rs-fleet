@@ -103,6 +103,13 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migr
 
 # cli / config / errors / logging
 clap = { version = "4", features = ["derive", "env"] }
+# Shell completion. `unstable-dynamic` is what gives us the `COMPLETE=<shell>`
+# runtime engine (`CompleteEnv`), so completions are computed by the binary
+# itself and can be *dynamic* — fleet names, board ids, ops — instead of a
+# frozen generated script. It is still an unstable clap feature, hence the
+# exact-version pin: a minor bump of clap_complete may change the shell code it
+# emits and the argv protocol it speaks.
+clap_complete = { version = "=4.6.3", features = ["unstable-dynamic"] }
 toml = "0.8"
 directories = "6"
 thiserror = "2"

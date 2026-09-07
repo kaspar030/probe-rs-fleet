@@ -6,6 +6,7 @@
 //! `share` / `node up` against a live coordinator).
 
 pub mod cli;
+pub mod completion;
 pub mod config;
 pub mod fleet_config;
 pub mod logging;
