@@ -1,0 +1,43 @@
+# Formatting gate: the tree is rustfmt-clean and stays that way.
+#
+# Deliberately narrow — this workflow runs `cargo fmt --all --check` and
+# nothing else. It is not the build/test workflow; add that separately rather
+# than growing this one, so a formatting nit never masks (or is masked by) a
+# compile failure.
+#
+# Why a gate at all: the tree was reformatted once, wholesale, in
+# 0eb5a004db0a5c25de890c0fe4802a75092af3c6. Without a check, drift silently
+# reaccumulates and the next person pays the same one-time cost again — plus a
+# rebase through it for every open branch.
+#
+# Local equivalent, before pushing:
+#
+#     cargo fmt --all
+#
+# See CONTRIBUTING.md.
+
+name: fmt
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rustfmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The GitHub-hosted runner image ships rustup with a stable toolchain;
+      # `rustup component add` is a cheap no-op if rustfmt is already there and
+      # the fix if a future image drops it. No third-party action needed for a
+      # check this small.
+      - name: Ensure rustfmt is installed
+        run: rustup component add rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
