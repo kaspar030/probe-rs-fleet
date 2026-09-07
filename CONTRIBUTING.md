@@ -49,6 +49,24 @@ Add a revision to that file only when it is provably behaviour-preserving
 (a bulk reformat or a mechanical rename), and always as the full 40-character
 SHA — git rejects abbreviated ones.
 
+**Verifying it works.** Once the config above is set, a bare `git blame`
+*already* ignores the reformat, so comparing it against `--ignore-revs-file`
+compares ignore-on with ignore-on and always shows zero difference — which
+looks exactly like a broken ignore file. An empty file or `/dev/null` is no
+control either: `--ignore-revs-file` *supplements* the configured file rather
+than replacing it. Use `--no-ignore-revs-file` (or `-c blame.ignoreRevsFile=`)
+as the control, and probe a file the reformat actually touched, e.g.
+`crates/fleet-core/src/scheduler.rs` (14 lines credited to the reformat with
+the ignore file, 392 with `--no-ignore-revs-file`) or
+`crates/fleet-coordinator/src/core.rs`. Do not probe
+`crates/fleet-proto/src/ids.rs:141` — the reformat never touched it, so it
+blames the same commit either way and proves nothing.
+
+About 45 lines tree-wide stay credited to the reformat even when it is working.
+Those are tokens rustfmt newly emitted when splitting expressions (`)`, `],`,
+`;`, `0,`); they have no earlier author to fall back to, so crediting the
+reformat is correct. Expected residue, not a failure.
+
 ## Before you open a PR
 
 ```sh
