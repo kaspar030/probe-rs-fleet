@@ -3001,9 +3001,10 @@ mod tests {
         BoardRef::new(org(org_name), node_id(org_name, agent), name)
     }
 
-    /// The org-namespaced node id `state.rs::node_id_for` would mint.
+    /// The org-namespaced node id `state.rs::node_id_for` mints — by calling
+    /// it, not by re-spelling its format string.
     fn node_id(org_name: &str, agent: &str) -> AgentId {
-        AgentId(format!("{org_name}/{agent}"))
+        crate::state::node_id_for(&org(org_name), agent)
     }
 
     fn board(org_name: &str, id: &str, agent: &str) -> Board {

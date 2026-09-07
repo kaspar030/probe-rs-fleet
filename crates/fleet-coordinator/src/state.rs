@@ -2691,7 +2691,14 @@ async fn unique_personal_slug(
 /// machine re-enrolls that node (replacing its token) instead of littering the
 /// org with duplicate rows for one physical Pi. The id is namespaced by org so
 /// the same node name in two tenants is two nodes.
-fn node_id_for(org: &OrgId, name: &str) -> AgentId {
+///
+/// `pub(crate)` rather than private so the crate's unit-test fixtures can mint
+/// node ids by *calling* it instead of re-implementing the format string. A
+/// fixture that hand-rolls a domain identifier is a second, unversioned
+/// definition of it, and it drifts: `core.rs`'s board fixture built bare ids
+/// (`"node-a"`) for long enough that every qualified-name resolution test
+/// passed while addressing boards production cannot produce.
+pub(crate) fn node_id_for(org: &OrgId, name: &str) -> AgentId {
     AgentId(format!("{}/{name}", org.0))
 }
 
