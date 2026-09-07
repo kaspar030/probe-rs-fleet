@@ -11,7 +11,8 @@
 #   probe-rs-fleet login       → writes [user]
 #   probe-rs-fleet share       → writes [node], using the login you already have
 #   probe-rs-fleet node up     → writes [node] (session, or --auth-key)
-# All of them preserve the other's table.
+#   probe-rs-fleet agent login → writes [agent] (a persistent sandbox session)
+# All of them preserve the others' tables.
 #
 # ---------------------------------------------------------------------------
 # THIS FILE HOLDS BEARER CREDENTIALS. It is written 0600.
@@ -21,6 +22,12 @@
 # Anyone who can read [node].node_token can act as this node until the token
 # rotates or the node's row is deleted on the coordinator.
 #
+# [agent].auth_key is the strongest of the three, and the only DURABLE one: it
+# does not merely act, it MINTS. Anyone who can read it can keep minting fresh
+# sessions as that identity until the key is revoked or expires. That is why it
+# is written by one verb whose documentation names the trust decision, and by
+# nothing else.
+#
 # ---------------------------------------------------------------------------
 # Why one file per fleet, and why the two tokens do NOT merge
 # ---------------------------------------------------------------------------
@@ -28,18 +35,28 @@
 # A laptop is routinely both a user and a node. The previous layout (one config
 # tree per role, subdivided per profile) could not express that: it needed two
 # unrelated enrollments, two identities, and two trees, with nothing tying them
-# to the same fleet. Here it is one file with two optional tables:
+# to the same fleet. Here it is one file with three optional tables:
 #
 #   laptop     → [user] AND [node]
 #   headless Pi→ [node] only
 #   CI runner  → neither (its token comes from the environment)
+#   sandbox    → [agent] (a persistent machine identity; see below)
 #
-# That last row is a rule, not an omission. `probe-rs-fleet ci login` writes
+# The CI row is a rule, not an omission. `probe-rs-fleet ci login` writes
 # NOTHING here: it exchanges the job's workload identity for a token that lives
 # in PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN for one job, and expires
 # with it (architecture §6.7). Persisting a credential to disk on a shared
 # runner is the one durable artefact the whole CI path exists to avoid, and the
 # sidecar reads exactly those two variables, so nothing needs the file.
+#
+# `probe-rs-fleet agent login` is the deliberate, opt-in exception to that rule,
+# and only for the machine it is run on. A persistent single-tenant sandbox with
+# concurrent users cannot re-run `ci login` hourly in every process, so it
+# stores a durable auth key here and re-redeems it as the session nears expiry.
+# The premise is that the operator OWNS that sandbox and is content to let it
+# hold a persistent key in its filesystem reach — never true of a shared runner,
+# which is why the two verbs stay separate rather than one growing a --persist
+# flag.
 #
 # The two tokens stay DISTINCT CREDENTIALS. Merging them — "one identity per
 # machine" — would make a compromised Pi, a device sitting on a shelf that
@@ -124,3 +141,52 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # recovers without server state — and without it, that case needs someone
 # standing next to the Pi.
 # previous_node_token = "prfn1_…"
+
+
+# ---------------------------------------------------------------------------
+# [agent] — written by `probe-rs-fleet agent login`, refreshed by ctl / the shim
+# ---------------------------------------------------------------------------
+#
+# Present only on a PERSISTENT SANDBOX: a long-running, single-tenant machine
+# with concurrent processes that all want to reach the fleet — a dev container,
+# a shared build box, an agent's workspace.
+#
+# Such a machine can hold a persistent *identity* without this table (mint the
+# key with `auth-key create --purpose agent --as <name>`), but not a persistent
+# *session*: the workload token it authenticates with lives about an hour and
+# nothing renews it. Without this table every sandbox threads its own hourly
+#   eval "$(probe-rs-fleet ci login …)"
+# which is a cron job reimplemented per sandbox, and which does not even
+# propagate between the concurrent processes sharing the machine.
+#
+# Written by:
+#   probe-rs-fleet agent login --fleet-url <url> --auth-key prffk1_… --as <name>
+#
+# THE KEY MUST BE `--multi-use`. A single-use key breaks on the second PROCESS,
+# not merely the second hour, so `agent login` refuses one — it detects this by
+# redeeming twice, which costs a single-use key its one redemption.
+
+[agent]
+# The durable credential. Re-redeemed by `ctl` and the `probe-rs` shim whenever
+# the workload token below is within 60s of expiry, so the session renews itself
+# with no cron job and no wrapper.
+#
+# Re-redeeming a multi-use key is NOT a rotation: nothing is invalidated, each
+# redemption mints an independent token and upserts the same grant row. That is
+# why concurrent processes here need no locking, and why there is no
+# `previous_workload_token` field to mirror [node]'s.
+auth_key = "prffk1_…"
+
+# The `--as` identity the key speaks as. DISPLAY ONLY, and not verified: the
+# redemption response does not echo the subject name, so this is what the
+# operator typed, not what the coordinator resolved.
+name = "desk-bot"
+
+# The current short-lived session, re-minted from the key above.
+workload_token = "prfw1_…"
+
+# When that token expires (epoch seconds). REQUIRED, unlike [user].expires: a
+# self-renewing session must know when to renew without a round trip. Renewing
+# on every invocation would be a permanent herd; never renewing defeats the
+# point.
+expires = 1788999999

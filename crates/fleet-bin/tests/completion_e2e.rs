@@ -143,24 +143,41 @@ fn top_level_subcommands_complete() {
 }
 
 #[test]
-fn a_hidden_deprecated_verb_is_not_advertised() {
-    // `agent` still parses (it is a deployed service unit) but is
-    // `#[command(hide = true)]`, so completion must not offer it: Tab teaches
-    // the vocabulary, and it should teach the current one.
+fn the_agent_group_completes_but_its_deprecated_subcommands_do_not() {
+    // Tab teaches the vocabulary, and it should teach the current one. That cuts
+    // both ways since `agent login` shipped: the *group* is now current and must
+    // be offered, while the deprecated node spellings under it (`agent up`, and
+    // the bare `agent` that runs a node) stay hidden — they are deployed service
+    // units, so they keep parsing, but nothing should teach them.
     let dir = config_tree();
     let got = complete_with(bin(), dir.path(), &["probe-rs-fleet", ""]);
     assert!(
-        !got.contains(&"agent".to_owned()),
-        "hidden verb should not be completed: {got:?}"
+        got.contains(&"agent".to_owned()),
+        "the agent group is current now that `agent login` exists: {got:?}"
     );
 
-    // ...but it must still run, hidden or not.
-    let output = Command::new(bin())
-        .args(["agent", "--help"])
-        .env("XDG_CONFIG_HOME", dir.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "hidden verb stopped working");
+    let under_agent = complete_with(bin(), dir.path(), &["probe-rs-fleet", "agent", ""]);
+    assert!(
+        under_agent.contains(&"login".to_owned()),
+        "`agent login` must be offered: {under_agent:?}"
+    );
+    assert!(
+        !under_agent.contains(&"up".to_owned()),
+        "the deprecated `agent up` must stay hidden: {under_agent:?}"
+    );
+
+    // ...and every spelling still runs, hidden or not.
+    for argv in [
+        ["agent", "--help"].as_slice(),
+        ["agent", "up", "--help"].as_slice(),
+    ] {
+        let output = Command::new(bin())
+            .args(argv)
+            .env("XDG_CONFIG_HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{argv:?} stopped working");
+    }
 }
 
 #[test]

@@ -298,6 +298,12 @@ expires = 1788600000
 node_token = "…"       # long-lived machine bearer, auto-rotating
 node_id = "gh-4242/kaspar-laptop"
 coordinator_token_pubkey = "…"   # verifies per-lease capability tokens
+
+[agent]                # present once `agent login` has run (§6.7)
+auth_key = "…"         # the DURABLE credential, re-redeemed on demand
+name = "desk-bot"      # the `--as` identity; display only, not verified
+workload_token = "…"   # the current short-lived session
+expires = 1788999999   # required here, so staleness is knowable offline
 ```
 
 **`org` is `gh-<github_user_id>`, never the login.** This is load-bearing, not
@@ -311,7 +317,8 @@ consulted by nothing.
 
 A laptop that both consumes and provides simply has **both tables**. A headless
 Pi has only `[node]`. A CI runner has neither (it exchanges a workload token per
-job). `--fleet <name>` / `PROBE_RS_FLEET` select among several fleets; `default`
+job). A persistent sandbox has `[agent]` (§6.7). `--fleet <name>` /
+`PROBE_RS_FLEET` select among several fleets; `default`
 is used otherwise. Credentials are stored `0600`; the two tokens stay **distinct**
 by design (§6.4).
 
@@ -336,6 +343,23 @@ rotated `[node]` token — so each patches only its own table. The residual race
 is a lost update, recoverable by re-running the command; there is no file
 locking in v1. The asymmetry justifies the cost: re-running `login` is a browser
 tab, whereas clobbering a node credential is a physical visit to the Pi.
+
+`[agent]` adds a **third writer, and the high-frequency one**: every `ctl`
+invocation and every `probe-rs` shim invocation on a sandbox re-redeems the
+stored auth key once the workload token is within `REFRESH_SKEW_SECS` (60s) of
+expiry. It needs no locking, for a reason specific to it: re-redeeming a
+**multi-use** auth key is not a rotation. `consume_auth_key` stamps
+`consumed_at` only when `single_use != 0`, so each redemption mints an
+independent `workload_token` row and upserts the *same* grant row — nothing is
+invalidated, N concurrent redemptions all succeed, and every resulting token
+stays valid. There is no correctness race to lose, only churn.
+
+The churn is damped by **re-reading the file immediately before redeeming**, not
+only on failure: a process that finds a peer's fresher token on disk uses it and
+redeems nothing. Jitter and lock files are deliberately not added — they would
+buy correctness that is not at stake. Correspondingly there is no
+`previous_workload_token` mirroring `[node]`'s: that field exists because
+rotation can lose an ack, and nothing here is ever invalidated.
 
 There is **no migration path** from the revision-1 trees. The database is wiped
 for revision 2; the documented upgrade is to delete
@@ -406,7 +430,10 @@ Owns local probes. Reconciles discovered probes against `boards.toml`.
 > `node run` (run with the credential this machine already has). The older
 > `agent` / `agent up` spelling still works — same argument shapes, same role
 > functions — but is hidden from `--help`, so deployed service units and
-> scripts keep running while `--help` advertises one vocabulary.
+> scripts keep running while `--help` advertises one vocabulary. Note the
+> `agent` **group** is itself advertised, because `agent login` (§6.7) is a
+> current verb under it; what is hidden is the deprecated bare `agent` and
+> `agent up`.
 
 > **Updated by investigation (tasks #1710, #1965 — verified against the real
 > probe-rs 0.31.0 source; re-verified line-by-line against v0.32.0 by #3322,
@@ -779,8 +806,10 @@ for, `ctl release` / `--id` complete the board ids in this node's
 `boards.toml`, `--select` completes `id=` / `board=` / `chip=` / `tag=` and then
 the local values for the prefix typed, and `--ops` completes the labels
 `AllowedOp` actually defines — so adding an op cannot leave a stale script
-behind. Hidden verbs (the deprecated `agent` spelling, §4.2) are not offered:
-Tab teaches the vocabulary, so it should teach the current one.
+behind. Hidden verbs (the deprecated `agent` / `agent up` node spellings, §4.2)
+are not offered: Tab teaches the vocabulary, so it should teach the current one.
+That cuts both ways — the `agent` group itself *is* offered, since `agent login`
+(§6.7) is current; only its deprecated subcommands are suppressed.
 
 Two constraints follow from a completer running inside a keypress, and both are
 load-bearing:
@@ -1505,7 +1534,9 @@ one line.
 workload token** — `Refresh` is session-only — so a job that runs longer than the
 token's TTL must re-run `ci login`. That is an acceptable v1 bound, but it is
 stated here and in `docs/ci-github-actions.md` rather than left to be discovered
-as a flake.
+as a flake. (A persistent sandbox escapes the bound by re-**redeeming** a stored
+key rather than refreshing a token — see "A persistent, self-renewing sandbox
+session" below, which does not contradict this.)
 
 #### A workload's lease is clamped to CI priority
 
@@ -1676,6 +1707,52 @@ vocabulary stops saying "per job" about a persistent identity. It is normalised
 at the parse boundary and **stores `ci`**, so the database holds exactly two
 purposes and a listing shows `ci` for such a key — because it is one. It is
 CLI-only sugar: `"purpose": "agent"` on the wire is a `400`.
+
+#### A persistent, self-renewing sandbox session (`agent login`)
+
+A named key gives a long-running machine a persistent *identity*. It does not
+give it a persistent *session*: the `prfw1_` workload token it authenticates
+with lives `workload_token_ttl_secs` (default 1h) and, per the subsection above,
+**there is no refresh path for a workload token**. So a sandbox had to re-run
+`ci login` hourly — a cron job or retry wrapper reimplemented per sandbox, which
+does not even propagate between the concurrent processes sharing the machine.
+
+`probe-rs-fleet agent login --fleet-url <url> --auth-key prffk1_… [--as <name>]`
+closes that. It stores the durable key in the fleet file's `[agent]` table
+(§4.1), and `ctl` and the `probe-rs` shim re-**redeem** it whenever the stored
+token is within 60s of expiry.
+
+**The mechanism is re-redemption, not refresh, and that distinction is what
+keeps the earlier subsection literally true.** Nothing gained a refresh path;
+`Refresh` is still session-only. Each renewal is an ordinary `workload_key`
+exchange — the same request `ci login --auth-key` makes, verified the same way,
+upserting the same grant row — which also explains why concurrency here needs no
+locking: a multi-use key is never consumed (`consume_auth_key` stamps
+`consumed_at` only for `single_use != 0`), so N processes renewing at once all
+succeed and every token they mint stays valid. The only cost is churn, damped by
+re-reading the fleet file before redeeming (§4.1).
+
+**A single-use key is refused**, because in a sandbox with concurrent users it
+breaks on the second *process*, not merely the second hour. Nothing on the wire
+reveals single-use-ness — `TokenResponse` has no such field — so `agent login`
+detects it by redeeming **twice**: a multi-use key yields two valid tokens (the
+first is left orphaned until its TTL expires, one wasted `workload_token` row
+per login), while a single-use key's second redemption is rejected. That
+rejection, and only a rejection, produces the refusal; a transport failure on
+the second call persists the first token and warns that the property could not
+be confirmed, rather than telling an operator their key is spent because a
+packet dropped.
+
+**This does not weaken the per-repo OIDC path.** That path still stores nothing
+and remains the recommendation for anything GitHub mints an identity for. What
+changed is confined to a machine whose operator opted in by running a verb whose
+documentation names the trust decision: the sandbox is single-tenant and owned
+by the person storing the key. The key itself is unchanged — still org-scoped,
+tag-scoped, op-scoped, expiring and revocable, with revocation still cascading
+through §6.5 to tear down live leases. The one honest new exposure is that the
+durable credential now sits in a `0600` file rather than only in a secret store,
+which is exactly why `ci login` keeps writing no file at all: a shared runner
+has no owner who can make that trade.
 
 #### Not built in v1
 

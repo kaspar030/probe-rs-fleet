@@ -40,10 +40,19 @@ impl CtlConnection {
     /// Precedence: explicit flag / env var > `fleets/<name>.toml`. Errors only
     /// if a required field is supplied by neither source.
     ///
-    /// The session token is refreshed on the way through if it is about to
-    /// expire (see [`crate::fleet_config::ensure_fresh_session`]) — which is why
-    /// this is `async` and why a flag-supplied token bypasses it: a token the
-    /// user handed us is not ours to rotate.
+    /// The credential is refreshed on the way through if it is about to expire
+    /// (see [`crate::fleet_config::ensure_fresh_session`] and
+    /// [`crate::fleet_config::ensure_fresh_agent_session`]) — which is why this
+    /// is `async` and why a flag-supplied token bypasses it: a token the user
+    /// handed us is not ours to rotate, and redeeming an auth key to replace
+    /// one they typed would be worse still.
+    ///
+    /// # Which table wins
+    ///
+    /// `[user]` if present, else `[agent]`. A machine holding both is a
+    /// developer laptop that also hosts a sandbox, and the human's own
+    /// credential must win — mirroring the sidecar's existing rule that a node
+    /// credential is never silently substituted for a user's.
     ///
     /// # Errors
     ///
@@ -53,11 +62,18 @@ impl CtlConnection {
         let fleet = args.fleet.clone();
         let fallback = crate::fleet_config::load_named_opt(&fleet);
         let token = match (&args.token, &fallback) {
-            (None, Some(file)) => Some(
+            (None, Some(file)) if file.user.is_some() => Some(
                 crate::fleet_config::ensure_fresh_session(&fleet, file)
                     .await
                     .with_context(|| format!("resolving the session token for fleet `{fleet}`"))?,
             ),
+            (None, Some(file)) if file.agent.is_some() => Some(
+                crate::fleet_config::ensure_fresh_agent_session(&fleet, file)
+                    .await
+                    .with_context(|| format!("resolving the agent session for fleet `{fleet}`"))?,
+            ),
+            // Neither table, or an explicit `--token`: leave `resolve` to fire
+            // its "no credential" error, which names both login verbs.
             _ => None,
         };
         Self::resolve(args, fallback.as_ref(), token)
@@ -86,7 +102,8 @@ impl CtlConnection {
         let token = args.token.or(fallback_token).with_context(|| {
             format!(
                 "no credential for fleet `{fleet}`; run `probe-rs-fleet login --fleet {fleet}` \
-                 (or pass --token / PROBE_RS_FLEET_TOKEN)"
+                 (or, for a persistent sandbox, `probe-rs-fleet agent login --fleet {fleet} \
+                 --auth-key prffk1_\u{2026}`; or pass --token / PROBE_RS_FLEET_TOKEN)"
             )
         })?;
         let server_cert_sha256 = args.server_cert_sha256.or(fb_pin);

@@ -15,9 +15,13 @@ fn examples_dir() -> PathBuf {
 }
 
 /// `examples/fleet.toml` is the reference for the per-fleet layout, and it
-/// deliberately shows a laptop: both `[user]` and `[node]` populated.
+/// deliberately shows every table populated at once: a laptop (`[user]` +
+/// `[node]`) that also hosts a persistent sandbox (`[agent]`).
+///
+/// One file carrying all three is the case the read-modify-write rule exists
+/// for, so the shipped reference must show that it is legal.
 #[test]
-fn fleet_example_parses_with_both_tables() {
+fn fleet_example_parses_with_all_three_tables() {
     let path = examples_dir().join("fleet.toml");
     let text = std::fs::read_to_string(&path).unwrap();
     let file: fleet_bin::fleet_config::FleetFile = toml::from_str(&text).unwrap();
@@ -35,6 +39,31 @@ fn fleet_example_parses_with_both_tables() {
     // The two credentials are distinct values, which is the property the
     // example's prose is about.
     assert_ne!(user.session_token, node.node_token);
+
+    let agent = file.agent.expect("[agent] table");
+    assert_eq!(agent.name.as_deref(), Some("desk-bot"));
+    // `expires` is a required field here, unlike `[user].expires`: a live
+    // example that omitted it would not deserialise at all, which is exactly
+    // what this assertion is for.
+    assert!(agent.expires > 0);
+    assert_ne!(agent.auth_key, agent.workload_token);
+}
+
+/// The `[agent]` block must teach the two rules a reader cannot infer from the
+/// field names: the key has to be `--multi-use`, and storing it is a trust
+/// decision about *this machine*.
+#[test]
+fn the_fleet_example_states_the_agent_tables_two_preconditions() {
+    let path = examples_dir().join("fleet.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("agent login"), "the writing verb is named");
+    assert!(
+        text.contains("--multi-use"),
+        "the key requirement is stated"
+    );
+    // The CI rule must still be there, and must now name its exception rather
+    // than contradicting the code.
+    assert!(text.contains("ci login` writes\nNOTHING here") || text.contains("NOTHING here"));
 }
 
 /// `examples/node.toml` is entirely commented out, so it must parse as the

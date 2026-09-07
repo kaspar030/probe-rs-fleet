@@ -13,6 +13,8 @@
 //! - [`auth_key`] → mint/list/revoke this org's auth keys with that same login
 //! - [`grant`] → share a subset of this org's boards with another person
 //! - [`ci`] → exchange a CI job's workload identity for a per-job fleet token
+//! - [`agent_login`] → store a durable auth key so a persistent sandbox holds a
+//!   self-renewing session instead of an hourly `ci login` wrapper
 //! - [`completions`] → print how to switch shell completion on
 //! - [`node_approve`] → approve a headless machine that printed a short code
 //! - [`node_board`] → declare a board (discover probes, append to
@@ -28,6 +30,7 @@
 //! [`crate::signal::shutdown`] for graceful termination.
 
 pub mod admin;
+pub mod agent_login;
 pub mod auth_key;
 pub mod ci;
 pub mod completions;

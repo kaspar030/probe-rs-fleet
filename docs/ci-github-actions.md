@@ -384,6 +384,42 @@ revocation**. Do step 3 when the old runner is idle. To retire the agent for
 good: revoke *every* key carrying the name, then `probe-rs-fleet grant revoke
 <id from grant list>`. Tokens already issued expire on their own within the hour.
 
+### A persistent session, so the sandbox stops re-running `ci login`
+
+The name above gives a long-running machine a persistent *identity*. It does not
+give it a persistent *session*: the token `ci login` mints lives about an hour
+and there is no refresh for it, so a sandbox has to re-run the command — which
+is how people end up with an hourly cron job, or an `eval "$(probe-rs-fleet ci
+login …)"` wrapper around every invocation that does not even propagate between
+concurrent processes on the same box.
+
+If that machine is a **sandbox you own** rather than a shared runner, hand the
+key over once instead:
+
+```sh
+probe-rs-fleet agent login --fleet-url https://fleet.example \
+    --auth-key "$PROBE_RS_FLEET_AUTH_KEY" --as builder
+```
+
+That stores the key in `~/.config/probe-rs-fleet/fleets/<name>.toml` (0600), and
+`ctl` and the `probe-rs` shim re-redeem it as the session nears expiry — no cron
+job, no wrapper, and concurrent processes on the machine share the renewed token
+through that file.
+
+Two conditions, both deliberate:
+
+- **The key must be `--multi-use`.** A single-use key breaks on the second
+  *process*, not merely the second hour. `agent login` refuses one, and detects
+  it by redeeming twice — which spends a single-use key's one redemption, so it
+  tells you the key is now gone.
+- **The durable key is on disk.** That is the trade, and it is why `ci login`
+  still writes nothing: a shared runner has no owner who can make it. Use this
+  only where you are content to let the machine hold a persistent identity in
+  its filesystem reach.
+
+Architecture §6.7 has the mechanism, including why re-redemption is not the
+refresh path that section says does not exist.
+
 ---
 
 ## What is not built

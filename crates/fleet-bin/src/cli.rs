@@ -37,10 +37,11 @@ pub struct Cli {
 pub enum Command {
     /// Run the fleet coordinator daemon (scheduler / leases / relay).
     Coordinator(CoordinatorArgs),
-    /// Deprecated spelling of `node run` / `node up`. Kept working — it is a
-    /// documented command and a deployed service unit — but hidden from help
-    /// so `--help` advertises one vocabulary.
-    #[command(hide = true)]
+    /// Persistent sandbox/agent session verbs. Today: `login`.
+    ///
+    /// Also the deprecated spelling of `node run` / `node up` — those
+    /// subcommands are hidden but keep working, since `agent up` is a
+    /// documented command and a deployed service unit.
     Agent(AgentArgs),
     /// Sidecar shim: forward a probe-rs invocation through the fleet.
     ///
@@ -852,14 +853,22 @@ impl From<AdoptArg> for fleet_proto::AdoptPolicy {
     }
 }
 
-/// Arguments for the deprecated `agent` role.
+/// Arguments for the `agent` group.
 ///
-/// Shape unchanged so `probe-rs-fleet agent` / `agent up` keep parsing exactly
-/// as they did; both dispatch into the same role functions `node run` /
-/// `node up` use.
+/// Two things live under one verb. `agent login` is current: it stores a
+/// durable auth key so a persistent sandbox holds a self-renewing session.
+/// Bare `agent` and `agent up` are the **deprecated spellings** of `node run` /
+/// `node up`, kept parsing byte-for-byte (a documented command and a deployed
+/// service unit) but hidden from `--help`, so Tab and `--help` teach one
+/// vocabulary.
 #[derive(Debug, Args)]
 pub struct AgentArgs {
-    /// The fleet whose `[node]` credential this node connects with.
+    /// The fleet this verb acts on.
+    ///
+    /// For `agent login`, the fleet whose `[agent]` table is written; for the
+    /// deprecated node spellings, the fleet whose `[node]` credential this node
+    /// connects with.
+
     ///
     /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`. There is no
     /// `--config` any more: `agent.toml` is gone, the credential lives in the
@@ -871,16 +880,62 @@ pub struct AgentArgs {
     /// packaging support.
     #[arg(long, hide = true, global = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
-    /// Optional nested subcommand (e.g. `up`). When absent, the node runs.
+    /// Optional nested subcommand (`login`, or the deprecated `up`). When
+    /// absent, the node runs — the deprecated bare spelling.
     #[command(subcommand)]
     pub command: Option<AgentCommand>,
 }
 
-/// Deprecated `agent` subcommands.
+/// `agent` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// Store a durable auth key so this machine holds a persistent,
+    /// self-renewing fleet session.
+    Login(AgentLoginArgs),
     /// Register this machine as a node if it is not one yet, then run it.
+    ///
+    /// Deprecated spelling of `node up`; hidden, still parsed.
+    #[command(hide = true)]
     Up(NodeUpFlags),
+}
+
+/// Arguments for `probe-rs-fleet agent login`.
+///
+/// A **separate verb** from both neighbours because the concurrency contract
+/// differs from both. `login` is a rotating credential for a single human;
+/// `ci login` is one job's token and deliberately writes no file. This is a
+/// long-lived machine with concurrent processes that must share one
+/// self-renewing session, which means the durable credential is stored on disk
+/// — a trust decision taken per machine by running this verb.
+///
+/// Carries **no** `--fleet` / `--config-dir`: [`AgentArgs`] declares both
+/// `global = true`, and redeclaring a global arg id is a clap **runtime
+/// panic**, not a compile error (the same trap [`NodeUpFlags`] documents).
+#[derive(Debug, Args)]
+pub struct AgentLoginArgs {
+    /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
+    ///
+    /// Required the first time; afterwards the fleet file remembers it.
+    #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR")]
+    pub fleet_url: Option<String>,
+    /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
+    /// self-hosted deployment with no publicly trusted certificate.
+    #[arg(long, env = "PROBE_RS_FLEET_SERVER_CERT_SHA256")]
+    pub server_cert_sha256: Option<String>,
+    /// The durable auth key this session is minted from. Must be `--multi-use`.
+    ///
+    /// Read it from a secret store, not from a literal on the command line —
+    /// argv is visible to every process on the box, and this key is the
+    /// strongest credential the fleet file can hold.
+    #[arg(long, env = "PROBE_RS_FLEET_AUTH_KEY")]
+    pub auth_key: String,
+    /// The identity name the key was minted with (`auth-key create --as`).
+    ///
+    /// **Display only**: the redemption response does not echo the subject
+    /// name, so this is recorded, not verified. Getting it wrong changes what
+    /// the summary prints and nothing else.
+    #[arg(long = "as", value_name = "NAME")]
+    pub subject_name: Option<String>,
 }
 
 /// The bootstrap flags shared by `node up` and the hidden `agent up`.
@@ -1327,9 +1382,14 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         Ok(ExitCode::SUCCESS)
                     }
                 },
-                // The deprecated spelling: same role functions, so `agent`
-                // and `node` cannot drift in what they do.
+                // `login` is the current verb here; `up` and the bare form are
+                // the deprecated node spellings, dispatching into the same role
+                // functions `node` uses so the two cannot drift.
                 Command::Agent(args) => match args.command {
+                    Some(AgentCommand::Login(login)) => {
+                        roles::agent_login::run(login, &args.fleet, args.config_dir).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
                     Some(AgentCommand::Up(flags)) => {
                         roles::node_up::run(flags, &args.fleet, args.config_dir).await?;
                         Ok(ExitCode::SUCCESS)
@@ -1922,20 +1982,132 @@ mod tests {
         assert_eq!(run, "lab1");
     }
 
-    /// `--help` advertises `node` and not the deprecated `agent`, while both
-    /// old spellings still parse.
+    /// `agent` is now advertised, because `agent login` is a current verb —
+    /// but only the **deprecated subcommands** under it stay hidden.
+    ///
+    /// This inverts what the group used to assert. Before `agent login`, the
+    /// whole group was `hide = true` and the test read "the deprecated spelling
+    /// must not be advertised". Now `--help` must teach `agent login` while
+    /// still not teaching `agent up`, and every old spelling must keep parsing
+    /// byte-for-byte: they are documented commands and deployed service units.
     #[test]
-    fn agent_is_hidden_from_help_but_still_usable() {
+    fn agent_advertises_login_while_the_deprecated_node_spellings_stay_hidden() {
         let help = Cli::command().render_help().to_string();
         assert!(help.contains("node"), "got: {help}");
         assert!(
-            !help.lines().any(|l| l.trim_start().starts_with("agent")),
-            "the deprecated spelling must not be advertised: {help}"
+            help.lines().any(|l| l.trim_start().starts_with("agent")),
+            "the agent group is advertised now that `agent login` exists: {help}"
         );
+
+        // ...but `up` is not offered under it.
+        let agent_help = Cli::command()
+            .find_subcommand_mut("agent")
+            .expect("agent group")
+            .render_help()
+            .to_string();
+        assert!(agent_help.contains("login"), "got: {agent_help}");
+        assert!(
+            !agent_help.lines().any(|l| l.trim_start().starts_with("up")),
+            "the deprecated `agent up` must stay hidden: {agent_help}"
+        );
+
+        // Every spelling still parses, hidden or not.
         assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent", "up"])).is_ok());
         assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent"])).is_ok());
         assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "up"])).is_ok());
         assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "run"])).is_ok());
+    }
+
+    /// `agent login` parses with every flag it has.
+    #[test]
+    fn parses_agent_login_with_all_flags() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "agent",
+            "login",
+            "--fleet-url",
+            "https://fleet.example",
+            "--auth-key",
+            "prffk1_abc",
+            "--as",
+            "desk-bot",
+            "--server-cert-sha256",
+            &"ab".repeat(32),
+        ]));
+        match cli.command {
+            Command::Agent(a) => {
+                assert_eq!(a.fleet, "default");
+                match a.command {
+                    Some(AgentCommand::Login(l)) => {
+                        assert_eq!(l.fleet_url.as_deref(), Some("https://fleet.example"));
+                        assert_eq!(l.auth_key, "prffk1_abc");
+                        assert_eq!(l.subject_name.as_deref(), Some("desk-bot"));
+                        assert_eq!(l.server_cert_sha256.as_deref(), Some(&*"ab".repeat(32)));
+                    }
+                    other => panic!("expected agent login, got {other:?}"),
+                }
+            }
+            other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    /// A re-login needs only the key: the fleet file remembers the URL, exactly
+    /// as `login` does.
+    #[test]
+    fn agent_login_needs_only_the_auth_key() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "agent",
+            "login",
+            "--auth-key",
+            "prffk1_abc",
+        ]));
+        match cli.command {
+            Command::Agent(a) => match a.command {
+                Some(AgentCommand::Login(l)) => {
+                    assert!(l.fleet_url.is_none());
+                    assert!(l.subject_name.is_none());
+                }
+                other => panic!("expected agent login, got {other:?}"),
+            },
+            other => panic!("expected agent, got {other:?}"),
+        }
+    }
+
+    /// `--auth-key` is the one required flag: the verb has nothing to store
+    /// without it, and it has no interactive fallback.
+    #[test]
+    fn agent_login_requires_an_auth_key() {
+        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent", "login"])).is_err());
+    }
+
+    /// `--fleet` / `--config-dir` are [`AgentArgs`] **globals**, so they sit
+    /// before the subcommand and must not be redeclared on the leaf.
+    ///
+    /// Redeclaring a global arg id is a clap **runtime panic** during parse,
+    /// not a compile error — the trap [`NodeUpFlags`] documents — so only a
+    /// parse test catches a regression here.
+    #[test]
+    fn agent_login_inherits_the_groups_global_flags() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "agent",
+            "--fleet",
+            "lab1",
+            "--config-dir",
+            "/tmp/cfg",
+            "login",
+            "--auth-key",
+            "prffk1_abc",
+        ]));
+        match cli.command {
+            Command::Agent(a) => {
+                assert_eq!(a.fleet, "lab1");
+                assert_eq!(a.config_dir.as_deref(), Some(Path::new("/tmp/cfg")));
+                assert!(matches!(a.command, Some(AgentCommand::Login(_))));
+            }
+            other => panic!("expected agent, got {other:?}"),
+        }
     }
 
     /// `share` is the story-2 payoff: one word, no flags.

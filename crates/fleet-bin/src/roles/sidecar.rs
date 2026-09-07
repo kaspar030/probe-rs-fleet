@@ -140,7 +140,11 @@ pub async fn run(
     // — an argument typed on this command line is more specific than an
     // exported variable. The flag is layered on with `SelectorOverride` rather
     // than written into the environment.
-    inject_client_config_env(fleet);
+    //
+    // Split in two: the *resolve* half may await (the `[agent]` refresh below),
+    // the *inject* half must not — see `set_env_if_absent`'s SAFETY note.
+    let resolved = resolve_client_config(fleet).await;
+    inject_client_config_env(resolved.as_ref());
 
     // Reconstruct a full argv: program name + the forwarded probe-rs args.
     let mut argv: Vec<OsString> = Vec::with_capacity(probe_rs_args.len() + 1);
@@ -151,30 +155,78 @@ pub async fn run(
     Ok(exit_code_from_i32(code))
 }
 
-/// Populate the sidecar's coordinator / credential env vars from the fleet file
-/// for any key not already present in the environment.
+/// The coordinator endpoint and credential this shim should present: `(url,
+/// token, pin)`.
 ///
-/// Only the `[user]` table is consulted: the shim runs a probe-rs invocation on
-/// the human's behalf, and a machine that is also a node must not silently
-/// present its *node* credential here. That is the whole reason the two tokens
-/// stay separate.
+/// # Which table is consulted, and the one place a refresh happens
 ///
-/// No refresh happens on this path. The shim is a short-lived child process of
-/// a build or test run, and blocking it on an HTTP round trip — or worse,
-/// racing a concurrent `ctl` for the one refreshable token — is not worth the
-/// few minutes it would buy; an expired token surfaces as an auth error telling
-/// the user to run `login`.
-fn inject_client_config_env(fleet: &str) {
-    let Some(file) = crate::fleet_config::load_named_opt(fleet) else {
-        return;
+/// `[user]` first: the shim runs a probe-rs invocation on the human's behalf,
+/// and a machine that is also a node must not silently present its *node*
+/// credential here. That is the whole reason those two tokens stay separate,
+/// and `[node]` is still never consulted.
+///
+/// For `[user]` the old rule holds verbatim: **no refresh happens on this
+/// path.** The shim is a short-lived child process of a build or test run, and
+/// blocking it on an HTTP round trip — or worse, racing a concurrent `ctl` for
+/// the one refreshable token — is not worth the few minutes it would buy; an
+/// expired session surfaces as an auth error telling the user to run `login`.
+///
+/// **The `[agent]` branch deliberately reverses that rule**, and the reversal
+/// is stated here rather than left to be discovered. The reasoning that
+/// justifies not refreshing a `[user]` token is that the alternative costs
+/// minutes of freshness; for a persistent sandbox there is no human to re-run
+/// anything, so the alternative is a **hard failure** every hour instead. The
+/// two differences that make the round trip acceptable here are the ones from
+/// [`crate::fleet_config::ensure_fresh_agent_session`]: re-redeeming a
+/// multi-use auth key invalidates nothing, so there is no race to lose, and the
+/// pre-redemption re-read means concurrent shims in one sandbox share a peer's
+/// token instead of each minting their own.
+///
+/// A refresh failure is a `warn!` and a fall back to the stored token, not an
+/// error: a token that is merely expired still produces a better failure than
+/// a shim that refuses to start.
+async fn resolve_client_config(fleet: &str) -> Option<(String, String, Option<String>)> {
+    let file = crate::fleet_config::load_named_opt(fleet)?;
+    let pin = file.server_cert_sha256.clone();
+
+    if let Some(user) = file.user.as_ref() {
+        return Some((file.url.clone(), user.session_token.clone(), pin));
+    }
+
+    let agent = file.agent.as_ref()?;
+    // An explicit `PROBE_RS_FLEET_TOKEN` wins anyway (`set_env_if_absent`), so
+    // refreshing for a token we would then discard is pure churn — and it would
+    // make every shim invocation on a sandbox with an exported token do a round
+    // trip for nothing.
+    let token_already_set = std::env::var_os("PROBE_RS_FLEET_TOKEN").is_some_and(|v| !v.is_empty());
+    if token_already_set {
+        return Some((file.url.clone(), agent.workload_token.clone(), pin));
+    }
+
+    let token = match crate::fleet_config::ensure_fresh_agent_session(fleet, &file).await {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not refresh the agent session; using the stored token");
+            agent.workload_token.clone()
+        }
     };
-    let Some(user) = file.user.as_ref() else {
+    Some((file.url.clone(), token, pin))
+}
+
+/// Inject a [`resolve_client_config`] result into the process environment, for
+/// any key not already present there.
+///
+/// Synchronous, and deliberately: every `set_env_if_absent` below happens with
+/// no `.await` between them, which is the invariant that function's SAFETY note
+/// rests on. Anything that needs to await belongs in `resolve_client_config`.
+fn inject_client_config_env(resolved: Option<&(String, String, Option<String>)>) {
+    let Some((url, token, pin)) = resolved else {
         return;
     };
 
-    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", &file.url);
-    set_env_if_absent("PROBE_RS_FLEET_TOKEN", &user.session_token);
-    if let Some(pin) = &file.server_cert_sha256 {
+    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", url);
+    set_env_if_absent("PROBE_RS_FLEET_TOKEN", token);
+    if let Some(pin) = pin {
         set_env_if_absent("PROBE_RS_FLEET_SERVER_CERT_SHA256", pin);
     }
 }

@@ -238,7 +238,12 @@ fn print_summary(response: &TokenResponse) {
 /// says what to do next has to be written here. `no_grant` is the one that
 /// matters: it is the per-repo trust rule firing, and the fix is a command the
 /// *fleet admin* runs, not something the CI job can do.
-fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
+///
+/// Shared with [`crate::roles::agent_login`] rather than copied: the same key
+/// shape reaches `/auth/token` from both verbs, so two hand-written
+/// remediation tables would be two chances to tell operators different things
+/// about one rejection.
+pub(crate) fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
     let ClientError::Rejected { code, status } = e else {
         return anyhow::anyhow!("{doing} failed: {e}");
     };
@@ -265,9 +270,9 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         }
         "forbidden" => {
             "that auth key is not a CI key, or carries no tags. A key that can \
-             lease hardware must be minted with `--purpose ci` and at least one \
-             `--tag`: an empty tag set is an empty selector, which would match \
-             every board in the org"
+             lease hardware must be minted with `--purpose ci` (or its \
+             `--purpose agent` spelling) and at least one `--tag`: an empty tag \
+             set is an empty selector, which would match every board in the org"
         }
         _ => return anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {code}"),
     };
