@@ -636,8 +636,12 @@ chip = "nRF52840_xxAA"
         // Keys we must never emit. `probe_access` is a stale, never-valid name
         // (the field is `access`). `socket://` (Unix-socket serve) and
         // `cycle_power` are *real* 0.32 `ServerConfig` features we deliberately
-        // do not use: we keep the loopback-TCP model, whose token fence
-        // `run_unix` does not implement (issue #297).
+        // do not use. `socket://` was evaluated and **rejected** (issue #297;
+        // rationale recorded in architecture §4.2, "Rejected: `socket://`
+        // Unix-socket serve"): 0.32's `handle_unix_rpc` hardcodes
+        // `ProbeAccess::All` and is never handed the config at all, so the
+        // per-board allow-fence asserted just above cannot exist on that path.
+        // This assertion pins that decision in code.
         assert!(!cfg.contains("socket://"));
         assert!(!cfg.contains("probe_access"));
         assert!(!cfg.contains("cycle_power"));

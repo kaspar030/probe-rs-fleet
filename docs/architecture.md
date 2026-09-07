@@ -418,10 +418,9 @@ Owns local probes. Reconciles discovered probes against `boards.toml`.
 > - **Binds TCP**, default `0.0.0.0:3000` (`TcpListener::bind`). *(0.32 update:
 >   an `address = "socket://<path>"` Unix-socket scheme **does** now exist, so
 >   the "no `socket://` scheme" wording above was true for 0.31 only. We
->   deliberately keep the loopback-TCP model: 0.32's `run_unix()` ignores
->   `config.users` entirely — no challenge/token auth at all, only `0o660` fs
->   permissions — so adopting it would silently remove our per-board
->   `ProbeAccess::Allow` fence. Tracked as issue #297.)*
+>   deliberately keep the loopback-TCP model. That is a **recorded decision,
+>   not an unexamined default** — see *Rejected: `socket://` Unix-socket serve*
+>   below, which closes issue #297.)*
 > - **Speaks WebSocket** at route `/worker` (axum), with **challenge/token**
 >   auth (`Probe-Rs-Challenge` header; client replies `sha512(challenge||token)`).
 > - Has **no `--config` flag**. `ServerConfig` is the `server` field of the
@@ -475,6 +474,68 @@ Decided agent model (per #1710, corrected by #1965):
   tunnel) is an optional follow-up. *(Post-0.32 master has since made `probe-rs
   gdb` attach through the RPC client, so this tunnel can likely be retired once
   0.33 ships — unreleased, so nothing changes yet; tracked as issue #298.)*
+
+#### Rejected: `socket://` Unix-socket serve (issue #297, decided)
+
+probe-rs 0.32 added a Unix-socket server path (`[server] address =
+"socket://<path>"`). It was evaluated as a replacement for the loopback-TCP
+port-per-board model above and **rejected**. Verified line-by-line against the
+real `probe-rs-tools` 0.32.0 sources — `src/bin/probe-rs/cmd/serve.rs`,
+`rpc/client.rs`, `rpc/transport/unix.rs` — not against the changelog. Three
+findings, each independently sufficient:
+
+1. **The socket path cannot be fenced per-probe at all.** This is stronger than
+   "`run_unix()` ignores `config.users`". `run_unix(self, socket_path, _config)`
+   never reads the config; `handle_unix_rpc(stream)` is handed *only* the
+   stream, so it could not consult it; and it builds the RPC app as
+   `RpcApp::create_server(SERVER_DEPTH, ProbeAccess::All)` — the access level is
+   a **hardcoded literal**. No config, no socket permissions and no filesystem
+   layout can restore `ProbeAccess::Allow(["vid:pid:serial"])` on that path.
+   Anything that connects drives **every probe on the Pi**. So the "equivalent
+   isolation story" this swap was required to come with is not merely expensive,
+   it is **unavailable in 0.32**. Today a buggy or hostile session is fenced to
+   its own board; on the socket path it would reach all of them.
+
+2. **Filesystem permissions fence the wrong population.** `run_unix` chmods the
+   socket `0o660` — a fence against *other local uids on the Pi*. But a fleet
+   leaseholder is not a local uid: it is a remote workstation/CI client arriving
+   through the coordinator relay, and the only process that ever connects to
+   `serve` is the agent itself, which byte-splices. Every board's `serve` is
+   spawned by the one agent uid, so every per-board socket would carry identical
+   owner and mode — **zero per-board separation**. Recovering any would mean
+   spawning each `serve` under its own dedicated uid (per-Pi user provisioning,
+   plus root or `CAP_SETUID` in the agent), and by finding 1 that would *still*
+   not fence which probe a connection may touch. A real deployment cost buying
+   nothing.
+
+3. **It breaks the end-to-end capability-token wiring on both ends.** The two
+   transports are not the same byte stream: the socket path is raw `u32-LE`
+   length-prefixed postcard (`UnixStreamTx`/`UnixStreamRx`), while TCP is
+   WebSocket at `/worker` behind the `Probe-Rs-Challenge` /
+   `sha512(challenge||token)` handshake. §4.2's "zero protocol change" token
+   story rests on that handshake. And the *client* drops the token too:
+   `connect(host, token)` early-returns `connect_unix(path)` without passing it.
+   So adopting `socket://` also forces the sidecar off its advertised
+   `ws://127.0.0.1:<port>` endpoint, and leaves the capability token decorative
+   at the probe-rs layer on **both** ends.
+
+**What it would have bought.** Only `alloc_ephemeral_port` plus the connect-retry
+that covers its bind/close race — about ten lines. Not even conceptually, since
+`probe-rs gdb` independently binds an ephemeral loopback port for
+`--gdb-connection-string` (`crates/fleet-agent/src/gdb.rs`), so the agent keeps
+port allocation regardless. Trading the per-board `ProbeAccess` fence and the
+end-to-end token for ten lines is not a trade worth making.
+
+**Why loopback TCP is sound.** `address = "127.0.0.1"` makes `serve` unreachable
+off-Pi, and the per-board user token gates it on-Pi — an *authenticated* fence,
+where the socket path offers only an ambient one.
+
+**What would reopen this.** Upstream teaching `run_unix` to honour
+`config.users` — both the `access` fence and a credential check (the challenge
+handshake, or `SO_PEERCRED`). Until then, loopback TCP stands. The negative
+assertions in `probers.rs`'s `rendered_config_is_server_table_with_access` pin
+the decision in code.
+
 
 Agent also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
