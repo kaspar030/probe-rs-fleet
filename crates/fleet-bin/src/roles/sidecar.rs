@@ -235,11 +235,19 @@ fn inject_client_config_env(resolved: Option<&(String, String, Option<String>)>)
 fn set_env_if_absent(key: &str, value: &str) {
     let already = std::env::var_os(key).is_some_and(|v| !v.is_empty());
     if !already {
-        // SAFETY of correctness (not memory): although an outer tokio runtime
-        // now exists, this env injection runs synchronously at the very top of
-        // the sidecar role — before the first `.await` and before any sidecar
-        // code reads these vars — so no other task or thread is reading the
-        // environment concurrently.
+        // SAFETY of correctness (not memory): the env writes in
+        // `inject_client_config_env` are contiguous — no `.await` between them
+        // — and they all precede any reader of these variables: no sidecar code
+        // has run yet and we have spawned no task that reads the environment.
+        //
+        // Note what this deliberately does NOT claim any more. It used to say
+        // "before the first `.await`", which stopped being true when the
+        // credential resolve was split out: `resolve_client_config` may perform
+        // a full HTTP round trip (the `[agent]` refresh) on a multi-threaded
+        // runtime before we get here. That await is harmless because it happens
+        // *before* the writes rather than between them, and because nothing
+        // concurrent with it reads these keys — not because no await has
+        // happened.
         std::env::set_var(key, value);
     }
 }

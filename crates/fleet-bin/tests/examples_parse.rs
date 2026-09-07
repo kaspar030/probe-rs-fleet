@@ -62,8 +62,17 @@ fn the_fleet_example_states_the_agent_tables_two_preconditions() {
         "the key requirement is stated"
     );
     // The CI rule must still be there, and must now name its exception rather
-    // than contradicting the code.
-    assert!(text.contains("ci login` writes\nNOTHING here") || text.contains("NOTHING here"));
+    // than contradicting the code. Asserted on the substantive sentence: a
+    // laxer fallback would make this check pass on prose that had lost the
+    // rule entirely.
+    assert!(
+        text.contains("`probe-rs-fleet ci login` writes\n# NOTHING here"),
+        "the shipped example must keep stating that `ci login` persists nothing"
+    );
+    assert!(
+        text.contains("deliberate, opt-in exception"),
+        "...and must name `agent login` as its exception rather than contradicting it"
+    );
 }
 
 /// `examples/node.toml` is entirely commented out, so it must parse as the

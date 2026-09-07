@@ -868,7 +868,6 @@ pub struct AgentArgs {
     /// For `agent login`, the fleet whose `[agent]` table is written; for the
     /// deprecated node spellings, the fleet whose `[node]` credential this node
     /// connects with.
-
     ///
     /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`. There is no
     /// `--config` any more: `agent.toml` is gone, the credential lives in the

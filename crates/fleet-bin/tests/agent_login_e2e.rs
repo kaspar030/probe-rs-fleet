@@ -337,9 +337,13 @@ async fn a_peer_process_refresh_is_shared_rather_than_duplicated() {
         .expect("the peer's token is reused");
     assert_eq!(ours, peer, "concurrent processes share one session");
 
-    // Exactly two workload tokens exist for this identity: `agent login`'s
-    // confirmation pair is one thing, the single shared refresh another — the
-    // second caller minted nothing.
+    // Token equality *is* the "minted nothing" assertion: a workload token is
+    // random, so a second redemption could not have produced this value. The
+    // file agrees, which is what the next process in the sandbox will read.
+    //
+    // (The coordinator-side count is deliberately not asserted: `Db` exposes no
+    // way to count `workload_token` rows, and reaching into its pool to add one
+    // would test the schema rather than this behaviour.)
     let after = fleet_bin::fleet_config::load(path).unwrap();
     assert_eq!(after.agent.as_ref().unwrap().workload_token, peer);
 }
