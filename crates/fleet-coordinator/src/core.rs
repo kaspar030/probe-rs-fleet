@@ -4360,8 +4360,10 @@ mod tests {
         use fleet_proto::agent_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
-        // Deliberately NOT calling `ensure_node`: this node is unknown.
-        let ghost = AgentId("ghost".to_owned());
+        // Deliberately NOT calling `ensure_node`: this node is unknown. Its
+        // id is still production-shaped — the report being dropped must be
+        // because no row exists, not because the id could not name one.
+        let ghost = node_id(DEFAULT_ORG_ID, "ghost");
 
         let inv = ProbeInventory {
             boards: vec![status(
@@ -4403,7 +4405,7 @@ mod tests {
         {
             let clock = Arc::new(TestClock(AtomicU64::new(1000)));
             let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
-            let agent_id = AgentId("laptop".to_owned());
+            let node = node_id(DEFAULT_ORG_ID, "laptop");
             coord
                 .db()
                 .register_node_full(
@@ -4417,7 +4419,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let node = AgentId(format!("{DEFAULT_ORG_ID}/laptop"));
 
             let inv = ProbeInventory {
                 boards: vec![status(
@@ -4445,7 +4446,6 @@ mod tests {
                 "policy {policy} should {}have scheduled the adopted board",
                 if expect_scheduled { "" } else { "not " }
             );
-            let _ = agent_id;
         }
     }
 

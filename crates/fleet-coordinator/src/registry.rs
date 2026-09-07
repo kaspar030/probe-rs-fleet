@@ -326,11 +326,21 @@ impl ChannelTable {
 mod tests {
     use super::*;
 
+    /// The node id the coordinator would mint for this fixture's agent — the
+    /// registry keys on an opaque `AgentId`, but the one it keys on in
+    /// production is org-namespaced.
+    fn test_agent_id() -> AgentId {
+        crate::state::node_id_for(
+            &fleet_proto::ids::OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+            "agent-a",
+        )
+    }
+
     #[tokio::test]
     async fn agent_registry_insert_get_remove() {
         let reg = AgentRegistry::new();
         let (tx, mut rx) = mpsc::channel(4);
-        let agent = AgentId("agent-a".to_owned());
+        let agent = test_agent_id();
         reg.insert(agent.clone(), AgentHandle::new(tx)).await;
         assert_eq!(reg.len().await, 1);
 
@@ -396,7 +406,7 @@ mod tests {
                 ch,
                 ChannelRoute {
                     lease: LeaseId(1),
-                    agent: AgentId("agent-a".to_owned()),
+                    agent: test_agent_id(),
                     sidecar: tx,
                     kind: fleet_proto::ChannelKind::Data,
                 },
@@ -410,7 +420,7 @@ mod tests {
         assert_eq!(route.lease, LeaseId(1));
 
         let removed = table.remove(ch).await.unwrap();
-        assert_eq!(removed.agent, AgentId("agent-a".to_owned()));
+        assert_eq!(removed.agent, test_agent_id());
         assert!(table.is_empty().await);
     }
 }

@@ -714,6 +714,18 @@ mod tests {
 
     const SEED: [u8; 32] = [5u8; 32];
 
+    /// The node id the coordinator would mint for this fixture's agent.
+    ///
+    /// The server treats an `AgentId` as an opaque routing key, but the key it
+    /// routes in production is org-namespaced, so the fixture builds its own
+    /// with the production constructor rather than inventing a bare literal.
+    fn test_agent_id() -> AgentId {
+        crate::state::node_id_for(
+            &fleet_proto::ids::OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+            "agent-a",
+        )
+    }
+
     fn config() -> CoordinatorConfig {
         CoordinatorConfig {
             sqlite_path: ":memory:".into(),
@@ -741,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn agent_to_sidecar_relay_end_to_end() {
         let coord = coordinator().await;
-        let agent_id = AgentId("agent-a".to_owned());
+        let agent_id = test_agent_id();
 
         // Pre-register an open channel routed to a sidecar receiver.
         let channel = coord.channels().allocate().await;
@@ -805,7 +817,7 @@ mod tests {
     #[tokio::test]
     async fn coordinator_to_agent_command_end_to_end() {
         let coord = coordinator().await;
-        let agent_id = AgentId("agent-a".to_owned());
+        let agent_id = test_agent_id();
 
         let (server_tx, server_rx, _peer_tx, mut peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
@@ -845,7 +857,7 @@ mod tests {
     #[tokio::test]
     async fn register_with_a_foreign_id_closes_the_connection() {
         let coord = coordinator().await;
-        let agent_id = AgentId("agent-a".to_owned());
+        let agent_id = test_agent_id();
 
         let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
@@ -878,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn register_with_the_token_id_is_accepted() {
         let coord = coordinator().await;
-        let agent_id = AgentId("agent-a".to_owned());
+        let agent_id = test_agent_id();
 
         let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);

@@ -768,6 +768,20 @@ Three decisions are load-bearing:
   All three authentication paths resolve to this one shape, so authorization is
   a single mechanism regardless of how the caller proved itself.
 
+**A note on test fixtures.** Domain identifiers in tests are built with the
+production constructor, at the layer that would actually build them — a node id
+via `state.rs::node_id_for`, never a hand-rolled `format!("{org}/{name}")`. A
+fixture that spells an identifier itself is a second, unversioned definition of
+that identifier, and it drifts: the coordinator's board fixture built bare node
+ids (`node-a`) where production builds `gh-1/rpi-1` for long enough that every
+qualified-name resolution test passed while addressing boards the fleet cannot
+produce. The rule is *construct it the way the producing side does*, not "always
+prefix": an agent genuinely does not know its own org, so the `BoardName` it
+mints is correctly unprefixed, and mechanically prefixing it would manufacture a
+shape production never emits. Where the constructor is out of reach — the agent
+crate does not depend on the coordinator — the fixture names the shape in one
+documented constant rather than repeating a literal.
+
 ### 6.2 Connection auth: bearer tokens (revision 2)
 
 **The private CA and mTLS are withdrawn.** Deleted: `client_ca` /
