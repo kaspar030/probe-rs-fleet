@@ -324,8 +324,8 @@ async fn add_with(
     );
     print!("{table}");
     println!();
-    println!("The agent reads boards.toml once at startup, so restart it for this to");
-    println!("take effect (`systemctl --user restart …`, or re-run `probe-rs-fleet agent`).");
+    println!("The node reads boards.toml once at startup, so restart it for this to");
+    println!("take effect (`systemctl --user restart …`, or re-run `probe-rs-fleet node run`).");
     if draft.chip.is_empty() || draft.model.is_none() {
         println!();
         if draft.chip.is_empty() {

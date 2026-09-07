@@ -635,8 +635,8 @@ It obtains a node token by whichever of these applies, in order:
 > credential still wins over everything, and is reused rather than replaced.
 >
 > `share` is `node up`'s rung 2 as a standalone verb, and does **not** start
-> the agent: it writes the credential and the node-local settings, and its
-> summary points at `probe-rs-fleet agent`.
+> the node: it writes the credential and the node-local settings, and its
+> summary points at `probe-rs-fleet node run`.
 
 The node token is long-lived but **rotating**: the coordinator can issue a
 replacement over the established connection, so a leaked token has bounded

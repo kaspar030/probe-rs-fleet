@@ -220,7 +220,7 @@ adopt = "{adopt}"
 /// A commented starter `boards.toml` with one example `[[board]]`.
 #[must_use]
 pub fn starter_boards_toml() -> String {
-    r#"# probe-rs-fleet agent board inventory
+    r#"# probe-rs-fleet node board inventory
 #
 # Easiest way to add an entry: `probe-rs-fleet node board add`, which discovers
 # attached probes and APPENDS a [[board]] table here (your comments survive;
@@ -336,8 +336,8 @@ pub fn print_summary(e: &Enrollment<'_>) {
     }
     if run_hint {
         println!();
-        println!("The agent is not running yet. Start it with:");
-        println!("       probe-rs-fleet agent --fleet {fleet}");
+        println!("The node is not running yet. Start it with:");
+        println!("       probe-rs-fleet node run --fleet {fleet}");
     }
 }
 
