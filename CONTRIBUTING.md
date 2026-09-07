@@ -13,6 +13,23 @@ cargo fmt --all
 There is no `rustfmt.toml`: the default style is the whole rule, so there is
 nothing to argue about and nothing to configure.
 
+### Formatting is whatever *current stable* rustfmt produces
+
+The workflow pins no toolchain — it uses the runner's stable rustfmt — so the
+style tracks stable rather than a frozen version. **If `cargo fmt --all --check`
+fails on a tree you did not change, your rustfmt differs from CI's: run
+`rustup update` first**, before hunting for a real formatting mistake.
+
+The whole-tree pass was produced with:
+
+```
+rustfmt 1.9.0-stable (2d8144b788 2026-07-07)   # rustc 1.97.0
+```
+
+A future stable rustfmt may reflow a few lines differently; when it does, the
+fix is one more `cargo fmt --all` commit, not a pin.
+
+
 ### Make `git blame` skip the reformat
 
 The whole tree was reformatted in one commit
