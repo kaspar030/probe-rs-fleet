@@ -329,6 +329,14 @@ where
     // 1. Register. The id is advisory — the coordinator authenticates us by our
     //    token and will close the connection if this contradicts it.
     let node_id = fleet_proto::ids::NodeId(config.node_id.clone());
+    // Ghost-channel guard: the previous connection's splice tasks died with it
+    // (dropping their sockets), but nothing told the agent. A surviving
+    // `BoardSession` on the same lease is about to be *reused*, so its channel
+    // map must start empty or it over-reports live channels forever. The
+    // `serve` processes deliberately stay up: a lease outlives a control-plane
+    // blip. Done before `Register`, so it holds however the last connection
+    // died.
+    agent.clear_data_channels().await;
     send_report(
         &out_tx,
         NodeReport::Register {
@@ -693,7 +701,6 @@ mod tests {
     // and a DataFrame round-trip through the mock serve socket. ---
 
     use crate::agent::Agent;
-    use crate::probers::mock::MockSession;
     use crate::probers::{ProbeRsBackend, Session};
     use ed25519_dalek::{Signer, SigningKey};
     use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
@@ -805,10 +812,37 @@ kind = "none"
         .to_wire()
     }
 
-    /// A backend that hands out a [`MockSession`] pre-wired with an in-memory
-    /// duplex, exposing the peer half so the test can drive the "serve socket".
+    /// A backend whose sessions hand each channel a fresh in-memory duplex,
+    /// publishing the peer half so the test can drive the "serve socket".
+    ///
+    /// Per **connect**, not per open: since task 3670 one `probe-rs serve`
+    /// serves many channels, and it is [`Session::connect`] that the connection
+    /// layer calls for each one.
     struct DuplexBackend {
         peer: Arc<tokio::sync::Mutex<Option<tokio::io::DuplexStream>>>,
+    }
+
+    struct DuplexSession {
+        board: String,
+        peer: Arc<tokio::sync::Mutex<Option<tokio::io::DuplexStream>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Session for DuplexSession {
+        fn board(&self) -> &str {
+            &self.board
+        }
+        async fn connect(&self) -> std::result::Result<Box<dyn crate::probers::SpliceIo>, String> {
+            let (agent_side, peer) = tokio::io::duplex(4096);
+            *self.peer.lock().await = Some(peer);
+            Ok(Box::new(agent_side) as Box<dyn crate::probers::SpliceIo>)
+        }
+        async fn kill(&self) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        async fn wait(&self) -> crate::probers::SessionExit {
+            crate::probers::SessionExit::Killed
+        }
     }
 
     #[async_trait::async_trait]
@@ -818,9 +852,10 @@ kind = "none"
             board: &crate::config::BoardSpec,
             _serve_token: &str,
         ) -> std::result::Result<Box<dyn Session>, String> {
-            let (session, peer) = MockSession::with_io(board.id.clone());
-            *self.peer.lock().await = Some(peer);
-            Ok(Box::new(session) as Box<dyn Session>)
+            Ok(Box::new(DuplexSession {
+                board: board.id.clone(),
+                peer: Arc::clone(&self.peer),
+            }) as Box<dyn Session>)
         }
     }
 
@@ -887,6 +922,7 @@ kind = "none"
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: "5e12e70ce11".to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             }),

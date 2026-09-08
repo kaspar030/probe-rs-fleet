@@ -475,13 +475,42 @@ Decided agent model (per #1710, corrected by #1965):
   there (**no `--config`**). It then byte-splices the raw **TCP stream of
   serve's `/worker` WebSocket** through the relay — **zero probe-rs / WebSocket
   parsing** (the relay stays byte-opaque; it just carries WS-over-TCP bytes).
-  Per-board (reused across a holder's many invocations), recycled on release
-  for cleanup. This matches time-based sharing (§6).
-  - **Token wiring (end-to-end, zero protocol change):** the per-board serve
-    user `token` in `.probe-rs.toml` is the **hex of the fleet capability
-    token**. The sidecar already sets `PROBE_RS_REMOTE_TOKEN = hex(grant.token)`
-    and the agent receives those exact bytes as `token_wire` on `OpenSession`,
-    so the two ends authenticate against the same value with no new wire field.
+  Per-board and **actually reused across a holder's many invocations**, recycled
+  on release, fault or power-cycle. This matches time-based sharing (§6).
+  - **Reuse is what the process model is for, and since #512 it is what the
+    code does** (it was previously only the intent: the node spawned a server
+    per *channel*, and the second invocation against a board died in `nusb`
+    with `interface is busy`, `errno 16`). Upstream `serve`'s `run_tcp` accepts
+    connections in a **loop**, building a per-connection `RpcApp` over one
+    shared `ProbeBroker` — the type whose job is "grant exclusive use of a probe
+    to one waiter at a time, in the order the waiters arrived". Two OS
+    processes cannot share that broker; one process with many connections is
+    exactly what it was written for. The node's session table is therefore keyed
+    by **board**, holding one process and the set of channels spliced onto it.
+  - **A channel is per-invocation; the process is per-lease.** Closing a channel
+    never kills the server — killing on last-channel-close would reintroduce the
+    per-invocation respawn. It dies at release, expiry, fault, or a power cycle,
+    and is respawned if a channel arrives under a *different* lease (new
+    hardware ownership must not inherit target state).
+  - **The fleet opts into the broker rather than around it.** probe-rs's
+    `--attach-timeout` defaults to **zero**, which makes `attach` report
+    `ProbeInUse` the instant the broker is busy instead of queueing. The sidecar
+    therefore sets `PROBE_RS_ATTACH_TIMEOUT` (10s) when the caller set none, so
+    a teardown still in flight, or a second legitimately concurrent channel on
+    one board (§6.5 sharing, or a `ctl delegate` sandbox landing on the same
+    server), *waits its turn* — the §6 time-sharing semantics — rather than
+    failing. An explicit `--attach-timeout` always wins.
+  - **Token wiring (end-to-end), protocol 11:** the serve user `token` in
+    `.probe-rs.toml` is a **lease-scoped serve token** the coordinator mints
+    (`HMAC-SHA256(signing seed, label ‖ lease ‖ board)`, hex) and carries to
+    both ends — `OpenSession { serve_token }` to the node, `ChannelOpened
+    { serve_token }` to the sidecar, which exports it verbatim as
+    `PROBE_RS_REMOTE_TOKEN`. It is deliberately **not** the capability token any
+    more: that one is per-channel and re-attenuated at every open, while a
+    reused server reads its Figment config exactly once at startup, so a
+    per-channel value would force a respawn per invocation. The capability token
+    keeps its own job unchanged — the node verifies it, per channel, before
+    doing anything (§6.5).
   - **Figment caveat:** a `.probe-rs.toml` in the agent's home dir would, by
     Figment merge order (later wins), override the per-board cwd config. The
     agent runs in a controlled environment without one.
@@ -1367,14 +1396,58 @@ it goes through the scheduler's non-enqueueing `try_lease`, because a waiter
 left by a verb that returns immediately could later be promoted onto a board
 nobody is holding.
 
-**One data-plane token, carried explicitly.** `CoordToSidecar::ChannelOpened`
-now carries the exact capability-token bytes the coordinator sent the node, and
-that is what the sidecar exports as `PROBE_RS_REMOTE_TOKEN`. Previously the
-sidecar exported the *lease grant's* token and the two matched only by
-coincidence — same fields, deterministic ed25519 — a coincidence that an
-`extend` already broke (it rewrites the expiry the channel mint reads) and that
-attenuation breaks by construction. The wire field removes the whole class of
-"two mints must be byte-identical" bugs. Protocol 6 → 7.
+**Two data-plane tokens, both carried explicitly.** `CoordToSidecar::
+ChannelOpened` carries the exact capability-token bytes the coordinator sent the
+node. Previously the sidecar exported the *lease grant's* token as
+`PROBE_RS_REMOTE_TOKEN` and the two matched only by coincidence — same fields,
+deterministic ed25519 — a coincidence that an `extend` already broke (it
+rewrites the expiry the channel mint reads) and that attenuation breaks by
+construction. The wire field removed the whole class of "two mints must be
+byte-identical" bugs. Protocol 6 → 7.
+
+Since protocol 11 the two data-plane jobs that field was doing are **split**,
+because `probe-rs serve` is now reused across a holder's invocations (§4.2):
+
+- `ChannelOpened { token }` / `OpenSession { token }` — the **capability** token,
+  unchanged in every respect. Per channel, re-attenuated to the holder's current
+  effective ops at every open, and verified by the node (`token::verify_wire`)
+  before it acts. This is authorization, and it stays exactly where it was.
+- `ChannelOpened { serve_token }` / `OpenSession { serve_token }` — the
+  **`probe-rs serve` user token**: a lease-scoped hex secret the coordinator
+  derives as `HMAC-SHA256(signing seed, "probe-rs-fleet/serve-token/v1" ‖ lease ‖
+  board)`, the node writes into the board's `.probe-rs.toml`, and the sidecar
+  exports verbatim as `PROBE_RS_REMOTE_TOKEN`. It authenticates the agent's own
+  loopback splice, not the remote user; per-channel attenuation stays at the
+  coordinator, where it is actually enforced.
+
+The serve token is scoped to the lease rather than the channel because a reused
+server reads its Figment config exactly **once, at startup**: a per-channel value
+would force a respawn per invocation, which is the `errno 16` bug §4.2
+describes. Derived rather than stored, so there is no per-lease map to expire in
+`tear_down_lease`, `sweep_once` and the revocation cascade. Lease ids restart at
+1 on a coordinator reboot, so a post-restart lease can re-derive a pre-restart
+token; exposure is nil, since the port is loopback-only, every path to it is
+authorized per channel, and the process the old token addressed was killed at
+release. Neither token ever reaches the browser (§4.2 of `web-ui.md`, D4).
+
+**A channel dies with its invocation; a lease does not.** The rule is enforced
+in three layers, because each covers what the others cannot:
+
+1. the invocation closes its own channel when the child returns, and waits for
+   the coordinator's `ChannelClosed` (the shim exits immediately after, so an
+   unacknowledged write races process teardown). This happens whatever the lease
+   disposition — a cached lease is kept, its channel is not;
+2. a **dropped connection**'s channels are closed by the coordinator
+   (`drop_sidecar`, and the `/delegate` route's twin), which covers a sidecar
+   that is killed rather than returning. Keyed on the connection's handle, not
+   the lease: two connections may legitimately hold channels on one lease;
+3. `PROBE_RS_ATTACH_TIMEOUT` defaults so the node's shared `ProbeBroker`
+   *sequences* whatever overlap remains instead of refusing it (§4.2).
+
+Without (1) nothing on the lease-cache-hit path ever closed a channel at all —
+`Disposition::Keep` sends no `Release`, and the node reports `SessionClosed` only
+in reply to a `KillSession` — so a reused server kept the previous invocation's
+`ProbeLease` and the next `attach` was refused.
 
 ### 6.6 Lease lifecycle
 

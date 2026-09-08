@@ -248,7 +248,28 @@ pub enum CoordinatorCommand {
         /// uses only [`BoardRef::name`] for its local `boards.toml` lookup.
         board: BoardRef,
         /// The signed capability token (wire framing: see [`crate::token`]).
+        ///
+        /// This is the **authorization** credential: the node verifies it
+        /// locally (signature, lease, board, required op, expiry) before doing
+        /// anything. It is minted afresh per channel and re-attenuated to the
+        /// holder's current effective ops, so it changes across an `extend` or
+        /// a narrowed grant. It is deliberately **not** what `probe-rs serve`
+        /// accepts — see `serve_token`.
         token: Vec<u8>,
+        /// The `probe-rs serve` user token for this lease's board session.
+        ///
+        /// Lowercase hex, minted by the coordinator per **lease** (not per
+        /// channel), and written verbatim into the board's `.probe-rs.toml`
+        /// as the server user's token. The sidecar is handed the identical
+        /// string in `ChannelOpened { serve_token }` and exports it as
+        /// `PROBE_RS_REMOTE_TOKEN`, so the loopback splice authenticates end
+        /// to end.
+        ///
+        /// Lease-scoped rather than per-channel because a reused `serve`
+        /// process reads its Figment config exactly once at startup: a
+        /// per-channel value would force a respawn for every invocation,
+        /// which is precisely the cost this seam removes.
+        serve_token: String,
         /// The relay channel to splice the session onto.
         channel: ChannelId,
         /// What the channel carries (data plane vs. gdb tunnel).
@@ -356,6 +377,7 @@ mod tests {
             lease: LeaseId(42),
             board: test_board_ref(),
             token: vec![1, 2, 3, 4],
+            serve_token: "deadbeef".to_owned(),
             channel: ChannelId(9),
             kind: ChannelKind::Data,
         };
@@ -370,6 +392,7 @@ mod tests {
             lease: LeaseId(7),
             board: test_board_ref(),
             token: vec![9, 9],
+            serve_token: "cafe".to_owned(),
             channel: ChannelId(3),
             kind: ChannelKind::Gdb,
         };

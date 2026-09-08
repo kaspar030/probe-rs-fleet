@@ -33,10 +33,12 @@
 //!
 //! # No capability token ever reaches the browser
 //!
-//! Not `LeaseGrant::token`, not `ChannelOpened::token`, not the `/delegate`
-//! bearer. A capability token is offline-verifiable and cannot be revoked short
-//! of tearing down the lease, which makes it exactly the wrong thing to put
-//! where an XSS can read it. The view structs below are the enforcement: they
+//! Not `LeaseGrant::token`, not `ChannelOpened::token`, not
+//! `ChannelOpened::serve_token`, not the `/delegate` bearer. A capability token
+//! is offline-verifiable and cannot be revoked short of tearing down the lease,
+//! which makes it exactly the wrong thing to put where an XSS can read it; the
+//! serve token is a live loopback credential for a leased board and belongs
+//! there just as little. The view structs below are the enforcement: they
 //! name the fields they expose rather than deriving `Serialize` on a wire type
 //! that might grow one, and `tests/api_readonly.rs` asserts no response body
 //! contains a token prefix.

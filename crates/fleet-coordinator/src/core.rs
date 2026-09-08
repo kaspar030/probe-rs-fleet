@@ -42,7 +42,7 @@ use crate::clock::SharedClock;
 use crate::config::CoordinatorConfig;
 use crate::error::Result;
 use crate::proto::{CoordToSidecar, SidecarToCoord};
-use crate::registry::{ChannelTable, NodeRegistry, SidecarRegistry};
+use crate::registry::{ChannelTable, NodeRegistry, SidecarHandle, SidecarRegistry};
 use crate::relay;
 use crate::state::{AuditEntry, Db};
 
@@ -208,6 +208,19 @@ impl Coordinator {
     #[must_use]
     pub fn channels(&self) -> &ChannelTable {
         &self.channels
+    }
+
+    /// The lease-scoped `probe-rs serve` user token for `(lease, board)`.
+    ///
+    /// Derived from the signing seed rather than stored (see
+    /// [`crate::auth::serve_token`]), so every channel open on one lease yields
+    /// the same value with no per-lease state to expire or leak. Both mint
+    /// paths — [`Coordinator::open_channel`] and
+    /// [`Coordinator::open_delegated_channel`] — go through here, which is what
+    /// makes a delegated sandbox land on the delegator's *existing* `serve`.
+    fn serve_token(&self, lease: LeaseId, board: &BoardRef) -> String {
+        let crate::config::SigningKeySource::Seed(seed) = self.config.signing_key;
+        crate::auth::serve_token(&seed, lease, board)
     }
 
     /// The token signer.
@@ -2482,6 +2495,10 @@ impl Coordinator {
             expires,
         };
         let wire = self.signer.sign_to_wire(&token)?;
+        // The serve user token is scoped to the **lease**, not this channel: the
+        // node reuses one `probe-rs serve` process across the holder's many
+        // invocations, and its Figment config is read once at startup.
+        let serve = self.serve_token(lease, &board);
 
         let channel = relay::open_channel(
             &self.channels,
@@ -2492,6 +2509,7 @@ impl Coordinator {
                 lease,
                 board: board.clone(),
                 token: wire.clone(),
+                serve_token: serve.clone(),
                 kind,
             },
         )
@@ -2513,12 +2531,13 @@ impl Coordinator {
         )
         .await?;
         // Return the *exact* bytes the node got, so the sidecar can hand the
-        // genuine probe-rs client a credential `probe-rs serve` will accept.
-        // Re-minting on the sidecar side is what used to break after an
-        // `extend_lease`.
+        // genuine probe-rs client credentials the node and `probe-rs serve`
+        // will both accept. Re-minting on the sidecar side is what used to
+        // break after an `extend_lease`.
         Ok(Some(CoordToSidecar::ChannelOpened {
             channel,
             token: wire,
+            serve_token: serve,
         }))
     }
 
@@ -2621,6 +2640,10 @@ impl Coordinator {
             expires,
         };
         let wire = self.signer.sign_to_wire(&fresh)?;
+        // Same lease and board as the delegator's own channels, so the sandbox
+        // lands on the *same* `probe-rs serve` process rather than racing a
+        // second one onto the probe.
+        let serve = self.serve_token(token.lease, &board);
 
         let channel = relay::open_channel(
             &self.channels,
@@ -2631,6 +2654,7 @@ impl Coordinator {
                 lease: token.lease,
                 board: board.clone(),
                 token: wire.clone(),
+                serve_token: serve.clone(),
                 kind,
             },
         )
@@ -2652,6 +2676,7 @@ impl Coordinator {
         Ok(CoordToSidecar::ChannelOpened {
             channel,
             token: wire,
+            serve_token: serve,
         })
     }
 
@@ -2725,19 +2750,51 @@ impl Coordinator {
     /// the wait-deadline path in `fleet-sidecar`'s `CoordSession::lease` loses
     /// its cleanup with it.
     ///
-    /// Any relay channels the sidecar had open are torn down when its writer
-    /// task drops and the node reports `SessionClosed`.
+    /// It also closes every relay channel this **connection** had open, which
+    /// is the third rule and sits deliberately between the two above: a channel
+    /// belongs to one invocation, so it dies with the socket, while the lease
+    /// it ran under survives. Nothing else would close it — the node reports
+    /// `SessionClosed` only in *reply* to a `KillSession`, so waiting for the
+    /// node here would wait forever, and a surviving channel keeps the node's
+    /// `probe-rs serve` holding its `ProbeLease`, so the next invocation's
+    /// `attach` would be refused with `ProbeInUse`. Keyed on the connection's
+    /// handle rather than on the lease ([`ChannelTable::channels_for_sidecar`]),
+    /// so a second connection's channels on the same lease are untouched.
     pub async fn drop_sidecar(&self, subject: &Subject, requester: RequesterId) {
         let dropped = {
             let mut sched = self.scheduler.lock().await;
             sched.remove_waiters(requester)
         };
+        let handle = self.sidecars.get(requester).await;
         self.sidecars.remove(requester).await;
+        let closed = match handle {
+            Some(handle) => self.close_sidecar_channels(&handle).await,
+            None => 0,
+        };
         debug!(
             %subject,
             dropped_waiters = dropped,
+            closed_channels = closed,
             "sidecar disconnected"
         );
+    }
+
+    /// Close every relay channel routed to one sidecar connection, returning
+    /// how many were closed.
+    ///
+    /// Shared by [`Coordinator::drop_sidecar`] and the `/delegate` route's
+    /// teardown, which has no [`RequesterId`] to be found by and hands its own
+    /// `out_tx` in directly.
+    pub async fn close_sidecar_channels(&self, handle: &SidecarHandle) -> usize {
+        let channels = self.channels.channels_for_sidecar(handle).await;
+        for channel in &channels {
+            let node = match self.channels.get(*channel).await {
+                Some(route) => self.nodes.get(&route.node).await,
+                None => None,
+            };
+            relay::close_channel(&self.channels, node.as_ref(), *channel).await;
+        }
+        channels.len()
     }
 
     /// Push a promoted grant to the connection that queued for it.

@@ -54,8 +54,10 @@
 //! # Decision 3 — the cached grant's token is not reusable
 //!
 //! A hit skips `Lease` and goes straight to `OpenChannel`; the data-plane
-//! credential is the **fresh** `ChannelOpened { token }`, as on the cold path. A
-//! record therefore stores no token at all: not the bearer token, not the
+//! credentials are the **fresh** ones from `ChannelOpened`, as on the cold
+//! path — its `token` (the per-channel capability the node verifies) and its
+//! `serve_token` (the lease-scoped secret `probe-rs serve` accepts). A record
+//! therefore stores no token at all: not the bearer token, not the
 //! grant's capability token. A [`LeaseGrant`] reconstructed for
 //! [`LeaseCache::insert`] carries an empty `token`, which is sound precisely
 //! because the hit path never reads it.

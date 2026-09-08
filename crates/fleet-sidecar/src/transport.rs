@@ -392,8 +392,11 @@ impl CoordSession {
     /// caller consumes it in place of its own reply — the mirror image of the
     /// off-by-one the `Extended` slot exists to prevent. It is harmless today
     /// and deliberately left alone: nothing reads `ctrl_rx` during a splice,
-    /// and the one caller that follows a heartbeat is `release`, which ignores
-    /// whatever it drains. Anything added between the two would need to care.
+    /// and the two callers that follow a heartbeat are
+    /// [`CoordSession::close_channel_acked`] (end of invocation) and
+    /// [`CoordSession::release`], both of which drain exactly one frame and
+    /// ignore its content. Anything added between the two that *reads* what it
+    /// drained would need to care.
     ///
     /// # Errors
     ///
@@ -480,13 +483,42 @@ impl CoordSession {
         }
     }
 
-    /// Close a relay channel (best-effort).
+    /// Close a relay channel (best-effort, unacknowledged).
     ///
     /// Used when a channel was opened against a lease that turned out to name
     /// the wrong board (see [`crate::open_channel_verified`]): the channel is
-    /// handed back rather than left dangling until the lease expires.
+    /// handed back rather than left dangling until the lease expires. That path
+    /// wants to be non-blocking and is about to re-lease, so it does not wait.
+    /// The end-of-invocation close uses [`CoordSession::close_channel_acked`].
     pub async fn close_channel(&self, channel: ChannelId) {
         let _ = self.send(SidecarToCoord::CloseChannel { channel }).await;
+    }
+
+    /// Close a relay channel and wait briefly for the coordinator's
+    /// `ChannelClosed`.
+    ///
+    /// Called when an invocation ends, **whatever the lease disposition**: a
+    /// channel is per-invocation even when the lease is cached for the next one
+    /// (architecture §6.5). Without it nothing closes the channel on the
+    /// cache-hit path at all — `hold_and_run` with `Disposition::Keep` sends no
+    /// `Release`, and the node reports `SessionClosed` only in reply to a
+    /// `KillSession` that would never arrive — so the node's reused `probe-rs
+    /// serve` would keep the first connection's `ProbeLease` and refuse the
+    /// next invocation's `attach` with `ProbeInUse`.
+    ///
+    /// Waiting matters because the shim exits immediately afterwards: an
+    /// unacknowledged write can lose the race with process teardown. The ack is
+    /// the one the coordinator already sends from `relay::close_channel`, so
+    /// this needs no new wire message.
+    ///
+    /// **Deliberately content-blind.** It drains one control frame under a short
+    /// timeout and ignores what it is. A refused heartbeat leaves an `Error` in
+    /// `ctrl_rx` (see [`CoordSession::extend`]), so asserting `ChannelClosed`
+    /// here would turn a best-effort heartbeat refusal into a spurious failure.
+    /// Do not "improve" this into a check.
+    pub async fn close_channel_acked(&self, channel: ChannelId) {
+        let _ = self.send(SidecarToCoord::CloseChannel { channel }).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.next_ctrl()).await;
     }
 
     /// Release a held lease (best-effort).
@@ -495,15 +527,37 @@ impl CoordSession {
         // Drain the Released ack if it arrives promptly; ignore failures.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.next_ctrl()).await;
     }
+}
 
-    /// Open a relay channel of `kind` for `lease`, returning the channel id
-    /// **and the data-plane capability token** the coordinator handed the
-    /// owning node.
+/// A relay channel the coordinator opened, with both credentials it handed
+/// back.
+///
+/// A struct rather than a growing tuple: the two tokens do different jobs and
+/// confusing them is exactly the bug protocol 11 exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedChannel {
+    /// The allocated channel id.
+    pub channel: ChannelId,
+    /// The per-channel **capability** token: what the node verifies, and what
+    /// names the board a reused lease is cross-checked against. Never handed to
+    /// the probe-rs child.
+    pub token: Vec<u8>,
+    /// The lease-scoped **serve** token: the exact string to export as
+    /// `PROBE_RS_REMOTE_TOKEN`. Already the wire form the node wrote into
+    /// `.probe-rs.toml` — never hex-encode it again.
+    pub serve_token: String,
+}
+
+impl CoordSession {
+    /// Open a relay channel of `kind` for `lease`, returning the channel id and
+    /// both credentials the coordinator handed the owning node.
     ///
-    /// The token is the credential the genuine probe-rs client must present to
-    /// `probe-rs serve` (`PROBE_RS_REMOTE_TOKEN`). It is deliberately *not*
-    /// `LeaseGrant::token`: the two are different mints and diverge after an
-    /// `Extend`, or whenever a grant attenuates the allowed ops.
+    /// [`OpenedChannel::serve_token`] is what the genuine probe-rs client must
+    /// present to `probe-rs serve` (`PROBE_RS_REMOTE_TOKEN`); it is scoped to
+    /// the lease, because the node reuses one server across the holder's
+    /// invocations. [`OpenedChannel::token`] is the per-channel capability the
+    /// node verifies. Neither is `LeaseGrant::token`, which is a different mint
+    /// again and diverges after an `Extend` or under an attenuating grant.
     ///
     /// # Errors
     ///
@@ -512,18 +566,28 @@ impl CoordSession {
         &self,
         lease: fleet_proto::LeaseId,
         kind: ChannelKind,
-    ) -> Result<(ChannelId, Vec<u8>), TransportError> {
+    ) -> Result<OpenedChannel, TransportError> {
         self.send(SidecarToCoord::OpenChannel { lease, kind })
             .await?;
         match self.next_ctrl().await? {
-            CoordToSidecar::ChannelOpened { channel, token } => Ok((channel, token)),
+            CoordToSidecar::ChannelOpened {
+                channel,
+                token,
+                serve_token,
+            } => Ok(OpenedChannel {
+                channel,
+                token,
+                serve_token,
+            }),
             CoordToSidecar::Error { message } => Err(TransportError::Declined(message)),
             other => Err(TransportError::Wire(format!(
                 "expected ChannelOpened, got {other:?}"
             ))),
         }
     }
+}
 
+impl CoordSession {
     /// Route relayed data frames for `channel` to `sink` (replacing any prior
     /// active channel sink).
     async fn set_data_sink(&self, channel: ChannelId, sink: mpsc::Sender<DataFrame>) {
@@ -611,9 +675,56 @@ pub fn find_real_probe_rs() -> Result<std::path::PathBuf, TransportError> {
         .map_err(|e| TransportError::Io(format!("locating probe-rs: {e}")))
 }
 
+/// The default `PROBE_RS_ATTACH_TIMEOUT` the sidecar sets for the genuine
+/// probe-rs child, in seconds, when the caller set none.
+///
+/// probe-rs's `--attach-timeout` defaults to **zero**, which is exactly the
+/// setting that refuses to use upstream's `ProbeBroker`: with no grace the
+/// broker returns `Pending` and `attach` reports `ProbeInUse` immediately. Now
+/// that the node reuses one `probe-rs serve` per lease, two things need that
+/// grace: an invocation whose predecessor's connection is still being torn down
+/// (microseconds), and two legitimately concurrent channels on one board (§6.5
+/// sharing, or a `ctl delegate` sandbox), which should *queue* — the §6
+/// time-sharing semantics — rather than fail.
+///
+/// Ten seconds, matching the agent's `SERVE_READY_TIMEOUT`.
+/// `probe-rs`'s parser takes a bare `f64` of seconds, so the value is `"10"`,
+/// not a humantime string. Worst case, if a server genuinely never frees the
+/// probe, the user waits ten seconds and gets probe-rs's own `ProbeInUse`
+/// message: a clear error, not a hang, and strictly better than the `errno 16`
+/// this replaced.
+pub const DEFAULT_ATTACH_TIMEOUT_SECS: &str = "10";
+
+/// The environment overrides for the genuine probe-rs child: the relay host,
+/// the `probe-rs serve` token, and an attach timeout **only when the caller set
+/// none**.
+///
+/// Reads the parent environment through an injected [`EnvSource`] rather than
+/// [`std::env::var`] so the "never override an explicit `--attach-timeout`"
+/// rule is testable without joining the process-global env flake class.
+///
+/// [`EnvSource`]: crate::selector::EnvSource
+#[must_use]
+pub fn remote_child_env(
+    remote_host: &str,
+    serve_token: &str,
+    env: &dyn crate::selector::EnvSource,
+) -> Vec<(String, String)> {
+    let mut out = crate::local::build_remote_env(remote_host, Some(serve_token));
+    if env.get(crate::local::remote_env::ATTACH_TIMEOUT).is_none() {
+        out.push((
+            crate::local::remote_env::ATTACH_TIMEOUT.to_owned(),
+            DEFAULT_ATTACH_TIMEOUT_SECS.to_owned(),
+        ));
+    }
+    out
+}
+
 /// Run the genuine probe-rs (async) pointed at `remote_host` (a `ws://` base
-/// URL like `ws://127.0.0.1:<port>`) with the lease `token`, propagating its
-/// exit code.
+/// URL like `ws://127.0.0.1:<port>`) with the `probe-rs serve` `token`,
+/// propagating its exit code.
+///
+/// `env` supplies the *parent* environment (see [`remote_child_env`]).
 ///
 /// # Errors
 ///
@@ -623,11 +734,13 @@ pub async fn exec_remote_probe_rs(
     args: &[String],
     remote_host: &str,
     token: &str,
+    env: &dyn crate::selector::EnvSource,
 ) -> Result<i32, TransportError> {
     let mut cmd = tokio::process::Command::new(real);
     cmd.args(args);
-    cmd.env(crate::local::remote_env::HOST, remote_host);
-    cmd.env(crate::local::remote_env::TOKEN, token);
+    for (key, value) in remote_child_env(remote_host, token, env) {
+        cmd.env(key, value);
+    }
     // Kill the child if this future is dropped. The fleet path drops the work
     // future on SIGINT/SIGTERM and then *releases the lease*; without this the
     // genuine probe-rs would keep driving a board somebody else may already
@@ -659,6 +772,45 @@ mod tests {
     #[test]
     fn hex_encode_roundtrips() {
         assert_eq!(hex_encode(&[0x00, 0xde, 0xad, 0xff]), "00deadff");
+    }
+
+    /// The child's environment carries the relay host, the **serve** token
+    /// verbatim (never re-hexed), and an attach timeout the fleet supplies
+    /// because probe-rs's own default is zero — the setting that refuses to
+    /// queue on the node's shared `ProbeBroker`.
+    ///
+    /// Asserted on the production seam's own env builder, not on
+    /// `local::build_remote_env`: that one has no fleet caller, so a test
+    /// against it would pass while proving nothing about the spawned child.
+    /// The parent environment is injected rather than read from `std::env`, so
+    /// this joins no process-global env race.
+    #[test]
+    fn the_child_env_defaults_the_attach_timeout_when_unset() {
+        let empty = |_: &str| None;
+        let env = remote_child_env("ws://127.0.0.1:5", "5e12e70ce11", &empty);
+        assert!(env.contains(&(
+            crate::local::remote_env::TOKEN.to_owned(),
+            "5e12e70ce11".to_owned()
+        )));
+        assert!(env.contains(&(
+            crate::local::remote_env::ATTACH_TIMEOUT.to_owned(),
+            DEFAULT_ATTACH_TIMEOUT_SECS.to_owned()
+        )));
+    }
+
+    /// **The case that matters**: an explicit `--attach-timeout` (or a user-set
+    /// `PROBE_RS_ATTACH_TIMEOUT`) always wins. The fleet supplies a default, it
+    /// does not impose a policy.
+    #[test]
+    fn an_explicit_attach_timeout_is_never_overridden() {
+        let preset =
+            |k: &str| (k == crate::local::remote_env::ATTACH_TIMEOUT).then(|| "90".to_owned());
+        let env = remote_child_env("ws://127.0.0.1:5", "tok", &preset);
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k == crate::local::remote_env::ATTACH_TIMEOUT),
+            "a user-set attach timeout must be left alone, not re-set: {env:?}"
+        );
     }
 
     /// The pin is decoded from the resolved config, so a self-hosted
@@ -758,6 +910,7 @@ mod tests {
                 &CoordToSidecar::ChannelOpened {
                     channel: ChannelId(7),
                     token: vec![0x11, 0x22],
+                    serve_token: "5e12e70ce11".to_owned(),
                 },
             )
             .await
@@ -795,14 +948,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(grant.board, board_ref);
-        let (channel, channel_token) = session
+        let opened = session
             .open_channel(grant.lease, ChannelKind::Data)
             .await
             .unwrap();
+        let channel = opened.channel;
         assert_eq!(channel, ChannelId(7));
-        // The channel token is the coordinator's own, not the lease grant's.
-        assert_eq!(channel_token, vec![0x11, 0x22]);
-        assert_ne!(channel_token, grant.token);
+        // The capability token is the coordinator's own, not the lease grant's.
+        assert_eq!(opened.token, vec![0x11, 0x22]);
+        assert_ne!(opened.token, grant.token);
+        // And the serve token is a third thing again: the lease-scoped secret
+        // the child gets as `PROBE_RS_REMOTE_TOKEN`, verbatim.
+        assert_eq!(opened.serve_token, "5e12e70ce11");
 
         // A local "probe-rs client" over a duplex; the splice copies bytes to
         // the relay and the coordinator echoes them back.

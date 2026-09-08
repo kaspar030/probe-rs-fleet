@@ -102,20 +102,30 @@ async fn a_delegated_token_opens_a_channel_and_nothing_else_is_needed() {
 
     // The sandbox connects with nothing but that token.
     let sandbox = delegated_session(&fleet, &grant.token).await;
-    let (channel, channel_token) = sandbox
+    let opened = sandbox
         .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
         .await
         .unwrap();
 
-    // The node got a token, and it is byte-identical to the one the sandbox
-    // will hand `probe-rs serve`. This is the property `ChannelOpened { token }`
-    // exists for.
-    let (agent_channel, agent_token) = node.expect_open_session().await;
-    assert_eq!(agent_channel, channel);
+    // The node got a capability token, and it is byte-identical to the one the
+    // sandbox was handed. This is the property `ChannelOpened { token }` exists
+    // for.
+    let session = node.expect_open_session().await;
+    assert_eq!(session.channel, opened.channel);
     assert_eq!(
-        channel_token, agent_token,
-        "the sandbox's data-plane credential must be the node's"
+        opened.token, session.token,
+        "the sandbox's channel credential must be the node's"
     );
+    // And the **serve** token likewise: this is the new end-to-end property.
+    // The sandbox exports it as `PROBE_RS_REMOTE_TOKEN`, the node wrote it into
+    // `.probe-rs.toml`, so the two must be the same string or the loopback
+    // splice is refused. Being lease-scoped, it is also what lands the sandbox
+    // on the delegator's *existing* `probe-rs serve` rather than a second one.
+    assert_eq!(
+        opened.serve_token, session.serve_token,
+        "the sandbox's serve credential must be the node's"
+    );
+    assert!(!opened.serve_token.is_empty());
     // Note the channel token may or may not equal the capability the sandbox
     // presented — here it happens to, because nothing has narrowed the ops or
     // moved the expiry. That coincidence is exactly what `ChannelOpened
@@ -462,5 +472,155 @@ async fn a_delegation_cannot_exceed_the_delegators_own_access() {
         sched.board(&dk4).unwrap().state,
         fleet_proto::board::BoardState::Idle,
         "a refused delegation must not strand the board"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Connection-scoped channel teardown (task 3670, issue #512)
+// ---------------------------------------------------------------------------
+
+/// A dropped sidecar connection closes **its** channels, and tells the node.
+///
+/// The backstop for a sidecar that is `SIGKILL`ed rather than returning: the
+/// invocation closes its own channel on the way out, but a crashed one cannot.
+/// Nothing else would ever do it — the node reports `SessionClosed` only in
+/// reply to a `KillSession`, so waiting for the node here waits forever — and a
+/// surviving channel keeps the node's reused `probe-rs serve` holding the
+/// probe, so the next invocation's attach is refused.
+///
+/// The **lease** deliberately survives: it outlives one connection, which is
+/// the whole premise of the sidecar's lease cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_sidecar_connection_closes_its_channels() {
+    use crate::common::NodeStub;
+
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
+
+    let session = fleet.client_session(&alice_token).await;
+    let lease = match session
+        .request(SidecarToCoord::Lease(fleet_proto::lease::LeaseRequest {
+            select: by_board("dk-3"),
+            duration_secs: 600,
+            priority: fleet_proto::lease::Priority::Interactive,
+        }))
+        .await
+        .unwrap()
+    {
+        CoordToSidecar::Lease(g) => g.lease,
+        other => panic!("expected a lease, got {other:?}"),
+    };
+    let opened = session
+        .open_channel(lease, fleet_proto::ChannelKind::Data)
+        .await
+        .unwrap();
+    let _ = node.expect_open_session().await;
+    assert!(fleet.coord.channels().get(opened.channel).await.is_some());
+
+    // The client goes away without closing anything.
+    drop(session);
+
+    assert_eq!(
+        node.expect_kill_session().await,
+        opened.channel,
+        "the node must be told to drop its side"
+    );
+    assert!(
+        fleet.coord.channels().get(opened.channel).await.is_none(),
+        "the route must be gone too"
+    );
+    // But the lease is untouched: it is not the connection's to lose.
+    let sched = fleet.coord.scheduler().lock().await;
+    assert!(
+        sched.lease_target(lease).is_some(),
+        "a disconnect drops channels, not leases"
+    );
+}
+
+/// The same for a **delegated** connection, which mints no `RequesterId` at all
+/// and so is found by its own handle rather than by a registry lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_delegated_connection_closes_its_channels() {
+    use crate::common::NodeStub;
+
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
+
+    let grant = delegate(
+        &fleet,
+        &alice_token,
+        by_board("dk-3"),
+        vec![AllowedOp::Flash, AllowedOp::Attach],
+    )
+    .await;
+    let sandbox = delegated_session(&fleet, &grant.token).await;
+    let opened = sandbox
+        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .await
+        .unwrap();
+    let _ = node.expect_open_session().await;
+
+    drop(sandbox);
+
+    assert_eq!(node.expect_kill_session().await, opened.channel);
+    assert!(fleet.coord.channels().get(opened.channel).await.is_none());
+    // The delegator's lease is untouched: the sandbox never owned it.
+    let sched = fleet.coord.scheduler().lock().await;
+    assert!(sched.lease_target(grant.lease).is_some());
+}
+
+/// Teardown is keyed on the **connection**, not the lease: two connections may
+/// legitimately hold channels on one lease (the delegator's own `probe-rs run`
+/// and a `ctl delegate` sandbox landing on the same `probe-rs serve`), and
+/// dropping one must leave the other's channel alone.
+///
+/// A lease-keyed implementation passes every other test in this file and fails
+/// exactly here, by killing a live sandbox's channel when its delegator exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_connection_dropping_leaves_another_connections_channel_alone() {
+    use crate::common::NodeStub;
+
+    let fleet = TestCoordinator::start().await;
+    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
+
+    let grant = delegate(
+        &fleet,
+        &alice_token,
+        by_board("dk-3"),
+        vec![AllowedOp::Flash, AllowedOp::Attach],
+    )
+    .await;
+
+    // Two connections, one lease.
+    let first = delegated_session(&fleet, &grant.token).await;
+    let second = delegated_session(&fleet, &grant.token).await;
+    let a = first
+        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .await
+        .unwrap();
+    let _ = node.expect_open_session().await;
+    let b = second
+        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .await
+        .unwrap();
+    let _ = node.expect_open_session().await;
+    assert_ne!(a.channel, b.channel);
+    // Same lease, so both channels carry the same serve token and the node
+    // reuses one `probe-rs serve` for them.
+    assert_eq!(a.serve_token, b.serve_token);
+
+    drop(first);
+
+    assert_eq!(node.expect_kill_session().await, a.channel);
+    assert!(fleet.coord.channels().get(a.channel).await.is_none());
+    assert!(
+        fleet.coord.channels().get(b.channel).await.is_some(),
+        "the surviving connection's channel must be untouched"
     );
 }

@@ -31,11 +31,35 @@ const SEED: [u8; 32] = [7u8; 32];
 
 /// A backend whose `probe-rs serve` session is an in-memory duplex that echoes
 /// every byte back (a stand-in for a real probe-rs server's request/response).
+///
+/// One duplex **per channel**, not per process: since task 3670 a single serve
+/// serves many channels, and `Session::connect` is what the connection layer
+/// calls for each of them.
 struct EchoBackend;
 
 struct EchoSession {
     board: String,
-    io: tokio::sync::Mutex<Option<tokio::io::DuplexStream>>,
+}
+
+/// Spawn an in-memory "serve" that bounces every byte back, returning the
+/// agent-side half.
+fn echo_duplex() -> tokio::io::DuplexStream {
+    let (agent_side, mut peer) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        loop {
+            match peer.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if peer.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                    let _ = peer.flush().await;
+                }
+            }
+        }
+    });
+    agent_side
 }
 
 #[async_trait::async_trait]
@@ -43,12 +67,8 @@ impl Session for EchoSession {
     fn board(&self) -> &str {
         &self.board
     }
-    async fn take_io(&self) -> Option<Box<dyn SpliceIo>> {
-        self.io
-            .lock()
-            .await
-            .take()
-            .map(|s| Box::new(s) as Box<dyn SpliceIo>)
+    async fn connect(&self) -> Result<Box<dyn SpliceIo>, String> {
+        Ok(Box::new(echo_duplex()) as Box<dyn SpliceIo>)
     }
     async fn kill(&self) -> Result<(), String> {
         Ok(())
@@ -65,25 +85,8 @@ impl ProbeRsBackend for EchoBackend {
         board: &fleet_agent::config::BoardSpec,
         _serve_token: &str,
     ) -> Result<Box<dyn Session>, String> {
-        let (agent_side, mut peer) = tokio::io::duplex(4096);
-        // Echo task: bounce every byte the node writes back to it.
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                match peer.read(&mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if peer.write_all(&buf[..n]).await.is_err() {
-                            break;
-                        }
-                        let _ = peer.flush().await;
-                    }
-                }
-            }
-        });
         Ok(Box::new(EchoSession {
             board: board.id.clone(),
-            io: tokio::sync::Mutex::new(Some(agent_side)),
         }))
     }
 }
@@ -269,10 +272,11 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     assert_eq!(grant.node, node_id());
 
     // Open a data relay channel.
-    let (channel, _channel_token) = session
+    let channel = session
         .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
         .await
-        .unwrap();
+        .unwrap()
+        .channel;
 
     // A local "probe-rs client" duplex; the splice copies bytes to the relay,
     // the node forwards them to the echo backend, and they come back.

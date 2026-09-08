@@ -311,6 +311,30 @@ impl ChannelTable {
             .collect()
     }
 
+    /// All channels routed to one **sidecar connection**, compared by handle
+    /// identity rather than by lease.
+    ///
+    /// The distinction is load-bearing: a lease outlives the connection that
+    /// opened it (that is the whole premise of the sidecar's lease cache), and
+    /// two connections may legitimately hold channels on the *same* lease — a
+    /// `probe-rs run` and a `ctl delegate` sandbox, say. Keying teardown on the
+    /// lease would kill the other connection's channel.
+    ///
+    /// [`tokio::sync::mpsc::Sender::same_channel`] answers exactly "were these
+    /// cloned from the same channel?", so no `RequesterId` needs to be threaded
+    /// onto [`ChannelRoute`] — which matters because the `/delegate` route
+    /// mints none at all and holds only its own `out_tx`.
+    pub async fn channels_for_sidecar(&self, handle: &SidecarHandle) -> Vec<ChannelId> {
+        self.inner
+            .lock()
+            .await
+            .routes
+            .iter()
+            .filter(|(_, r)| r.sidecar.same_channel(handle))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     /// Number of open channels.
     pub async fn len(&self) -> usize {
         self.inner.lock().await.routes.len()
@@ -425,5 +449,32 @@ mod tests {
         let removed = table.remove(ch).await.unwrap();
         assert_eq!(removed.node, test_node_id());
         assert!(table.is_empty().await);
+    }
+
+    /// Teardown keys on the **connection**, not the lease: two sidecar
+    /// connections may hold channels on the same lease (a `probe-rs run` and a
+    /// delegated sandbox), and dropping one must not close the other's.
+    #[tokio::test]
+    async fn channels_for_sidecar_distinguishes_two_connections_on_one_lease() {
+        let table = ChannelTable::new();
+        let (tx_a, _rx_a) = mpsc::channel(4);
+        let (tx_b, _rx_b) = mpsc::channel(4);
+        let route = |sidecar: SidecarHandle| ChannelRoute {
+            lease: LeaseId(1),
+            node: test_node_id(),
+            sidecar,
+            kind: fleet_proto::ChannelKind::Data,
+        };
+        let ch_a = table.allocate().await;
+        let ch_b = table.allocate().await;
+        table.insert(ch_a, route(tx_a.clone())).await;
+        table.insert(ch_b, route(tx_b.clone())).await;
+
+        // Same lease, so a lease-keyed teardown would take both.
+        assert_eq!(table.channels_for_lease(LeaseId(1)).await.len(), 2);
+        assert_eq!(table.channels_for_sidecar(&tx_a).await, vec![ch_a]);
+        assert_eq!(table.channels_for_sidecar(&tx_b).await, vec![ch_b]);
+        // A clone of a handle is the same connection.
+        assert_eq!(table.channels_for_sidecar(&tx_a.clone()).await, vec![ch_a]);
     }
 }

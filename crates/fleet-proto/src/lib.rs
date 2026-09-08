@@ -121,4 +121,17 @@ pub struct ChannelId(pub u64);
 ///   cannot decode the reply and an old coordinator cannot decode the request.
 ///   No stored data is affected (contrast 7 → 8, which invalidated
 ///   `board=`-shaped grant selectors).
-pub const PROTOCOL_VERSION: u32 = 10;
+/// * 10 → 11: the data-plane token split, so one `probe-rs serve` can be reused
+///   across a holder's invocations. [`node_api::CoordinatorCommand::OpenSession`]
+///   and `CoordToSidecar::ChannelOpened` each gained a `serve_token: String`:
+///   the lowercase-hex `probe-rs serve` user token, minted by the coordinator
+///   per **lease** and carried to both ends, which the node writes into the
+///   board's `.probe-rs.toml` and the sidecar exports as
+///   `PROBE_RS_REMOTE_TOKEN`. `token` keeps its exact meaning — the per-channel
+///   capability the node verifies — but stops being what `serve` accepts: a
+///   reused serve reads its Figment config once at startup, so a per-channel
+///   token would force a respawn for every invocation (which is the `errno 16`
+///   bug this split fixes). postcard is positional, so the inserted field
+///   re-encodes every `OpenSession` and every `ChannelOpened`; neither end can
+///   decode the other's frames across the bump.
+pub const PROTOCOL_VERSION: u32 = 11;

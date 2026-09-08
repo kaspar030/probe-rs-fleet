@@ -13,12 +13,56 @@
 //! from a scheduler [`GrantedLease`].
 
 use ed25519_dalek::{Signer, SigningKey};
+use hmac::{Mac as _, SimpleHmac};
+use sha2::Sha256;
 
 use fleet_core::scheduler::GrantedLease;
+use fleet_proto::ids::{BoardRef, LeaseId};
 use fleet_proto::lease::LeaseGrant;
 use fleet_proto::token::{
     AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner, TokenVerifier,
 };
+
+/// Domain separator for [`serve_token`], so no other HMAC over the signing seed
+/// can ever collide with it.
+const SERVE_TOKEN_LABEL: &[u8] = b"probe-rs-fleet/serve-token/v1";
+
+/// The `probe-rs serve` user token for one lease's board session:
+/// `HMAC-SHA256(seed, label || lease || board)`, lowercase hex.
+///
+/// This is the **loopback** credential, not an authorization one: the node
+/// writes it into the board's `.probe-rs.toml` and the sidecar exports it as
+/// `PROBE_RS_REMOTE_TOKEN`, so the genuine probe-rs client authenticates to the
+/// `probe-rs serve` process the node runs for it. Authorization stays with the
+/// per-channel capability token, which the node verifies at every open.
+///
+/// **Derived, not stored.** It mirrors
+/// [`crate::browser_auth`]'s CSRF key: an HMAC over the signing seed the
+/// coordinator already holds. That buys the property that actually matters —
+/// stable for the whole lease, across every channel open, with no per-lease map
+/// to populate, expire, or forget to clean up in `tear_down_lease`,
+/// `sweep_once` and the revocation cascade.
+///
+/// Caveat, deliberately accepted: lease ids restart at 1 on a coordinator
+/// reboot, so a post-restart lease can re-derive a pre-restart token. Exposure
+/// is nil — the serve port is loopback-only, every path to it is authorized by
+/// the coordinator per channel, and the process the old token addressed was
+/// killed when its lease was released.
+///
+/// # Panics
+///
+/// Never in practice: `SimpleHmac` accepts a key of any length, so the only
+/// fallible step cannot fail for a 32-byte seed.
+#[must_use]
+pub fn serve_token(seed: &[u8; 32], lease: LeaseId, board: &BoardRef) -> String {
+    let mut mac =
+        <SimpleHmac<Sha256>>::new_from_slice(seed).expect("SimpleHmac accepts a key of any length");
+    mac.update(SERVE_TOKEN_LABEL);
+    mac.update(&lease.0.to_be_bytes());
+    mac.update(board.to_string().as_bytes());
+    let bytes: [u8; 32] = mac.finalize().into_bytes().into();
+    hex32(&bytes)
+}
 
 /// Signs capability tokens with the coordinator's ed25519 private key.
 #[derive(Clone)]

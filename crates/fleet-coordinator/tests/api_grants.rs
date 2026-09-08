@@ -1171,11 +1171,15 @@ async fn no_response_body_carries_a_capability_token() {
     let fleet = TestCoordinator::start().await;
     let (alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
     fleet.seed_github_user(2, "bob", Role::Member).await;
-    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     // A live lease, so the one artefact that *has* a capability token exists
     // while the sweep runs.
     let session = fleet.client_session(&alice).await;
     let lease = take_lease(&session, "dk-3").await;
+    // The serve token the coordinator would mint for that lease, derived the
+    // way production derives it, so the sweep below tests the real value rather
+    // than a hex shape that happens to look like it.
+    let serve_token = fleet_coordinator::auth::serve_token(&common::SEED, lease, &board);
 
     // Mint the two objects, then sweep everything.
     let (_, created_grant) = as_browser(
@@ -1248,6 +1252,15 @@ async fn no_response_body_carries_a_capability_token() {
         assert!(
             !contains_long_hex_run(body),
             "{route} carried something shaped like a capability token: {body}"
+        );
+        // The `probe-rs serve` token (protocol 11) is a *new* secret in a wire
+        // type, and a short one: 64 hex characters, under the long-hex-run bar
+        // above, so it needs naming rather than shape-matching. It is a
+        // loopback credential for a leased board, so it belongs in the browser
+        // exactly as little as a capability token does (api.rs, D4).
+        assert!(
+            !body.contains(&serve_token),
+            "{route} carried the lease's `probe-rs serve` token: {body}"
         );
     }
 

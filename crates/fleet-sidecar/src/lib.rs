@@ -268,8 +268,8 @@ async fn run_fleet(
     let expect = acquired.reused.then(|| acquired.grant.board.clone());
     let opened =
         open_channel_verified(&session, acquired.grant.lease, kind, expect.as_ref()).await?;
-    let (acquired, channel, channel_token) = if let Some((channel, token)) = opened {
-        (acquired, channel, token)
+    let (acquired, opened) = if let Some(opened) = opened {
+        (acquired, opened)
     } else {
         // Exactly one retry, and only from the cache-hit path: the cached
         // lease named somebody else's board (a coordinator restart aliased
@@ -288,18 +288,19 @@ async fn run_fleet(
         }
         drop(acquired);
         let fresh = acquire_lease(&session, &cfg, store.as_mut(), now).await?;
-        let (channel, token) = open_channel_verified(&session, fresh.grant.lease, kind, None)
+        let opened = open_channel_verified(&session, fresh.grant.lease, kind, None)
             .await?
             .expect("a channel opened without an expected board always verifies");
-        (fresh, channel, token)
+        (fresh, opened)
     };
+    let channel = opened.channel;
 
     let work = async {
         match &invocation {
             cli::ProbeRsInvocation::Gdb {
                 connection_string, ..
             } => run_fleet_gdb(&session, channel, connection_string.as_deref()).await,
-            _ => run_fleet_data(&session, channel, &channel_token, &original_argv).await,
+            _ => run_fleet_data(&session, channel, &opened.serve_token, &original_argv).await,
         }
     };
 
@@ -547,26 +548,28 @@ pub async fn open_channel_verified(
     lease: LeaseId,
     kind: ChannelKind,
     expect: Option<&BoardRef>,
-) -> Result<Option<(ChannelId, Vec<u8>)>, RunError> {
-    let (channel, token) = session.open_channel(lease, kind).await?;
+) -> Result<Option<transport::OpenedChannel>, RunError> {
+    let opened = session.open_channel(lease, kind).await?;
     let Some(expected) = expect else {
-        return Ok(Some((channel, token)));
+        return Ok(Some(opened));
     };
-    let named = fleet_proto::token::SignedToken::from_wire(&token)
+    // The **capability** token is what names a board; the serve token is an
+    // opaque loopback secret and says nothing about which board it belongs to.
+    let named = fleet_proto::token::SignedToken::from_wire(&opened.token)
         .ok()
         .and_then(|signed| signed.decode_token().ok())
         .map(|decoded| decoded.board);
     match named {
         // An undecodable token is not evidence of a mismatch: the sidecar has no
         // stake in the token's shape, and the agent is what verifies it.
-        None => Ok(Some((channel, token))),
-        Some(board) if &board == expected => Ok(Some((channel, token))),
+        None => Ok(Some(opened)),
+        Some(board) if &board == expected => Ok(Some(opened)),
         Some(board) => {
             tracing::warn!(
                 %board, expected = %expected,
                 "the reused lease names a different board; discarding it"
             );
-            session.close_channel(channel).await;
+            session.close_channel(opened.channel).await;
             Ok(None)
         }
     }
@@ -768,32 +771,88 @@ async fn run_delegated(
     } else {
         ChannelKind::Data
     };
-    let (channel, channel_token) = session.open_channel(lease, kind).await?;
+    let opened = session.open_channel(lease, kind).await?;
 
     match &invocation {
         cli::ProbeRsInvocation::Gdb {
             connection_string, ..
-        } => run_fleet_gdb(&session, channel, connection_string.as_deref()).await,
-        _ => run_fleet_data(&session, channel, &channel_token, &original_argv).await,
+        } => run_fleet_gdb(&session, opened.channel, connection_string.as_deref()).await,
+        _ => run_fleet_data(
+            &session,
+            opened.channel,
+            &opened.serve_token,
+            &original_argv,
+        )
+        .await,
     }
     // Deliberately no `session.release(lease)`: the lease is not ours.
+}
+
+/// Run one invocation's work on `channel`, then **hand the channel back**.
+///
+/// The single place the channel-per-invocation rule is enforced, shared by the
+/// data and gdb planes. A channel is per-invocation; a lease is not. On the
+/// lease-cache-hit path nothing else would ever close it — `hold_and_run` with
+/// [`Disposition::Keep`](lease_store::Disposition::Keep) sends no `Release`,
+/// and the node reports `SessionClosed` only in reply to a `KillSession` — so
+/// the node's reused `probe-rs serve` would hold this invocation's `ProbeLease`
+/// forever and the *next* invocation's `attach` would be refused with
+/// `ProbeInUse`. Before serve was reused the same omission showed up as
+/// `errno 16` instead.
+///
+/// The close runs on **every** arm, error included: the `?` is deliberately
+/// after it. `Coordinator::drop_sidecar` is the backstop for a sidecar that is
+/// killed rather than returning at all.
+///
+/// # Errors
+///
+/// Propagates `work`'s error, after closing the channel.
+pub async fn run_on_channel<F>(
+    session: &transport::CoordSession,
+    channel: ChannelId,
+    work: F,
+) -> Result<i32, RunError>
+where
+    F: std::future::Future<Output = Result<i32, RunError>>,
+{
+    let outcome = work.await;
+    session.close_channel_acked(channel).await;
+    outcome
 }
 
 /// Data-plane path: bind a loopback endpoint the genuine probe-rs client dials
 /// as its remote host, splice it onto an already-opened relay `channel`, and
 /// exec the real probe-rs.
 ///
-/// Takes the opened channel and its credential rather than a lease, because the
-/// caller has to open the channel anyway: the fleet path cross-checks the board
-/// the credential names ([`open_channel_verified`]), and the delegated path has
-/// no grant at all — only a token, from which it decodes the lease locally. The
-/// data-plane credential comes from `ChannelOpened` on every path, so the two
-/// converge here completely. In particular a **reused** lease does not reuse a
-/// token: `channel_token` is always the fresh per-channel one.
+/// Takes the opened channel and its serve credential rather than a lease,
+/// because the caller has to open the channel anyway: the fleet path
+/// cross-checks the board the *capability* token names
+/// ([`open_channel_verified`]), and the delegated path has no grant at all —
+/// only a token, from which it decodes the lease locally. Both converge here.
+///
+/// **Closes the channel on the way out** via [`run_on_channel`], whatever the
+/// lease disposition.
 async fn run_fleet_data(
     session: &transport::CoordSession,
     channel: ChannelId,
-    channel_token: &[u8],
+    serve_token: &str,
+    original_argv: &[String],
+) -> Result<i32, RunError> {
+    run_on_channel(
+        session,
+        channel,
+        run_fleet_data_inner(session, channel, serve_token, original_argv),
+    )
+    .await
+}
+
+/// [`run_fleet_data`] without the channel close, so the close lives in exactly
+/// one place ([`run_on_channel`]) rather than on each of this function's return
+/// arms.
+async fn run_fleet_data_inner(
+    session: &transport::CoordSession,
+    channel: ChannelId,
+    serve_token: &str,
     original_argv: &[String],
 ) -> Result<i32, RunError> {
     // Bind a loopback listener the probe-rs client treats as its remote host.
@@ -806,13 +865,15 @@ async fn run_fleet_data(
         .local_addr()
         .map_err(|e| transport::TransportError::Io(format!("reading local endpoint: {e}")))?;
     let remote_host = format!("ws://{local_addr}");
-    // The **channel** token, not the lease grant's: this is the credential the
-    // coordinator handed the agent, and therefore the one `probe-rs serve`
-    // accepts. A lease grant's token is the delegation artefact and diverges
-    // from it after an `Extend` or under an attenuating grant — and a cached
-    // grant's token is staler still, which is why nothing on the cache-hit path
-    // ever touches it.
-    let token = transport::hex_encode(channel_token);
+    // The **serve** token: the lease-scoped secret the coordinator minted, wrote
+    // into the node's `.probe-rs.toml` and handed us verbatim, so it is already
+    // the exact string `probe-rs serve` will accept — no hex-encoding.
+    //
+    // Deliberately *not* the capability token. That one authorises the channel
+    // and is checked by the coordinator and the node, per channel; it changes
+    // across an `extend` or an attenuating grant, and a reused `serve` reads its
+    // config once at startup, so it could not be what the server checks.
+    let token = serve_token;
 
     // Accept the single probe-rs client connection and splice it in a task that
     // borrows the session for the duration of the child process.
@@ -826,7 +887,13 @@ async fn run_fleet_data(
             let _ = transport::splice_client(session, channel, client).await;
         }
     };
-    let child = transport::exec_remote_probe_rs(&real, &args, &remote_host, &token);
+    let child = transport::exec_remote_probe_rs(
+        &real,
+        &args,
+        &remote_host,
+        token,
+        &selector::ProcessEnv,
+    );
 
     // The child drives the session; when it exits we stop accepting/splicing.
     tokio::pin!(splice);
@@ -835,26 +902,31 @@ async fn run_fleet_data(
     loop {
         tokio::select! {
             () = &mut splice, if !splice_done => { splice_done = true; }
-            code = &mut child => {
-                return Ok(code?);
-            }
+            code = &mut child => return Ok(code?),
         }
     }
 }
 
 /// gdb-plane fleet path: bind the local gdb listener the user's gdb client
 /// connects to and byte-splice it onto the already-opened relay `channel`.
+///
+/// Closes the channel on the way out through [`run_on_channel`], for the same
+/// reason [`run_fleet_data`] does: a gdb tunnel is per-invocation, and nothing
+/// else would ever tear it down when the lease is kept.
 async fn run_fleet_gdb(
     session: &transport::CoordSession,
     channel: ChannelId,
     connection_string: Option<&str>,
 ) -> Result<i32, RunError> {
-    let addr = gdb::resolve_listen_addr(connection_string)?;
-    let listener = gdb::bind(addr).await?;
-    tracing::info!(%addr, "gdb tunnel listening; point your gdb client here");
-    let client = gdb::accept(&listener).await?;
-    transport::splice_client(session, channel, client).await?;
-    Ok(0)
+    run_on_channel(session, channel, async {
+        let addr = gdb::resolve_listen_addr(connection_string)?;
+        let listener = gdb::bind(addr).await?;
+        tracing::info!(%addr, "gdb tunnel listening; point your gdb client here");
+        let client = gdb::accept(&listener).await?;
+        transport::splice_client(session, channel, client).await?;
+        Ok(0)
+    })
+    .await
 }
 
 #[cfg(test)]

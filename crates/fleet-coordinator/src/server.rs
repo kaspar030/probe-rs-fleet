@@ -496,6 +496,13 @@ pub async fn handle_delegate(
     })
     .await;
 
+    // A delegated connection's channels die with it, exactly as a sidecar's do
+    // (`Coordinator::drop_sidecar`), and for the same reason: the channel is
+    // per-invocation, and a surviving one would keep the node's `probe-rs
+    // serve` holding the probe. There is no `RequesterId` on this route — see
+    // the doc comment above — so the channels are found by this connection's
+    // own handle. The **lease** is untouched: it belongs to the delegator.
+    coord.close_sidecar_channels(&out_tx).await;
     writer_task.abort();
     result
 }

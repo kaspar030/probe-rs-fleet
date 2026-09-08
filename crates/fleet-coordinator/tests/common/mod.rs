@@ -579,6 +579,17 @@ pub struct NodeStub {
     rx: tokio::sync::mpsc::Receiver<fleet_coordinator::registry::NodeMessage>,
 }
 
+/// What a node was told to open, as observed by a [`NodeStub`].
+///
+/// The tokens are what make this worth returning: `token` is the byte string
+/// the node checks, `serve_token` the string it writes into `.probe-rs.toml`,
+/// and a test's job is to prove the client is handed exactly those.
+pub struct OpenedSession {
+    pub channel: fleet_proto::ChannelId,
+    pub token: Vec<u8>,
+    pub serve_token: String,
+}
+
 impl NodeStub {
     /// Register a stub handle for `node`.
     pub async fn attach(fleet: &TestCoordinator, node: &NodeId) -> Self {
@@ -594,15 +605,21 @@ impl NodeStub {
         Self { rx }
     }
 
-    /// Await the next `OpenSession` command, returning `(channel, token)`.
-    ///
-    /// The token is what makes this helper worth having: it is the byte string
-    /// the node will check, and therefore the one the client must present.
-    pub async fn expect_open_session(&mut self) -> (fleet_proto::ChannelId, Vec<u8>) {
+    /// Await the next `OpenSession` command.
+    pub async fn expect_open_session(&mut self) -> OpenedSession {
         match self.rx.recv().await.expect("node connection closed") {
             fleet_coordinator::registry::NodeMessage::Command(
-                fleet_proto::CoordinatorCommand::OpenSession { channel, token, .. },
-            ) => (channel, token),
+                fleet_proto::CoordinatorCommand::OpenSession {
+                    channel,
+                    token,
+                    serve_token,
+                    ..
+                },
+            ) => OpenedSession {
+                channel,
+                token,
+                serve_token,
+            },
             other => panic!("expected OpenSession, got {other:?}"),
         }
     }
@@ -619,6 +636,20 @@ impl NodeStub {
                 fleet_proto::CoordinatorCommand::PowerCycle { board },
             ) => board,
             other => panic!("expected PowerCycle, got {other:?}"),
+        }
+    }
+
+    /// Await the next `KillSession` command, returning the channel it names.
+    ///
+    /// The observable half of channel teardown: the coordinator removing its
+    /// route is not enough — the node must be told, or its `probe-rs serve`
+    /// keeps holding the probe.
+    pub async fn expect_kill_session(&mut self) -> fleet_proto::ChannelId {
+        match self.rx.recv().await.expect("node connection closed") {
+            fleet_coordinator::registry::NodeMessage::Command(
+                fleet_proto::CoordinatorCommand::KillSession { channel },
+            ) => channel,
+            other => panic!("expected KillSession, got {other:?}"),
         }
     }
 

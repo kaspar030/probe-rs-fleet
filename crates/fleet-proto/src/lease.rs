@@ -271,12 +271,14 @@ pub struct LeaseGrant {
     pub expires: u64,
     /// Opaque signed capability token (see `fleet-coordinator` auth).
     ///
-    /// **This is not the data-plane credential.** It is the *delegation*
+    /// **This is not a data-plane credential.** It is the *delegation*
     /// artefact (`ctl delegate` hands exactly these bytes to a sandbox) and
-    /// the lease cache's identity. The bytes a probe-rs client must present to
-    /// `probe-rs serve` are the ones the coordinator sent the node, returned
-    /// per channel in `CoordToSidecar::ChannelOpened { token }` — they differ
-    /// as soon as the lease is extended or a grant attenuates `allowed_ops`.
+    /// the lease cache's identity. Two other credentials do the data-plane
+    /// jobs, both arriving per channel in `CoordToSidecar::ChannelOpened`:
+    /// its `token` is the per-channel capability the **node** verifies, and
+    /// its `serve_token` is the lease-scoped secret **`probe-rs serve`**
+    /// accepts. All three differ as soon as the lease is extended or a grant
+    /// attenuates `allowed_ops`.
     pub token: Vec<u8>,
 }
 

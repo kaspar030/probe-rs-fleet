@@ -41,7 +41,12 @@ pub struct OpenRequest {
     /// scoped to.
     pub board: BoardRef,
     /// The signed capability token (wire framing: see `fleet_proto::token`).
+    /// Per-channel, re-attenuated at every open; the node verifies it.
     pub token: Vec<u8>,
+    /// The lease-scoped `probe-rs serve` user token (lowercase hex), which the
+    /// node writes into the board's `.probe-rs.toml`. See
+    /// [`crate::auth::serve_token`].
+    pub serve_token: String,
     /// Which plane the channel carries (data vs. gdb tunnel).
     pub kind: fleet_proto::ChannelKind,
 }
@@ -68,6 +73,7 @@ pub async fn open_channel(
         lease,
         board,
         token,
+        serve_token,
         kind,
     } = request;
     let channel = table.allocate().await;
@@ -86,6 +92,7 @@ pub async fn open_channel(
         lease,
         board,
         token,
+        serve_token,
         channel,
         kind,
     })
@@ -214,6 +221,7 @@ mod tests {
                 lease: LeaseId(1),
                 board: test_board_ref(),
                 token: vec![0xde, 0xad],
+                serve_token: "cafef00d".to_owned(),
                 kind: fleet_proto::ChannelKind::Data,
             },
         )
@@ -227,12 +235,14 @@ mod tests {
                 lease,
                 board,
                 token,
+                serve_token,
                 channel: ch,
                 kind,
             }) => {
                 assert_eq!(lease, LeaseId(1));
                 assert_eq!(board, test_board_ref());
                 assert_eq!(token, vec![0xde, 0xad]);
+                assert_eq!(serve_token, "cafef00d");
                 assert_eq!(ch, channel);
                 assert_eq!(kind, fleet_proto::ChannelKind::Data);
             }
@@ -290,6 +300,7 @@ mod tests {
                 lease: LeaseId(1),
                 board: test_board_ref(),
                 token: vec![],
+                serve_token: String::new(),
                 kind: fleet_proto::ChannelKind::Data,
             },
         )

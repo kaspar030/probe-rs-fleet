@@ -397,20 +397,35 @@ pub enum CoordToSidecar {
         /// The **exact wire bytes** of the capability token the coordinator
         /// sent the owning node in its `OpenSession` command.
         ///
-        /// This is the data-plane credential: the node writes these same
-        /// bytes (hex-encoded) into the per-board `.probe-rs.toml` as the
-        /// `probe-rs serve` user token, so the sidecar must export *this*
-        /// value as `PROBE_RS_REMOTE_TOKEN` — **not**
-        /// [`fleet_proto::LeaseGrant::token`].
+        /// This is the per-channel **authorization** credential the node
+        /// verifies (`fleet-agent`'s `token::verify_wire`), and it is what the
+        /// sidecar cross-checks the board of on a reused lease. It is minted
+        /// afresh per channel and re-attenuated to the holder's current
+        /// effective ops, so it changes across an `Extend` or a narrowed
+        /// grant. It is **not** [`fleet_proto::LeaseGrant::token`], and since
+        /// protocol 11 it is no longer what `probe-rs serve` accepts either —
+        /// that is `serve_token`.
         ///
-        /// Before this field existed the two matched only by coincidence:
-        /// both mints produced `{lease, board, <all ops>,
-        /// expires}` and ed25519 signing is deterministic. That coincidence
-        /// already broke after an `Extend` (which rewrites the expiry
-        /// `open_channel` reads) and breaks by construction once grants
-        /// attenuate `allowed_ops`. Carrying the bytes removes the whole
-        /// class of "two mints must be byte-identical" bugs.
+        /// Before this field existed the two mints matched only by
+        /// coincidence: both produced `{lease, board, <all ops>, expires}` and
+        /// ed25519 signing is deterministic. That coincidence already broke
+        /// after an `Extend` (which rewrites the expiry `open_channel` reads)
+        /// and breaks by construction once grants attenuate `allowed_ops`.
+        /// Carrying the bytes removes the whole class of "two mints must be
+        /// byte-identical" bugs.
         token: Vec<u8>,
+        /// The `probe-rs serve` user token, lowercase hex.
+        ///
+        /// The data-plane credential proper: the sidecar exports exactly this
+        /// string as `PROBE_RS_REMOTE_TOKEN`, and the node writes exactly this
+        /// string into the board's `.probe-rs.toml`. Scoped to the **lease**,
+        /// not the channel, because the node reuses one `probe-rs serve`
+        /// process across a holder's many invocations and Figment reads that
+        /// config once at startup.
+        ///
+        /// Never hex-encode it again — it is already the exact string both
+        /// ends must agree on.
+        serve_token: String,
     },
     /// A channel was closed (by request, node, or lease expiry).
     ChannelClosed {
@@ -640,6 +655,7 @@ mod tests {
             lease: LeaseId(1),
             board: test_board_ref(),
             token: vec![9, 9, 9],
+            serve_token: "abc123".to_owned(),
             channel: ChannelId(2),
             kind: ChannelKind::Data,
         });

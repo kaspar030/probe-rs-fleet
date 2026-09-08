@@ -54,8 +54,9 @@ impl CacheKey {
 /// separate; unifying them would make one of them wrong.
 ///
 /// Also note what a cached `CachedLease.grant.token` is since §6.5: an identity
-/// and delegation artefact, **not** the data-plane credential. That comes per
-/// channel in `ChannelOpened`.
+/// and delegation artefact, **not** a data-plane credential. Those come per
+/// channel in `ChannelOpened`: its `token` (the capability the node verifies)
+/// and its `serve_token` (what `probe-rs serve` accepts).
 #[must_use]
 pub fn fingerprint(select: &Constraint) -> String {
     match select {

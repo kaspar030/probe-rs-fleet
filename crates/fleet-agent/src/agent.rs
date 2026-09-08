@@ -2,12 +2,14 @@
 //! implements the coordinator-command handlers (architecture §4.2, §5).
 //!
 //! Command flow:
-//! * `OpenSession` → verify the capability token locally, then start a
-//!   `probe-rs serve` session for the board and splice it onto the channel.
-//! * `KillSession` → kill the session on that channel.
-//! * `ReleaseLease` → kill the lease's session, then run cleanup (power-cycle +
-//!   optional erase).
-//! * `PowerCycle` → power-cycle a board on operator command.
+//! * `OpenSession` → verify the capability token locally, then splice the
+//!   board's `probe-rs serve` onto the channel — **reusing** the process when
+//!   one is already running for this lease, spawning otherwise.
+//! * `KillSession` → drop that channel's splice. The `serve` process survives:
+//!   it belongs to the lease, not the invocation.
+//! * `ReleaseLease` → close the lease's channels, then run cleanup (kill the
+//!   board's `serve`, power-cycle, optional erase).
+//! * `PowerCycle` → kill the board's sessions, *then* power-cycle it.
 //! * `QueryState` → re-report inventory.
 
 use std::collections::HashMap;
@@ -30,17 +32,37 @@ use crate::power::{self, PowerControl};
 use crate::probers::{ProbeRsBackend, Session};
 use crate::token::Ed25519Verifier;
 
-/// An open data-plane session bound to a lease/board/channel.
-struct ActiveSession {
+/// One `probe-rs serve` process and every relay channel spliced onto it.
+///
+/// Board-keyed rather than channel-keyed (the shape before task 3670): upstream
+/// `serve` accepts connections in a loop and sequences them through its own
+/// `ProbeBroker`, so many channels share one process, while two processes
+/// fenced to the same probe collide in the USB driver (`errno 16`). A process
+/// therefore outlives the invocation that spawned it and dies only with its
+/// lease — at release, expiry, fault, or a power cycle.
+struct BoardSession {
+    /// The lease this process was spawned for.
+    ///
+    /// A channel arriving under a *different* lease means new hardware
+    /// ownership: the process is torn down and respawned rather than reused, so
+    /// no target state leaks between tenants.
     lease: LeaseId,
-    board: BoardName,
-    session: Box<dyn Session>,
+    /// The `probe-rs serve` user token written into this process's
+    /// `.probe-rs.toml`. Lease-scoped, minted by the coordinator; a mismatch is
+    /// treated exactly like a lease mismatch.
+    serve_token: String,
+    /// The running server.
+    serve: Box<dyn Session>,
+    /// Live channels on this board, each holding its own loopback connection
+    /// until [`Agent::take_data_io`] hands it to the splice.
+    channels: HashMap<ChannelId, Option<Box<dyn crate::probers::SpliceIo>>>,
 }
 
 /// An open gdb-tunnel session: a board-local `probe-rs gdb` stub whose TCP
 /// stream is spliced onto the relay channel. Tracked separately from
-/// [`ActiveSession`] because it owns a process + connection rather than a
-/// `probe-rs serve` [`Session`], but shares the same lease/board lifecycle.
+/// [`BoardSession`] because it owns a process + connection per channel rather
+/// than a shared `probe-rs serve` [`Session`], but shares the same lease/board
+/// lifecycle.
 struct GdbSession {
     lease: LeaseId,
     board: BoardName,
@@ -81,8 +103,12 @@ pub struct Agent<B: ProbeRsBackend> {
     /// Spawns board-local `probe-rs gdb` stubs for gdb-tunnel channels.
     gdb_stub: Arc<dyn GdbStub>,
     inventory: Mutex<ProbeInventory>,
-    sessions: Mutex<HashMap<ChannelId, ActiveSession>>,
-    /// Open gdb-tunnel sessions, keyed by channel (parallel to `sessions`).
+    /// Live `probe-rs serve` processes, **one per board**, each shared by every
+    /// data channel open on that board (see [`BoardSession`]).
+    sessions: Mutex<HashMap<BoardName, BoardSession>>,
+    /// Open gdb-tunnel sessions, keyed by channel. Deliberately *not* folded
+    /// into `sessions`: a gdb stub is per-channel by nature (each carries one
+    /// client connection), so it has no process to share.
     gdb_sessions: Mutex<HashMap<ChannelId, GdbSession>>,
     /// Reports the agent wants to emit upward (drained by the connection loop).
     outbox: Mutex<Vec<NodeReport>>,
@@ -118,16 +144,6 @@ fn declared_board_status(b: &BoardSpec) -> fleet_proto::BoardStatus {
         power: b.power.to_power_kind(),
         adopted: false,
     }
-}
-
-/// Lowercase-hex encode a byte slice (used to render the serve user token).
-fn hex_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
 }
 
 impl<B: ProbeRsBackend> Agent<B> {
@@ -326,10 +342,11 @@ impl<B: ProbeRsBackend> Agent<B> {
                 lease,
                 board,
                 token,
+                serve_token,
                 channel,
                 kind,
             } => {
-                self.on_open_session(lease, &board, &token, channel, kind)
+                self.on_open_session(lease, &board, &token, &serve_token, channel, kind)
                     .await
             }
             CoordinatorCommand::KillSession { channel } => self.on_kill_session(channel).await,
@@ -362,6 +379,7 @@ impl<B: ProbeRsBackend> Agent<B> {
         lease: LeaseId,
         board: &BoardRef,
         token_wire: &[u8],
+        serve_token: &str,
         channel: ChannelId,
         kind: ChannelKind,
     ) -> Result<()> {
@@ -382,47 +400,247 @@ impl<B: ProbeRsBackend> Agent<B> {
 
         match kind {
             ChannelKind::Data => {
-                self.open_data_session(lease, &local, token_wire, channel, &spec)
+                self.open_data_session(lease, &local, serve_token, channel, &spec)
                     .await
             }
             ChannelKind::Gdb => self.open_gdb_session(lease, &local, channel, &spec).await,
         }
     }
 
-    /// Open a `probe-rs serve` data-plane session and record it.
+    /// Open a data-plane channel, reusing this board's `probe-rs serve` process
+    /// when one is already running for the same lease.
+    ///
+    /// Three cases, decided under **one** `sessions` guard held across the
+    /// spawn:
+    ///
+    /// 1. a live session for this board, same lease and same serve token →
+    ///    reuse it and just connect a new loopback stream;
+    /// 2. a live session under a *different* lease (or token) → kill it, report
+    ///    its channels closed, and spawn afresh: a new lease is new hardware
+    ///    ownership, and reusing across leases would leak target state between
+    ///    tenants;
+    /// 3. nothing → spawn.
+    ///
+    /// **A reused session whose `connect` fails is treated as dead and replaced,
+    /// once.** Nothing supervises the child (`Session::wait` has no production
+    /// caller), and reuse is decided on lease equality, not liveness — so a
+    /// server that exited on its own (crash, OOM, probe unplugged) would
+    /// otherwise fail *every* later invocation on that lease, each paying the
+    /// full connect retry, until an operator released the lease. Per-channel
+    /// spawning used to make that self-healing by accident; this restores the
+    /// property deliberately. Exactly one retry, so a board that cannot host a
+    /// server fails fast instead of respawn-looping.
+    ///
+    /// Holding the lock across the spawn (up to `SERVE_READY_TIMEOUT`, plus the
+    /// connect) blocks [`Agent::take_data_io`] and
+    /// [`Agent::active_session_count`] for that window. Accepted deliberately:
+    /// it is what makes "two opens cannot race into two `serve` processes" a
+    /// structural property rather than a consequence of the connection loop
+    /// happening to dispatch commands serially.
     async fn open_data_session(
         &self,
         lease: LeaseId,
         board: &BoardName,
-        token_wire: &[u8],
+        serve_token: &str,
         channel: ChannelId,
         spec: &BoardSpec,
     ) -> Result<()> {
-        // The serve user token is the hex of the fleet capability token. The
-        // sidecar sets `PROBE_RS_REMOTE_TOKEN = hex(grant.token)` and the agent
-        // receives those exact bytes as `token_wire`, so writing the same hex
-        // into `.probe-rs.toml` makes the two ends match end-to-end.
-        let serve_token = hex_encode(token_wire);
-        let session = self
-            .backend
-            .open(spec, &serve_token)
-            .await
-            .map_err(AgentError::Probers)?;
-        self.sessions.lock().await.insert(
-            channel,
-            ActiveSession {
+        let mut sessions = self.sessions.lock().await;
+
+        // Decide from a *copied* answer rather than a live borrow: a
+        // `&BoardSession` is not `Send` (its channels own `dyn SpliceIo`
+        // streams, which are `Send` but not `Sync`), and holding one across the
+        // spawn below would make the whole connection future non-`Send`.
+        let reusable = sessions
+            .get(board)
+            .map(|existing| existing.lease == lease && existing.serve_token == serve_token);
+
+        let reused = match reusable {
+            Some(true) => true,
+            Some(false) => {
+                // Different tenant: tear the old process (and its routes) down
+                // before spawning. `kill_board_session_locked` takes the map,
+                // never `&self` — calling `self.on_kill_session` here would
+                // re-lock `sessions` and deadlock.
+                Self::kill_board_session_locked(&mut sessions, board, &self.outbox).await?;
+                false
+            }
+            None => false,
+        };
+
+        if !reused {
+            Self::spawn_board_session_locked(
+                &mut sessions,
+                &self.backend,
                 lease,
-                board: board.clone(),
-                session,
-            },
-        );
+                board,
+                serve_token,
+                spec,
+            )
+            .await?;
+        }
+
+        // Borrow only for the statement: `connect` returns an owned stream, so
+        // the guard is free again for the respawn arm below.
+        let connected = sessions
+            .get_mut(board)
+            .expect("the board session was just reused or inserted")
+            .serve
+            .connect()
+            .await;
+
+        let (io, outcome) = match connected {
+            Ok(io) => (io, if reused { "reused" } else { "spawned" }),
+            // Only a *reused* session earns a second chance: a connect failure
+            // against a server we just spawned is a real spawn failure, and
+            // respawning into it would loop.
+            Err(e) if reused => {
+                tracing::warn!(
+                    board = %board.0, error = %e,
+                    "the reused `probe-rs serve` is unreachable; assuming it died and respawning"
+                );
+                Self::kill_board_session_locked(&mut sessions, board, &self.outbox).await?;
+                Self::spawn_board_session_locked(
+                    &mut sessions,
+                    &self.backend,
+                    lease,
+                    board,
+                    serve_token,
+                    spec,
+                )
+                .await?;
+                let io = sessions
+                    .get_mut(board)
+                    .expect("the board session was just respawned")
+                    .serve
+                    .connect()
+                    .await
+                    .map_err(AgentError::Probers)?;
+                (io, "respawned")
+            }
+            Err(e) => return Err(AgentError::Probers(e)),
+        };
+
+        sessions
+            .get_mut(board)
+            .expect("the board session is live")
+            .channels
+            .insert(channel, Some(io));
+        drop(sessions);
+
         self.emit(NodeReport::Log {
             level: fleet_proto::LogLevel::Info,
             board: Some(board.clone()),
             message: format!(
-                "opened session on channel {} for lease {}",
-                channel.0, lease.0
+                "opened session on channel {} for lease {} (serve {outcome})",
+                channel.0, lease.0,
             ),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Spawn a `probe-rs serve` for `board` and record it in the locked map.
+    ///
+    /// Takes the map and the backend rather than `&self` for the same reason
+    /// [`Agent::kill_board_session_locked`] does: both run under the `sessions`
+    /// guard, and reaching back through `self` would re-lock it.
+    async fn spawn_board_session_locked(
+        sessions: &mut HashMap<BoardName, BoardSession>,
+        backend: &Arc<B>,
+        lease: LeaseId,
+        board: &BoardName,
+        serve_token: &str,
+        spec: &BoardSpec,
+    ) -> Result<()> {
+        let serve = backend
+            .open(spec, serve_token)
+            .await
+            .map_err(AgentError::Probers)?;
+        sessions.insert(
+            board.clone(),
+            BoardSession {
+                lease,
+                serve_token: serve_token.to_owned(),
+                serve,
+                channels: HashMap::new(),
+            },
+        );
+        Ok(())
+    }
+
+    /// Kill the board's `probe-rs serve` process and report every channel it
+    /// carried closed. Returns whether a session was present.
+    ///
+    /// The **data plane only**: callers wanting the board's gdb tunnels too
+    /// want [`Agent::kill_board_sessions`], which owns that rule.
+    ///
+    /// Takes the already-locked map and the outbox directly rather than `&self`
+    /// so it can run **under** the `sessions` guard: every caller holds it, and
+    /// routing through `self` would re-lock and deadlock. [`Agent::emit`] locks
+    /// only `outbox`, which is why passing that separately is sound.
+    async fn kill_board_session_locked(
+        sessions: &mut HashMap<BoardName, BoardSession>,
+        board: &BoardName,
+        outbox: &Mutex<Vec<NodeReport>>,
+    ) -> Result<bool> {
+        let Some(entry) = sessions.remove(board) else {
+            return Ok(false);
+        };
+        entry.serve.kill().await.map_err(AgentError::Probers)?;
+        let mut reports = outbox.lock().await;
+        for channel in entry.channels.keys() {
+            reports.push(NodeReport::SessionClosed {
+                channel: *channel,
+                exit_code: None,
+            });
+        }
+        Ok(true)
+    }
+
+    /// Kill **every** session on `board` — the gdb tunnels *and* the data
+    /// plane's `probe-rs serve` process, with the channels riding it.
+    ///
+    /// Both planes, because both hold a handle to the same physical probe: a
+    /// `probe-rs gdb` stub that survives a power cycle is left holding a stale
+    /// handle exactly as a surviving `serve` would. Folding the gdb half in
+    /// here rather than leaving it to each caller is what makes
+    /// [`Agent::kill_sessions_and_cycle`] one helper instead of a rule every
+    /// power-cycling path has to remember — `on_power_cycle` is precisely the
+    /// path that goes straight to the helper and would otherwise forget.
+    ///
+    /// The gdb half runs **first and outside** the `sessions` guard:
+    /// [`Agent::on_kill_session`] takes that lock itself, so calling it under
+    /// the guard would deadlock.
+    ///
+    /// # Errors
+    ///
+    /// Propagates backend termination failures.
+    async fn kill_board_sessions(&self, board: &BoardName) -> Result<()> {
+        for channel in self.gdb_channels_for_board(board).await {
+            self.on_kill_session(channel).await?;
+        }
+        let mut sessions = self.sessions.lock().await;
+        Self::kill_board_session_locked(&mut sessions, board, &self.outbox).await?;
+        Ok(())
+    }
+
+    /// Kill this board's sessions — **both planes** — then power-cycle it.
+    ///
+    /// One helper for every power-cycling path (explicit power-cycle, board
+    /// cleanup on release, and anything that follows) because the order is the
+    /// whole point: a power cycle re-enumerates the USB device, so any process
+    /// that survived it — `probe-rs serve` or a `probe-rs gdb` stub — is left
+    /// holding a stale handle, the same failure class as `errno 16` reached
+    /// from the other side. With board-scoped, lease-lived processes that goes
+    /// from latent to guaranteed.
+    async fn kill_sessions_and_cycle(&self, board: &BoardName) -> Result<()> {
+        self.kill_board_sessions(board).await?;
+        let power = self.power_for(board).await?;
+        power.cycle().await?;
+        self.emit(NodeReport::PowerEvent {
+            board: board.clone(),
+            action: PowerAction::Cycle,
         })
         .await;
         Ok(())
@@ -463,11 +681,31 @@ impl<B: ProbeRsBackend> Agent<B> {
         Ok(())
     }
 
-    /// Kill the session on `channel` (data plane *or* gdb tunnel).
+    /// Close the session on `channel` (data plane *or* gdb tunnel).
+    ///
+    /// For a data channel this drops **only that channel's splice**, never the
+    /// `probe-rs serve` process — not even when it was the last channel on the
+    /// board. Killing on last-channel-close is exactly the per-invocation
+    /// respawn task 3670 removed: the process belongs to the lease, and the
+    /// lease outlives one `probe-rs` run. It dies at release, expiry, fault, or
+    /// a power cycle (see [`Agent::kill_board_sessions`]).
+    ///
+    /// The loopback socket for the dropped channel closes anyway, and that is
+    /// now load-bearing: `connection::handle_inbound_command` removes
+    /// `routes[channel]` after dispatching a `KillSession`, so the splice
+    /// task's `from_relay.recv()` returns `None`, `splice_io` returns, and the
+    /// `TcpStream` is dropped — which is what lets serve's `ProbeBroker` hand
+    /// the probe to the next connection. It replaces the old invariant, "the
+    /// process died and the socket EOF'd".
     async fn on_kill_session(&self, channel: ChannelId) -> Result<()> {
-        let removed = self.sessions.lock().await.remove(&channel);
-        if let Some(active) = removed {
-            active.session.kill().await.map_err(AgentError::Probers)?;
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .values_mut()
+                .find_map(|entry| entry.channels.remove(&channel))
+                .is_some()
+        };
+        if removed {
             self.emit(NodeReport::SessionClosed {
                 channel,
                 exit_code: None,
@@ -487,8 +725,35 @@ impl<B: ProbeRsBackend> Agent<B> {
         Ok(())
     }
 
-    /// Release a lease: kill its session, then power-cycle (and optionally
-    /// erase) the board for cleanup.
+    /// Forget every data channel this agent believes is open, without killing a
+    /// single `serve` process.
+    ///
+    /// Called by the connection loop at the **start** of every coordinator
+    /// connection. A dropped control connection kills the splice tasks (their
+    /// sockets close with them) but tells the agent nothing, so a reconnect
+    /// would otherwise reuse a [`BoardSession`] whose `channels` map is full of
+    /// ghosts and over-report [`Agent::active_session_count`]. Clearing at
+    /// connection *start* rather than at teardown makes the invariant "the
+    /// agent's channel set is a subset of what this connection has routed" hold
+    /// however the previous connection died — including a panic.
+    ///
+    /// The processes deliberately survive: a lease outlives a control-plane
+    /// blip, and the coordinator reopens channels onto the same lease. One whose
+    /// lease really is gone is reaped when the expiry sweep sends
+    /// `ReleaseLease`, so the worst case is bounded by the lease TTL rather than
+    /// being a leak.
+    pub async fn clear_data_channels(&self) {
+        for entry in self.sessions.lock().await.values_mut() {
+            entry.channels.clear();
+        }
+    }
+
+    /// Release a lease: close its channels, then kill the board's `serve` and
+    /// power-cycle it for cleanup.
+    ///
+    /// The per-channel loop is what reports `SessionClosed` for the lease's gdb
+    /// tunnels (and its data channels); `cleanup_board` is what guarantees the
+    /// `serve` process itself is gone. Neither subsumes the other.
     async fn on_release_lease(&self, lease: LeaseId, board: &BoardName, erase: bool) -> Result<()> {
         // Kill any session(s) tied to this lease (data plane and gdb tunnels).
         let channels = self.channels_for_lease(lease).await;
@@ -496,24 +761,24 @@ impl<B: ProbeRsBackend> Agent<B> {
             self.on_kill_session(channel).await?;
         }
 
-        // Cleanup: power-cycle the board.
+        // Cleanup: kill the board's serve, then power-cycle.
         self.cleanup_board(board, erase).await
     }
 
-    /// Cleanup a board: power-cycle and optionally note erase.
+    /// Cleanup a board: kill its `serve`, power-cycle, and optionally note
+    /// erase.
     async fn cleanup_board(&self, board: &BoardName, erase: bool) -> Result<()> {
-        let power = self.power_for(board).await?;
-        power.cycle().await?;
-        self.emit(NodeReport::PowerEvent {
-            board: board.clone(),
-            action: PowerAction::Cycle,
-        })
-        .await;
+        self.kill_sessions_and_cycle(board).await?;
         if erase {
             // RESOLVE(1713): an explicit erase requires briefly attaching a
             // probe-rs session to the board and issuing `erase`. The seam is
             // here; the actual erase rides the same backend once the relay
             // splice lands. For now we record the intent.
+            //
+            // When it lands it inherits this function's discipline: it runs
+            // *after* the kill-then-cycle above, so it never races a live
+            // `serve` for the probe, and whatever session it opens must not
+            // outlive it.
             self.emit(NodeReport::Log {
                 level: fleet_proto::LogLevel::Info,
                 board: Some(board.clone()),
@@ -525,15 +790,14 @@ impl<B: ProbeRsBackend> Agent<B> {
     }
 
     /// Explicit operator power-cycle.
+    ///
+    /// Kills the board's sessions first: `ctl power-cycle` is an operator verb
+    /// that fires **while a lease is held**, so this is not only a release-path
+    /// concern. Before task 3670 this path cycled without killing anything,
+    /// leaving the `serve` process holding a handle to a device that had just
+    /// re-enumerated.
     async fn on_power_cycle(&self, board: &BoardName) -> Result<()> {
-        let power = self.power_for(board).await?;
-        power.cycle().await?;
-        self.emit(NodeReport::PowerEvent {
-            board: board.clone(),
-            action: PowerAction::Cycle,
-        })
-        .await;
-        Ok(())
+        self.kill_sessions_and_cycle(board).await
     }
 
     /// Re-report inventory upward.
@@ -543,18 +807,26 @@ impl<B: ProbeRsBackend> Agent<B> {
         Ok(())
     }
 
-    /// Quarantine a board after a fault: kill its sessions, power-cycle, and
-    /// emit a `Fault` report.
+    /// Quarantine a board after a fault: kill its sessions and emit a `Fault`
+    /// report.
+    ///
+    /// Deliberately does **not** power-cycle — it resolves a controller
+    /// best-effort and drops it, exactly as before task 3670. Making a fault
+    /// start cycling boards is a real behaviour change, not a tidy-up.
+    ///
+    /// This is the one entry point outside the connection loop's serial command
+    /// dispatch, so it must reach the session map only through the locked
+    /// helpers ([`Agent::kill_board_sessions`], [`Agent::on_kill_session`]) and
+    /// never take the `sessions` guard itself.
     ///
     /// # Errors
     ///
     /// Propagates power/backend errors.
     pub async fn fault_board(&self, board: &BoardName, reason: String) -> Result<()> {
-        let channels = self.channels_for_board(board).await;
-        for channel in channels {
-            self.on_kill_session(channel).await?;
-        }
-        // Best-effort power-cycle; report the fault regardless.
+        // Both planes, gdb tunnels included: `kill_board_sessions` owns that
+        // rule, so this is not a second copy of it.
+        self.kill_board_sessions(board).await?;
+        // Best-effort power resolution; report the fault regardless.
         let _ = self.power_for(board).await.map(|_| ());
         self.emit(NodeReport::Fault {
             board: board.clone(),
@@ -570,9 +842,9 @@ impl<B: ProbeRsBackend> Agent<B> {
             .sessions
             .lock()
             .await
-            .iter()
-            .filter(|(_, s)| s.lease == lease)
-            .map(|(c, _)| *c)
+            .values()
+            .filter(|s| s.lease == lease)
+            .flat_map(|s| s.channels.keys().copied())
             .collect();
         channels.extend(
             self.gdb_sessions
@@ -585,43 +857,57 @@ impl<B: ProbeRsBackend> Agent<B> {
         channels
     }
 
-    /// All channels (data plane + gdb tunnels) tied to `board`.
-    async fn channels_for_board(&self, board: &BoardName) -> Vec<ChannelId> {
-        let mut channels: Vec<ChannelId> = self
-            .sessions
+    /// The **gdb-tunnel** channels tied to `board`.
+    ///
+    /// Only the gdb half: the data plane is torn down by board, not by channel
+    /// ([`Agent::kill_board_sessions`]), so enumerating its channels here would
+    /// invite a caller to kill them one at a time and leave the process behind.
+    async fn gdb_channels_for_board(&self, board: &BoardName) -> Vec<ChannelId> {
+        self.gdb_sessions
             .lock()
             .await
             .iter()
             .filter(|(_, s)| &s.board == board)
             .map(|(c, _)| *c)
-            .collect();
-        channels.extend(
-            self.gdb_sessions
-                .lock()
-                .await
-                .iter()
-                .filter(|(_, s)| &s.board == board)
-                .map(|(c, _)| *c),
-        );
-        channels
+            .collect()
     }
 
-    /// Number of currently active sessions (for tests / introspection).
+    /// Number of live data-plane **channels** (not processes; see
+    /// [`Agent::serve_count`]).
     pub async fn active_session_count(&self) -> usize {
+        self.sessions
+            .lock()
+            .await
+            .values()
+            .map(|s| s.channels.len())
+            .sum()
+    }
+
+    /// Number of live `probe-rs serve` **processes**.
+    ///
+    /// Distinct from [`Agent::active_session_count`] since task 3670: many
+    /// channels share one process, and a process outlives the channels on it.
+    pub async fn serve_count(&self) -> usize {
         self.sessions.lock().await.len()
     }
 
-    /// Take the spliceable byte stream for an open data-plane session, so the
+    /// Take the spliceable byte stream for an open data-plane channel, so the
     /// connection layer can byte-splice it onto the relay channel. Returns
-    /// `None` if no session is open on `channel` or its stream was already
+    /// `None` if no channel is open with that id or its stream was already
     /// taken.
     pub async fn take_data_io(
         &self,
         channel: ChannelId,
     ) -> Option<Box<dyn crate::probers::SpliceIo>> {
-        let sessions = self.sessions.lock().await;
-        let active = sessions.get(&channel)?;
-        active.session.take_io().await
+        // Scans boards rather than keeping a second channel-keyed index: a node
+        // holds a handful of boards, and one map means no cross-map invariant
+        // to violate.
+        self.sessions
+            .lock()
+            .await
+            .values_mut()
+            .find_map(|entry| entry.channels.get_mut(&channel))
+            .and_then(Option::take)
     }
 
     /// Take the spliceable gdb TCP stream for an open gdb-tunnel session, so the
@@ -654,6 +940,13 @@ mod tests {
     use fleet_proto::token::{CapabilityToken, SignedToken};
 
     const SEED: [u8; 32] = [3u8; 32];
+
+    /// The lease-scoped `probe-rs serve` user token, standing in for what the
+    /// coordinator's `auth::serve_token` derives. The agent treats it as an
+    /// opaque string it writes into `.probe-rs.toml` and compares for equality,
+    /// so its shape is irrelevant here — only that two channels on one lease
+    /// present the *same* one, and a different lease a different one.
+    const SERVE_TOKEN: &str = "5e12e70ce11";
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&SEED)
@@ -749,6 +1042,25 @@ port = 2
         a
     }
 
+    /// Open a data channel on `b1` for `lease` with `serve_token`.
+    async fn open_data(
+        agent: &Agent<MockBackend>,
+        lease: u64,
+        channel: u64,
+        serve_token: &str,
+    ) -> Result<()> {
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(lease),
+                board: board_ref("b1"),
+                token: signed_token(lease, "b1", vec![AllowedOp::Attach], 2_000),
+                serve_token: serve_token.to_owned(),
+                channel: ChannelId(channel),
+                kind: ChannelKind::Data,
+            })
+            .await
+    }
+
     #[tokio::test]
     async fn open_session_with_valid_token_starts_backend() {
         let backend = Arc::new(MockBackend::new());
@@ -759,6 +1071,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -779,6 +1092,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -799,6 +1113,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -818,6 +1133,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("ghost"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -830,18 +1146,9 @@ port = 2
     async fn release_lease_kills_session_and_powercycles() {
         let backend = Arc::new(MockBackend::new());
         let agent = make_agent(backend.clone());
-        let token = signed_token(7, "b1", vec![AllowedOp::Attach], 2_000);
-        agent
-            .handle_command(CoordinatorCommand::OpenSession {
-                lease: LeaseId(7),
-                board: board_ref("b1"),
-                token,
-                channel: ChannelId(1),
-                kind: ChannelKind::Data,
-            })
-            .await
-            .unwrap();
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
         assert_eq!(agent.active_session_count().await, 1);
+        assert_eq!(agent.serve_count().await, 1);
 
         agent
             .handle_command(CoordinatorCommand::ReleaseLease {
@@ -853,6 +1160,9 @@ port = 2
             .unwrap();
 
         assert_eq!(agent.active_session_count().await, 0);
+        // No `serve` outlives its lease.
+        assert_eq!(agent.serve_count().await, 0);
+        assert!(backend.sessions()[0].was_killed());
         let reports = agent.take_reports().await;
         // Expect a PowerEvent::Cycle among the emitted reports.
         assert!(reports.iter().any(|r| matches!(
@@ -911,22 +1221,16 @@ port = 2
     async fn fault_board_kills_sessions_and_reports() {
         let backend = Arc::new(MockBackend::new());
         let agent = make_agent(backend.clone());
-        let token = signed_token(7, "b1", vec![AllowedOp::Attach], 2_000);
-        agent
-            .handle_command(CoordinatorCommand::OpenSession {
-                lease: LeaseId(7),
-                board: board_ref("b1"),
-                token,
-                channel: ChannelId(1),
-                kind: ChannelKind::Data,
-            })
-            .await
-            .unwrap();
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
         agent
             .fault_board(&BoardName("b1".into()), "probe lost".to_owned())
             .await
             .unwrap();
         assert_eq!(agent.active_session_count().await, 0);
+        // A fault takes the whole process, not just the channel: the board is
+        // quarantined, so nothing may keep driving it.
+        assert_eq!(agent.serve_count().await, 0);
+        assert!(backend.sessions()[0].was_killed());
         let reports = agent.take_reports().await;
         assert!(reports
             .iter()
@@ -944,6 +1248,7 @@ port = 2
             .await
             .unwrap();
         assert_eq!(agent.active_session_count().await, 0);
+        assert_eq!(agent.serve_count().await, 0);
     }
 
     #[tokio::test]
@@ -956,6 +1261,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Gdb,
             })
@@ -978,6 +1284,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Gdb,
             })
@@ -998,6 +1305,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -1017,6 +1325,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Gdb,
             })
@@ -1042,6 +1351,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token: signed_token(7, "b1", vec![AllowedOp::Attach], 2_000),
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -1052,6 +1362,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("b1"),
                 token: signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000),
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(2),
                 kind: ChannelKind::Gdb,
             })
@@ -1070,6 +1381,310 @@ port = 2
             .unwrap();
         assert_eq!(agent.active_session_count().await, 0);
         assert_eq!(agent.gdb_session_count().await, 0);
+        // Release takes the process too, not merely the channels riding it.
+        assert_eq!(agent.serve_count().await, 0);
+    }
+
+    // ---- serve reuse (task 3670, issue #512) -------------------------------
+
+    /// **The direct `errno 16` regression test.**
+    ///
+    /// Two sequential invocations under one cached lease open two channels on
+    /// one board. Before this, each unconditionally spawned a `probe-rs serve`,
+    /// and the second one's `nusb` open failed with `interface is busy`
+    /// (`errno 16`) because the first process still held the probe.
+    #[tokio::test]
+    async fn two_channels_on_one_board_share_one_serve() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        open_data(&agent, 7, 2, SERVE_TOKEN).await.unwrap();
+
+        // One process...
+        assert_eq!(backend.open_count(), 1, "the serve process must be reused");
+        assert_eq!(agent.serve_count().await, 1);
+        // ...two connections to it, one per channel...
+        assert_eq!(backend.connect_count(), 2);
+        assert_eq!(agent.active_session_count().await, 2);
+        // ...and both channels really got a spliceable stream.
+        assert!(agent.take_data_io(ChannelId(1)).await.is_some());
+        assert!(agent.take_data_io(ChannelId(2)).await.is_some());
+        // Taken exactly once each.
+        assert!(agent.take_data_io(ChannelId(1)).await.is_none());
+    }
+
+    /// A channel under a **different lease** is new hardware ownership, so the
+    /// process is torn down and respawned rather than reused — otherwise target
+    /// state (and a `.probe-rs.toml` token) would leak between tenants.
+    #[tokio::test]
+    async fn a_channel_under_a_different_lease_respawns() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        let _ = agent.take_reports().await;
+        open_data(&agent, 8, 2, "a-different-lease-token")
+            .await
+            .unwrap();
+
+        assert_eq!(backend.open_count(), 2, "a new lease must respawn");
+        // Still exactly one live process for the board: the old one was killed.
+        assert_eq!(agent.serve_count().await, 1);
+        let sessions = backend.sessions();
+        assert!(sessions[0].was_killed(), "the first serve must be killed");
+        assert!(!sessions[1].was_killed());
+        // The first lease's channel is gone, and the coordinator was told.
+        assert_eq!(agent.active_session_count().await, 1);
+        let reports = agent.take_reports().await;
+        assert!(
+            reports.iter().any(|r| matches!(
+                r,
+                NodeReport::SessionClosed {
+                    channel: ChannelId(1),
+                    ..
+                }
+            )),
+            "the displaced channel must be reported closed: {reports:?}"
+        );
+    }
+
+    /// Killing a channel drops **only that channel's splice**. Even the last
+    /// one leaves the process up: it belongs to the lease, and killing on
+    /// last-channel-close is exactly the per-invocation respawn that caused
+    /// `errno 16`.
+    #[tokio::test]
+    async fn killing_channels_leaves_the_serve_running() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        open_data(&agent, 7, 2, SERVE_TOKEN).await.unwrap();
+
+        agent
+            .handle_command(CoordinatorCommand::KillSession {
+                channel: ChannelId(1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.active_session_count().await, 1);
+        assert_eq!(agent.serve_count().await, 1);
+
+        // The *last* channel too: still no kill.
+        agent
+            .handle_command(CoordinatorCommand::KillSession {
+                channel: ChannelId(2),
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.active_session_count().await, 0);
+        assert_eq!(agent.serve_count().await, 1);
+        assert!(!backend.sessions()[0].was_killed());
+
+        // And the next invocation reuses it rather than respawning.
+        open_data(&agent, 7, 3, SERVE_TOKEN).await.unwrap();
+        assert_eq!(backend.open_count(), 1);
+    }
+
+    /// A power cycle re-enumerates the USB device, so the board's `serve` must
+    /// die **before** the cycle or it is left holding a stale handle.
+    ///
+    /// Ordering, not membership: `ctl power-cycle` used to cycle without
+    /// killing anything at all, which a set-based assertion would not
+    /// distinguish from killing afterwards.
+    #[tokio::test(start_paused = true)]
+    async fn power_cycle_kills_sessions_before_cycling() {
+        let log: crate::probers::mock::EventLog =
+            Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let backend = Arc::new(MockBackend::with_log(Arc::clone(&log)));
+        let mut agent = Agent::new(agent_config(), boards(), backend.clone()).unwrap();
+        agent.set_clock(|| 1_000);
+        agent.set_gdb_stub(Arc::new(crate::gdb::mock::MockGdbStub::new()));
+        let power_log = Arc::clone(&log);
+        agent.set_power_factory(Box::new(move |_| {
+            Box::new(RecordingPower(Arc::clone(&power_log)))
+        }));
+
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        agent
+            .handle_command(CoordinatorCommand::PowerCycle {
+                board: BoardName("b1".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["spawn:b1", "kill:b1", "cycle"],
+            "the board's serve must die before the probe re-enumerates"
+        );
+        assert_eq!(agent.serve_count().await, 0);
+    }
+
+    /// A power cycle takes the board's **gdb** stub down too, and before the
+    /// cycle.
+    ///
+    /// Both planes hold a handle to the same physical probe, so a `probe-rs
+    /// gdb` surviving a re-enumeration is the identical stale-handle bug as a
+    /// surviving `serve`. `on_power_cycle` is the path that goes straight to
+    /// the shared helper, so it is the one that would silently miss a plane the
+    /// helper forgot.
+    #[tokio::test(start_paused = true)]
+    async fn power_cycle_kills_the_gdb_stub_too() {
+        let log: crate::probers::mock::EventLog =
+            Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let backend = Arc::new(MockBackend::with_log(Arc::clone(&log)));
+        let mut agent = Agent::new(agent_config(), boards(), backend.clone()).unwrap();
+        agent.set_clock(|| 1_000);
+        agent.set_gdb_stub(Arc::new(crate::gdb::mock::MockGdbStub::new()));
+        let power_log = Arc::clone(&log);
+        agent.set_power_factory(Box::new(move |_| {
+            Box::new(RecordingPower(Arc::clone(&power_log)))
+        }));
+
+        // Both planes live on the board at once.
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(7),
+                board: board_ref("b1"),
+                token: signed_token(7, "b1", vec![AllowedOp::Gdb], 2_000),
+                serve_token: SERVE_TOKEN.to_owned(),
+                channel: ChannelId(2),
+                kind: ChannelKind::Gdb,
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.gdb_session_count().await, 1);
+
+        agent
+            .handle_command(CoordinatorCommand::PowerCycle {
+                board: BoardName("b1".into()),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            agent.gdb_session_count().await,
+            0,
+            "the gdb stub must not survive the re-enumeration either"
+        );
+        assert_eq!(agent.serve_count().await, 0);
+        // The gdb stub is killed through `on_kill_session`, which the mock does
+        // not log, so ordering is asserted on what the log does see: the serve
+        // still dies before the cycle, and the cycle is last.
+        assert_eq!(*log.lock().unwrap(), vec!["spawn:b1", "kill:b1", "cycle"]);
+        // The gdb teardown is reported upward, and it happened before the
+        // PowerEvent — the ordering that matters, in the reports themselves.
+        let reports = agent.take_reports().await;
+        let closed = reports
+            .iter()
+            .position(|r| matches!(r, NodeReport::SessionClosed { channel, .. } if *channel == ChannelId(2)))
+            .expect("the gdb channel must be reported closed");
+        let cycled = reports
+            .iter()
+            .position(|r| matches!(r, NodeReport::PowerEvent { .. }))
+            .expect("the board must be cycled");
+        assert!(
+            closed < cycled,
+            "the gdb tunnel must be torn down before the cycle: {reports:?}"
+        );
+    }
+
+    /// A `probe-rs serve` that exits on its own is replaced on the next
+    /// invocation, rather than stranding the lease.
+    ///
+    /// Nothing supervises the child and reuse is decided on lease equality, not
+    /// liveness, so without this a crashed server would fail *every* later
+    /// invocation on that lease — each paying the full connect retry — until an
+    /// operator released it. Per-channel spawning made that self-healing by
+    /// accident; this is the deliberate replacement.
+    #[tokio::test]
+    async fn a_serve_that_died_on_its_own_is_respawned() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        assert_eq!(backend.open_count(), 1);
+
+        // The server dies between invocations: its socket stops answering.
+        backend.sessions()[0].fail_next_connects(1);
+
+        open_data(&agent, 7, 2, SERVE_TOKEN).await.unwrap();
+
+        assert_eq!(
+            backend.open_count(),
+            2,
+            "an unreachable reused serve must be replaced, not reused again"
+        );
+        assert_eq!(agent.serve_count().await, 1);
+        assert!(
+            agent.take_data_io(ChannelId(2)).await.is_some(),
+            "and the channel really gets a stream off the new process"
+        );
+        // The dead one is reaped rather than left in the map.
+        assert!(backend.sessions()[0].was_killed());
+    }
+
+    /// The respawn is **once**, not a loop: a board that genuinely cannot host
+    /// a server fails fast with the backend's own error.
+    #[tokio::test]
+    async fn a_serve_that_cannot_be_reached_at_all_fails_rather_than_looping() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        // Both the reused session's connect and the respawned one's fail.
+        backend.sessions()[0].fail_next_connects(1);
+        backend.set_fail_connect(true);
+
+        let err = open_data(&agent, 7, 2, SERVE_TOKEN).await.unwrap_err();
+        assert!(matches!(err, AgentError::Probers(_)), "got {err:?}");
+        // Exactly one respawn attempt was made.
+        assert_eq!(backend.open_count(), 2);
+    }
+
+    /// A `PowerControl` that records the cycle into the shared event log, so
+    /// kill-then-cycle ordering can be asserted against the backend's events.
+    struct RecordingPower(crate::probers::mock::EventLog);
+
+    #[async_trait::async_trait]
+    impl crate::power::PowerControl for RecordingPower {
+        async fn cycle(&self) -> std::result::Result<(), crate::power::PowerError> {
+            self.0.lock().unwrap().push("cycle".to_owned());
+            Ok(())
+        }
+        async fn off(&self) -> std::result::Result<(), crate::power::PowerError> {
+            self.0.lock().unwrap().push("off".to_owned());
+            Ok(())
+        }
+        async fn on(&self) -> std::result::Result<(), crate::power::PowerError> {
+            self.0.lock().unwrap().push("on".to_owned());
+            Ok(())
+        }
+        fn label(&self) -> String {
+            "recording".to_owned()
+        }
+    }
+
+    /// A reconnect must not inherit the previous connection's channels: their
+    /// splice tasks died with it, but the `serve` process legitimately survives
+    /// (a lease outlives a control-plane blip), so a reused `BoardSession`
+    /// would otherwise report ghosts forever.
+    #[tokio::test]
+    async fn clearing_data_channels_forgets_channels_but_keeps_the_serve() {
+        let backend = Arc::new(MockBackend::new());
+        let agent = make_agent(backend.clone());
+        open_data(&agent, 7, 1, SERVE_TOKEN).await.unwrap();
+        assert_eq!(agent.active_session_count().await, 1);
+
+        agent.clear_data_channels().await;
+
+        assert_eq!(agent.active_session_count().await, 0);
+        assert_eq!(agent.serve_count().await, 1);
+        assert!(!backend.sessions()[0].was_killed());
+        // The coordinator reopens onto the same lease, and finds the process.
+        open_data(&agent, 7, 5, SERVE_TOKEN).await.unwrap();
+        assert_eq!(backend.open_count(), 1);
     }
 
     // ---- adoption ----------------------------------------------------------
@@ -1122,6 +1737,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref(&board),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })
@@ -1262,6 +1878,7 @@ port = 2
                 lease: LeaseId(7),
                 board: board_ref("j-link-zzz"),
                 token,
+                serve_token: SERVE_TOKEN.to_owned(),
                 channel: ChannelId(1),
                 kind: ChannelKind::Data,
             })

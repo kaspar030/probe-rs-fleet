@@ -8,7 +8,9 @@
 //! * **Fleet proxy** ([`build_remote_env`]): a board was leased ⇒ run the real
 //!   `probe-rs` but point it at the sidecar's local relay endpoint via
 //!   `PROBE_RS_REMOTE_HOST` / `PROBE_RS_REMOTE_TOKEN`. The genuine client does
-//!   probe + chip selection in-band and computes the exit code itself.
+//!   probe + chip selection in-band and computes the exit code itself. The
+//!   fleet path spawns through [`crate::transport::exec_remote_probe_rs`],
+//!   which builds on this function and adds the attach-timeout default.
 //!
 //! In both cases we hand the genuine client an unaltered argv and propagate its
 //! exit code.
@@ -32,6 +34,14 @@ pub mod remote_env {
     pub const HOST: &str = "PROBE_RS_REMOTE_HOST";
     /// Bearer token the probe-rs client presents to the remote.
     pub const TOKEN: &str = "PROBE_RS_REMOTE_TOKEN";
+    /// How long the client waits for the remote's probe broker to hand it the
+    /// probe, in seconds (probe-rs's `--attach-timeout`, which defaults to 0).
+    ///
+    /// The sidecar supplies a default when the caller set none — see
+    /// [`crate::transport::remote_child_env`] — because the node now reuses one
+    /// `probe-rs serve` per lease, and a zero timeout is precisely the setting
+    /// that refuses to queue behind it.
+    pub const ATTACH_TIMEOUT: &str = "PROBE_RS_ATTACH_TIMEOUT";
 }
 
 /// Errors from locating / running the real probe-rs.
@@ -107,7 +117,12 @@ fn is_executable_file(path: &Path) -> bool {
 ///
 /// Returns the `(key, value)` pairs to set on the child process: the remote
 /// host (the sidecar's local endpoint as a `ws://` base URL, e.g.
-/// `ws://127.0.0.1:51001`) and, if a lease token is present, the remote token.
+/// `ws://127.0.0.1:51001`) and, if a serve token is present, the remote token.
+///
+/// The fleet path reaches this through
+/// [`crate::transport::remote_child_env`], which appends the attach-timeout
+/// default; call that rather than this one if you are spawning the child, so
+/// the two cannot drift apart again.
 #[must_use]
 pub fn build_remote_env(remote_host: &str, token: Option<&str>) -> Vec<(String, String)> {
     let mut env = vec![(remote_env::HOST.to_owned(), remote_host.to_owned())];

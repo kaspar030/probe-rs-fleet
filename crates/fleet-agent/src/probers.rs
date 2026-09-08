@@ -2,12 +2,20 @@
 //!
 //! Decided model: the agent runs **one `probe-rs serve` per board** listening
 //! on a loopback **TCP** port, each locked to its physical probe via a per-board
-//! user with `ProbeAccess::Allow(["vid:pid:serial"])` + a per-board token. `probe-rs serve`
-//! (0.32) speaks **WebSocket** at route `/worker`; the agent then
-//! **byte-splices** the raw TCP stream (the bytes of that WebSocket connection)
-//! between serve's port and the coordinator-relayed data channel — *zero*
-//! probe-rs / WebSocket parsing. The server is reused across a holder's many
-//! invocations (matching time-based sharing, §6) and recycled on board release.
+//! user with `ProbeAccess::Allow(["vid:pid:serial"])` + a lease-scoped token.
+//! `probe-rs serve` (0.32) speaks **WebSocket** at route `/worker`; the agent
+//! then **byte-splices** the raw TCP stream (the bytes of that WebSocket
+//! connection) between serve's port and the coordinator-relayed data channel —
+//! *zero* probe-rs / WebSocket parsing.
+//!
+//! The server is **reused** across a holder's many invocations (matching
+//! time-based sharing, §6) and recycled on board release, fault or power-cycle.
+//! That is why the seam is split in two: [`ProbeRsBackend::open`] spawns a
+//! process (once per board per lease) and [`Session::connect`] opens one
+//! loopback connection per relay channel. Upstream `serve` accepts connections
+//! in a loop and sequences them through a shared `ProbeBroker`; two *processes*
+//! fenced to the same probe cannot share that broker and collide in the USB
+//! driver instead (`nusb` `errno 16`).
 //!
 //! `probe-rs serve` 0.32 takes **no** `--config`, `--probe` or `--chip`: its
 //! `ServerConfig` is loaded via **Figment** from a `.probe-rs.{toml,json,yaml}`
@@ -94,9 +102,13 @@ impl ServeSpec {
     /// per-board `token`, and `access = { allow = ["<serial>"] }`
     /// (`ProbeAccess::Allow`).
     ///
-    /// `serve_token` is the per-board token the connecting client must present
-    /// (the fleet capability token, hex-encoded, threaded through end-to-end so
-    /// the sidecar's `PROBE_RS_REMOTE_TOKEN` matches).
+    /// `serve_token` is the **lease-scoped** `probe-rs serve` user token the
+    /// connecting client must present, minted by the coordinator and carried to
+    /// both ends (`OpenSession { serve_token }` / `ChannelOpened
+    /// { serve_token }`), so the sidecar's `PROBE_RS_REMOTE_TOKEN` matches
+    /// verbatim. It is deliberately *not* the per-channel capability token: a
+    /// reused server reads this config exactly once at startup, so a
+    /// per-channel value would force a respawn per invocation.
     #[must_use]
     pub fn render_server_config(&self, serve_token: &str) -> String {
         format!(
@@ -139,19 +151,31 @@ pub enum SessionExit {
     Killed,
 }
 
-/// A live probe-rs session: a running `probe-rs serve` for one board, whose
-/// byte stream is being spliced onto a relay channel.
+/// A live probe-rs session: a running `probe-rs serve` for one board, shared by
+/// every channel spliced onto it.
+///
+/// One process per **board** (per lease), not per channel: `probe-rs serve`
+/// accepts connections in a loop and sequences them through its own
+/// `ProbeBroker`, whereas two OS processes fenced to the same probe collide in
+/// the USB driver (`errno 16`). [`Session::connect`] is therefore called once
+/// per channel; [`ProbeRsBackend::open`] once per board.
 #[async_trait]
 pub trait Session: Send + Sync {
     /// The board this session serves.
     fn board(&self) -> &str;
 
-    /// Take the spliceable byte stream for this session, exactly once.
+    /// Open a **fresh** spliceable byte stream to this session's server.
     ///
-    /// The connection layer calls this to obtain the connected `probe-rs serve`
-    /// transport and byte-splice it onto the relay data channel. Returns `None`
-    /// on the second and later calls (the stream was already taken).
-    async fn take_io(&self) -> Option<Box<dyn SpliceIo>>;
+    /// Called once per relay channel. The first call hands back the connection
+    /// [`ProbeRsBackend::open`] already established as its readiness proof (so
+    /// the first channel behaves exactly as it did when there was one
+    /// connection per process); later calls dial the recorded loopback address
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the server could not be reached.
+    async fn connect(&self) -> Result<Box<dyn SpliceIo>, String>;
 
     /// Kill the session: terminate the process and stop the splice.
     ///
@@ -170,10 +194,13 @@ pub trait Session: Send + Sync {
 /// with a mock backend; the real [`ProcessBackend`] spawns processes.
 #[async_trait]
 pub trait ProbeRsBackend: Send + Sync {
-    /// Open a session for `board`, locking serve to `serve_token` (the hex of
-    /// the fleet capability token, written into the per-board `.probe-rs.toml`
-    /// user so it matches the client's `PROBE_RS_REMOTE_TOKEN`). The returned
-    /// [`Session`] owns the process and the splice to the relay channel.
+    /// Open a session for `board`, locking serve to `serve_token` (the
+    /// lease-scoped `probe-rs serve` user token the coordinator minted, written
+    /// into the per-board `.probe-rs.toml` user so it matches the client's
+    /// `PROBE_RS_REMOTE_TOKEN`). The returned [`Session`] owns the process;
+    /// each relay channel then calls [`Session::connect`] for its own stream.
+    ///
+    /// Called **once per board per lease**, not once per channel.
     ///
     /// # Errors
     ///
@@ -298,14 +325,18 @@ const SERVE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Poll interval while retry-connecting to the serve TCP port.
 const SERVE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// A live `probe-rs serve` session: a running child process and a connected
-/// loopback TCP stream (the bytes of serve's `/worker` WebSocket) the agent
-/// splices onto a relay data channel.
+/// A live `probe-rs serve` session: a running child process plus the loopback
+/// address it listens on, which every channel on this board dials for its own
+/// stream.
 struct ProcessSession {
     board: String,
     child: tokio::sync::Mutex<tokio::process::Child>,
-    /// The connected TCP stream, taken once by the connection layer.
-    io: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
+    /// `host:port` the server listens on, redialled per channel.
+    socket_addr: String,
+    /// The connection `open` established as its readiness proof, handed to the
+    /// first channel so the common case costs no extra connect (and leaves no
+    /// stray half-open connection in serve's log).
+    first_io: tokio::sync::Mutex<Option<tokio::net::TcpStream>>,
     killed: std::sync::atomic::AtomicBool,
 }
 
@@ -315,12 +346,12 @@ impl Session for ProcessSession {
         &self.board
     }
 
-    async fn take_io(&self) -> Option<Box<dyn SpliceIo>> {
-        self.io
-            .lock()
-            .await
-            .take()
-            .map(|s| Box::new(s) as Box<dyn SpliceIo>)
+    async fn connect(&self) -> Result<Box<dyn SpliceIo>, String> {
+        if let Some(stream) = self.first_io.lock().await.take() {
+            return Ok(Box::new(stream) as Box<dyn SpliceIo>);
+        }
+        let stream = connect_serve_tcp(&self.socket_addr).await?;
+        Ok(Box::new(stream) as Box<dyn SpliceIo>)
     }
 
     async fn kill(&self) -> Result<(), String> {
@@ -396,7 +427,8 @@ impl ProbeRsBackend for ProcessBackend {
         Ok(Box::new(ProcessSession {
             board: spec.board.clone(),
             child: tokio::sync::Mutex::new(child),
-            io: tokio::sync::Mutex::new(Some(io)),
+            socket_addr: spec.socket_addr(),
+            first_io: tokio::sync::Mutex::new(Some(io)),
             killed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -429,12 +461,19 @@ pub(crate) mod mock {
     //! A mock backend + session for unit-testing the agent state machine.
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use super::{ProbeRsBackend, Session, SessionExit, SpliceIo};
     use crate::config::BoardSpec;
     use async_trait::async_trait;
     use tokio::sync::Notify;
+
+    /// A shared, ordered log of backend/session lifecycle events.
+    ///
+    /// Ordering is the point: the power-cycle tests assert that a board's serve
+    /// was killed *before* the board was cycled, which set membership cannot
+    /// distinguish from the bug.
+    pub type EventLog = Arc<StdMutex<Vec<String>>>;
 
     /// A mock session whose exit can be driven by the test.
     pub struct MockSession {
@@ -442,9 +481,16 @@ pub(crate) mod mock {
         killed: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         exit: Arc<std::sync::Mutex<Option<SessionExit>>>,
-        /// The agent-side half of an in-memory duplex, taken once by `take_io`.
-        /// Tests drive the peer half to emulate `probe-rs serve`.
-        io: tokio::sync::Mutex<Option<tokio::io::DuplexStream>>,
+        /// Peer halves of the duplexes handed out by `connect`, in order, for
+        /// the test to drive as if it were `probe-rs serve`.
+        peers: tokio::sync::Mutex<Vec<tokio::io::DuplexStream>>,
+        /// How many channels have connected to this session.
+        connects: AtomicUsize,
+        /// How many of the next `connect` calls must fail, emulating a server
+        /// that exited on its own (crash, OOM, probe unplugged): the socket is
+        /// simply not there any more.
+        fail_connects: AtomicUsize,
+        log: Option<EventLog>,
     }
 
     impl MockSession {
@@ -455,18 +501,54 @@ pub(crate) mod mock {
                 killed: Arc::new(AtomicBool::new(false)),
                 exit_notify: Arc::new(Notify::new()),
                 exit: Arc::new(std::sync::Mutex::new(None)),
-                io: tokio::sync::Mutex::new(None),
+                peers: tokio::sync::Mutex::new(Vec::new()),
+                connects: AtomicUsize::new(0),
+                fail_connects: AtomicUsize::new(0),
+                log: None,
             }
         }
 
-        /// Build a mock session with an in-memory duplex, returning the peer
-        /// half the test drives to emulate `probe-rs serve`.
+        /// A mock session that appends its lifecycle events to `log`.
         #[must_use]
-        pub fn with_io(board: String) -> (Self, tokio::io::DuplexStream) {
-            let (agent_side, peer) = tokio::io::duplex(4096);
+        pub fn with_log(board: String, log: EventLog) -> Self {
             let mut s = Self::new(board);
-            s.io = tokio::sync::Mutex::new(Some(agent_side));
+            s.log = Some(log);
+            s
+        }
+
+        /// Build a mock session and eagerly connect one channel, returning the
+        /// peer half the test drives to emulate `probe-rs serve`.
+        ///
+        /// A thin wrapper over [`MockSession::connect`] for tests that want the
+        /// peer before the agent asks for its stream.
+        #[allow(dead_code)]
+        pub async fn with_io(board: String) -> (Self, tokio::io::DuplexStream) {
+            let s = Self::new(board);
+            let _ = s.connect().await.expect("mock connect never fails");
+            let peer = s.take_peer().await.expect("connect pushes a peer");
             (s, peer)
+        }
+
+        /// Take the oldest not-yet-taken peer half.
+        pub async fn take_peer(&self) -> Option<tokio::io::DuplexStream> {
+            let mut peers = self.peers.lock().await;
+            if peers.is_empty() {
+                None
+            } else {
+                Some(peers.remove(0))
+            }
+        }
+
+        /// How many channels have connected to this session.
+        #[must_use]
+        pub fn connect_count(&self) -> usize {
+            self.connects.load(Ordering::SeqCst)
+        }
+
+        /// Make the next `n` `connect` calls fail, as a `probe-rs serve` that
+        /// died on its own would.
+        pub fn fail_next_connects(&self, n: usize) {
+            self.fail_connects.store(n, Ordering::SeqCst);
         }
 
         #[must_use]
@@ -481,16 +563,33 @@ pub(crate) mod mock {
             &self.board
         }
 
-        async fn take_io(&self) -> Option<Box<dyn SpliceIo>> {
-            self.io
-                .lock()
-                .await
-                .take()
-                .map(|s| Box::new(s) as Box<dyn SpliceIo>)
+        async fn connect(&self) -> Result<Box<dyn SpliceIo>, String> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_connects
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    // `then_some(n - 1)` would underflow: the argument is
+                    // evaluated eagerly, including when `n == 0`.
+                    if n > 0 {
+                        Some(n - 1)
+                    } else {
+                        None
+                    }
+                })
+                .is_ok()
+            {
+                return Err("mock serve is not listening".to_owned());
+            }
+            let (agent_side, peer) = tokio::io::duplex(4096);
+            self.peers.lock().await.push(peer);
+            Ok(Box::new(agent_side) as Box<dyn SpliceIo>)
         }
 
         async fn kill(&self) -> Result<(), String> {
             self.killed.store(true, Ordering::SeqCst);
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(format!("kill:{}", self.board));
+            }
             *self.exit.lock().unwrap() = Some(SessionExit::Killed);
             self.exit_notify.notify_waiters();
             Ok(())
@@ -512,6 +611,13 @@ pub(crate) mod mock {
     pub struct MockBackend {
         opens: AtomicUsize,
         fail: AtomicBool,
+        /// Sessions handed out from now on refuse every `connect`, emulating a
+        /// board whose server cannot be reached at all.
+        fail_connect: AtomicBool,
+        log: Option<EventLog>,
+        /// Every session handed out, so a test can assert on one after the
+        /// agent has taken ownership of it.
+        sessions: StdMutex<Vec<Arc<MockSession>>>,
     }
 
     impl MockBackend {
@@ -520,14 +626,68 @@ pub(crate) mod mock {
             Self::default()
         }
 
+        /// A backend whose sessions append their lifecycle events to `log`.
+        #[must_use]
+        pub fn with_log(log: EventLog) -> Self {
+            Self {
+                log: Some(log),
+                ..Self::default()
+            }
+        }
+
         #[allow(dead_code)]
         pub fn set_fail(&self, fail: bool) {
             self.fail.store(fail, Ordering::SeqCst);
         }
 
+        /// Make every session handed out from now on refuse all connects.
+        pub fn set_fail_connect(&self, fail: bool) {
+            self.fail_connect.store(fail, Ordering::SeqCst);
+        }
+
+        /// How many `probe-rs serve` **processes** were spawned.
+        ///
+        /// The assertion the `errno 16` regression hangs on: reuse means this
+        /// stays at 1 however many channels open. Per-channel connections are
+        /// counted by [`MockSession::connect_count`].
         #[must_use]
         pub fn open_count(&self) -> usize {
             self.opens.load(Ordering::SeqCst)
+        }
+
+        /// The sessions handed out so far, oldest first.
+        #[must_use]
+        pub fn sessions(&self) -> Vec<Arc<MockSession>> {
+            self.sessions.lock().unwrap().clone()
+        }
+
+        /// Total connections across every session handed out.
+        #[must_use]
+        pub fn connect_count(&self) -> usize {
+            self.sessions()
+                .iter()
+                .map(|s| s.connect_count())
+                .sum::<usize>()
+        }
+    }
+
+    /// A handle sharing one [`MockSession`] between the agent (which owns a
+    /// `Box<dyn Session>`) and the test (which keeps the `Arc`).
+    struct SharedSession(Arc<MockSession>);
+
+    #[async_trait]
+    impl Session for SharedSession {
+        fn board(&self) -> &str {
+            self.0.board()
+        }
+        async fn connect(&self) -> Result<Box<dyn SpliceIo>, String> {
+            self.0.connect().await
+        }
+        async fn kill(&self) -> Result<(), String> {
+            self.0.kill().await
+        }
+        async fn wait(&self) -> SessionExit {
+            self.0.wait().await
         }
     }
 
@@ -542,7 +702,18 @@ pub(crate) mod mock {
             if self.fail.load(Ordering::SeqCst) {
                 return Err("mock backend forced failure".to_owned());
             }
-            Ok(Box::new(MockSession::new(board.id.clone())))
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(format!("spawn:{}", board.id));
+            }
+            let session = Arc::new(match &self.log {
+                Some(log) => MockSession::with_log(board.id.clone(), Arc::clone(log)),
+                None => MockSession::new(board.id.clone()),
+            });
+            if self.fail_connect.load(Ordering::SeqCst) {
+                session.fail_next_connects(usize::MAX);
+            }
+            self.sessions.lock().unwrap().push(Arc::clone(&session));
+            Ok(Box::new(SharedSession(session)))
         }
     }
 }
@@ -730,5 +901,45 @@ chip = "nRF52840_xxAA"
         s.kill().await.unwrap();
         assert!(s.was_killed());
         assert_eq!(s.wait().await, SessionExit::Killed);
+    }
+
+    /// The cheap, hardware-free half of the reuse claim: one listener standing
+    /// in for `probe-rs serve` accepts **two** sequential connections, so a
+    /// second channel does not need a second process.
+    ///
+    /// (The other half — that a real `serve` hands the probe back when the
+    /// first connection closes — is `ProbeBroker`'s job upstream and cannot be
+    /// asserted without hardware.)
+    #[tokio::test]
+    async fn connect_serve_tcp_dials_the_same_server_twice() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepted = tokio::spawn(async move {
+            let first = listener.accept().await.unwrap().0;
+            // Close the first connection, exactly as a finished invocation does.
+            drop(first);
+            let second = listener.accept().await.unwrap().0;
+            drop(second);
+        });
+
+        let a = connect_serve_tcp(&addr).await.unwrap();
+        drop(a);
+        let b = connect_serve_tcp(&addr)
+            .await
+            .expect("a second connection to a live server must succeed");
+        drop(b);
+        accepted.await.unwrap();
+    }
+
+    /// `connect` hands out one stream per channel, each with its own peer half.
+    #[tokio::test]
+    async fn mock_session_hands_out_one_stream_per_channel() {
+        let s = mock::MockSession::new("b1".to_owned());
+        let _first = s.connect().await.unwrap();
+        let _second = s.connect().await.unwrap();
+        assert_eq!(s.connect_count(), 2);
+        assert!(s.take_peer().await.is_some());
+        assert!(s.take_peer().await.is_some());
+        assert!(s.take_peer().await.is_none());
     }
 }

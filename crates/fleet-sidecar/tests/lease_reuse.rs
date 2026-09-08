@@ -284,10 +284,11 @@ async fn an_expired_entry_is_never_offered() {
 
 /// A cache hit still takes a **fresh** per-channel credential.
 ///
-/// The stored grant's token is the delegation artefact, not the data-plane
+/// The stored grant's token is the delegation artefact, not a data-plane
 /// credential (architecture §6.5), and a reused one would be stale by
-/// construction. What reaches the probe-rs child must always be the
-/// `ChannelOpened` token.
+/// construction. Both credentials the child path uses — the capability token
+/// the node verifies and the serve token `probe-rs serve` accepts — come from
+/// `ChannelOpened`, on the hit path exactly as on the cold one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cache_hit_still_takes_a_fresh_channel_token() {
     let dir = tempfile::tempdir().unwrap();
@@ -322,6 +323,7 @@ async fn a_cache_hit_still_takes_a_fresh_channel_token() {
                         &CoordToSidecar::ChannelOpened {
                             channel: ChannelId(7),
                             token: channel_token(lease.0, "b1"),
+                            serve_token: format!("serve-for-lease-{}", lease.0),
                         },
                     )
                     .await
@@ -353,7 +355,7 @@ async fn a_cache_hit_still_takes_a_fresh_channel_token() {
         "a reconstructed grant carries no token at all"
     );
 
-    let (_channel, token) = fleet_sidecar::open_channel_verified(
+    let opened = fleet_sidecar::open_channel_verified(
         &session,
         hit.grant.lease,
         ChannelKind::Data,
@@ -363,12 +365,15 @@ async fn a_cache_hit_still_takes_a_fresh_channel_token() {
     .unwrap()
     .expect("the channel names the board we cached");
     assert_eq!(
-        token,
+        opened.token,
         channel_token(1, "b1"),
-        "the child gets the fresh channel token"
+        "the capability token is the fresh per-channel one"
     );
+    // And the data-plane credential is the lease-scoped serve token that came
+    // back on this same `ChannelOpened` — never anything reconstructed locally.
+    assert_eq!(opened.serve_token, "serve-for-lease-1");
     assert_ne!(
-        token,
+        opened.token,
         b"GRANT-TOKEN-NEVER-USE-ME".to_vec(),
         "never the stored grant's token"
     );
@@ -662,6 +667,7 @@ async fn a_channel_naming_another_board_is_refused() {
                         &CoordToSidecar::ChannelOpened {
                             channel: ChannelId(9),
                             token: channel_token(1, "some-other-board"),
+                            serve_token: "serve-for-someone-else".to_owned(),
                         },
                     )
                     .await
@@ -735,6 +741,119 @@ async fn without_a_store_every_invocation_leases_afresh() {
         assert_eq!(acquired.grant.lease, LeaseId(expected));
         assert_eq!(acquired.disposition, Disposition::Release);
     }
+
+    drop(session);
+    peer.await.unwrap();
+}
+
+/// **The channel-lifetime regression test.** An invocation *ending* closes its
+/// channel, even when the lease is deliberately **kept** for the next one.
+///
+/// Driven through `run_on_channel` — the seam both planes share — rather than a
+/// synthetic `CloseChannel`, because a synthetic one proves nothing: the bug is
+/// precisely that no code path sent it. On the lease-cache-hit path
+/// `hold_and_run` with `Disposition::Keep` sends no `Release`, and the node
+/// reports `SessionClosed` only in reply to a `KillSession`, so before this the
+/// node's `probe-rs serve` kept the first invocation's `ProbeLease` and the next
+/// invocation's `attach` was refused (`ProbeInUse`; `errno 16` before serve was
+/// reused at all).
+///
+/// The peer also asserts the close is *acknowledged*: the shim exits
+/// immediately afterwards, so an unacknowledged write can lose the race with
+/// process teardown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invocation_ending_closes_its_channel_with_the_lease_kept() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let closed = Arc::new(Mutex::new(Vec::<ChannelId>::new()));
+    let closed_peer = Arc::clone(&closed);
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+            match msg {
+                SidecarToCoord::OpenChannel { lease, .. } => {
+                    fleet_wire::send(
+                        &mut coord_tx,
+                        &CoordToSidecar::ChannelOpened {
+                            channel: ChannelId(7),
+                            token: channel_token(lease.0, "b1"),
+                            serve_token: "serve-tok".to_owned(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                SidecarToCoord::CloseChannel { channel } => {
+                    closed_peer.lock().await.push(channel);
+                    // The coordinator's real `relay::close_channel` acks; the
+                    // sidecar waits for exactly this frame.
+                    fleet_wire::send(&mut coord_tx, &CoordToSidecar::ChannelClosed { channel })
+                        .await
+                        .unwrap();
+                }
+                // No `Release`: the lease is kept for the next invocation.
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let opened = fleet_sidecar::open_channel_verified(&session, LeaseId(1), ChannelKind::Data, None)
+        .await
+        .unwrap()
+        .expect("no expected board, so it always verifies");
+    assert_eq!(opened.serve_token, "serve-tok");
+
+    // One invocation's worth of work, returning as the probe-rs child would.
+    let code = fleet_sidecar::run_on_channel(&session, opened.channel, async { Ok(0) })
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+
+    assert_eq!(
+        *closed.lock().await,
+        vec![ChannelId(7)],
+        "the channel must be handed back when the invocation ends"
+    );
+
+    drop(session);
+    peer.await.unwrap();
+}
+
+/// The close happens on the **failing** arm too: a probe-rs run that exits with
+/// an error still owes the board's `serve` its probe back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_invocation_still_closes_its_channel() {
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let closed = Arc::new(Mutex::new(false));
+    let closed_peer = Arc::clone(&closed);
+
+    let peer = tokio::spawn(async move {
+        handshake(&mut coord_tx, &mut coord_rx).await;
+        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+            match msg {
+                SidecarToCoord::CloseChannel { channel } => {
+                    *closed_peer.lock().await = true;
+                    fleet_wire::send(&mut coord_tx, &CoordToSidecar::ChannelClosed { channel })
+                        .await
+                        .unwrap();
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    });
+
+    let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+        .await
+        .unwrap();
+    let err = fleet_sidecar::run_on_channel(&session, ChannelId(7), async {
+        Err(fleet_sidecar::transport::TransportError::Io("boom".to_owned()).into())
+    })
+    .await;
+    assert!(err.is_err(), "the work's error must be propagated");
+    assert!(*closed.lock().await, "and the channel still handed back");
 
     drop(session);
     peer.await.unwrap();
