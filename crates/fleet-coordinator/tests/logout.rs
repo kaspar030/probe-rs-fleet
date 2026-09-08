@@ -254,3 +254,50 @@ async fn a_second_logout_of_the_same_credentials_is_still_204() {
     assert!(!session_works(&fleet, &session).await);
     assert!(!refresh_works(&fleet, &refresh).await);
 }
+
+/// **A storage failure must not be reported as a successful revocation.**
+///
+/// This is the one place in the refresh-token feature where swallowing an error
+/// is not conservative: the CLI takes a `204` as truth and prints "revoked every
+/// session and refresh token you hold in this fleet", so a failed write would
+/// tell someone whose laptop was stolen that a 30-day mint-capable credential
+/// was gone when it was not.
+///
+/// The failure is induced by dropping the table out from under the handler —
+/// crude, but it is the honest way to reach the `Err` arm of a `DELETE`, and it
+/// is exactly what a locked or corrupt database surfaces as. `api::logout`
+/// already answers `500` for its own delete error; this pins the same rule for
+/// both of this route's modes.
+#[tokio::test]
+async fn a_storage_failure_is_a_500_rather_than_a_false_success() {
+    for all in [false, true] {
+        let fleet = TestCoordinator::start().await;
+        let now = i64::try_from(fleet.coord.now()).unwrap();
+        let session = fleet.seed_session("acme", "alice", Role::Admin).await;
+        let refresh = fleet
+            .seed_refresh_token("acme", "alice", now + 86_400)
+            .await;
+
+        // `authenticate` reads `session`, so only the *delete* targets may go:
+        // dropping `session` too would fail the request at authentication and
+        // assert nothing about the delete path.
+        sqlx::query("DROP TABLE refresh_token")
+            .execute(fleet.db().pool_for_test())
+            .await
+            .unwrap();
+
+        let (status, response) = fleet
+            .http_auth(
+                "POST",
+                "/auth/logout",
+                Some(&session),
+                Some(body(Some(&refresh), all)),
+            )
+            .await;
+        assert_eq!(
+            status, 500,
+            "all={all}: a failed revocation must not answer 204 ({response})"
+        );
+        assert!(response.contains("server_error"), "{response}");
+    }
+}

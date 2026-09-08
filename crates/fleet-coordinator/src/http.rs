@@ -6,7 +6,8 @@
 //! | `GET /agent` | nodes | `WebSocket` upgrade → the node control plane |
 //! | `GET /client` | users, workloads | `WebSocket` upgrade → the sidecar/ctl plane |
 //! | `GET /delegate` | a sandboxed client | `WebSocket` upgrade → a **crippled** relay-only plane |
-//! | `POST /auth/token` | node enrollment, session refresh | JSON token exchange |
+//! | `POST /auth/token` | node enrollment, session refresh, refresh-token redemption | JSON token exchange |
+//! | `POST /auth/logout` | org members | revoke this session (`all`: every session and refresh token of the caller) |
 //! | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys |
 //! | `POST /auth/device/start` | anyone | begin a GitHub device flow |
 //! | `POST /auth/device/poll` | anyone | redeem a device code for a session token |
@@ -80,9 +81,10 @@
 //! The blast radius is fenced: cookie authentication is accepted on
 //! `/api/v1/*` and **nowhere else** — not `/agent`, `/client` or `/delegate`
 //! (a browser must never drive a control-plane `WebSocket` by ambient
-//! authority), and not `/auth/token` or `/auth/keys`, which keep requiring an
-//! explicit bearer. [`Carrier`] is that fence, and `tests/browser_auth.rs`
-//! asserts each of those five routes refuses a cookie-only request.
+//! authority), and not `/auth/token`, `/auth/keys` or `/auth/logout`, which
+//! keep requiring an explicit bearer. [`Carrier`] is that fence, and
+//! `tests/browser_auth.rs` asserts each of those six routes refuses a
+//! cookie-only request.
 //!
 //! `GET /node/approve` is **still** informational, and stays that way. Phase 1b
 //! of `docs/web-ui.md` shipped browser approval — but through
@@ -351,8 +353,8 @@ pub(crate) enum Carrier {
     /// A bearer header, or the `prfs_session` cookie. **`/api/v1/*` only** —
     /// that allowlist is the blast radius of the whole cookie design
     /// (`docs/web-ui.md` D1), and `tests/browser_auth.rs` asserts each of
-    /// `/agent`, `/client`, `/delegate`, `/auth/token`, `/auth/keys` refuses a
-    /// cookie-only request.
+    /// `/agent`, `/client`, `/delegate`, `/auth/token`, `/auth/keys` and
+    /// `/auth/logout` refuses a cookie-only request.
     HeaderOrCookie,
 }
 
@@ -1633,7 +1635,13 @@ pub(crate) async fn mint_refresh_token(
 ///
 /// Always `204`, whether or not any row was there — the same rule
 /// [`crate::api::logout`] follows, so a caller cannot distinguish "logged out"
-/// from "already gone".
+/// from "already gone". **A storage failure is a `500`, not a `204`.** That is
+/// not a hole in the uniform-`204` rule but the point of it: "revoked" and
+/// "already gone" are both successful deletes of zero-or-more rows and must be
+/// indistinguishable, whereas a failed write means the credential is *still
+/// live*. Reporting success there would tell someone whose laptop was stolen
+/// that a 30-day mint-capable credential had been revoked when it had not —
+/// the exact failure this route exists to prevent.
 ///
 /// `POST /api/v1/session/logout` stays exactly as it is: the browser never
 /// receives a refresh token (CLI-only, `docs/web-ui.md` D1), so it has none to
@@ -1652,19 +1660,33 @@ async fn auth_logout(
     let now_i64 = i64::try_from(coord.now()).unwrap_or(i64::MAX);
 
     let detail = if request.all {
-        let sessions = coord
-            .db()
-            .delete_sessions_for_user(&org, &auth.id)
-            .await
-            .unwrap_or(0);
-        let refreshes = coord
+        let sessions = match coord.db().delete_sessions_for_user(&org, &auth.id).await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, user = %auth.id, "failed to delete sessions on logout --all");
+                return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+            }
+        };
+        let refreshes = match coord
             .db()
             .delete_refresh_tokens_for_user(&org, &auth.id)
             .await
-            .unwrap_or(0);
+        {
+            Ok(n) => n,
+            Err(e) => {
+                // The sessions are already gone, so this is not a rollback
+                // situation — but the durable credential surviving is exactly
+                // what the caller must not be told went away.
+                warn!(error = %e, user = %auth.id, "failed to delete refresh tokens on logout --all");
+                return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+            }
+        };
         format!("logout --all: {sessions} sessions, {refreshes} refresh tokens")
     } else {
-        let _ = coord.db().delete_session(auth.hash.as_str()).await;
+        if let Err(e) = coord.db().delete_session(auth.hash.as_str()).await {
+            warn!(error = %e, "failed to delete a session on logout");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
         let mut revoked_refresh = false;
         if let Some(presented) = request.refresh_token.as_deref() {
             // Parse first: an unparseable or wrong-kind value is simply not a
@@ -1675,11 +1697,23 @@ async fn auth_logout(
                     // Ownership check before the delete. Without it this route
                     // would let a caller delete another user's refresh token,
                     // and — through the audit detail — learn that it existed.
-                    if let Ok(Some((user, row_org, _expires))) =
-                        coord.db().refresh_token_by_token_hash(hash.as_str()).await
-                    {
+                    //
+                    // A *lookup* failure is fatal for the same reason the
+                    // deletes are: we would otherwise report the token revoked
+                    // without having established that it even was ours.
+                    let row = match coord.db().refresh_token_by_token_hash(hash.as_str()).await {
+                        Ok(row) => row,
+                        Err(e) => {
+                            warn!(error = %e, "failed to look up a refresh token on logout");
+                            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+                        }
+                    };
+                    if let Some((user, row_org, _expires)) = row {
                         if user == auth.id && row_org == org {
-                            let _ = coord.db().delete_refresh_token(hash.as_str()).await;
+                            if let Err(e) = coord.db().delete_refresh_token(hash.as_str()).await {
+                                warn!(error = %e, "failed to delete a refresh token on logout");
+                                return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+                            }
                             revoked_refresh = true;
                         }
                     }

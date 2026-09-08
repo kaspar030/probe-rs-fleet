@@ -471,6 +471,12 @@ const REFRESH_SKEW_SECS: u64 = 60;
 /// new-client-against-old-coordinator requirement, and it is the only correct
 /// handling of an unknown-variant rejection.
 ///
+/// The one exception is a session already **past** `expires`: the legacy grant
+/// needs a live session, so it is skipped rather than spending a second 30s
+/// timeout on a refusal that is a foregone conclusion. An old coordinator is
+/// still reached through the in-skew case, which is the state a client that has
+/// been renewing on a deadline is always in.
+///
 /// # Errors
 ///
 /// Returns an error if the fleet file has no `[user]` table, or renewal both
@@ -556,17 +562,30 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
                 tracing::debug!(error = %e, "refresh token redemption failed; falling back");
             }
         }
-    } else if user.expires.is_some_and(|expires| expires <= now) {
-        // Expired, with nothing to renew it with. The legacy refresh below
-        // requires the presented session to authenticate as a **live** session,
-        // so the coordinator would definitionally refuse it — and the request
-        // has a 30-second client timeout. On the shim's hot path that turns a
-        // clear "run login" into a multi-minute build stall against a slow or
-        // unreachable coordinator. Skip the doomed round trip.
-        //
-        // The in-skew case still takes it (the session is valid, the refresh
-        // can succeed), and so does the post-redemption fallback above (a
-        // redemption failure does not prove the session is dead).
+    }
+
+    // The legacy `refresh` grant requires the presented session to
+    // authenticate as a **live** `Session`, so against an already-expired one
+    // the coordinator's refusal is a foregone conclusion — and the client
+    // timeout is 30s. Skipping it matters most in the case this whole feature
+    // targets: an expired session *with* a refresh token, against a slow or
+    // unreachable coordinator, would otherwise spend 30s on the redemption and
+    // then another 30s here, i.e. up to a minute per `probe-rs` invocation,
+    // before producing an error it could have produced immediately.
+    //
+    // The fallback is kept for the two cases where it can still succeed, which
+    // is why this is a guard rather than an `else`:
+    //
+    //   * **in-skew** (`expires > now`): the session is still valid and a
+    //     redemption failure does not prove otherwise;
+    //   * **no recorded expiry**: an externally minted token whose lifetime we
+    //     cannot reason about, so the coordinator is the only judge.
+    //
+    // Deliberately no clock tolerance: this compares against the same `now`
+    // that already decided the token needed renewing a few lines above, so a
+    // skewed client clock produces one consistent decision rather than two
+    // contradictory ones.
+    if user.expires.is_some_and(|expires| expires <= now) {
         return Err(anyhow::anyhow!(
             "the session token for fleet `{fleet}` has expired; run \
              `probe-rs-fleet login --fleet {fleet}`"
@@ -716,6 +735,13 @@ fn reread_agent(fleet: &str) -> Option<AgentSection> {
 /// The `[user]` sibling of [`reread_agent`], with the same XDG caveat: it
 /// resolves the XDG path and therefore ignores any `--config-dir` override, so
 /// a test exercising it must repoint `XDG_CONFIG_HOME`.
+///
+/// Note the caveat bites slightly harder here than for `[agent]`, because this
+/// one is on a **returning** path: under a `--config-dir` override the herd
+/// damper can hand back a session read from the XDG file rather than the
+/// overridden one, instead of merely failing to persist to it. Pre-existing
+/// (`update_named` has the same shape) and out of scope here, but it is the
+/// reason the tests below drive `XDG_CONFIG_HOME` rather than `--config-dir`.
 fn reread_user(fleet: &str) -> Option<UserSection> {
     load_named_opt(fleet).and_then(|f| f.user)
 }
@@ -1102,6 +1128,60 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(5),
             "the doomed refresh round trip must be skipped, not merely fail"
         );
+    }
+
+    /// An expired session **with** a refresh token, against an unreachable
+    /// coordinator, must cost **one** doomed round trip and not two.
+    ///
+    /// This is the case the whole feature targets, so it is the one where a
+    /// double timeout would hurt most: the shim runs once per `probe-rs`
+    /// invocation, and 30s of redemption plus 30s of legacy refresh is up to a
+    /// minute of stall each time. The legacy grant provably cannot succeed here
+    /// — it needs a live session and this one is past `expires` — so it is
+    /// skipped.
+    ///
+    /// The closed port makes the failure immediate rather than slow, so this
+    /// asserts the *shape* (an error naming `login`) while the sibling test
+    /// below pins the in-skew case that must still take the fallback.
+    #[tokio::test]
+    async fn an_expired_session_with_a_refresh_token_does_not_pay_two_timeouts() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let now = now_epoch_secs();
+        let file = FleetFile {
+            url: "http://127.0.0.1:1".to_owned(),
+            user: Some(UserSection {
+                expires: Some(now.saturating_sub(60)),
+                refresh_token: Some(refresh_token()),
+                ..user_section()
+            }),
+            ..FleetFile::default()
+        };
+        let path = paths::fleet_config_path("default").unwrap();
+        save_atomic(&path, &file).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = ensure_fresh_session("default", &file)
+            .await
+            .expect_err("nothing is listening on 127.0.0.1:1");
+        let text = format!("{err:#}");
+        assert!(text.contains("probe-rs-fleet login"), "got: {text}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an expired session must not also pay the legacy refresh's timeout"
+        );
+
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
     }
 
     /// The reported bug's fix, in miniature: an expired session **with** a
