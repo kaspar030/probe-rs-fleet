@@ -14,6 +14,7 @@
 use anyhow::{Context, Result};
 use std::process::ExitCode;
 
+use fleet_proto::admin::{BoardSummary, NodeSummary};
 use fleet_proto::ids::BoardName;
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use fleet_proto::token::AllowedOp;
@@ -191,32 +192,67 @@ impl CtlClient {
     }
 
     /// `ctl list` — fleet inventory.
-    async fn list(&self) -> Result<()> {
+    ///
+    /// `--json` emits the **wire type verbatim** (`Vec<BoardSummary>`), which
+    /// is deliberately a *different contract* from `GET /api/v1/boards`: that
+    /// body is the web UI's and is re-shaped for it (`BoardKeyView`,
+    /// `SubjectView`, a lowercase `availability`), precisely so a field added
+    /// for one consumer does not silently appear in the other's response.
+    /// Emitting the wire type here means there is exactly one definition of
+    /// this output, so it cannot drift from what the coordinator sent; its
+    /// stability is the wire's stability, and a `PROTOCOL_VERSION` bump that
+    /// reshapes `BoardSummary` reshapes this too.
+    ///
+    /// Concretely, and unlike the HTTP body: `board` is a nested object rather
+    /// than a flattened key, `availability` is `PascalCase` (`"Leased"`),
+    /// `holder` carries a `groups` array, `lease` is a bare number, and
+    /// `power` is the full variant.
+    async fn list(&self, json: bool) -> Result<()> {
         let session = self.connect_session().await?;
         match session.request(SidecarToCoord::ListBoards).await? {
             CoordToSidecar::BoardList(boards) => {
-                if boards.is_empty() {
+                if json {
+                    // `power` is emitted in full, hub/port/gpio-line included.
+                    // `api.rs`'s `BoardView` makes the opposite choice for the
+                    // browser ("it describes the physical layout of somebody's
+                    // lab"); that argument does not transfer here. The wire
+                    // already carries the complete `PowerKind` to every `ctl
+                    // list` caller, grantees included, so this is a new
+                    // rendering of bytes the caller already holds rather than a
+                    // new disclosure — and the hub/port is exactly what an
+                    // operator debugging "why did power-cycle do nothing"
+                    // needs.
+                    println!("{}", serde_json::to_string_pretty(&boards)?);
+                } else if boards.is_empty() {
                     println!("no boards in the fleet");
                 } else {
-                    // BOARD is the fleet key "<org>/<node>/<name>", so it is
-                    // wider than revision 1's bare id. MODEL is what
-                    // `board=<model>` matches; `-` means the board declared
-                    // none (every adopted board), so no `board=` selector can
-                    // reach it.
-                    println!(
-                        "{:<32} {:<16} {:<14} {:<16} {:<12} HOLDER",
-                        "BOARD", "AGENT", "MODEL", "CHIP", "STATE"
-                    );
-                    for b in boards {
-                        let state = format!("{:?}", b.availability);
-                        // Render the holder as its stable key ("<org>/<kind>:<id>").
-                        let holder = b.holder.map_or_else(String::new, |h| h.key().to_string());
-                        let model = b.model.unwrap_or_else(|| "-".to_owned());
-                        println!(
-                            "{:<32} {:<16} {:<14} {:<16} {:<12} {}",
-                            b.board, b.node.0, model, b.chip, state, holder
-                        );
-                    }
+                    print!("{}", render_board_table(&boards));
+                }
+                Ok(())
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        }
+    }
+
+    /// `ctl nodes` — the org's machines and their tags.
+    ///
+    /// The listing `ctl list` cannot give: it is board-shaped, so a machine
+    /// that has plugged in no probes has no row there at all.
+    ///
+    /// `--json` emits the wire type verbatim for the same reasons as
+    /// [`CtlClient::list`], and is likewise a different contract from
+    /// `GET /api/v1/nodes`.
+    async fn nodes(&self, json: bool) -> Result<()> {
+        let session = self.connect_session().await?;
+        match session.request(SidecarToCoord::ListNodes).await? {
+            CoordToSidecar::NodeList(nodes) => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&nodes)?);
+                } else if nodes.is_empty() {
+                    println!("no nodes in this org");
+                } else {
+                    print!("{}", render_node_table(&nodes));
                 }
                 Ok(())
             }
@@ -437,6 +473,85 @@ impl CtlClient {
     }
 }
 
+/// Render the `ctl list` board table.
+///
+/// Split out of the RPC so the layout is unit-testable without a coordinator.
+///
+/// TAGS sits **before** HOLDER because HOLDER is the one frequently-empty,
+/// variable-width column and is already last; padding TAGS to a fixed width
+/// keeps HOLDER aligned. `exclusive` and `power` stay out of the table — they
+/// would push it past any terminal — and are carried by `--json`, which is
+/// exactly why `--json` exists.
+fn render_board_table(boards: &[BoardSummary]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    // BOARD is the fleet key "<org>/<node>/<name>", so it is wider than
+    // revision 1's bare id. MODEL is what `board=<model>` matches; `-` means
+    // the board declared none (every adopted board), so no `board=` selector
+    // can reach it.
+    let _ = writeln!(
+        out,
+        "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} HOLDER",
+        "BOARD", "AGENT", "MODEL", "CHIP", "STATE", "TAGS"
+    );
+    for b in boards {
+        let state = format!("{:?}", b.availability);
+        // Render the holder as its stable key ("<org>/<kind>:<id>").
+        let holder = b
+            .holder
+            .as_ref()
+            .map_or_else(String::new, |h| h.key().to_string());
+        let model = b.model.as_deref().unwrap_or("-");
+        let _ = writeln!(
+            out,
+            "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} {}",
+            b.board,
+            b.node.0,
+            model,
+            b.chip,
+            state,
+            crate::render::tags_cell(&b.tags),
+            holder
+        );
+    }
+    out
+}
+
+/// Render the `ctl nodes` machine table.
+///
+/// `LAST-SEEN` is epoch seconds (consistent with `ctl who`'s `EXPIRES`) and
+/// `never` when the node has not connected — unambiguous, because the
+/// populated value is numeric. BOARDS is an empty cell for a machine that has
+/// reported no probes, which is exactly the row `ctl list` cannot show.
+fn render_node_table(nodes: &[NodeSummary]) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{:<24} {:<24} {:<10} {:<8} {:<12} BOARDS",
+        "NAME", "TAGS", "ADOPT", "ONLINE", "LAST-SEEN"
+    );
+    for n in nodes {
+        let online = if n.online { "yes" } else { "no" };
+        let last_seen = n
+            .last_seen
+            .map_or_else(|| "never".to_owned(), |ts| ts.to_string());
+        let _ = writeln!(
+            out,
+            "{:<24} {:<24} {:<10} {:<8} {:<12} {}",
+            n.name,
+            crate::render::tags_cell(&n.tags),
+            n.adopt.as_str(),
+            online,
+            last_seen,
+            n.boards.join(",")
+        );
+    }
+    out
+}
+
 /// Run a `ctl` command, returning the process exit code.
 ///
 /// Most verbs succeed or bail; `delegate` is the one that reports a *soft*
@@ -452,7 +567,8 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
     let client = CtlClient::new(conn);
 
     match args.command {
-        CtlCommand::List => client.list().await?,
+        CtlCommand::List { json } => client.list(json).await?,
+        CtlCommand::Nodes { json } => client.nodes(json).await?,
         CtlCommand::Lease { selector, duration } => {
             let request = LeaseRequest {
                 select: parse_selector(&selector).map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -626,5 +742,166 @@ mod tests {
         a.server_cert_sha256 = Some("ab".repeat(32));
         let conn = CtlConnection::resolve(a, None, None).unwrap();
         assert_eq!(conn.pin(), Some([0xabu8; 32]));
+    }
+
+    // ---- rendering -------------------------------------------------------
+
+    fn owned(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn sample_board(name: &str, tags: &[&str]) -> BoardSummary {
+        use fleet_proto::admin::BoardAvailability;
+        use fleet_proto::board::PowerKind;
+        use fleet_proto::ids::{BoardRef, NodeId, OrgId, Subject, SubjectKind};
+
+        BoardSummary {
+            board: BoardRef::new(
+                OrgId("gh-1".to_owned()),
+                NodeId("gh-1/beast".to_owned()),
+                name,
+            ),
+            node: NodeId("gh-1/beast".to_owned()),
+            chip: "nRF52840_xxAA".to_owned(),
+            model: Some("nrf52840dk".to_owned()),
+            tags: owned(tags),
+            exclusive: true,
+            power: PowerKind::Uhubctl {
+                hub: "1-1".to_owned(),
+                port: 3,
+            },
+            availability: BoardAvailability::Leased,
+            holder: Some(Subject::new(
+                OrgId("gh-1".to_owned()),
+                SubjectKind::User,
+                "gh-9",
+            )),
+            lease: Some(fleet_proto::LeaseId(7)),
+            expires: Some(123),
+        }
+    }
+
+    fn sample_node(name: &str, tags: &[&str], boards: &[&str]) -> NodeSummary {
+        use fleet_proto::ids::NodeId;
+
+        NodeSummary {
+            node: NodeId(format!("gh-1/{name}")),
+            name: name.to_owned(),
+            tags: owned(tags),
+            adopt: fleet_proto::AdoptPolicy::Auto,
+            owner: Some("gh-9".to_owned()),
+            last_seen: Some(1_700_000_000),
+            created_at: 1_600_000_000,
+            online: true,
+            boards: owned(boards),
+        }
+    }
+
+    /// The board table shows tags, and an untagged board gets an **empty**
+    /// cell rather than a placeholder word: `none` is a legal tag value, so a
+    /// placeholder would be ambiguous.
+    #[test]
+    fn board_table_shows_tags_and_leaves_an_empty_cell_for_none() {
+        let out = render_board_table(&[
+            sample_board("dk-1", &["nrf52", "desk"]),
+            sample_board("dk-2", &[]),
+        ]);
+
+        assert!(
+            out.contains("TAGS"),
+            "the header must name the column: {out}"
+        );
+        assert!(out.contains("nrf52,desk"), "{out}");
+        let untagged = out
+            .lines()
+            .find(|l| l.contains("dk-2"))
+            .expect("the untagged board has a row");
+        assert!(
+            !untagged.contains("none"),
+            "an untagged board must not render a placeholder: {untagged}"
+        );
+    }
+
+    /// The node table shows what `ctl list` cannot: tags, adopt policy, live
+    /// state — and a machine that has reported no boards at all.
+    #[test]
+    fn node_table_shows_tags_adopt_online_and_a_boardless_node() {
+        let mut offline = sample_node("never-seen", &[], &[]);
+        offline.online = false;
+        offline.last_seen = None;
+        let out = render_node_table(&[sample_node("beast", &["desk"], &["dk-1", "dk-2"]), offline]);
+
+        assert!(out.contains("TAGS") && out.contains("ADOPT"), "{out}");
+        let beast = out.lines().find(|l| l.starts_with("beast")).unwrap();
+        assert!(beast.contains("desk"), "{beast}");
+        assert!(beast.contains("auto"), "{beast}");
+        assert!(beast.contains("yes"), "{beast}");
+        assert!(beast.contains("dk-1,dk-2"), "{beast}");
+
+        let boardless = out
+            .lines()
+            .find(|l| l.starts_with("never-seen"))
+            .expect("a node with no boards still gets a row");
+        assert!(boardless.contains("no"), "{boardless}");
+        assert!(boardless.contains("never"), "{boardless}");
+    }
+
+    /// `--json` emits the **wire type verbatim**, which is a different
+    /// contract from `GET /api/v1/boards` (the web UI's). The assertions pin
+    /// that shape — including `power` in full and the `PascalCase`
+    /// `availability` — so a later `#[serde(rename_all)]` on the wire type
+    /// trips here rather than silently breaking somebody's script.
+    #[test]
+    fn board_json_is_the_wire_shape_and_round_trips() {
+        let boards = vec![sample_board("dk-1", &["nrf52", "desk"])];
+        let out = serde_json::to_string_pretty(&boards).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Vec<BoardSummary>>(&out).unwrap(),
+            boards
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0]["tags"], serde_json::json!(["nrf52", "desk"]));
+        assert_eq!(v[0]["exclusive"], serde_json::json!(true));
+        // The power decision, asserted rather than assumed: the CLI does NOT
+        // mirror `BoardView`'s redaction of the lab wiring.
+        assert_eq!(v[0]["power"]["Uhubctl"]["hub"], serde_json::json!("1-1"));
+        assert_eq!(v[0]["power"]["Uhubctl"]["port"], serde_json::json!(3));
+        // PascalCase, unlike the HTTP body's lowercase `"leased"`.
+        assert_eq!(v[0]["availability"], serde_json::json!("Leased"));
+        // A nested key object, not the API's flattened `BoardKeyView`.
+        assert_eq!(v[0]["board"]["name"], serde_json::json!("dk-1"));
+    }
+
+    /// A JSON consumer must always get JSON — never the "no boards in the
+    /// fleet" prose the table path prints.
+    #[test]
+    fn board_json_of_an_empty_fleet_is_an_empty_array() {
+        let boards: Vec<BoardSummary> = Vec::new();
+        let out = serde_json::to_string_pretty(&boards).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!([])
+        );
+    }
+
+    /// The same for nodes. `adopt` *is* lowercase (`AdoptPolicy` carries
+    /// `#[serde(rename_all = "lowercase")]`) while `availability` above is
+    /// not — an asymmetry worth pinning precisely because it is surprising.
+    #[test]
+    fn node_json_is_the_wire_shape_and_round_trips() {
+        let nodes = vec![sample_node("beast", &["desk"], &["dk-1"])];
+        let out = serde_json::to_string_pretty(&nodes).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Vec<NodeSummary>>(&out).unwrap(),
+            nodes
+        );
+
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v[0]["tags"], serde_json::json!(["desk"]));
+        assert_eq!(v[0]["adopt"], serde_json::json!("auto"));
+        assert_eq!(v[0]["online"], serde_json::json!(true));
     }
 }

@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::adopt::AdoptPolicy;
 use crate::board::PowerKind;
 use crate::ids::{BoardRef, LeaseId, NodeId, OrgId, Subject, SubjectKey};
 use crate::token::AllowedOp;
@@ -59,6 +60,47 @@ pub struct BoardSummary {
     pub lease: Option<LeaseId>,
     /// If leased, the expiry (epoch seconds).
     pub expires: Option<u64>,
+}
+
+/// One row of the `ctl nodes` machine inventory.
+///
+/// The wire projection of the coordinator's node row (`OrgDb::list_nodes`,
+/// joined with live connection state), so a CLI caller can answer "what
+/// machines exist, and which tags do they carry?" — a question `ctl list`
+/// cannot answer, because it is board-shaped and a machine that has plugged in
+/// no probes has no row there.
+///
+/// Deliberately **not** the same struct as the coordinator's `NodeView` (the
+/// body of `GET /api/v1/nodes`): that one is the web UI's contract and is free
+/// to evolve on the browser's schedule, while this one is the wire's and moves
+/// with [`crate::PROTOCOL_VERSION`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeSummary {
+    /// The node's fleet id (`{org}/{name}`).
+    pub node: NodeId,
+    /// The node-local name — what `ctl` and the node-patch API address it by.
+    pub name: String,
+    /// Free-form node tags. The point of the verb: these are what a `tag=`
+    /// selector can match on every board the node offers.
+    pub tags: Vec<String>,
+    /// What the node does with a probe `boards.toml` does not declare.
+    pub adopt: AdoptPolicy,
+    /// The owning user id, if the node was enrolled by a logged-in human.
+    /// `None` for an auth-key enrollment, which has no owning human by
+    /// construction.
+    pub owner: Option<String>,
+    /// Epoch seconds of the last inventory report; `None` if the node has
+    /// never connected.
+    pub last_seen: Option<i64>,
+    /// Epoch seconds the node row was created.
+    pub created_at: i64,
+    /// Whether the node holds its control-plane `WebSocket` right now.
+    /// Composed from the live registry, never a stored column.
+    pub online: bool,
+    /// The node-local names of the boards recorded for this node. Empty for a
+    /// machine that has reported no probes — which is exactly why this listing
+    /// is not board-shaped.
+    pub boards: Vec<String>,
 }
 
 /// One row of the `ctl who` lease table.

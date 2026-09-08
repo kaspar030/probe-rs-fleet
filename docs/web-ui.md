@@ -186,8 +186,10 @@ types are shaped for postcard, and any that do not serialize to pleasant JSON
 coordinator**, never a divergent field set in `fleet-proto`.
 
 **The honest cost.** Today's operator methods on `Coordinator` are private, and
-several verbs the UI needs **have no wire verb at all**: node list / tags /
-adopt-policy / delete, member list. Those are
+several verbs the UI needs **have no wire verb at all**: node tags /
+adopt-policy / delete, member list (node *list* has since gained one:
+`SidecarToCoord::ListNodes`, added for `ctl nodes` and sharing this document's
+`list_nodes_core`). Those are
 new `Coordinator` methods plus new `state.rs` / `OrgDb` queries — real
 implementation work in the follow-up tasks, not plumbing. Every new query goes
 through `OrgDb` so the tenancy fence holds by construction (`audit_log.org_id`

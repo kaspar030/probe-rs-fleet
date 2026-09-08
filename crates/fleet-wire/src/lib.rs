@@ -27,7 +27,7 @@
 //! `axum` adapter lives in `fleet-coordinator`; the `tokio-tungstenite` one
 //! lives here behind the `tungstenite` feature.
 
-use fleet_proto::admin::{BoardSummary, GrantSummary, LeaseHolderSummary, LogLine};
+use fleet_proto::admin::{BoardSummary, GrantSummary, LeaseHolderSummary, LogLine, NodeSummary};
 use fleet_proto::ids::BoardName;
 use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest};
 use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
@@ -346,6 +346,17 @@ pub enum SidecarToCoord {
         /// delegator may actually do.
         ops: Vec<AllowedOp>,
     },
+    /// Operator: list the org's machines and their tags (`ctl nodes`).
+    ///
+    /// Authorized by the same `require_role(Member)` check the browser API's
+    /// `GET /api/v1/nodes` goes through, because it dispatches to the same
+    /// `list_nodes_core`: the CLI and the web UI cannot drift on who may see a
+    /// node.
+    ///
+    /// Appended at the **end** of the enum rather than placed next to
+    /// [`SidecarToCoord::ListBoards`] where it belongs semantically: postcard
+    /// is positional, so inserting a variant renumbers every later one.
+    ListNodes,
 }
 
 /// A message from the coordinator down to a sidecar.
@@ -457,6 +468,12 @@ pub enum CoordToSidecar {
         /// The configured cap.
         cap: u32,
     },
+    /// Operator: the org's machines (reply to [`SidecarToCoord::ListNodes`]).
+    ///
+    /// Appended at the end for the same reason [`CoordToSidecar::NoCandidate`]
+    /// is, rather than sitting next to [`CoordToSidecar::BoardList`]: postcard
+    /// is positional, so inserting renumbers every later variant.
+    NodeList(Vec<NodeSummary>),
 }
 
 /// An in-memory [`WireTx`] / [`WireRx`] pair, for tests.
@@ -538,6 +555,7 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fleet_proto::admin::NodeSummary;
     use fleet_proto::ids::{BoardRef, NodeId, OrgId};
     use fleet_proto::lease::Priority;
     use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
@@ -548,6 +566,38 @@ mod tests {
             NodeId("node-a".to_owned()),
             "b1",
         )
+    }
+
+    /// The `ctl nodes` request verb round-trips, in the style of the
+    /// `ListBoards` assertion below.
+    #[tokio::test]
+    async fn list_nodes_request_roundtrip() {
+        let (mut a_tx, _a_rx, _b_tx, mut b_rx) = mock::pair();
+        send(&mut a_tx, &SidecarToCoord::ListNodes).await.unwrap();
+        assert_eq!(
+            recv::<SidecarToCoord>(&mut b_rx).await.unwrap(),
+            SidecarToCoord::ListNodes
+        );
+    }
+
+    /// The reply carries the fields `ctl nodes` renders: tags, adopt policy,
+    /// a never-connected `last_seen`, and the node's board names.
+    #[tokio::test]
+    async fn node_list_reply_roundtrip() {
+        let (mut a_tx, _a_rx, _b_tx, mut b_rx) = mock::pair();
+        let msg = CoordToSidecar::NodeList(vec![NodeSummary {
+            node: NodeId("default/beast".to_owned()),
+            name: "beast".to_owned(),
+            tags: vec!["desk".to_owned(), "nrf52".to_owned()],
+            adopt: fleet_proto::AdoptPolicy::Auto,
+            owner: Some("gh-1".to_owned()),
+            last_seen: None,
+            created_at: 1_700_000_000,
+            online: true,
+            boards: vec!["dk-1".to_owned(), "dk-2".to_owned()],
+        }]);
+        send(&mut a_tx, &msg).await.unwrap();
+        assert_eq!(recv::<CoordToSidecar>(&mut b_rx).await.unwrap(), msg);
     }
 
     #[tokio::test]

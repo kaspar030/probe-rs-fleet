@@ -2321,9 +2321,13 @@ impl OrgDb<'_> {
 
     /// Every node in this org, with its board names.
     ///
-    /// New for the browser API (`GET /api/v1/nodes`); there is no wire verb for
-    /// it — `ctl list` is board-shaped, and a machine that has plugged in no
-    /// probes is invisible to it.
+    /// Two consumers: the browser API (`GET /api/v1/nodes`) and the wire verb
+    /// `SidecarToCoord::ListNodes` (`ctl nodes`). Both reach it through
+    /// `Coordinator::list_nodes_core`, so the query has one authorization
+    /// story and not two.
+    ///
+    /// It exists because `ctl list` is board-shaped, and a machine that has
+    /// plugged in no probes is invisible to it.
     ///
     /// Two rows-per-node deliberately are **not** joined into one query: the
     /// board join would multiply the node columns by the board count and make
@@ -2582,10 +2586,11 @@ pub struct MemberRow {
 
 /// One row of [`OrgDb::list_nodes`].
 ///
-/// Deliberately not a `fleet-proto` type: nothing on the wire carries a node
-/// listing, and inventing one in the shared crate for the sake of one HTTP
-/// endpoint would put a browser-shaped struct where the postcard protocol
-/// lives.
+/// Deliberately **not** the wire type: that is
+/// [`fleet_proto::admin::NodeSummary`], carried by `CoordToSidecar::NodeList`
+/// for `ctl nodes`. This stays the *database* shape — it is free to carry
+/// columns the wire projection does not — and `core.rs`'s `node_summary` maps
+/// one to the other, alongside `api.rs`'s `NodeView` for the browser.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeRow {
     /// The node's fleet id (`{org}/{name}`).

@@ -11,6 +11,9 @@ pub mod config;
 pub mod fleet_config;
 pub mod logging;
 pub mod paths;
+/// Shared table-cell renderers. Crate-private: these are output formatting,
+/// not a library surface.
+pub(crate) mod render;
 pub mod roles;
 pub mod secrets;
 pub mod signal;

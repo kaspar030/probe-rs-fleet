@@ -1576,9 +1576,21 @@ route have been walked, so they were:
 |---|---|---|
 | `Lease` / `Extend` / `Release` / `OpenChannel` / `CloseChannel` | `board_access` / `require_lease_control` | allowed — this is the CI story |
 | `ListBoards` / `Who` | access-scoped | allowed |
+| `ListNodes` | `require_role(Member)` | denied |
 | `Logs`, `GrantCreate` | `require_role(Admin)` | denied |
 | `GrantList` / `GrantRevoke` | `require_role(Member)` | denied |
 | **`Delegate`** | `board_access` **alone** | **explicitly refused** |
+
+`ListNodes` (`ctl nodes`) carries the same `require_role(Member)` gate as the
+grant verbs, and therefore the same workload answer, because it dispatches to
+the very `list_nodes_core` the browser API's `GET /api/v1/nodes` calls: the CLI
+and the web UI cannot drift on who may see a node. It exists because
+`ListBoards` is board-shaped — a machine that has plugged in no probes has no
+row there, and node *tags* (which every `tag=` selector matches against) were
+otherwise visible only in the browser. Both `ctl list` and `ctl nodes` also take
+`--json`, which emits the wire payload verbatim; that is deliberately a
+different contract from the `/api/v1` bodies, which are the web UI's and are
+re-shaped for it.
 
 `Delegate` was the one verb gated by `board_access` and nothing else, so a
 workload would otherwise be able to mint a capability token for a lab board and

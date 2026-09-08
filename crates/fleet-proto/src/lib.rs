@@ -18,7 +18,9 @@ pub mod lease;
 pub mod node_api;
 pub mod token;
 
-pub use admin::{BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine};
+pub use admin::{
+    BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine, NodeSummary,
+};
 pub use adopt::AdoptPolicy;
 pub use board::{Board, BoardState, PowerKind};
 pub use ids::{
@@ -110,4 +112,13 @@ pub struct ChannelId(pub u64);
 ///   postcard peers still reject an unknown one, so an old sidecar cannot
 ///   decode either. A `Queued` reply now also implies a promotion push may
 ///   follow on the same connection.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// * 9 → 10: node visibility. `SidecarToCoord` gained `ListNodes` and
+///   `CoordToSidecar` gained `NodeList(Vec<`[`admin::NodeSummary`]`>)`, which
+///   is what `ctl nodes` speaks: node tags (and machines that offer no boards
+///   at all) were previously reachable only through the browser API. Both
+///   variants are **appended**, so every existing discriminant stays where it
+///   was, but a postcard peer still refuses an unknown one — so an old sidecar
+///   cannot decode the reply and an old coordinator cannot decode the request.
+///   No stored data is affected (contrast 7 → 8, which invalidated
+///   `board=`-shaped grant selectors).
+pub const PROTOCOL_VERSION: u32 = 10;

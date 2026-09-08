@@ -626,6 +626,9 @@ impl Coordinator {
     /// token signing); request-level failures — including every authorization
     /// refusal — are reported back to the sidecar via [`CoordToSidecar::Error`]
     /// and return `Ok`.
+    // One arm per wire verb, so the length tracks the protocol's surface rather
+    // than any complexity of its own; each arm delegates immediately.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_sidecar_message(
         &self,
         subject: &Subject,
@@ -690,6 +693,10 @@ impl Coordinator {
             }
             SidecarToCoord::ListBoards => {
                 let reply = self.list_boards(subject).await;
+                let _ = tx.send(reply).await;
+            }
+            SidecarToCoord::ListNodes => {
+                let reply = self.list_nodes(subject).await?;
                 let _ = tx.send(reply).await;
             }
             SidecarToCoord::Who => {
@@ -872,6 +879,30 @@ impl Coordinator {
         }
     }
 
+    /// Wire adapter for [`Coordinator::list_nodes_core`]: renders the org's
+    /// machines as a [`CoordToSidecar::NodeList`] for `ctl nodes`.
+    ///
+    /// Adds **no** authorization of its own — it calls the same core the
+    /// browser API's `GET /api/v1/nodes` calls, so the two surfaces cannot
+    /// drift on who may see a node.
+    ///
+    /// Unlike [`Coordinator::list_boards`] this returns a `Result`: the core
+    /// does fallible database I/O, and rendering an `OpError::Internal` as the
+    /// flat "not authorized" refusal would misreport a DB fault as a
+    /// permission problem.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a database failure; refusals become a [`CoordToSidecar`].
+    async fn list_nodes(&self, subject: &Subject) -> Result<CoordToSidecar> {
+        match self.list_nodes_core(subject).await {
+            Ok(nodes) => Ok(CoordToSidecar::NodeList(
+                nodes.into_iter().map(node_summary).collect(),
+            )),
+            Err(e) => e.into_wire(),
+        }
+    }
+
     /// The org's membership, for the browser API.
     ///
     /// **New surface, no wire counterpart**, so there is no adapter: nothing on
@@ -910,10 +941,16 @@ impl Coordinator {
 
     /// The org's machines, with live connection state.
     ///
-    /// **New surface, no wire counterpart** — see [`Coordinator::list_members_core`]
-    /// for why it is a core anyway. `ctl list` is board-shaped, so a machine
-    /// that has plugged in no probes is invisible to it; a fleet UI has to be
-    /// able to say "this Pi is enrolled and online but is offering nothing".
+    /// Shared by two surfaces with one authorization story: the browser API's
+    /// `GET /api/v1/nodes` and the wire verb `SidecarToCoord::ListNodes`
+    /// (`ctl nodes`), which reaches it through [`Coordinator::list_nodes`].
+    /// Neither adds a check of its own.
+    ///
+    /// It is a core of its own — rather than part of `ctl list` — because
+    /// `ctl list` is board-shaped, so a machine that has plugged in no probes
+    /// is invisible to it; an operator (or a fleet UI) has to be able to say
+    /// "this Pi is enrolled and online but is offering nothing", and to see the
+    /// node tags a `tag=` selector will match.
     ///
     /// `online` is composed here rather than stored: liveness is the
     /// [`crate::registry::NodeRegistry`]'s in-memory answer to "is the
@@ -2904,6 +2941,27 @@ impl Coordinator {
 /// A shared, cheaply-cloneable coordinator handle.
 pub type SharedCoordinator = Arc<Coordinator>;
 
+/// Project a [`NodeStatus`] onto its wire shape for `ctl nodes`.
+///
+/// A free function rather than a `From` impl on a foreign type pair's own
+/// module: the row is the *database* shape (it carries columns the wire
+/// projection need not), and this is the one place the two are joined.
+/// `api.rs`'s `NodeView` is the parallel projection for the browser, kept
+/// separate on purpose — see [`Coordinator::list_nodes`].
+fn node_summary(status: NodeStatus) -> fleet_proto::admin::NodeSummary {
+    fleet_proto::admin::NodeSummary {
+        node: status.row.id,
+        name: status.row.name,
+        tags: status.row.tags,
+        adopt: status.row.adopt,
+        owner: status.row.owner_user_id,
+        last_seen: status.row.last_seen,
+        created_at: status.row.created_at,
+        online: status.online,
+        boards: status.row.boards,
+    }
+}
+
 /// One row of [`Coordinator::list_nodes_core`]: a node row plus its live
 /// connection state.
 ///
@@ -4069,6 +4127,60 @@ mod tests {
         }
     }
 
+    /// `ctl nodes` renders the org's machines with their tags, adopt policy
+    /// and live state — **including a machine that has reported no boards**,
+    /// which is the whole reason this listing is not board-shaped.
+    #[tokio::test]
+    async fn list_nodes_renders_tags_and_includes_a_boardless_node() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator(clock).await;
+        let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
+
+        // A second node that has never reported a probe. `coordinator_with`
+        // only ensures node rows for orgs that have boards, so seed it here.
+        let empty = node_id(DEFAULT_ORG_ID, "boardless");
+        scoped.ensure_node(&empty, 1000).await.unwrap();
+        scoped
+            .update_node(
+                "boardless",
+                Some(&["desk".to_owned(), "nrf52".to_owned()]),
+                Some(AdoptPolicy::Auto),
+            )
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &user(DEFAULT_ORG_ID, "alice"),
+                SidecarToCoord::ListNodes,
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+
+        let nodes = match rx.recv().await.unwrap() {
+            CoordToSidecar::NodeList(nodes) => nodes,
+            other => panic!("expected NodeList, got {other:?}"),
+        };
+        let boardless = nodes
+            .iter()
+            .find(|n| n.name == "boardless")
+            .expect("a node with no boards must still be listed");
+        assert_eq!(boardless.tags, ["desk", "nrf52"]);
+        assert_eq!(boardless.adopt, AdoptPolicy::Auto);
+        assert!(boardless.boards.is_empty());
+        // Never connected: the registry has no session for it.
+        assert!(!boardless.online);
+
+        let with_board = nodes
+            .iter()
+            .find(|n| n.name == "node-a")
+            .expect("the board-carrying node is listed too");
+        assert_eq!(with_board.node, node_id(DEFAULT_ORG_ID, "node-a"));
+    }
+
     /// `ctl logs` is admin-only.
     #[tokio::test]
     async fn logs_require_admin() {
@@ -4126,6 +4238,7 @@ mod tests {
         for s in strangers {
             for msg in [
                 SidecarToCoord::ListBoards,
+                SidecarToCoord::ListNodes,
                 SidecarToCoord::Who,
                 SidecarToCoord::Lease(lease_req("b1")),
                 SidecarToCoord::PowerCycle {

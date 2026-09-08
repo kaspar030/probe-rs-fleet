@@ -153,6 +153,7 @@ async fn every_non_relay_verb_is_refused_on_the_delegated_route() {
             }),
         ),
         ("enumerating the fleet", SidecarToCoord::ListBoards),
+        ("listing the fleet's machines", SidecarToCoord::ListNodes),
         ("seeing who holds what", SidecarToCoord::Who),
         (
             "reading the audit log",

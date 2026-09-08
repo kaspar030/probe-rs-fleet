@@ -386,8 +386,8 @@ fn render_list(
     } else {
         let _ = writeln!(
             out,
-            "{:<24} {:<18} {:<18} {:<14} PRESENCE",
-            "ID", "SERIAL", "CHIP", "MODEL"
+            "{:<24} {:<18} {:<18} {:<14} {:<20} PRESENCE",
+            "ID", "SERIAL", "CHIP", "MODEL", "TAGS"
         );
         for b in &inventory.boards {
             let chip = if b.chip.is_empty() { "-" } else { &b.chip };
@@ -398,8 +398,13 @@ fn render_list(
             };
             let _ = writeln!(
                 out,
-                "{:<24} {:<18} {:<18} {:<14} {}",
-                b.board.0, b.serial, chip, model, presence
+                "{:<24} {:<18} {:<18} {:<14} {:<20} {}",
+                b.board.0,
+                b.serial,
+                chip,
+                model,
+                crate::render::tags_cell(&b.tags),
+                presence
             );
         }
     }
@@ -1014,6 +1019,40 @@ mod tests {
         assert!(
             out.contains("NOT leasable"),
             "under `declared` the header must say what that means: {out}"
+        );
+    }
+
+    /// The declared table shows the tags a board was given — this is where an
+    /// operator *sets* them, so it is where they confirm what was set. A board
+    /// with none gets an empty cell, never a placeholder word (`none` is a
+    /// legal tag).
+    #[test]
+    fn list_renders_declared_tags() {
+        let boards = BoardsConfig::from_str(
+            "[[board]]\nid = \"tagged\"\nserial = \"AAA\"\nchip = \"nRF52840_xxAA\"\n\
+             tags = [\"nrf52\", \"desk\"]\n\
+             [[board]]\nid = \"untagged\"\nserial = \"BBB\"\nchip = \"\"\n",
+        )
+        .unwrap();
+        let out = render_list(
+            &boards,
+            &[probe("AAA"), probe("BBB")],
+            AdoptPolicy::Declared,
+            Path::new("/x/boards.toml"),
+        );
+
+        assert!(
+            out.contains("TAGS"),
+            "the header must name the column: {out}"
+        );
+        assert!(out.contains("nrf52,desk"), "{out}");
+        let untagged = out
+            .lines()
+            .find(|l| l.starts_with("untagged"))
+            .expect("the untagged board has a row");
+        assert!(
+            !untagged.contains("none"),
+            "an untagged board gets an empty cell, not a placeholder: {untagged}"
         );
     }
 

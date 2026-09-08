@@ -798,8 +798,17 @@ async fn org_members(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) 
 
 /// `GET /api/v1/nodes` — the org's machines.
 ///
-/// New surface: there is no wire verb for it, because `ctl list` is
-/// board-shaped and a machine that has plugged in no probes is invisible to it.
+/// Exists because `ctl list` is board-shaped and a machine that has plugged in
+/// no probes is invisible to it. The CLI now asks the same question over the
+/// wire (`ctl nodes` / `SidecarToCoord::ListNodes`), and both paths go through
+/// [`Coordinator::list_nodes_core`], so they cannot drift on who may see a
+/// node.
+///
+/// [`NodeView`] is nonetheless kept **separate** from the wire's
+/// `fleet_proto::admin::NodeSummary`: this body is the web UI's contract (its
+/// `id` and `adopt` are already flattened to strings) and must be free to
+/// evolve on the browser's schedule rather than on `PROTOCOL_VERSION`'s. The
+/// two renderings happen to agree today; that is not a guarantee either way.
 async fn nodes(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
     let (_auth, subject, _) = match api_auth(&coord, &headers).await {
         Ok(v) => v,

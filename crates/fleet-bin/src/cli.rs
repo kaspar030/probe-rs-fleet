@@ -1097,7 +1097,29 @@ pub struct CtlArgs {
 #[derive(Debug, Subcommand)]
 pub enum CtlCommand {
     /// List the fleet inventory (boards and their state).
-    List,
+    List {
+        /// Emit the wire payload as JSON, including the tags, exclusivity and
+        /// power capability the table omits.
+        ///
+        /// A **different shape** from `GET /api/v1/boards`, which is the web
+        /// UI's contract: this is the coordinator's wire type verbatim, so it
+        /// cannot drift from what was actually sent.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the org's machines (nodes) and their tags.
+    ///
+    /// Answers what `ctl list` cannot, because that listing is board-shaped:
+    /// which machines exist at all (including one that has plugged in no
+    /// probes), which tags each carries, and whether it is online right now.
+    Nodes {
+        /// Emit the wire payload as JSON.
+        ///
+        /// A **different shape** from `GET /api/v1/nodes`, which is the web
+        /// UI's contract.
+        #[arg(long)]
+        json: bool,
+    },
     /// Lease a board by selector (`id=…`, `board=…`, `tag=…`, `chip=…`).
     Lease {
         /// Board selector: `id=<name>` for one board, `board=<model>` for any
@@ -2532,7 +2554,24 @@ mod tests {
     #[test]
     fn parses_ctl_subcommands() {
         let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "list"]));
-        assert!(matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List)));
+        assert!(
+            matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List { json: false }))
+        );
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "list", "--json"]));
+        assert!(
+            matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List { json: true }))
+        );
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "nodes"]));
+        assert!(
+            matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::Nodes { json: false }))
+        );
+
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "nodes", "--json"]));
+        assert!(
+            matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::Nodes { json: true }))
+        );
 
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
