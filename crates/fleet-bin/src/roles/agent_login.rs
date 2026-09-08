@@ -315,6 +315,7 @@ mod tests {
             expires: Some(4_600),
             coordinator_token_pubkey: None,
             login: None,
+            refresh_token: None,
         }
     }
 
@@ -363,6 +364,7 @@ mod tests {
                 org: "acme".to_owned(),
                 login: None,
                 expires: None,
+                refresh_token: None,
             }),
             agent: Some(AgentSection {
                 auth_key: OpaqueToken::mint(TokenKind::AuthKey).to_secret_string(),

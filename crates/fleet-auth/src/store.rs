@@ -77,6 +77,20 @@ pub struct WorkloadRecord {
     pub expires: u64,
 }
 
+/// A user's refresh-token row.
+///
+/// Deliberately org-scoped, unlike [`WorkloadRecord`]: a user *is* a member of
+/// an org, so the `session`-table reasoning applies verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshRecord {
+    /// The subject id of the user this refresh token belongs to.
+    pub user_id: String,
+    /// The org the minted sessions will be scoped to.
+    pub org_id: String,
+    /// Expiry, epoch seconds. Always set.
+    pub expires: u64,
+}
+
 /// Read/write access to the credential tables.
 ///
 /// Errors are returned as `String` rather than a concrete error type so this
@@ -111,6 +125,17 @@ pub trait TokenStore: Send + Sync {
     ///
     /// Returns a storage error description.
     async fn lookup_workload(&self, hash: &TokenHash) -> Result<Option<WorkloadRecord>, String>;
+
+    /// Look up a refresh token by its hash **without** consuming it.
+    ///
+    /// There is deliberately no consume counterpart: redemption is
+    /// non-rotating (see [`crate::token::TokenKind::Refresh`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error description.
+    async fn lookup_refresh_token(&self, hash: &TokenHash)
+        -> Result<Option<RefreshRecord>, String>;
 }
 
 #[cfg(test)]
@@ -120,7 +145,9 @@ pub(crate) mod fake {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore, WorkloadRecord};
+    use super::{
+        AuthKeyRecord, NodeRecord, RefreshRecord, SessionRecord, TokenStore, WorkloadRecord,
+    };
     use crate::token::TokenHash;
     use async_trait::async_trait;
 
@@ -130,6 +157,7 @@ pub(crate) mod fake {
         pub(crate) sessions: Mutex<HashMap<String, SessionRecord>>,
         pub(crate) auth_keys: Mutex<HashMap<String, AuthKeyRecord>>,
         pub(crate) workloads: Mutex<HashMap<String, WorkloadRecord>>,
+        pub(crate) refresh_tokens: Mutex<HashMap<String, RefreshRecord>>,
     }
 
     impl FakeStore {
@@ -164,6 +192,14 @@ pub(crate) mod fake {
                 .insert(hash.as_str().to_owned(), record);
             self
         }
+
+        pub(crate) fn with_refresh_token(self, hash: &TokenHash, record: RefreshRecord) -> Self {
+            self.refresh_tokens
+                .lock()
+                .unwrap()
+                .insert(hash.as_str().to_owned(), record);
+            self
+        }
     }
 
     #[async_trait]
@@ -185,6 +221,18 @@ pub(crate) mod fake {
             hash: &TokenHash,
         ) -> Result<Option<WorkloadRecord>, String> {
             Ok(self.workloads.lock().unwrap().get(hash.as_str()).cloned())
+        }
+
+        async fn lookup_refresh_token(
+            &self,
+            hash: &TokenHash,
+        ) -> Result<Option<RefreshRecord>, String> {
+            Ok(self
+                .refresh_tokens
+                .lock()
+                .unwrap()
+                .get(hash.as_str())
+                .cloned())
         }
     }
 }

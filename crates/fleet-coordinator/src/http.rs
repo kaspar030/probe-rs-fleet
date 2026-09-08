@@ -261,7 +261,7 @@ use tracing::{debug, info, warn};
 
 use fleet_auth::api::{
     AuthKeyCreated, AuthKeyInfo, AuthKeyList, AuthKeyRequest, AuthKeyRevoked, DevicePollRequest,
-    DeviceStartRequest, DeviceStartResponse, ErrorResponse, NodeApprovalDecision,
+    DeviceStartRequest, DeviceStartResponse, ErrorResponse, LogoutRequest, NodeApprovalDecision,
     NodeApprovalRequest, NodeApprovalResponse, NodeRegisterPollRequest, NodeRegisterStartRequest,
     NodeRegisterStartResponse, TokenRequest, TokenResponse,
 };
@@ -281,6 +281,7 @@ pub fn router(coord: Arc<Coordinator>) -> Router {
         .route("/client", get(client_ws))
         .route("/delegate", get(delegate_ws))
         .route("/auth/token", post(auth_token))
+        .route("/auth/logout", post(auth_logout))
         .route("/auth/keys", post(auth_keys))
         .route("/auth/device/start", post(auth_device_start))
         .route("/auth/device/poll", post(auth_device_poll))
@@ -444,9 +445,9 @@ pub(crate) async fn authenticate_request_with(
         // only through per-repo grants, which `board_access` evaluates against
         // this exact subject key.
         TokenKind::Workload => Subject::new(org, SubjectKind::Workload, auth.id.clone()),
-        // `authenticate` never returns these kinds; both are redeemed at a
-        // route, never presented as a connection credential.
-        TokenKind::AuthKey | TokenKind::NodeDevice => {
+        // `authenticate` never returns these kinds; all three are redeemed at
+        // a route, never presented as a connection credential.
+        TokenKind::AuthKey | TokenKind::NodeDevice | TokenKind::Refresh => {
             return Err(reject(StatusCode::FORBIDDEN, "forbidden"));
         }
     };
@@ -673,6 +674,9 @@ async fn auth_token(
             tags,
         } => redeem_auth_key(&coord, &auth_key, &node_name, tags).await,
         TokenRequest::Refresh { session_token } => refresh_session(&coord, &session_token).await,
+        TokenRequest::RefreshToken { refresh_token } => {
+            redeem_refresh_token(&coord, &refresh_token).await
+        }
         TokenRequest::SelfRegister {
             session_token,
             node_name,
@@ -758,6 +762,7 @@ async fn redeem_auth_key(
         expires: None,
         coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
         login: None,
+        refresh_token: None,
     })
     .into_response()
 }
@@ -941,6 +946,7 @@ async fn exchange_github_oidc(coord: &Coordinator, jwt: &str) -> Response {
         expires: Some(u64::try_from(expires).unwrap_or(0)),
         coordinator_token_pubkey: None,
         login: None,
+        refresh_token: None,
     })
     .into_response()
 }
@@ -1182,6 +1188,7 @@ async fn exchange_workload_key(coord: &Coordinator, auth_key: &str) -> Response 
         expires: Some(u64::try_from(expires).unwrap_or(0)),
         coordinator_token_pubkey: None,
         login: None,
+        refresh_token: None,
     })
     .into_response()
 }
@@ -1434,6 +1441,7 @@ async fn mint_node_token(
         expires: None,
         coordinator_token_pubkey: Some(coord.token_pubkey_hex()),
         login: None,
+        refresh_token: None,
     })
     .into_response()
 }
@@ -1481,8 +1489,225 @@ async fn refresh_session(coord: &Coordinator, session_token: &str) -> Response {
         expires: u64::try_from(expires).ok(),
         coordinator_token_pubkey: None,
         login: None,
+        refresh_token: None,
     })
     .into_response()
+}
+
+/// `grant_type: refresh_token` — redeem a long-lived refresh token for a fresh
+/// session token.
+///
+/// # Why this does not delete the refresh token
+///
+/// [`refresh_session`], thirty lines above, says of the *session* token it
+/// exchanges: "Refresh replaces: the old token stops working immediately".
+/// **This path is deliberately the opposite**, and the difference is the whole
+/// reason the feature exists.
+///
+/// A replacing refresh cannot be put on the `probe-rs` sidecar's path: two
+/// concurrent invocations in one build would both redeem, and the loser would
+/// be left holding a token the winner's redemption deleted, mid-build. A
+/// non-rotating redemption has the same safety property as a `--multi-use`
+/// auth key — N concurrent redemptions all succeed and every minted session is
+/// independently valid — which is what makes the sidecar fix possible at all.
+///
+/// The cost is stated in migration 0011 and in `docs/architecture.md`: a leaked
+/// refresh token is usable for its whole TTL, bounded by `logout --all` and by
+/// `refresh_token_ttl_secs`.
+///
+/// **If you are here to "fix" the missing delete: it is not missing.** The
+/// regression test is
+/// `tests/auth_token.rs::redeeming_a_refresh_token_leaves_it_usable`.
+async fn redeem_refresh_token(coord: &Coordinator, refresh_token: &str) -> Response {
+    let now = coord.now();
+
+    let record =
+        match fleet_auth::verify::verify_refresh_token(coord.db(), refresh_token, now).await {
+            Ok((hash, record)) => {
+                debug!(token = %hash.short(), user = %record.user_id, "refresh token redeemed");
+                record
+            }
+            Err(e) => {
+                // Uniform rejection, no oracle: unknown, expired and wrong-kind
+                // all answer the same thing, and the distinction lives here.
+                warn!(reason = e.label(), detail = %e, "refresh token redemption rejected");
+                return reject(StatusCode::UNAUTHORIZED, "invalid_grant");
+            }
+        };
+
+    let org = OrgId(record.org_id.clone());
+    let ttl = coord.config().session_ttl_secs;
+    let (token, expires) = match mint_session_for_user(
+        coord,
+        &org,
+        &record.user_id,
+        ttl,
+        "refresh token redemption",
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "failed to mint a session from a refresh token");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
+
+    // Nothing is deleted here. See the doc comment above.
+
+    Json(TokenResponse {
+        token,
+        node_id: None,
+        org: org.0,
+        // A session belongs to exactly one org, so there is nothing to list.
+        orgs: Vec::new(),
+        expires: u64::try_from(expires).ok(),
+        coordinator_token_pubkey: None,
+        login: None,
+        // Not echoed: the caller already holds it. Re-sending a durable
+        // credential would put it on the wire for nothing and invite a client
+        // to overwrite a good credential with a copy of itself.
+        refresh_token: None,
+    })
+    .into_response()
+}
+
+/// Mint a refresh token for an **already provisioned** user.
+///
+/// The [`mint_session_for_user`] sibling, and the same foreign-key discipline
+/// applies: the caller must have provisioned the org, user and member rows.
+///
+/// # Errors
+///
+/// Returns a database error if the insert fails.
+pub(crate) async fn mint_refresh_token(
+    coord: &Coordinator,
+    org: &OrgId,
+    user_id: &str,
+) -> crate::error::Result<(String, i64)> {
+    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+    let ttl = coord.config().refresh_token_ttl_secs;
+    let expires = now.saturating_add(i64::try_from(ttl).unwrap_or(i64::MAX));
+
+    let token = OpaqueToken::mint(TokenKind::Refresh);
+    coord
+        .db()
+        .insert_refresh_token(token.hash().as_str(), org, user_id, now, expires)
+        .await?;
+
+    let _ = coord
+        .db()
+        .scoped(org.clone())
+        .append_audit(&AuditEntry {
+            ts: now,
+            subject: Some(user_id),
+            action: "refresh_token.mint",
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some("login minted a refresh token"),
+        })
+        .await;
+
+    Ok((token.to_secret_string(), expires))
+}
+
+/// `POST /auth/logout` — revoke the caller's credentials.
+///
+/// Authenticated with `Authorization: Bearer <session token>`, the
+/// `/auth/keys` shape: this is an ordinary authenticated call about the
+/// caller's own identity, not a grant whose subject is a body credential.
+///
+/// Two modes, and the distinction is what makes a durable credential
+/// acceptable to issue at all:
+///
+/// * default — delete the session row the caller **authenticated with** (never
+///   one named in the request) and, if a `refresh_token` is supplied and its
+///   row belongs to this same user and org, that row too. A refresh token
+///   naming somebody else is ignored silently: never an oracle, never a
+///   cross-user delete.
+/// * `all` — delete every session and every refresh token of the calling user.
+///   This is the lost-machine answer, and the only one available: the
+///   coordinator never learns another machine's secrets, so "revoke that one"
+///   is not expressible.
+///
+/// Always `204`, whether or not any row was there — the same rule
+/// [`crate::api::logout`] follows, so a caller cannot distinguish "logged out"
+/// from "already gone".
+///
+/// `POST /api/v1/session/logout` stays exactly as it is: the browser never
+/// receives a refresh token (CLI-only, `docs/web-ui.md` D1), so it has none to
+/// revoke.
+async fn auth_logout(
+    State(coord): State<Arc<Coordinator>>,
+    headers: HeaderMap,
+    Json(request): Json<LogoutRequest>,
+) -> Response {
+    let (auth, _subject) = match authenticate_request(&coord, &headers, &[TokenKind::Session]).await
+    {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    let org = OrgId(auth.org_id.clone());
+    let now_i64 = i64::try_from(coord.now()).unwrap_or(i64::MAX);
+
+    let detail = if request.all {
+        let sessions = coord
+            .db()
+            .delete_sessions_for_user(&org, &auth.id)
+            .await
+            .unwrap_or(0);
+        let refreshes = coord
+            .db()
+            .delete_refresh_tokens_for_user(&org, &auth.id)
+            .await
+            .unwrap_or(0);
+        format!("logout --all: {sessions} sessions, {refreshes} refresh tokens")
+    } else {
+        let _ = coord.db().delete_session(auth.hash.as_str()).await;
+        let mut revoked_refresh = false;
+        if let Some(presented) = request.refresh_token.as_deref() {
+            // Parse first: an unparseable or wrong-kind value is simply not a
+            // refresh token of ours and is dropped without a lookup.
+            if let Ok(parsed) = OpaqueToken::parse(presented.trim()) {
+                if parsed.kind() == TokenKind::Refresh {
+                    let hash = parsed.hash();
+                    // Ownership check before the delete. Without it this route
+                    // would let a caller delete another user's refresh token,
+                    // and — through the audit detail — learn that it existed.
+                    if let Ok(Some((user, row_org, _expires))) =
+                        coord.db().refresh_token_by_token_hash(hash.as_str()).await
+                    {
+                        if user == auth.id && row_org == org {
+                            let _ = coord.db().delete_refresh_token(hash.as_str()).await;
+                            revoked_refresh = true;
+                        }
+                    }
+                }
+            }
+        }
+        if revoked_refresh {
+            "logout: session and refresh token".to_owned()
+        } else {
+            "logout: session".to_owned()
+        }
+    };
+
+    let _ = coord
+        .db()
+        .scoped(org)
+        .append_audit(&AuditEntry {
+            ts: now_i64,
+            subject: Some(auth.id.as_str()),
+            action: "session.logout",
+            node: None,
+            board: None,
+            lease: None,
+            detail: Some(&detail),
+        })
+        .await;
+
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// The longest TTL `POST /auth/keys` will mint (30 days).
@@ -2193,6 +2418,20 @@ async fn auth_device_poll(
             }
         };
 
+    // Mint the durable credential that ends the 12-hour cliff. A failure here
+    // must **not** fail the login: the session token that just came back is
+    // perfectly usable, and the client's fallback already handles a `None`
+    // (that is the same code path an older coordinator exercises). Losing a
+    // login over a bookkeeping row would be a strictly worse outcome than the
+    // status quo this feature is improving on.
+    let refresh_token = match mint_refresh_token(&coord, &org, &user_id).await {
+        Ok((token, _expires)) => Some(token),
+        Err(e) => {
+            warn!(error = %e, "minted a session but could not mint a refresh token");
+            None
+        }
+    };
+
     Json(TokenResponse {
         token,
         node_id: None,
@@ -2201,6 +2440,7 @@ async fn auth_device_poll(
         expires: u64::try_from(expires).ok(),
         coordinator_token_pubkey: None,
         login: Some(user.login),
+        refresh_token,
     })
     .into_response()
 }

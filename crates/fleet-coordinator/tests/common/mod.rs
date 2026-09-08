@@ -160,6 +160,28 @@ impl TestCoordinator {
         token.to_secret_string()
     }
 
+    /// Seed a refresh token for a user; returns the token's string form.
+    ///
+    /// Separate from [`TestCoordinator::seed_session`] because it is a
+    /// different credential with a different power: a session token *opens*
+    /// connections, a refresh token only *mints* sessions. Conflating the two
+    /// in a test would hide exactly the property the negative tests assert.
+    pub async fn seed_refresh_token(&self, org: &str, login: &str, expires: i64) -> String {
+        let org = OrgId(org.to_owned());
+        self.db().ensure_org(&org, "personal").await.unwrap();
+        self.db()
+            .ensure_user_member(&org, login, Role::Admin)
+            .await
+            .unwrap();
+        let token = OpaqueToken::mint(TokenKind::Refresh);
+        let now = i64::try_from(self.coord.now()).unwrap();
+        self.db()
+            .insert_refresh_token(token.hash().as_str(), &org, login, now, expires)
+            .await
+            .unwrap();
+        token.to_secret_string()
+    }
+
     /// Seed a session that has already expired.
     pub async fn seed_expired_session(&self, org: &str, login: &str) -> String {
         let org = OrgId(org.to_owned());

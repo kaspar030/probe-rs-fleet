@@ -203,6 +203,21 @@ pub struct CoordinatorConfig {
     pub pong_timeout_secs: u64,
     /// How long (seconds) a freshly minted user session token is valid.
     pub session_ttl_secs: u64,
+    /// How long (seconds) a freshly minted **refresh token** is valid.
+    ///
+    /// Default 30 days, deliberately the same figure as
+    /// [`crate::http::MAX_API_AUTH_KEY_TTL_SECS`], which is already this tree's
+    /// stated ceiling for "a durable bearer credential a member may hold". A
+    /// refresh token is strictly weaker than an auth key — it mints only
+    /// sessions, for one user, in one org, and enrolls nothing — so it does not
+    /// deserve a longer bound.
+    ///
+    /// There is deliberately **no cap** on this value, matching
+    /// `session_ttl_secs`: a second capped-vs-uncapped rule with no enforcement
+    /// story would be worse than neither. What bounds a leak in practice is
+    /// revocation (`probe-rs-fleet logout --all`), which is why that verb
+    /// exists.
+    pub refresh_token_ttl_secs: u64,
     /// How old (seconds) a node token may get before it is rotated.
     pub node_token_rotate_secs: u64,
     /// How long (seconds) an approval-pending node registration lives
@@ -276,6 +291,7 @@ impl CoordinatorConfig {
             ("ping_interval_secs", self.ping_interval_secs),
             ("pong_timeout_secs", self.pong_timeout_secs),
             ("session_ttl_secs", self.session_ttl_secs),
+            ("refresh_token_ttl_secs", self.refresh_token_ttl_secs),
             ("node_token_rotate_secs", self.node_token_rotate_secs),
             ("pending_node_ttl_secs", self.pending_node_ttl_secs),
         ] {
@@ -431,6 +447,7 @@ impl Default for CoordinatorConfig {
             ping_interval_secs: 20,
             pong_timeout_secs: 60,
             session_ttl_secs: 12 * 60 * 60,
+            refresh_token_ttl_secs: 30 * 24 * 3600,
             node_token_rotate_secs: fleet_auth::RotationPolicy::DEFAULT.max_age_secs,
             pending_node_ttl_secs: 15 * 60,
             max_pending_nodes: 256,
@@ -486,6 +503,7 @@ mod tests {
             |c| c.ping_interval_secs = 0,
             |c| c.pong_timeout_secs = 0,
             |c| c.session_ttl_secs = 0,
+            |c| c.refresh_token_ttl_secs = 0,
             |c| c.node_token_rotate_secs = 0,
             |c| c.pending_node_ttl_secs = 0,
             |c| c.max_pending_nodes = 0,

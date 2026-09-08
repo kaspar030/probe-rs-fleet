@@ -30,7 +30,7 @@ use hyper_util::rt::TokioExecutor;
 
 use crate::api::{
     AuthKeyCreated, AuthKeyList, AuthKeyRequest, AuthKeyRevoked, DevicePollRequest,
-    DeviceStartRequest, DeviceStartResponse, ErrorResponse, NodeApprovalDecision,
+    DeviceStartRequest, DeviceStartResponse, ErrorResponse, LogoutRequest, NodeApprovalDecision,
     NodeApprovalRequest, NodeApprovalResponse, NodeRegisterPollRequest, NodeRegisterStartRequest,
     NodeRegisterStartResponse, TokenRequest, TokenResponse,
 };
@@ -147,6 +147,34 @@ async fn post_json<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
     bearer: Option<&str>,
     request: &Q,
 ) -> Result<R, ClientError> {
+    let bytes = post_json_raw(uri, pin, bearer, request).await?;
+    serde_json::from_slice(&bytes).map_err(|e| ClientError::Malformed(e.to_string()))
+}
+
+/// [`post_json`] for a route that answers `204` with no body.
+///
+/// Separate rather than `post_json::<_, ()>`: `serde_json` cannot decode `()`
+/// from an empty body, and a route whose success is "nothing happened that you
+/// need to hear about" should not be made to invent a body to satisfy a helper.
+async fn post_json_discarding_body<Q: serde::Serialize>(
+    uri: &http::Uri,
+    pin: Option<[u8; 32]>,
+    bearer: Option<&str>,
+    request: &Q,
+) -> Result<(), ClientError> {
+    post_json_raw(uri, pin, bearer, request).await.map(|_| ())
+}
+
+/// POST `request` as JSON to `uri`, returning the raw success body.
+///
+/// The one place the trust config, timeout and error mapping live; the two
+/// wrappers above differ only in what they do with the bytes.
+async fn post_json_raw<Q: serde::Serialize>(
+    uri: &http::Uri,
+    pin: Option<[u8; 32]>,
+    bearer: Option<&str>,
+    request: &Q,
+) -> Result<Bytes, ClientError> {
     let body = serde_json::to_vec(request)
         .map_err(|e| ClientError::Malformed(format!("encoding request: {e}")))?;
 
@@ -192,7 +220,7 @@ async fn post_json<Q: serde::Serialize, R: serde::de::DeserializeOwned>(
         });
     }
 
-    serde_json::from_slice(&bytes).map_err(|e| ClientError::Malformed(e.to_string()))
+    Ok(bytes)
 }
 
 /// Redeem an auth key for a node token.
@@ -270,6 +298,11 @@ pub async fn exchange_workload_key(
 
 /// Exchange a still-valid session token for a fresh one.
 ///
+/// **Replacing**: the coordinator deletes the presented session on success, so
+/// two callers racing near expiry leave one holding a dead token, and a session
+/// that has already lapsed cannot be refreshed at all. [`redeem_refresh_token`]
+/// has neither property and is what a concurrent caller should reach for first.
+///
 /// # Errors
 ///
 /// See [`exchange`].
@@ -283,6 +316,69 @@ pub async fn refresh_session(
         pin,
         &TokenRequest::Refresh {
             session_token: session_token.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Redeem a long-lived refresh token (`prfr1_…`) for a fresh session token.
+///
+/// The counterpart of [`refresh_session`], and different in the two ways that
+/// matter: it works after the session has expired, and it is **non-rotating**
+/// — the refresh token stays usable, so concurrent redemptions all succeed.
+///
+/// A coordinator too old to know this grant answers a `4xx`
+/// [`ClientError::Rejected`] (the `grant_type` fails to deserialise). Callers
+/// must treat *any* failure here as "fall back to the session token", never as
+/// a fatal error — that is the whole new-client-against-old-coordinator
+/// compatibility story.
+///
+/// # Errors
+///
+/// See [`exchange`]. An unknown or expired refresh token is a
+/// `401 invalid_grant`.
+pub async fn redeem_refresh_token(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    refresh_token: &str,
+) -> Result<TokenResponse, ClientError> {
+    exchange(
+        base_url,
+        pin,
+        &TokenRequest::RefreshToken {
+            refresh_token: refresh_token.to_owned(),
+        },
+    )
+    .await
+}
+
+/// Revoke credentials at `POST /auth/logout`.
+///
+/// The session token authenticates as a **bearer header** (the `/auth/keys`
+/// shape), because this is an ordinary authenticated call about the caller's
+/// own identity rather than a grant whose subject is a body credential.
+///
+/// With `all = false` the presented session row and, if supplied, the caller's
+/// own refresh token are deleted. With `all = true` every session and refresh
+/// token of the calling user goes — the lost-machine answer.
+///
+/// # Errors
+///
+/// See [`exchange`]. The response carries no body, so nothing is decoded.
+pub async fn logout(
+    base_url: &str,
+    pin: Option<[u8; 32]>,
+    session_token: &str,
+    refresh_token: Option<&str>,
+    all: bool,
+) -> Result<(), ClientError> {
+    post_json_discarding_body(
+        &route_uri(base_url, "/auth/logout")?,
+        pin,
+        Some(session_token),
+        &LogoutRequest {
+            refresh_token: refresh_token.map(ToOwned::to_owned),
+            all,
         },
     )
     .await
@@ -654,6 +750,16 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "http://127.0.0.1:7000/auth/keys"
+        );
+    }
+
+    #[test]
+    fn logout_route_shares_the_base_normalisation() {
+        assert_eq!(
+            route_uri("fleet.example:7000/", "/auth/logout")
+                .unwrap()
+                .to_string(),
+            "https://fleet.example:7000/auth/logout"
         );
     }
 

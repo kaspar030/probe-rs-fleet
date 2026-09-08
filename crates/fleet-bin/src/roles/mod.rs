@@ -9,6 +9,8 @@
 //! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
 //!   coordinator client the tree has
 //! - [`login`] → the GitHub device flow, brokered by the coordinator
+//! - [`logout`] → revoke this machine's session and refresh token (`--all`:
+//!   every one the caller holds, the lost-machine answer)
 //! - [`share`] → self-register this machine as a node with the login it has
 //! - [`auth_key`] → mint/list/revoke this org's auth keys with that same login
 //! - [`grant`] → share a subset of this org's boards with another person
@@ -39,6 +41,7 @@ pub mod ctl;
 pub mod grant;
 pub mod init;
 pub mod login;
+pub mod logout;
 pub mod node_approve;
 pub mod node_board;
 pub mod node_run;

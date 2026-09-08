@@ -158,29 +158,33 @@ pub async fn run(
 /// The coordinator endpoint and credential this shim should present: `(url,
 /// token, pin)`.
 ///
-/// # Which table is consulted, and the one place a refresh happens
+/// # Which table is consulted, and the refresh that now happens on both
 ///
 /// `[user]` first: the shim runs a probe-rs invocation on the human's behalf,
 /// and a machine that is also a node must not silently present its *node*
 /// credential here. That is the whole reason those two tokens stay separate,
 /// and `[node]` is still never consulted.
 ///
-/// For `[user]` the old rule holds verbatim: **no refresh happens on this
-/// path.** The shim is a short-lived child process of a build or test run, and
-/// blocking it on an HTTP round trip — or worse, racing a concurrent `ctl` for
-/// the one refreshable token — is not worth the few minutes it would buy; an
-/// expired session surfaces as an auth error telling the user to run `login`.
+/// **The `[user]` branch refreshes.** It used to not, and the reasoning was
+/// that a refresh here would race a concurrent `ctl` for the one refreshable
+/// token — true of the *replacing* session refresh, which deletes the old
+/// session on success and would leave the loser of that race holding a dead
+/// token mid-build. That reasoning is now obsolete: renewal goes through the
+/// **non-rotating** refresh token
+/// ([`crate::fleet_config::ensure_fresh_session`]), so N concurrent shims all
+/// redeem successfully and every minted session stays independently valid.
+/// This is exactly the argument the `[agent]` branch below already makes for
+/// re-redeeming a multi-use auth key, and it now applies to both.
 ///
-/// **The `[agent]` branch deliberately reverses that rule**, and the reversal
-/// is stated here rather than left to be discovered. The reasoning that
-/// justifies not refreshing a `[user]` token is that the alternative costs
-/// minutes of freshness; for a persistent sandbox there is no human to re-run
-/// anything, so the alternative is a **hard failure** every hour instead. The
-/// two differences that make the round trip acceptable here are the ones from
-/// [`crate::fleet_config::ensure_fresh_agent_session`]: re-redeeming a
-/// multi-use auth key invalidates nothing, so there is no race to lose, and the
-/// pre-redemption re-read means concurrent shims in one sandbox share a peer's
-/// token instead of each minting their own.
+/// It matters because this was the reported failure: a workstation whose only
+/// fleet use is `laze` → shim → `probe-rs` expired every 12 hours no matter how
+/// heavily it was used, and surfaced as a bare `401 Unauthorized` through the
+/// build tool. The heaviest user of the fleet was the only one that could not
+/// keep its own credential alive.
+///
+/// Both branches skip the round trip entirely when `PROBE_RS_FLEET_TOKEN` is
+/// already set: an explicit env token wins at `set_env_if_absent` anyway, so
+/// renewing a credential we would then discard is pure churn.
 ///
 /// A refresh failure is a `warn!` and a fall back to the stored token, not an
 /// error: a token that is merely expired still produces a better failure than
@@ -189,16 +193,27 @@ async fn resolve_client_config(fleet: &str) -> Option<(String, String, Option<St
     let file = crate::fleet_config::load_named_opt(fleet)?;
     let pin = file.server_cert_sha256.clone();
 
+    // An explicit `PROBE_RS_FLEET_TOKEN` wins anyway (`set_env_if_absent`), so
+    // renewing for a token we would then discard is pure churn — and it would
+    // make every shim invocation on a machine with an exported token do a round
+    // trip for nothing.
+    let token_already_set = std::env::var_os("PROBE_RS_FLEET_TOKEN").is_some_and(|v| !v.is_empty());
+
     if let Some(user) = file.user.as_ref() {
-        return Some((file.url.clone(), user.session_token.clone(), pin));
+        if token_already_set {
+            return Some((file.url.clone(), user.session_token.clone(), pin));
+        }
+        let token = match crate::fleet_config::ensure_fresh_session(fleet, &file).await {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not refresh the session; using the stored token");
+                user.session_token.clone()
+            }
+        };
+        return Some((file.url.clone(), token, pin));
     }
 
     let agent = file.agent.as_ref()?;
-    // An explicit `PROBE_RS_FLEET_TOKEN` wins anyway (`set_env_if_absent`), so
-    // refreshing for a token we would then discard is pure churn — and it would
-    // make every shim invocation on a sandbox with an exported token do a round
-    // trip for nothing.
-    let token_already_set = std::env::var_os("PROBE_RS_FLEET_TOKEN").is_some_and(|v| !v.is_empty());
     if token_already_set {
         return Some((file.url.clone(), agent.workload_token.clone(), pin));
     }
@@ -211,6 +226,21 @@ async fn resolve_client_config(fleet: &str) -> Option<(String, String, Option<St
         }
     };
     Some((file.url.clone(), token, pin))
+}
+
+/// [`resolve_client_config`], exposed for the end-to-end test.
+///
+/// Exposed the way `fleet_coordinator::state::Db::pool_for_test` is: the
+/// reported failure — an expired `[user]` session on a workstation whose only
+/// fleet use is the shim — is *this function's* behaviour, and asserting it
+/// against a live coordinator is the only test that would actually have caught
+/// the bug. The alternative, driving [`run`] itself, needs a real `probe-rs`
+/// on `PATH` and a real board.
+#[doc(hidden)]
+pub async fn resolve_client_config_for_test(
+    fleet: &str,
+) -> Option<(String, String, Option<String>)> {
+    resolve_client_config(fleet).await
 }
 
 /// Inject a [`resolve_client_config`] result into the process environment, for

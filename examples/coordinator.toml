@@ -134,6 +134,29 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # credential, so its TTL is what bounds the value of a leak. Default: 43200 (12h).
 # session_ttl_secs = 43200
 
+# How long (seconds) a refresh token is valid.
+#
+# A refresh token (`prfr1_…`) is written into the client's fleet file by
+# `probe-rs-fleet login`, and its only power is minting session tokens for its
+# own user in its own org. It is accepted at POST /auth/token and on no other
+# route — not /agent, not /client, not /delegate, not /api/v1 — and is refused
+# as a connection credential from its prefix alone, before any database access.
+#
+# Redeeming it deliberately does NOT consume it. That is what lets N concurrent
+# `probe-rs` shim invocations each renew and each get an independently valid
+# session; a rotating token would leave the losers of that race holding a
+# deleted credential mid-build. The cost is that a leaked refresh token is
+# usable for its whole TTL — bounded by this value and by
+# `probe-rs-fleet logout --all`, which deletes every session and refresh token
+# of the calling user.
+#
+# Default: 2592000 (30 days). Same figure as MAX_API_AUTH_KEY_TTL_SECS, the
+# ceiling this coordinator already places on a durable bearer credential a
+# member may hold through the API; a refresh token is strictly weaker than an
+# auth key (it enrolls nothing), so it does not get a longer bound. Like
+# session_ttl_secs there is no enforced cap.
+# refresh_token_ttl_secs = 2592000
+
 # How old (seconds) a node token may get before the coordinator pushes a
 # replacement down the established connection. Default: 604800 (7 days).
 #

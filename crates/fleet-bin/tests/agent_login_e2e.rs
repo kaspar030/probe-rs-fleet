@@ -215,6 +215,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(session.clone()),
+        refresh_token: None,
         no_browser: true,
         fleet: "default".to_owned(),
         // The XDG path, deliberately: `ensure_fresh_agent_session` writes there

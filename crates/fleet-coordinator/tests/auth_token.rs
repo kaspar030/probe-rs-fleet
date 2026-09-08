@@ -535,3 +535,148 @@ async fn an_auth_key_node_later_shared_converges_on_the_share_defaults() {
         Some("alice")
     );
 }
+
+// ---------------------------------------------------------------------------
+// grant_type = refresh_token
+// ---------------------------------------------------------------------------
+
+fn refresh_token_body(token: &str) -> String {
+    serde_json::json!({ "grant_type": "refresh_token", "refresh_token": token }).to_string()
+}
+
+/// Redemption mints a session that actually works — asserted by opening
+/// `/client` with it, so the exchange cannot pass by returning a plausible
+/// string.
+#[tokio::test]
+async fn a_refresh_token_mints_a_working_session() {
+    let fleet = TestCoordinator::start().await;
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let refresh = fleet
+        .seed_refresh_token("acme", "alice", now + 86_400)
+        .await;
+    assert!(refresh.starts_with("prfr1_"));
+
+    let (status, body) = fleet
+        .http("POST", "/auth/token", Some(refresh_token_body(&refresh)))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    let resp: TokenResponse = serde_json::from_str(&body).unwrap();
+    assert!(resp.token.starts_with("prfs1_"), "expected a session token");
+    assert_eq!(resp.org, "acme");
+    assert!(resp.expires.is_some(), "the client renews on a deadline");
+    // The refresh token is not echoed: the caller already holds it, and putting
+    // a durable credential back on the wire buys nothing.
+    assert!(resp.refresh_token.is_none());
+
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(&resp.token)).await,
+        101
+    );
+}
+
+/// **The regression test for the whole design.** Redemption is deliberately
+/// non-rotating: the refresh token survives, and every session it has minted
+/// stays independently valid.
+///
+/// If someone "fixes" `http::redeem_refresh_token` by deleting the row the way
+/// `refresh_session` deletes a session, this fails — and so does the sidecar
+/// path this feature exists for, under any concurrency at all.
+#[tokio::test]
+async fn redeeming_a_refresh_token_leaves_it_usable() {
+    let fleet = TestCoordinator::start().await;
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let refresh = fleet
+        .seed_refresh_token("acme", "alice", now + 86_400)
+        .await;
+
+    let (status, body) = fleet
+        .http("POST", "/auth/token", Some(refresh_token_body(&refresh)))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+    let first: TokenResponse = serde_json::from_str(&body).unwrap();
+
+    let (status, body) = fleet
+        .http("POST", "/auth/token", Some(refresh_token_body(&refresh)))
+        .await;
+    assert_eq!(status, 200, "the refresh token must survive redemption");
+    let second: TokenResponse = serde_json::from_str(&body).unwrap();
+
+    assert_ne!(first.token, second.token, "each redemption mints a new one");
+    // Both sessions work. Contrast `grant_type = refresh`, where the second
+    // exchange would have killed the first token.
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(&first.token)).await,
+        101,
+        "the earlier session must not be invalidated by a later redemption"
+    );
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(&second.token)).await,
+        101
+    );
+}
+
+/// The concurrency case the design is for: two `probe-rs` shims in one build
+/// redeeming at the same instant. Both must win.
+#[tokio::test]
+async fn concurrent_redemptions_both_yield_working_sessions() {
+    let fleet = TestCoordinator::start().await;
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let refresh = fleet
+        .seed_refresh_token("acme", "alice", now + 86_400)
+        .await;
+
+    let (a, b) = tokio::join!(
+        fleet.http("POST", "/auth/token", Some(refresh_token_body(&refresh))),
+        fleet.http("POST", "/auth/token", Some(refresh_token_body(&refresh))),
+    );
+    assert_eq!(a.0, 200, "body: {}", a.1);
+    assert_eq!(b.0, 200, "body: {}", b.1);
+    let a: TokenResponse = serde_json::from_str(&a.1).unwrap();
+    let b: TokenResponse = serde_json::from_str(&b.1).unwrap();
+    assert_ne!(a.token, b.token);
+    assert_eq!(fleet.upgrade_status("/client", Some(&a.token)).await, 101);
+    assert_eq!(fleet.upgrade_status("/client", Some(&b.token)).await, 101);
+}
+
+/// Expiry and revocation are both `401 invalid_grant`, uniform with every other
+/// rejection on this route: the body never distinguishes them.
+#[tokio::test]
+async fn an_expired_or_unknown_refresh_token_is_refused() {
+    let fleet = TestCoordinator::start().await;
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+
+    let expired = fleet.seed_refresh_token("acme", "alice", now - 1).await;
+    let (status, expired_body) = fleet
+        .http("POST", "/auth/token", Some(refresh_token_body(&expired)))
+        .await;
+    assert_eq!(status, 401);
+
+    let unknown = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
+    let (status, unknown_body) = fleet
+        .http("POST", "/auth/token", Some(refresh_token_body(&unknown)))
+        .await;
+    assert_eq!(status, 401);
+    assert_eq!(
+        expired_body, unknown_body,
+        "no oracle: expired and unknown must be indistinguishable"
+    );
+}
+
+/// A token of another kind in the `refresh_token` field mints nothing. In
+/// particular a *session* token must not: the two fields sit next to each other
+/// in the fleet file, so a swap is a plausible mistake and must fail closed.
+#[tokio::test]
+async fn a_wrong_kind_token_in_the_refresh_field_mints_nothing() {
+    let fleet = TestCoordinator::start().await;
+    let session = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let (node, _) = fleet.seed_node("acme", "rpi-1").await;
+    let key = fleet.seed_auth_key("acme", &[], false, None).await;
+
+    for credential in [session, node, key] {
+        let (status, body) = fleet
+            .http("POST", "/auth/token", Some(refresh_token_body(&credential)))
+            .await;
+        assert_eq!(status, 401, "body: {body}");
+        assert!(!body.contains("prfs1_"), "nothing may be minted: {body}");
+    }
+}

@@ -11,7 +11,9 @@
 use async_trait::async_trait;
 use tracing::warn;
 
-use fleet_auth::store::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore, WorkloadRecord};
+use fleet_auth::store::{
+    AuthKeyRecord, NodeRecord, RefreshRecord, SessionRecord, TokenStore, WorkloadRecord,
+};
 use fleet_auth::TokenHash;
 use fleet_proto::ids::SubjectKey;
 
@@ -82,6 +84,21 @@ impl TokenStore for Db {
             expires: u64::try_from(expires).unwrap_or(0),
         }))
     }
+
+    async fn lookup_refresh_token(
+        &self,
+        hash: &TokenHash,
+    ) -> Result<Option<RefreshRecord>, String> {
+        let row = self
+            .refresh_token_by_token_hash(hash.as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row.map(|(user, org, expires)| RefreshRecord {
+            user_id: user,
+            org_id: org.0,
+            expires: u64::try_from(expires).unwrap_or(0),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +161,92 @@ mod tests {
         assert_eq!(record.tags, vec!["nrf52".to_owned()]);
         assert!(record.single_use);
         assert_eq!(record.expires, Some(9_000));
+    }
+
+    /// The refresh-token bridge, and the property the whole design rests on:
+    /// looking one up **does not consume it**, so the row is still there for
+    /// the next redemption. The sweep is what eventually reclaims it.
+    #[tokio::test]
+    async fn refresh_token_lookup_bridges_its_row_and_does_not_consume() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let org = OrgId(DEFAULT_ORG_ID.to_owned());
+        db.ensure_user_member(&org, "alice", Role::Admin)
+            .await
+            .unwrap();
+
+        let token = OpaqueToken::mint(TokenKind::Refresh);
+        db.insert_refresh_token(token.hash().as_str(), &org, "alice", 1_000, 5_000)
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let record = db
+                .lookup_refresh_token(&token.hash())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.user_id, "alice");
+            assert_eq!(record.org_id, org.0);
+            assert_eq!(record.expires, 5_000);
+        }
+
+        let other = OpaqueToken::mint(TokenKind::Refresh);
+        assert!(db
+            .lookup_refresh_token(&other.hash())
+            .await
+            .unwrap()
+            .is_none());
+
+        // The sweep reclaims it, and it then resolves to nothing.
+        assert_eq!(
+            db.delete_expired_refresh_tokens(5_000).await.unwrap(),
+            1,
+            "expiry is inclusive in the sweep"
+        );
+        assert!(db
+            .lookup_refresh_token(&token.hash())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// `logout --all` deletes both credential kinds for one user, and touches
+    /// nobody else's — the cross-user delete this feature must never enable.
+    #[tokio::test]
+    async fn deleting_a_users_credentials_is_scoped_to_that_user() {
+        let db = Db::connect_in_memory().await.unwrap();
+        let org = OrgId(DEFAULT_ORG_ID.to_owned());
+        for who in ["alice", "bob"] {
+            db.ensure_user_member(&org, who, Role::Admin).await.unwrap();
+            let session = OpaqueToken::mint(TokenKind::Session);
+            db.insert_session(session.hash().as_str(), &org, who, 1_000, 9_000)
+                .await
+                .unwrap();
+            let refresh = OpaqueToken::mint(TokenKind::Refresh);
+            db.insert_refresh_token(refresh.hash().as_str(), &org, who, 1_000, 9_000)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(db.delete_sessions_for_user(&org, "alice").await.unwrap(), 1);
+        assert_eq!(
+            db.delete_refresh_tokens_for_user(&org, "alice")
+                .await
+                .unwrap(),
+            1
+        );
+
+        let (sessions,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM session WHERE user_id = 'bob'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let (refreshes,): (i64,) =
+            sqlx::query_as("SELECT count(*) FROM refresh_token WHERE user_id = 'bob'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((sessions, refreshes), (1, 1), "bob's credentials survive");
     }
 
     /// A consumed single-use key must stop resolving, or `verify_auth_key`

@@ -97,10 +97,10 @@ pub struct Authenticated {
 /// `bearer` is the raw credential (the value *after* `Bearer `). `now` is epoch
 /// seconds.
 ///
-/// Auth keys and node-device secrets are deliberately **not** accepted here:
-/// both are redeemed at a route (`POST /auth/token`, `POST /node/register/*`)
-/// rather than presented on a connection, so treating either as a connection
-/// credential is [`AuthError::WrongKind`].
+/// Auth keys, node-device secrets and refresh tokens are deliberately **not**
+/// accepted here: all three are redeemed at a route (`POST /auth/token`,
+/// `POST /node/register/*`) rather than presented on a connection, so treating
+/// any of them as a connection credential is [`AuthError::WrongKind`].
 ///
 /// # Errors
 ///
@@ -178,6 +178,11 @@ pub async fn authenticate(
         TokenKind::NodeDevice => Err(AuthError::WrongKind {
             got: TokenKind::NodeDevice,
         }),
+        // No store lookup at all: the prefix decides. A refresh token is
+        // redeemed at `POST /auth/token` and is accepted on no other route.
+        TokenKind::Refresh => Err(AuthError::WrongKind {
+            got: TokenKind::Refresh,
+        }),
     }
 }
 
@@ -217,11 +222,50 @@ pub async fn verify_auth_key(
     Ok((hash, record))
 }
 
+/// Verify a refresh token presented to `POST /auth/token`.
+///
+/// Modelled on [`verify_auth_key`]: kind check, then existence, then expiry.
+/// **Unlike [`verify_auth_key`] there is no consume step to follow it**, and
+/// that absence is the design rather than an omission — redemption is
+/// non-rotating so that N concurrent redemptions (the sidecar case) all
+/// succeed and every minted session stays independently valid. See
+/// [`crate::token::TokenKind::Refresh`].
+///
+/// # Errors
+///
+/// Returns [`AuthError`] if the token is missing, malformed, of the wrong
+/// kind, unknown or expired. Every variant must map to the same generic
+/// rejection at the route.
+pub async fn verify_refresh_token(
+    store: &impl TokenStore,
+    token: &str,
+    now: u64,
+) -> Result<(TokenHash, crate::store::RefreshRecord), AuthError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(AuthError::Missing);
+    }
+    let parsed = OpaqueToken::parse(token).map_err(AuthError::Malformed)?;
+    if parsed.kind() != TokenKind::Refresh {
+        return Err(AuthError::WrongKind { got: parsed.kind() });
+    }
+    let hash = parsed.hash();
+    let record = store
+        .lookup_refresh_token(&hash)
+        .await
+        .map_err(AuthError::Store)?
+        .ok_or(AuthError::Unknown(TokenKind::Refresh))?;
+    if record.expires <= now {
+        return Err(AuthError::Expired(TokenKind::Refresh));
+    }
+    Ok((hash, record))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::fake::FakeStore;
-    use crate::store::{AuthKeyRecord, NodeRecord, SessionRecord};
+    use crate::store::{AuthKeyRecord, NodeRecord, RefreshRecord, SessionRecord};
 
     fn node_token() -> OpaqueToken {
         OpaqueToken::mint(TokenKind::Node)
@@ -368,6 +412,72 @@ mod tests {
             AuthError::WrongKind {
                 got: TokenKind::NodeDevice
             }
+        );
+    }
+
+    /// A refresh token is redeemed at `/auth/token` and **nowhere else**: it is
+    /// refused as a connection credential from its prefix alone, before any
+    /// store access — which is why the store below holds a matching row and
+    /// the answer is still `WrongKind` rather than a successful session.
+    #[tokio::test]
+    async fn a_refresh_token_is_not_a_connection_credential() {
+        let refresh = OpaqueToken::mint(TokenKind::Refresh);
+        let store = FakeStore::default().with_refresh_token(
+            &refresh.hash(),
+            RefreshRecord {
+                user_id: "alice".to_owned(),
+                org_id: "acme".to_owned(),
+                expires: 9_999,
+            },
+        );
+        assert_eq!(
+            authenticate(&store, &refresh.to_secret_string(), 0)
+                .await
+                .unwrap_err(),
+            AuthError::WrongKind {
+                got: TokenKind::Refresh
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_token_verification_checks_kind_and_expiry() {
+        let refresh = OpaqueToken::mint(TokenKind::Refresh);
+        let store = FakeStore::default().with_refresh_token(
+            &refresh.hash(),
+            RefreshRecord {
+                user_id: "alice".to_owned(),
+                org_id: "acme".to_owned(),
+                expires: 500,
+            },
+        );
+        let s = refresh.to_secret_string();
+        let (hash, record) = verify_refresh_token(&store, &s, 499).await.unwrap();
+        assert_eq!(hash, refresh.hash());
+        assert_eq!(record.user_id, "alice");
+        assert_eq!(record.org_id, "acme");
+        // Expiry is exclusive, as everywhere else.
+        assert_eq!(
+            verify_refresh_token(&store, &s, 500).await.unwrap_err(),
+            AuthError::Expired(TokenKind::Refresh)
+        );
+        // Redemption does not consume: verifying twice keeps working.
+        assert!(verify_refresh_token(&store, &s, 400).await.is_ok());
+        assert!(verify_refresh_token(&store, &s, 400).await.is_ok());
+        // A session token offered where a refresh token is expected — the
+        // mix-up a `refresh_token` config field invites.
+        let session = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        assert_eq!(
+            verify_refresh_token(&store, &session, 0).await.unwrap_err(),
+            AuthError::WrongKind {
+                got: TokenKind::Session
+            }
+        );
+        // An unknown (revoked, or swept) refresh token.
+        let other = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
+        assert_eq!(
+            verify_refresh_token(&store, &other, 0).await.unwrap_err(),
+            AuthError::Unknown(TokenKind::Refresh)
         );
     }
 

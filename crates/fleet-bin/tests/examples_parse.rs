@@ -32,6 +32,15 @@ fn fleet_example_parses_with_all_three_tables() {
     // where people learn which of the two goes here.
     assert_eq!(user.org, "gh-4242");
     assert_eq!(user.login.as_deref(), Some("kaspar"));
+    // The durable half of `[user]`. Shown populated because the example is
+    // where a reader learns the field exists at all — and because it must be
+    // parseable, not merely described in prose.
+    let refresh = user
+        .refresh_token
+        .as_deref()
+        .expect("[user].refresh_token in the reference file");
+    assert!(refresh.starts_with("prfr1_"), "{refresh}");
+    assert_ne!(refresh, user.session_token);
 
     let node = file.node.expect("[node] table");
     assert_eq!(node.node_id, "gh-4242/rpi-lab-1");
@@ -72,6 +81,35 @@ fn the_fleet_example_states_the_agent_tables_two_preconditions() {
     assert!(
         text.contains("deliberate, opt-in exception"),
         "...and must name `agent login` as its exception rather than contradicting it"
+    );
+}
+
+/// The example must state what the refresh token can and cannot do, and what
+/// revokes it.
+///
+/// Prose as a control, the same way the `audience` test below is: a reader who
+/// takes `refresh_token` for "a second session token" will not understand why
+/// it survives a `logout` on one machine, or why it is worth more to an
+/// attacker than the line above it.
+#[test]
+fn the_fleet_example_states_what_the_refresh_token_can_and_cannot_do() {
+    let text = std::fs::read_to_string(examples_dir().join("fleet.toml")).unwrap();
+    assert!(
+        text.contains("logout --all"),
+        "the example must name what revokes the refresh token"
+    );
+    assert!(
+        text.contains("opens no connection"),
+        "...and what it cannot do"
+    );
+    assert!(
+        text.contains("does NOT consume it"),
+        "...and that redemption is non-rotating, which is why concurrent \
+         invocations do not race"
+    );
+    assert!(
+        text.contains("OPTIONAL"),
+        "a file without the field must be documented as valid"
     );
 }
 
@@ -175,6 +213,49 @@ fn coordinator_example_loads_and_its_github_block_works_uncommented() {
     assert_eq!(gh.client_id, "Iv1.0123456789abcdef");
     assert_eq!(gh.device_code_url, "https://github.com/login/device/code");
     assert_eq!(gh.api_base, "https://api.github.com");
+}
+
+/// The commented `refresh_token_ttl_secs` line must uncomment into a value the
+/// loader accepts, and must match the code's default — an example that showed
+/// a different figure would be read as the default and quietly disagree.
+#[test]
+fn the_coordinator_example_documents_the_refresh_token_ttl() {
+    let path = examples_dir().join("coordinator.toml");
+    let text = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("signing_key_path") {
+                format!("signing_key_hex = \"{}\"", "ab".repeat(32))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        text.contains("# refresh_token_ttl_secs = 2592000"),
+        "the knob must be documented with its default"
+    );
+    assert!(
+        text.contains("logout --all"),
+        "...and the example must name what revokes a refresh token, since the \
+         TTL is only half the bound"
+    );
+
+    // Commented out, so the code's default applies — and the two must agree.
+    let cfg = fleet_bin::config::load_coordinator_config_from_str(&text).unwrap();
+    assert_eq!(cfg.refresh_token_ttl_secs, 30 * 24 * 3600);
+
+    // Uncommenting it yields a file that loads and validates.
+    let uncommented = text.replace(
+        "# refresh_token_ttl_secs = 2592000",
+        "refresh_token_ttl_secs = 604800",
+    );
+    let cfg = fleet_bin::config::load_coordinator_config_from_str(&uncommented).unwrap();
+    cfg.validate().unwrap();
+    assert_eq!(cfg.refresh_token_ttl_secs, 604_800);
 }
 
 /// The `[github_actions]` block must uncomment into TOML the **real** loader

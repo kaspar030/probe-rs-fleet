@@ -182,6 +182,9 @@ struct CoordinatorConfigToml {
     /// User session token lifetime, seconds.
     #[serde(default = "default_session_ttl_secs")]
     session_ttl_secs: u64,
+    /// Refresh token lifetime, seconds.
+    #[serde(default = "default_refresh_token_ttl_secs")]
+    refresh_token_ttl_secs: u64,
     /// Node-token rotation age, seconds.
     #[serde(default = "default_node_token_rotate_secs")]
     node_token_rotate_secs: u64,
@@ -216,6 +219,13 @@ fn default_pong_timeout_secs() -> u64 {
 
 fn default_session_ttl_secs() -> u64 {
     12 * 60 * 60
+}
+
+/// 30 days — the same bound `http::MAX_API_AUTH_KEY_TTL_SECS` already places on
+/// a durable bearer credential a member may hold. A refresh token is strictly
+/// weaker than an auth key, so it does not deserve a longer one.
+fn default_refresh_token_ttl_secs() -> u64 {
+    30 * 24 * 3600
 }
 
 fn default_node_token_rotate_secs() -> u64 {
@@ -277,6 +287,7 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         ping_interval_secs: raw.ping_interval_secs,
         pong_timeout_secs: raw.pong_timeout_secs,
         session_ttl_secs: raw.session_ttl_secs,
+        refresh_token_ttl_secs: raw.refresh_token_ttl_secs,
         node_token_rotate_secs: raw.node_token_rotate_secs,
         pending_node_ttl_secs: raw.pending_node_ttl_secs,
         max_pending_nodes: raw.max_pending_nodes,

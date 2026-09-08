@@ -109,6 +109,7 @@ async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str, ro
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token),
+        refresh_token: None,
         no_browser: true,
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),

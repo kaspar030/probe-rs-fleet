@@ -690,6 +690,25 @@ async fn a_cookie_is_refused_everywhere_outside_the_api() {
         )
         .await;
     assert_eq!(status, 401, "/auth/keys accepted a cookie: {body}");
+
+    // `/auth/logout` is the newest route on this surface and follows the same
+    // rule: `Authorization: Bearer` only, so a cookie — which a hostile page
+    // can cause the browser to attach — must not be able to revoke a
+    // developer's credentials from under them.
+    let (status, _, body) = fleet
+        .http_full(
+            "POST",
+            "/auth/logout",
+            &[("cookie", &cookie)],
+            Some(json!({ "all": true }).to_string()),
+        )
+        .await;
+    assert_eq!(status, 401, "/auth/logout accepted a cookie: {body}");
+    // ...and nothing was revoked on the way out.
+    let (status, _, _) = fleet
+        .http_full("GET", "/api/v1/session", &[("cookie", &cookie)], None)
+        .await;
+    assert_eq!(status, 200, "a refused logout must revoke nothing");
 }
 
 /// CSRF, on the one mutating route phase 1a ships. Absent header, wrong

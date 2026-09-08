@@ -8,6 +8,7 @@
 //! prffk1_<43 chars>     auth key       (node enrollment; org-scoped, revocable)
 //! prfnd1_<43 chars>     node device    (pending interactive approval; redeemed at a route)
 //! prfw1_<43 chars>      workload token (CI; one job, exchanged at /auth/token)
+//! prfr1_<43 chars>      refresh token  (user; long-lived, mints sessions only)
 //! ```
 //!
 //! The prefix is load-bearing, not decoration: it tells the coordinator which
@@ -34,6 +35,8 @@ const PREFIX_AUTH_KEY: &str = "prffk1_";
 const PREFIX_NODE_DEVICE: &str = "prfnd1_";
 /// Prefix for a CI workload token (architecture §6.7).
 const PREFIX_WORKLOAD: &str = "prfw1_";
+/// Prefix for a user's long-lived refresh token.
+const PREFIX_REFRESH: &str = "prfr1_";
 
 /// Number of random bytes in a token secret.
 const SECRET_LEN: usize = 32;
@@ -63,6 +66,24 @@ pub enum TokenKind {
     /// what the sidecar presents on `/client`. It belongs to no org — a
     /// workload reaches boards only through per-repo grants.
     Workload,
+    /// A user's long-lived credential whose **only** power is minting session
+    /// tokens (architecture §6.2).
+    ///
+    /// Three facts decide everything about this kind:
+    ///
+    /// * Like [`TokenKind::AuthKey`] and [`TokenKind::NodeDevice`] it is
+    ///   **redeemed at a route, never presented as a connection credential**,
+    ///   so [`crate::verify::authenticate`] answers
+    ///   [`crate::AuthError::WrongKind`] for it — from the prefix alone, with
+    ///   no store access. No route's `allowed` list contains it.
+    /// * Its only power is minting session tokens for one user in one org. It
+    ///   enrolls nothing, opens nothing, and confers no operation of its own.
+    /// * **Redemption does not consume it.** That is deliberate and it is what
+    ///   makes the sidecar path safe: N concurrent redemptions all succeed and
+    ///   every minted session is independently valid, exactly as for a
+    ///   `--multi-use` auth key. The cost — a leaked refresh token is usable
+    ///   for its whole TTL — is bounded by `logout --all` and expiry.
+    Refresh,
 }
 
 impl TokenKind {
@@ -75,6 +96,7 @@ impl TokenKind {
             TokenKind::AuthKey => PREFIX_AUTH_KEY,
             TokenKind::NodeDevice => PREFIX_NODE_DEVICE,
             TokenKind::Workload => PREFIX_WORKLOAD,
+            TokenKind::Refresh => PREFIX_REFRESH,
         }
     }
 
@@ -87,6 +109,7 @@ impl TokenKind {
             TokenKind::AuthKey => "auth_key",
             TokenKind::NodeDevice => "node_device",
             TokenKind::Workload => "workload",
+            TokenKind::Refresh => "refresh",
         }
     }
 }
@@ -197,6 +220,7 @@ impl OpaqueToken {
             TokenKind::Node,
             TokenKind::Session,
             TokenKind::Workload,
+            TokenKind::Refresh,
         ];
         let (kind, body) = kinds
             .into_iter()
@@ -261,6 +285,7 @@ mod tests {
             TokenKind::AuthKey,
             TokenKind::NodeDevice,
             TokenKind::Workload,
+            TokenKind::Refresh,
         ] {
             let token = OpaqueToken::mint(kind);
             let s = token.to_secret_string();
@@ -318,6 +343,32 @@ mod tests {
             OpaqueToken::parse(&workload).unwrap().kind(),
             TokenKind::Workload
         );
+        // `prfr1_` shares only `prf` with the rest. Mistaking a refresh token
+        // for a session token would turn a credential that may only be
+        // *redeemed* into one that opens `/client`, which is precisely what
+        // this kind must never be.
+        let refresh = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
+        assert_eq!(
+            OpaqueToken::parse(&refresh).unwrap().kind(),
+            TokenKind::Refresh
+        );
+        assert!(!refresh.starts_with(PREFIX_SESSION));
+        assert!(!refresh.starts_with(PREFIX_NODE));
+        for other in [
+            TokenKind::Node,
+            TokenKind::Session,
+            TokenKind::AuthKey,
+            TokenKind::NodeDevice,
+            TokenKind::Workload,
+        ] {
+            let s = OpaqueToken::mint(other).to_secret_string();
+            assert_ne!(
+                OpaqueToken::parse(&s).unwrap().kind(),
+                TokenKind::Refresh,
+                "{} parsed as a refresh token",
+                other.as_str()
+            );
+        }
     }
 
     #[test]

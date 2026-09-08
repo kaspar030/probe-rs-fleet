@@ -68,6 +68,7 @@ pub async fn run(args: LoginArgs) -> Result<()> {
         fleet_url,
         server_cert_sha256,
         token,
+        refresh_token,
         no_browser,
         fleet,
         config_dir,
@@ -104,7 +105,7 @@ pub async fn run(args: LoginArgs) -> Result<()> {
     let pin = pin_hex.as_deref().and_then(fleet_tls::parse_fingerprint);
 
     let session = match token {
-        Some(token) => record_external_token(&token)?,
+        Some(token) => record_external_token(&token, refresh_token.as_deref())?,
         None => device_flow(&url, pin, no_browser).await?,
     };
 
@@ -118,18 +119,29 @@ pub async fn run(args: LoginArgs) -> Result<()> {
     Ok(())
 }
 
-/// Validate and wrap an externally minted session token.
+/// Validate and wrap an externally minted session token, with the refresh token
+/// that goes with it if one was minted.
 ///
 /// Checked here, where the operator can see what they typed: a node token in
 /// `[user]` would authenticate against `/agent` and be refused with a 403 on
-/// `/client`, a confusing failure a long way from the mistake.
-fn record_external_token(token: &str) -> Result<UserSection> {
+/// `/client`, a confusing failure a long way from the mistake. The same applies
+/// to `--refresh-token`, which `coordinator user-token` prints beside the
+/// session token.
+fn record_external_token(token: &str, refresh_token: Option<&str>) -> Result<UserSection> {
     anyhow::ensure!(
         fleet_auth::OpaqueToken::parse(token)
             .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Session),
         "--token must be a session token (`prfs1_…`); mint one with \
          `probe-rs-fleet coordinator user-token <login>`"
     );
+    if let Some(refresh) = refresh_token {
+        anyhow::ensure!(
+            fleet_auth::OpaqueToken::parse(refresh)
+                .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Refresh),
+            "--refresh-token must be a refresh token (`prfr1_…`); \
+             `probe-rs-fleet coordinator user-token <login>` prints one"
+        );
+    }
     Ok(UserSection {
         session_token: token.to_owned(),
         // An externally minted token carries no org in-band. The coordinator
@@ -137,7 +149,12 @@ fn record_external_token(token: &str) -> Result<UserSection> {
         // only a display value; `ctl` never sends it.
         org: "(unknown)".to_owned(),
         login: None,
+        // No expiry either. With a refresh token present that means
+        // `ensure_fresh_session` redeems once on first use and then records the
+        // expiry it gets back; with none it means "use it and let the
+        // coordinator judge", exactly as before.
         expires: None,
+        refresh_token: refresh_token.map(str::to_owned),
     })
 }
 
@@ -189,6 +206,10 @@ async fn device_flow(url: &str, pin: Option<[u8; 32]>, no_browser: bool) -> Resu
                     org: response.org,
                     login: response.login,
                     expires: response.expires,
+                    // `None` from a coordinator too old to mint one. That must
+                    // work: the session still functions, and
+                    // `ensure_fresh_session` falls back to today's behaviour.
+                    refresh_token: response.refresh_token,
                 });
             }
             Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => {
@@ -303,6 +324,12 @@ fn print_summary(fleet: &str, path: &Path, file: &FleetFile) {
         // reasonably fear the enrollment was overwritten.
         println!("  this machine is also enrolled as a node in this fleet ([node] preserved)");
     }
+    if user.is_some_and(|u| u.refresh_token.is_some()) {
+        // Only when one was actually stored: a coordinator that minted none
+        // must not have this printed about it.
+        println!("  this session renews itself — no re-login when it expires");
+        println!("  (`probe-rs-fleet logout --all` revokes it everywhere)");
+    }
     println!();
     println!("Next steps:");
     println!("  probe-rs-fleet ctl --fleet {fleet} list");
@@ -318,6 +345,7 @@ mod tests {
             fleet_url: Some("https://fleet.example".to_owned()),
             server_cert_sha256: None,
             token: token.map(ToOwned::to_owned),
+            refresh_token: None,
             no_browser: true,
             fleet: "default".to_owned(),
             config_dir: Some(dir.to_path_buf()),
@@ -414,5 +442,58 @@ mod tests {
         a.server_cert_sha256 = Some("nope".to_owned());
         assert!(run(a).await.is_err());
         assert!(!tmp.path().join("default.toml").exists());
+    }
+
+    /// The air-gapped escape hatch stores both halves, so the session it writes
+    /// renews itself exactly like a device-flow one.
+    #[tokio::test]
+    async fn an_external_refresh_token_is_stored_beside_the_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let refresh = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
+        let mut a = args(tmp.path(), Some(&token));
+        a.refresh_token = Some(refresh.clone());
+        run(a).await.unwrap();
+
+        let file = fleet_config::load(&tmp.path().join("default.toml")).unwrap();
+        let user = file.user.unwrap();
+        assert_eq!(user.session_token, token);
+        assert_eq!(user.refresh_token.as_deref(), Some(refresh.as_str()));
+    }
+
+    /// A wrong-kind `--refresh-token` is caught where the operator can see what
+    /// they typed, not as a 401 a day later.
+    #[tokio::test]
+    async fn a_refresh_token_of_the_wrong_kind_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let mut a = args(tmp.path(), Some(&token));
+        a.refresh_token = Some(OpaqueToken::mint(TokenKind::Session).to_secret_string());
+        assert!(run(a).await.is_err());
+        assert!(!tmp.path().join("default.toml").exists());
+    }
+
+    /// A re-login replaces the stored refresh token wholesale — `login` writes
+    /// `f.user` in one go, so a stale durable credential cannot survive.
+    #[tokio::test]
+    async fn a_relogin_replaces_the_refresh_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
+        let mut a = args(
+            tmp.path(),
+            Some(&OpaqueToken::mint(TokenKind::Session).to_secret_string()),
+        );
+        a.refresh_token = Some(first.clone());
+        run(a).await.unwrap();
+
+        // A second login with no refresh token at all clears it rather than
+        // leaving the previous one behind.
+        let b = args(
+            tmp.path(),
+            Some(&OpaqueToken::mint(TokenKind::Session).to_secret_string()),
+        );
+        run(b).await.unwrap();
+        let file = fleet_config::load(&tmp.path().join("default.toml")).unwrap();
+        assert!(file.user.unwrap().refresh_token.is_none());
     }
 }

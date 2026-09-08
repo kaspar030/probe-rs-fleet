@@ -11,6 +11,7 @@
 //! [user]                # written by `probe-rs-fleet login`
 //! session_token = "prfs1_…"
 //! org = "gh-4242"
+//! refresh_token = "prfr1_…"   # renews the session without a browser
 //!
 //! [node]                # written by `probe-rs-fleet share` / `node up`
 //! node_token = "prfn1_…"
@@ -36,11 +37,25 @@
 //! anyone who walks past — equivalent to a compromised user account.
 //!
 //! `[agent]` is the third case: a persistent, multi-user sandbox that holds an
-//! *identity* rather than a human session. It is the only table that stores a
-//! **durable** credential — `[agent].auth_key` lets anyone who reads it mint
-//! fresh sessions as that identity until the key is revoked or expires, which
-//! is strictly stronger than either of the other two — and it is written only
-//! by a verb (`agent login`) whose documentation names that trust decision.
+//! *identity* rather than a human session. It is written only by a verb (`agent
+//! login`) whose documentation names that trust decision.
+//!
+//! # Two durable credentials, not one
+//!
+//! `[agent].auth_key` and `[user].refresh_token` are both **durable**: each
+//! lets whoever reads it keep minting fresh credentials until it is revoked or
+//! expires, which is strictly stronger than the short-lived tokens sitting
+//! beside them. They differ in what they mint and in how they are revoked:
+//!
+//! * `[agent].auth_key` mints *workload* tokens for a machine identity, and is
+//!   revoked with `auth-key revoke`;
+//! * `[user].refresh_token` mints *session* tokens for one human in one org —
+//!   it opens nothing itself and enrolls nothing — and is revoked with
+//!   `probe-rs-fleet logout --all`, or by waiting out its 30-day TTL.
+//!
+//! Both are optional: a file written before either feature existed parses
+//! unchanged, and every code path that reads them treats absence as "fall back
+//! to what we did before".
 //!
 //! # Writing: read-modify-write, then atomic rename
 //!
@@ -106,6 +121,20 @@ pub struct UserSection {
     /// When the session token expires (epoch seconds), if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
+    /// A long-lived refresh token (`prfr1_…`), if the coordinator issued one.
+    ///
+    /// **Optional on purpose**: every fleet file written before this existed
+    /// parses unchanged, and a coordinator too old to mint one simply leaves it
+    /// `None`. Where it is present,
+    /// [`ensure_fresh_session`] renews the session with it instead of failing
+    /// at the 12-hour cliff — which is what lets the `probe-rs` shim keep
+    /// working through a long build without a browser.
+    ///
+    /// It is **stronger than the `session_token` above it**: it mints, for 30
+    /// days. It can do nothing else — it opens no connection and enrolls
+    /// nothing — and `probe-rs-fleet logout --all` revokes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
 }
 
 /// The `[node]` table, written by `probe-rs-fleet share` / `node up` and refreshed by
@@ -183,9 +212,16 @@ const HEADER: &str = r"# probe-rs-fleet — per-fleet configuration
 #
 # THIS FILE HOLDS BEARER CREDENTIALS and is written 0600. [user].session_token
 # lets anyone act as you until it expires; [node].node_token lets anyone act as
-# this node until it rotates or the node row is deleted; [agent].auth_key is the
-# strongest of the three — it does not merely act, it MINTS: anyone who reads it
-# can keep minting sessions as that identity until the key is revoked or expires.
+# this node until it rotates or the node row is deleted.
+#
+# Two of the fields do not merely act, they MINT, which makes them the strongest
+# things in this file:
+#   [agent].auth_key      — mints workload sessions as that machine identity
+#                           until the key is revoked (`auth-key revoke`).
+#   [user].refresh_token  — mints session tokens as YOU until it is revoked
+#                           (`probe-rs-fleet logout --all`) or expires (30d).
+#                           It can do nothing else: it opens no connection and
+#                           enrolls nothing.
 #
 # The tokens are deliberately distinct: merging them would make a compromised
 # node equivalent to a compromised user account.
@@ -258,6 +294,13 @@ fn validate(file: &FleetFile) -> Result<()> {
             "[user].session_token must be a session token (`prfs1_…`)"
         );
         anyhow::ensure!(!user.org.trim().is_empty(), "[user].org must not be empty");
+        if let Some(refresh) = &user.refresh_token {
+            anyhow::ensure!(
+                fleet_auth::OpaqueToken::parse(refresh)
+                    .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Refresh),
+                "[user].refresh_token must be a refresh token (`prfr1_…`)"
+            );
+        }
     }
     if let Some(node) = &file.node {
         anyhow::ensure!(
@@ -394,37 +437,140 @@ impl FleetFile {
 /// Seconds before expiry at which a session token is proactively refreshed.
 const REFRESH_SKEW_SECS: u64 = 60;
 
-/// Return a usable session token for `fleet`, refreshing it if it is about to
-/// expire, and writing any fresh token back to the file.
+/// Return a usable session token for `fleet`, renewing it if it is about to
+/// expire (or has already expired), and writing any fresh token back to the
+/// file.
+///
+/// # Two renewal paths, and why the refresh token is preferred
+///
+/// * **Redeem the `[user].refresh_token`** (`grant_type = refresh_token`), when
+///   there is one. Non-rotating: the refresh token survives redemption, so N
+///   concurrent callers all succeed and every minted session is independently
+///   valid. It also works when the session has *already* lapsed, which is the
+///   entire point — it is what ends the 12-hour cliff and what makes it safe to
+///   put this function on the `probe-rs` shim's hot path.
+/// * **Refresh the session token** (`grant_type = refresh`), the legacy path
+///   and the fallback. The coordinator's refresh **replaces**: it deletes the
+///   old session on success, so two `ctl` invocations racing near expiry both
+///   refresh and the loser's token is already dead. And it requires a
+///   still-valid session, so it cannot help at all once the TTL has passed.
 ///
 /// # Why refresh on a deadline rather than on a 401
 ///
-/// The coordinator's refresh **replaces**: it deletes the old session on
-/// success. Two `ctl` invocations racing near expiry would both refresh, and the
-/// loser's token would already be dead — an auth failure a long way from the
-/// cause. Refreshing ahead of the deadline does not remove that race, so the
-/// failure path below re-reads the file once and retries with whatever the other
-/// process wrote. One retry, no loop: if the token in the file is still refused
-/// after that, the credential is genuinely bad and the user should re-`login`.
+/// Refreshing ahead of the deadline does not remove the replacing path's race,
+/// so its failure branch re-reads the file once and retries with whatever the
+/// other process wrote. One retry, no loop: if the token in the file is still
+/// refused after that, the credential is genuinely bad and the user should
+/// re-`login`.
+///
+/// # Compatibility
+///
+/// **Any** failure of the redemption — a rejection, a transport error, or the
+/// `422` an older coordinator answers a `grant_type` it has never heard of —
+/// falls through to the legacy path and then to today's error text. That is the
+/// new-client-against-old-coordinator requirement, and it is the only correct
+/// handling of an unknown-variant rejection.
 ///
 /// # Errors
 ///
-/// Returns an error if the fleet file has no `[user]` table, or a refresh both
-/// fails and leaves no usable token.
+/// Returns an error if the fleet file has no `[user]` table, or renewal both
+/// fails and leaves no usable token. The error always names
+/// `probe-rs-fleet login`, never a bare 401.
 pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<String> {
     let user = file
         .user
         .as_ref()
         .context("this fleet has no [user] credential; run `probe-rs-fleet login`")?;
 
-    let Some(expires) = user.expires else {
-        // No recorded expiry (an externally minted token): nothing to decide on,
-        // use it and let the coordinator judge.
-        return Ok(user.session_token.clone());
-    };
     let now = now_epoch_secs();
-    if expires > now.saturating_add(REFRESH_SKEW_SECS) {
-        return Ok(user.session_token.clone());
+    let refresh_token = user
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+
+    match user.expires {
+        Some(expires) if expires > now.saturating_add(REFRESH_SKEW_SECS) => {
+            return Ok(user.session_token.clone());
+        }
+        Some(_) => {}
+        None => {
+            if refresh_token.is_none() {
+                // No recorded expiry and nothing to renew with (an externally
+                // minted token): nothing to decide on, use it and let the
+                // coordinator judge.
+                return Ok(user.session_token.clone());
+            }
+            // `expires: None` *with* a refresh token is the
+            // `login --token … --refresh-token …` shape. Redeem once; the
+            // response's `expires` is then persisted, so this self-limits to a
+            // single redemption rather than becoming per-invocation churn.
+        }
+    }
+
+    if let Some(refresh_token) = refresh_token {
+        // Herd damping, exactly as `ensure_fresh_agent_session` does it: our
+        // `FleetFile` is a snapshot, and a peer process on this machine may
+        // have renewed since it was loaded. One `stat` + parse saves a
+        // redundant round trip and a redundant session row.
+        if let Some(peer) = reread_user(fleet) {
+            if peer
+                .expires
+                .is_some_and(|e| e > now.saturating_add(REFRESH_SKEW_SECS))
+            {
+                return Ok(peer.session_token);
+            }
+        }
+
+        match fleet_auth::http_client::redeem_refresh_token(&file.url, file.pin(), refresh_token)
+            .await
+        {
+            Ok(response) => {
+                let token = response.token.clone();
+                if response.expires.is_none() {
+                    // Without an expiry we cannot tell when to renew next, so
+                    // every invocation would redeem. Use the token, say so
+                    // once, and do not loop.
+                    tracing::warn!(
+                        "the coordinator returned a session with no expiry; it cannot be \
+                         renewed on a deadline"
+                    );
+                }
+                // Best-effort persist: a token we cannot write down still works
+                // for this invocation, and failing the command over it would be
+                // worse than the next run redeeming again.
+                if let Err(e) = update_named(fleet, |f| {
+                    if let Some(u) = f.user.as_mut() {
+                        u.session_token.clone_from(&response.token);
+                        u.expires = response.expires;
+                        u.org.clone_from(&response.org);
+                    }
+                }) {
+                    tracing::warn!(error = %e, "redeemed the refresh token but could not save the session");
+                }
+                return Ok(token);
+            }
+            Err(e) => {
+                // Includes the unknown-variant rejection from a coordinator
+                // that predates this grant. Fall through; never fatal here.
+                tracing::debug!(error = %e, "refresh token redemption failed; falling back");
+            }
+        }
+    } else if user.expires.is_some_and(|expires| expires <= now) {
+        // Expired, with nothing to renew it with. The legacy refresh below
+        // requires the presented session to authenticate as a **live** session,
+        // so the coordinator would definitionally refuse it — and the request
+        // has a 30-second client timeout. On the shim's hot path that turns a
+        // clear "run login" into a multi-minute build stall against a slow or
+        // unreachable coordinator. Skip the doomed round trip.
+        //
+        // The in-skew case still takes it (the session is valid, the refresh
+        // can succeed), and so does the post-redemption fallback above (a
+        // redemption failure does not prove the session is dead).
+        return Err(anyhow::anyhow!(
+            "the session token for fleet `{fleet}` has expired; run \
+             `probe-rs-fleet login --fleet {fleet}`"
+        ));
     }
 
     match fleet_auth::http_client::refresh_session(&file.url, file.pin(), &user.session_token).await
@@ -448,11 +594,9 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
         Err(e) => {
             // Lost the refresh race, most likely: another process refreshed and
             // our token is already deleted. Re-read once and use what it wrote.
-            if let Some(reread) = load_named_opt(fleet) {
-                if let Some(u) = reread.user {
-                    if u.session_token != user.session_token {
-                        return Ok(u.session_token);
-                    }
+            if let Some(u) = reread_user(fleet) {
+                if u.session_token != user.session_token {
+                    return Ok(u.session_token);
                 }
             }
             Err(anyhow::anyhow!(
@@ -567,6 +711,15 @@ fn reread_agent(fleet: &str) -> Option<AgentSection> {
     load_named_opt(fleet).and_then(|f| f.agent)
 }
 
+/// Re-read the named fleet's `[user]` table from disk, if there is one.
+///
+/// The `[user]` sibling of [`reread_agent`], with the same XDG caveat: it
+/// resolves the XDG path and therefore ignores any `--config-dir` override, so
+/// a test exercising it must repoint `XDG_CONFIG_HOME`.
+fn reread_user(fleet: &str) -> Option<UserSection> {
+    load_named_opt(fleet).and_then(|f| f.user)
+}
+
 /// Current time in epoch seconds.
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -603,12 +756,20 @@ mod tests {
         OpaqueToken::mint(TokenKind::Workload).to_secret_string()
     }
 
+    fn refresh_token() -> String {
+        OpaqueToken::mint(TokenKind::Refresh).to_secret_string()
+    }
+
+    /// Today's shape: a `[user]` table with **no** `refresh_token`. Every file
+    /// written before this feature existed looks like this, so it is the
+    /// default the other tests build on.
     fn user_section() -> UserSection {
         UserSection {
             session_token: session_token(),
             org: "gh-4242".to_owned(),
             login: Some("kaspar".to_owned()),
             expires: Some(9_999_999_999),
+            refresh_token: None,
         }
     }
 
@@ -783,6 +944,7 @@ mod tests {
                 org: "gh-1".to_owned(),
                 login: None,
                 expires: None,
+                refresh_token: None,
             }),
             ..FleetFile::default()
         };
@@ -852,6 +1014,320 @@ mod tests {
         update(&path, |f| f.url = "https://fleet.example".to_owned()).unwrap();
         let loaded = load(&path).unwrap();
         assert!(loaded.user.is_none() && loaded.node.is_none() && loaded.agent.is_none());
+    }
+
+    // --- ensure_fresh_session ---------------------------------------------
+
+    /// Today's shape must keep working: a `[user]` table with no
+    /// `refresh_token` parses, and a session far from expiry is returned with
+    /// no network access at all (the closed port is the assertion).
+    #[tokio::test]
+    async fn a_user_table_without_a_refresh_token_loads_and_skips_the_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("default.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "url = \"http://127.0.0.1:1\"\n\n[user]\nsession_token = \"{}\"\n\
+                 org = \"gh-4242\"\nexpires = 9999999999\n",
+                session_token()
+            ),
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        let user = loaded.user.clone().unwrap();
+        assert!(user.refresh_token.is_none());
+        assert_eq!(
+            ensure_fresh_session("default", &loaded).await.unwrap(),
+            user.session_token
+        );
+    }
+
+    /// A wrong-kind `refresh_token` is caught where the operator can see it.
+    /// A session token there would be sent as `grant_type=refresh_token` and
+    /// refused, leaving the renewal silently broken.
+    #[test]
+    fn a_refresh_token_of_the_wrong_kind_is_rejected() {
+        let mut file = FleetFile {
+            url: "https://fleet.example".to_owned(),
+            user: Some(UserSection {
+                refresh_token: Some(session_token()),
+                ..user_section()
+            }),
+            ..FleetFile::default()
+        };
+        assert!(validate(&file).is_err());
+
+        file.user = Some(UserSection {
+            refresh_token: Some(auth_key()),
+            ..user_section()
+        });
+        assert!(validate(&file).is_err());
+
+        file.user = Some(UserSection {
+            refresh_token: Some(refresh_token()),
+            ..user_section()
+        });
+        assert!(validate(&file).is_ok());
+    }
+
+    /// The old behaviour, preserved exactly: an expired session with nothing to
+    /// renew it with errors, and the error names `login` rather than surfacing
+    /// a bare 401.
+    ///
+    /// It must also be **prompt**. The legacy `refresh_session` requires a
+    /// live session, so the coordinator would definitionally refuse this one —
+    /// and the client's timeout is 30s. On the shim's hot path that would turn
+    /// a clear error into a multi-minute build stall, so the round trip is
+    /// skipped. The closed port makes a regression hang-or-fail visibly.
+    #[tokio::test]
+    async fn an_expired_session_with_no_refresh_token_names_login_promptly() {
+        let now = now_epoch_secs();
+        let file = FleetFile {
+            url: "http://127.0.0.1:1".to_owned(),
+            user: Some(UserSection {
+                expires: Some(now.saturating_sub(60)),
+                ..user_section()
+            }),
+            ..FleetFile::default()
+        };
+        let started = std::time::Instant::now();
+        let err = ensure_fresh_session("default", &file)
+            .await
+            .expect_err("an expired session with nothing to renew it");
+        let text = format!("{err:#}");
+        assert!(text.contains("probe-rs-fleet login"), "got: {text}");
+        assert!(text.contains("default"), "got: {text}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the doomed refresh round trip must be skipped, not merely fail"
+        );
+    }
+
+    /// The reported bug's fix, in miniature: an expired session **with** a
+    /// refresh token redeems, and the result is persisted.
+    #[tokio::test]
+    async fn an_expired_session_falls_back_to_the_refresh_token_and_persists() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let now = now_epoch_secs();
+        let minted = session_token();
+        let refresh = refresh_token();
+        let server = StubCoordinator::start(minted.clone(), now + 3_600).await;
+
+        let file = FleetFile {
+            url: server.base_url.clone(),
+            user: Some(UserSection {
+                expires: Some(now.saturating_sub(60)),
+                refresh_token: Some(refresh.clone()),
+                ..user_section()
+            }),
+            ..FleetFile::default()
+        };
+        let path = paths::fleet_config_path("default").unwrap();
+        save_atomic(&path, &file).unwrap();
+
+        let got = ensure_fresh_session("default", &file).await.unwrap();
+        assert_eq!(got, minted, "the redeemed session must be returned");
+
+        let persisted = load(&path).unwrap().user.unwrap();
+        assert_eq!(persisted.session_token, minted);
+        assert_eq!(persisted.expires, Some(now + 3_600));
+        assert_eq!(
+            persisted.refresh_token.as_deref(),
+            Some(refresh.as_str()),
+            "redemption is non-rotating: the refresh token must survive"
+        );
+
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// **The compatibility requirement**: a new client against a coordinator
+    /// that has never heard of `grant_type=refresh_token` must degrade to
+    /// today's behaviour rather than erroring out.
+    ///
+    /// The stub answers the unknown grant with the `422` axum produces for a
+    /// body it cannot deserialise, and the legacy `refresh` grant with a fresh
+    /// session — exactly what an old coordinator does. The client must fall
+    /// through and come back with the legacy token.
+    #[tokio::test]
+    async fn an_old_coordinator_rejecting_the_new_grant_falls_back_to_refresh() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let now = now_epoch_secs();
+        let legacy = session_token();
+        let server = StubCoordinator::start_legacy_only(legacy.clone(), now + 3_600).await;
+
+        let file = FleetFile {
+            url: server.base_url.clone(),
+            user: Some(UserSection {
+                // Inside the skew window, not past expiry: the legacy refresh
+                // needs a live session, and an old coordinator is exactly the
+                // case where it is still the only thing that works.
+                expires: Some(now + 10),
+                refresh_token: Some(refresh_token()),
+                ..user_section()
+            }),
+            ..FleetFile::default()
+        };
+        let path = paths::fleet_config_path("default").unwrap();
+        save_atomic(&path, &file).unwrap();
+
+        let got = ensure_fresh_session("default", &file).await.unwrap();
+        assert_eq!(
+            got, legacy,
+            "an unknown-variant rejection must fall through to the legacy grant"
+        );
+
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// The herd damper: a peer process already renewed, so we take its session
+    /// and redeem nothing. `url` points at a closed port, so a regression that
+    /// redeems anyway fails fast rather than passing quietly.
+    #[tokio::test]
+    async fn a_peers_fresher_session_is_used_instead_of_redeeming() {
+        let _guard = crate::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+
+        let now = now_epoch_secs();
+        let peer_token = session_token();
+        let refresh = refresh_token();
+        let on_disk = FleetFile {
+            url: "http://127.0.0.1:1".to_owned(),
+            user: Some(UserSection {
+                session_token: peer_token.clone(),
+                expires: Some(now + 3_600),
+                refresh_token: Some(refresh.clone()),
+                ..user_section()
+            }),
+            ..FleetFile::default()
+        };
+        let path = paths::fleet_config_path("default").unwrap();
+        save_atomic(&path, &on_disk).unwrap();
+
+        // Our snapshot is stale: a different token, expired a minute ago.
+        let stale = FleetFile {
+            user: Some(UserSection {
+                session_token: session_token(),
+                expires: Some(now.saturating_sub(60)),
+                refresh_token: Some(refresh),
+                ..on_disk.user.clone().unwrap()
+            }),
+            ..on_disk.clone()
+        };
+
+        let got = ensure_fresh_session("default", &stale).await.unwrap();
+        assert_eq!(got, peer_token, "the peer's fresher session must be reused");
+
+        // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    /// A minimal `/auth/token` stub.
+    ///
+    /// Hand-rolled rather than borrowing `fleet-coordinator`'s router: what is
+    /// under test here is the *client's* branching on a coordinator's answer,
+    /// including an answer no real coordinator in this tree still gives (an
+    /// unknown `grant_type`). A stub is the only way to express that.
+    struct StubCoordinator {
+        base_url: String,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for StubCoordinator {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl StubCoordinator {
+        /// A modern coordinator: honours `grant_type = refresh_token`.
+        async fn start(token: String, expires: u64) -> Self {
+            Self::serve(token, expires, true).await
+        }
+
+        /// An old coordinator: `422`s the unknown grant, honours `refresh`.
+        async fn start_legacy_only(token: String, expires: u64) -> Self {
+            Self::serve(token, expires, false).await
+        }
+
+        async fn serve(token: String, expires: u64, knows_refresh_token: bool) -> Self {
+            use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            // An async task, aborted on drop. A blocking accept loop would
+            // keep the test's runtime from shutting down, because dropping a
+            // `Runtime` waits for blocking tasks to finish and this one never
+            // does.
+            let server = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let mut buf = vec![0u8; 8192];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    // The legacy grant is `"grant_type":"refresh"`; only the
+                    // new one carries the `refresh_token` field name.
+                    let is_refresh_token_grant = request.contains("refresh_token");
+                    let response = if is_refresh_token_grant && !knows_refresh_token {
+                        // What axum answers a body whose enum tag it cannot
+                        // match: the unknown-variant case, verbatim.
+                        let body = "{\"error\":\"unknown\"}";
+                        format!(
+                            "HTTP/1.1 422 Unprocessable Entity\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    } else {
+                        let body = format!(
+                            "{{\"token\":\"{token}\",\"org\":\"gh-4242\",\"expires\":{expires}}}"
+                        );
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                }
+            });
+
+            Self {
+                base_url: format!("http://{addr}"),
+                server,
+            }
+        }
     }
 
     // --- ensure_fresh_agent_session ---------------------------------------

@@ -134,7 +134,8 @@ Routes:
 | `GET /client` (WS upgrade) | ctl + sidecar | leases, relay channels, admin surface |
 | `GET /delegate` (WS upgrade) | a sandboxed agent | **relay only**, authorised by a capability token; no principal (§6.5) |
 | `POST /auth/device/*` | `login` | GitHub device-flow start/poll (§6.4) |
-| `POST /auth/token` | CI, nodes | token exchange (workload OIDC, auth keys) |
+| `POST /auth/token` | CI, nodes, `login`ed users | token exchange (workload OIDC, auth keys, session refresh, **refresh-token redemption**) |
+| `POST /auth/logout` | org members | revoke this session (`--all`: every session and refresh token of the caller) |
 | `POST /auth/keys` | org members | mint / list / revoke the org's auth keys (§6.4) |
 | `POST /node/register/start` | headless nodes | begin an approval-pending registration (§4.2 rung 3) |
 | `POST /node/register/poll` | headless nodes | redeem an approved registration for a node token |
@@ -158,7 +159,7 @@ here rather than only in that document:
   credential. Every other route in this table requires an explicit
   `Authorization: Bearer`, including `/agent`, `/client` and `/delegate` (a
   browser must never drive a control-plane WebSocket by ambient authority) and
-  the CLI's `/auth/token` and `/auth/keys`.
+  the CLI's `/auth/token`, `/auth/keys` and `/auth/logout`.
 * Mutating `/api/v1` calls whose credential arrived in a cookie must also carry
   an `X-Fleet-Csrf` header, and the coordinator emits **no CORS headers
   anywhere**, which is what makes that header a second independent control.
@@ -293,6 +294,10 @@ session_token = "…"    # short-TTL bearer, refreshable
 org = "gh-4242"        # the org **id**, not the login (see below)
 login = "kaspar"       # cached for display only
 expires = 1788600000
+refresh_token = "…"    # optional: the DURABLE credential that renews the
+                       # session above without a browser (§6.4). Absent in
+                       # every file written before it existed, and absent
+                       # against a coordinator too old to mint one.
 
 [node]                 # present once `share` / `node up` has run
 node_token = "…"       # long-lived machine bearer, auto-rotating
@@ -820,6 +825,23 @@ longer the only mechanism: `sidecar --board` / `--id` / `--select` override them
 **A sandboxed agent is never given these credentials.** It receives a
 lease-bound capability token instead (`ctl delegate`, §6.5).
 
+**Both renew their own session.** `ctl` always did; the shim did not, which is
+why a workstation whose only fleet use was `laze` → shim → `probe-rs` hit a
+12-hour cliff regardless of how heavily it was used. It now renews through the
+same `ensure_fresh_session`, using the `[user].refresh_token` written by
+`login`. That is safe on a per-invocation hot path only because redemption is
+non-rotating — see §6.4's "A self-renewing user session", which also states
+what that costs. Two consequences worth naming here:
+
+* an explicit `PROBE_RS_FLEET_TOKEN` short-circuits the whole thing, since it
+  wins by precedence anyway and renewing a credential we would discard is pure
+  churn; and
+* a renewal failure is a warning and a fall back to the stored token, never an
+  error — a merely-expired token produces a better failure than a shim that
+  refuses to start. A session already past `expires` with **no** refresh token
+  skips the round trip entirely rather than spending a 30s timeout on a refresh
+  the coordinator would definitionally refuse.
+
 
 ### 4.4 Shell completion (dynamic)
 
@@ -961,12 +983,15 @@ upgrade (§3.5):
 | Kind | Token | Lifetime | Revocation |
 |---|---|---|---|
 | User | session token, minted after GitHub login | short, refreshable | delete session |
+| **Refresh** (user, CLI only) | fleet-issued `prfr1_`, minted by `login` beside the session | `refresh_token_ttl_secs`, default 30d | `probe-rs-fleet logout --all`, or expiry |
 | Node | node token, minted at registration | long, auto-rotating | delete node row |
 | Workload (CI) | exchanged from a GH Actions OIDC JWT, or from a `ci` auth key (§6.7) | one job: `workload_token_ttl_secs`, default 1h, capped at 12h, **no refresh path** | expiry, or revoking the per-repo grant (which tears down live leases) |
 
 The cost, stated honestly: bearer tokens are pure bearer credentials, so a leak
 is immediately usable. Short user sessions, rotating node tokens, and per-job CI
-tokens bound the window.
+tokens bound the window. The refresh token is the deliberate exception to that
+bounding, and §6.4's "A self-renewing user session" states what it buys and
+what it costs.
 
 **One extra carrier for the user token (`docs/web-ui.md` D1).** A browser
 cannot hold an `Authorization` header the way `ctl` does, so a user session
@@ -1198,6 +1223,79 @@ systems**, and v1 needs both verifiers:
 ref X". Mapping that to a fleet org requires an explicit **per-repo** grant.
 `repository_owner` alone is deliberately *not* sufficient — a fork or a new repo
 under the same owner must not inherit hardware access.
+
+#### A self-renewing user session (`login` + refresh tokens)
+
+A user session lives `session_ttl_secs` (default 12h) and `ensure_fresh_session`
+slides that window forward — but only on the surfaces that call it: `ctl`,
+`share`, `node up`, `node approve`, `auth-key`. The `probe-rs` sidecar shim did
+not, so **a workstation whose only fleet use is `laze` → shim → `probe-rs`
+expired every 12 hours no matter how heavily it was used**, surfacing through
+the build tool as a bare `401 Unauthorized`. The heaviest user of the fleet was
+the only one that could not keep its own credential alive, and there was no path
+between "valid session" and "open a browser": nothing durable survived a login,
+so re-establishing identity meant another device-flow round trip.
+
+The fix is a fleet-issued **refresh token** (`prfr1_`), minted beside the session
+by `login` and stored in `[user].refresh_token`.
+
+**What it can do:** mint session tokens for one user, in one org, at
+`POST /auth/token` with `grant_type = refresh_token`.
+
+**What it cannot do:** open `/agent`, `/client` or `/delegate`; reach
+`/api/v1`; mint an auth key; approve an enrollment; enroll anything; outlive
+`refresh_token_ttl_secs`. It is refused **from its prefix alone, before any
+database access** — `fleet_auth::verify::authenticate` answers `WrongKind` for
+it the way it already does for auth keys and node-device secrets — and no
+route's `allowed: &[TokenKind]` list contains it.
+
+**Why fleet-issued rather than GitHub's access token.** Storing the GitHub
+access token was considered and rejected. With the default empty `scope` its
+blast radius is small, but it can only be revoked **at GitHub**, not by the
+fleet; it would make the fleet a custodian of somebody else's credentials for no
+gain; and it would not work at all for a future non-GitHub identity provider. A
+fleet-issued token is revocable by `DELETE`, auditable, org-scoped, and
+identical in shape whatever the login path.
+
+**Why redemption does not rotate — the load-bearing choice.** OAuth would rotate
+a refresh token on every use and detect reuse. This one does not. The reason is
+concurrency: the session refresh at `grant_type = refresh` *replaces* — it
+deletes the presented session immediately — which is precisely why the sidecar
+path was never allowed to refresh, since two concurrent `probe-rs` invocations
+would race and one would hold a deleted token mid-build. A non-rotating refresh
+token has the same safety property as a `--multi-use` auth key: N concurrent
+redemptions all succeed and every minted session is independently valid. That
+property is what makes fixing the sidecar possible at all.
+
+**The cost, stated plainly:** a leaked refresh token is usable for its whole
+TTL. There is no reuse detection to notice the leak, because there is no
+rotation to detect reuse against. This is the same trade a `--multi-use` auth
+key already makes, and it is bounded by two things and no others: the TTL
+(`refresh_token_ttl_secs`, default 30 days — the same figure
+`MAX_API_AUTH_KEY_TTL_SECS` already places on a durable bearer credential a
+member may hold, and a refresh token is strictly weaker than an auth key), and
+revocation.
+
+**What revokes it:** `probe-rs-fleet logout` → `POST /auth/logout`. Plain, it
+deletes the session the caller authenticated with and, if presented, that
+caller's own refresh token. `--all` deletes **every** session and refresh token
+of the calling user, on every machine — the lost-machine answer, and the only
+one available: the coordinator never learns another machine's secret, so
+"revoke that one specifically" is not expressible. Deliberately not built: a
+"list my sessions" verb, and any way for a re-`login` to reach the previous
+machine's credential. `--all` plus the 30-day TTL is the whole story.
+
+**CLI only.** Refresh tokens are minted on the device flow and by
+`coordinator user-token`. The browser's authorization-code path is unchanged and
+issues none — `docs/web-ui.md` D1 rules out a cookie-driven credential that
+mints — so `POST /api/v1/session/logout` has nothing extra to revoke and stays
+as it is.
+
+**Compatibility.** The grant rides `POST /auth/token`, which is HTTP+JSON, so
+`PROTOCOL_VERSION` is untouched. A new client against an old coordinator gets
+the unknown variant rejected and falls back to today's behaviour (use the
+session token; tell the user to `login` when it expires). An old client against
+a new coordinator simply never asks for one.
 
 #### The laptop dual-role case (resolved)
 

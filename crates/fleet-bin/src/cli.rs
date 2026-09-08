@@ -53,6 +53,9 @@ pub enum Command {
     /// Log in to a fleet with GitHub, caching a session token for `ctl` and the
     /// `probe-rs` sidecar shim.
     Login(LoginArgs),
+    /// Revoke this machine's fleet session (and, with --all, every session and
+    /// refresh token you hold anywhere).
+    Logout(LogoutArgs),
     /// Offer this machine's probes to the fleet, using the login you already
     /// have. No token, no coordinator shell.
     Share(ShareArgs),
@@ -118,10 +121,45 @@ pub struct LoginArgs {
     /// integration tests use, so they need no GitHub at all.
     #[arg(long)]
     pub token: Option<String>,
+    /// Record an externally minted refresh token beside `--token`.
+    ///
+    /// The same escape hatch, for the durable half: `coordinator user-token`
+    /// prints both, and storing only the session token would leave the
+    /// air-gapped path unable to renew — a second-class citizen of the very
+    /// feature this pairs with.
+    #[arg(long, requires = "token")]
+    pub refresh_token: Option<String>,
     /// Do not try to open a browser; just print the URL and code.
     #[arg(long)]
     pub no_browser: bool,
     /// The fleet to log in to.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
+    pub fleet: String,
+    /// Override the fleets directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet logout`.
+///
+/// The revocation half of the refresh-token feature. `login` stores a durable
+/// credential that can mint sessions for up to 30 days; a durable credential
+/// with no way to revoke it is not acceptable, and this is that way.
+///
+/// There is deliberately **no** "list my sessions" verb and no way to revoke
+/// *another* machine's credential individually: the coordinator never learns
+/// the other machine's secret, so "revoke that one" is not expressible.
+/// `--all` is the whole answer for a lost machine, and the 30-day TTL is the
+/// backstop.
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    /// Revoke every session and refresh token you hold in this fleet, on every
+    /// machine — not just this one. Use it if a machine was lost.
+    #[arg(long)]
+    pub all: bool,
+    /// The fleet to log out of.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
@@ -1427,6 +1465,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                 Command::Ctl(args) => roles::ctl::run(args).await,
                 Command::Login(args) => {
                     roles::login::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
+                Command::Logout(args) => {
+                    roles::logout::run(args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
                 Command::Share(args) => {

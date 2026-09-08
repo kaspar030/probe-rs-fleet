@@ -114,6 +114,18 @@ pub async fn sweep_once(coord: &Coordinator) {
         Err(e) => warn!(error = %e, "failed to sweep expired sessions"),
     }
 
+    // Refresh tokens (migration 0011), same hygiene argument as sessions: a
+    // refresh token past its `expires` is a dead credential — expiry is
+    // *enforced* at verification time by `verify_refresh_token`, so this is
+    // table upkeep, not the security boundary. It matters a little more than
+    // for sessions only because these rows live 30 days rather than 12 hours,
+    // so without the sweep the table accumulates one row per login per month.
+    match coord.db().delete_expired_refresh_tokens(now_i64).await {
+        Ok(0) => {}
+        Ok(n) => debug!(count = n, "expired refresh tokens swept"),
+        Err(e) => warn!(error = %e, "failed to sweep expired refresh tokens"),
+    }
+
     // Same reasoning for pending node registrations (architecture §4.2 rung 3):
     // expiry and single-use are *enforced* by the conditional statements in
     // `state.rs`, so this is hygiene. It matters more here than for sessions,

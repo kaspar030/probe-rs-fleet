@@ -151,6 +151,13 @@ signing_key_path = {signing_key_path}
 # How long (seconds) a user session token is valid before it must be refreshed.
 # session_ttl_secs = 43200
 
+# How long (seconds) a refresh token is valid. A refresh token is written by
+# `login` and can do exactly one thing: mint session tokens for its own user.
+# Redeeming it does NOT consume it, so concurrent `probe-rs` shims can each
+# renew. 30 days is the same bound the API places on an auth key, which is a
+# strictly stronger credential. `probe-rs-fleet logout --all` revokes it.
+# refresh_token_ttl_secs = 2592000
+
 # How old (seconds) a node token may get before the coordinator pushes a
 # replacement down the established connection. The old token stays valid until
 # the node acknowledges the new one, so a lost push costs a retry, not a visit.

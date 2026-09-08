@@ -9,6 +9,8 @@
 #
 # You do not normally write this file by hand. It is managed by:
 #   probe-rs-fleet login       → writes [user]
+#   probe-rs-fleet logout      → clears [user] and revokes it server-side
+#                                (--all: every session/refresh token you hold)
 #   probe-rs-fleet share       → writes [node], using the login you already have
 #   probe-rs-fleet node up     → writes [node] (session, or --auth-key)
 #   probe-rs-fleet agent login → writes [agent] (a persistent sandbox session)
@@ -22,11 +24,26 @@
 # Anyone who can read [node].node_token can act as this node until the token
 # rotates or the node's row is deleted on the coordinator.
 #
-# [agent].auth_key is the strongest of the three, and the only DURABLE one: it
-# does not merely act, it MINTS. Anyone who can read it can keep minting fresh
-# sessions as that identity until the key is revoked or expires. That is why it
-# is written by one verb whose documentation names the trust decision, and by
-# nothing else.
+# TWO of the fields are DURABLE: they do not merely act, they MINT.
+#
+#   [agent].auth_key      Anyone who can read it can keep minting fresh
+#                         workload sessions as that machine identity until the
+#                         key is revoked (`auth-key revoke`) or expires. That is
+#                         why it is written by one verb whose documentation
+#                         names the trust decision, and by nothing else.
+#
+#   [user].refresh_token  Anyone who can read it can keep minting session tokens
+#                         AS YOU, for up to 30 days. It can do nothing else: it
+#                         opens no connection (/agent, /client, /delegate and
+#                         /api/v1 all refuse it) and it enrolls nothing. Revoke
+#                         it with `probe-rs-fleet logout --all`, which kills
+#                         every session and refresh token you hold in the fleet,
+#                         on every machine.
+#
+# Redeeming a refresh token does NOT consume it, deliberately: that is what lets
+# several concurrent `probe-rs` invocations in one build each renew and each get
+# a working session. The cost is that a leak is usable for its whole lifetime,
+# bounded only by `logout --all` and the 30-day expiry.
 #
 # ---------------------------------------------------------------------------
 # Why one file per fleet, and why the two tokens do NOT merge
@@ -107,6 +124,20 @@ login = "kaspar"
 
 # When the session token expires (epoch seconds), if known.
 expires = 1788600000
+
+# The refresh token that renews the session above, written by `login` if the
+# coordinator issued one. OPTIONAL: a fleet file without it is valid and is what
+# every file written before this feature existed looks like — the session then
+# simply stops at its expiry and you re-run `login`, the old behaviour.
+#
+# With it, `ctl` and the `probe-rs` shim renew the session themselves, so a
+# workstation that only ever runs builds stops hitting a login cliff every 12
+# hours. Redemption is non-rotating, so this value stays valid and concurrent
+# processes do not race each other for it.
+#
+# What it can do: mint session tokens for you, in this org. That is the whole
+# list. What revokes it: `probe-rs-fleet logout --all`, or its own expiry.
+refresh_token = "prfr1_…"
 
 
 # ---------------------------------------------------------------------------

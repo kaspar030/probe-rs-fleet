@@ -304,6 +304,7 @@ mod tests {
             expires: Some(4_600),
             coordinator_token_pubkey: None,
             login: None,
+            refresh_token: None,
         }
     }
 

@@ -136,6 +136,70 @@ async fn an_auth_key_cannot_open_a_connection() {
     assert_eq!(status, 200);
 }
 
+/// A refresh token is redeemed at `/auth/token` and is a connection credential
+/// **nowhere**. This is the claim the whole feature rests on: no route's
+/// `allowed` list contains `TokenKind::Refresh`, and `authenticate` refuses it
+/// from the prefix alone before any database access.
+///
+/// The token seeded here is entirely valid — it mints a session on the route
+/// that is allowed to — which is what makes the 403s meaningful.
+#[tokio::test]
+async fn a_refresh_token_cannot_open_a_connection_or_reach_auth_keys() {
+    let fleet = TestCoordinator::start().await;
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let refresh = fleet
+        .seed_refresh_token("acme", "alice", now + 86_400)
+        .await;
+
+    for route in ["/agent", "/client"] {
+        assert_eq!(
+            fleet.upgrade_status(route, Some(&refresh)).await,
+            403,
+            "a refresh token must not open {route}"
+        );
+    }
+
+    // `/auth/keys` is a plain authenticated POST rather than an upgrade, and it
+    // allows only `Session` — minting an auth key with a mint-only credential
+    // would be a privilege escalation, not a convenience.
+    let (status, _) = fleet
+        .http_auth(
+            "POST",
+            "/auth/keys",
+            Some(&refresh),
+            Some(serde_json::json!({ "action": "list" }).to_string()),
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    // `/node/register/approve` too: approving an enrollment is a member act.
+    let (status, _) = fleet
+        .http_auth(
+            "POST",
+            "/node/register/approve",
+            Some(&refresh),
+            Some(
+                serde_json::json!({ "user_code": "ABCD-1234", "decision": "inspect" }).to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    // ...and it is still redeemable afterwards: a rejected upgrade must not
+    // consume it.
+    let (status, body) = fleet
+        .http(
+            "POST",
+            "/auth/token",
+            Some(
+                serde_json::json!({ "grant_type": "refresh_token", "refresh_token": refresh })
+                    .to_string(),
+            ),
+        )
+        .await;
+    assert_eq!(status, 200, "body: {body}");
+}
+
 /// Only the `Bearer` scheme counts. A `Basic` credential — or a bare token with
 /// no scheme — is *absent*, not malformed, and gets the same uniform 401.
 #[tokio::test]

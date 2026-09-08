@@ -126,6 +126,17 @@ holds a cookie the database has already forgotten, and a `401` from any
 mints a fresh credential, in exchange for saving a redirect the user notices
 twice a day.
 
+That stayed true when **refresh tokens** were added (`architecture.md` §6.4).
+They are minted only on the CLI login paths — the device flow and `coordinator
+user-token` — and the authorization-code path here deliberately issues none, for
+exactly the D1 reason above: a browser holding a 30-day mint-capable credential
+is a strictly worse CSRF and XSS target than one holding a 12h session, and the
+CLI's justification (a `probe-rs` shim with no human to re-run anything) does
+not apply to a tab whose user is sitting in front of it. So this paragraph is
+current, not stale: `grant_type: refresh_token` is CLI-only too, and
+`POST /api/v1/session/logout` is unchanged because the browser has no refresh
+token to revoke.
+
 **CSRF.** Two independent controls:
 
 1. A **double-submit token**: `prfs_csrf` = `HMAC(k, session_token_hash)`, set as

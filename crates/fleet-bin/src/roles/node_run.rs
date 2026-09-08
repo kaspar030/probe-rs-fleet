@@ -381,6 +381,7 @@ mod tests {
                 org: "gh-1".to_owned(),
                 login: None,
                 expires: None,
+                refresh_token: None,
             });
         })
         .unwrap();
@@ -467,6 +468,7 @@ mod tests {
                 org: "gh-1".to_owned(),
                 login: None,
                 expires: None,
+                refresh_token: None,
             });
         })
         .unwrap();

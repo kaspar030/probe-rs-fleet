@@ -815,6 +815,125 @@ impl Db {
         Ok(result.rows_affected())
     }
 
+    /// Delete every session belonging to one user; returns the count.
+    ///
+    /// Backs `logout --all`, which is the whole revocation answer for a lost
+    /// machine: the coordinator never learns the old machine's secrets, so
+    /// "revoke that one" is not expressible — "revoke all of mine" is.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_sessions_for_user(&self, org: &OrgId, user: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM session WHERE org_id = ?1 AND user_id = ?2")
+            .bind(org.0.as_str())
+            .bind(user)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Insert a refresh token (stored by token hash).
+    ///
+    /// Same foreign-key discipline as [`Db::insert_session`], and for the same
+    /// reason: the caller must have provisioned the org, user and member rows,
+    /// so a refresh token for a nonexistent user fails loudly here rather than
+    /// becoming a durable credential belonging to nobody.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn insert_refresh_token(
+        &self,
+        token_hash: &str,
+        org: &OrgId,
+        user: &str,
+        issued_at: i64,
+        expires: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO refresh_token
+                 (token_hash, org_id, user_id, issued_at, expires, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?4)",
+        )
+        .bind(token_hash)
+        .bind(org.0.as_str())
+        .bind(user)
+        .bind(issued_at)
+        .bind(expires)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up a refresh token by its hash: `(user id, org, expires)`.
+    ///
+    /// Expiry is **not** checked here, exactly as for
+    /// [`Db::session_by_token_hash`]: `fleet_auth::verify` owns the one
+    /// definition of "expired".
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn refresh_token_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, OrgId, i64)>> {
+        let row: Option<(String, String, i64)> = sqlx::query_as(
+            "SELECT user_id, org_id, expires FROM refresh_token WHERE token_hash = ?1",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(user, org, expires)| (user, OrgId(org), expires)))
+    }
+
+    /// Delete one refresh token (logout).
+    ///
+    /// Note what is *absent*: no redemption path calls this. Redemption is
+    /// non-rotating by design (migration 0011), which is what lets concurrent
+    /// sidecars each redeem and each keep a working session.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_refresh_token(&self, token_hash: &str) -> Result<()> {
+        sqlx::query("DELETE FROM refresh_token WHERE token_hash = ?1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Delete every refresh token belonging to one user; returns the count.
+    ///
+    /// The other half of `logout --all`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_refresh_tokens_for_user(&self, org: &OrgId, user: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM refresh_token WHERE org_id = ?1 AND user_id = ?2")
+            .bind(org.0.as_str())
+            .bind(user)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Delete every refresh token that expired at or before `now`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails.
+    pub async fn delete_expired_refresh_tokens(&self, now: i64) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM refresh_token WHERE expires <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Record a freshly minted CI workload token (architecture §6.7).
     ///
     /// # Why this is on [`Db`] and not [`OrgDb`]

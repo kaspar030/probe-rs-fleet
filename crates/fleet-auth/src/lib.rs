@@ -23,6 +23,9 @@
 //! window, and all three live here:
 //!
 //! * user **session** tokens are short-lived and refreshable;
+//! * a user's **refresh** token is long-lived but can do exactly one thing —
+//!   mint session tokens for that one user — and is revocable with
+//!   `probe-rs-fleet logout --all`;
 //! * **node** tokens auto-rotate ([`rotation`]) over the established connection,
 //!   so a leaked one has bounded value, and revocation is deleting the row;
 //! * workload (CI) tokens are exchanged per job.
@@ -53,7 +56,9 @@ pub mod github;
 pub mod http_client;
 
 pub use rotation::{should_rotate, RotationPolicy};
-pub use store::{AuthKeyRecord, NodeRecord, SessionRecord, TokenStore, WorkloadRecord};
+pub use store::{
+    AuthKeyRecord, NodeRecord, RefreshRecord, SessionRecord, TokenStore, WorkloadRecord,
+};
 pub use token::{OpaqueToken, TokenError, TokenHash, TokenKind};
 pub use verify::{authenticate, AuthError, Authenticated};
 
@@ -90,9 +95,30 @@ pub mod api {
             tags: Vec<String>,
         },
         /// Exchange a still-valid session token for a fresh one.
+        ///
+        /// **Replacing**: the old session stops working immediately. See
+        /// [`TokenRequest::RefreshToken`] for the non-rotating variant, which
+        /// is what a caller that may race a peer (the `probe-rs` sidecar)
+        /// wants.
         Refresh {
             /// The current session token (`prfs1_…`).
             session_token: String,
+        },
+        /// Redeem a long-lived **refresh token** for a fresh session token.
+        ///
+        /// Deliberately **not** [`TokenRequest::Refresh`], which exchanges a
+        /// still-valid session and replaces it. Two differences make this a
+        /// separate grant rather than an overload:
+        ///
+        /// * it works when the session has already lapsed — that is the whole
+        ///   point, since `Refresh` requires a live session and so cannot help
+        ///   after the 12h cliff; and
+        /// * **it is non-rotating**: redemption leaves the refresh token
+        ///   usable, so N concurrent redemptions all succeed and every minted
+        ///   session is independently valid.
+        RefreshToken {
+            /// The refresh token (`prfr1_…`), written by `login`.
+            refresh_token: String,
         },
         /// Register the calling machine as a node in the caller's own org,
         /// proving membership with a user session token (architecture §4.2
@@ -179,6 +205,40 @@ pub mod api {
         /// user id, never this string (a login can be renamed and reused).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub login: Option<String>,
+        /// A freshly minted **refresh token** (`prfr1_…`), on the login paths
+        /// that mint one (device flow, `coordinator user-token`).
+        ///
+        /// Absent everywhere else, including from a redemption response: the
+        /// caller already holds the refresh token it redeemed, and echoing it
+        /// back would put a durable credential on the wire for nothing and
+        /// invite a client to overwrite a good credential with a copy.
+        ///
+        /// An older coordinator simply omits it, which is why it is optional:
+        /// a new client against an old coordinator gets `None` and falls back
+        /// to today's behaviour.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_token: Option<String>,
+    }
+
+    /// A request to `POST /auth/logout` — revoke the caller's credentials.
+    ///
+    /// Authenticated with `Authorization: Bearer <session token>`, the
+    /// `/auth/keys` shape rather than the `/auth/token` body-credential shape:
+    /// this is an ordinary authenticated call about the caller's *own*
+    /// identity, not a grant whose subject is a credential in the body.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct LogoutRequest {
+        /// The caller's refresh token, so it can be revoked alongside the
+        /// session.
+        ///
+        /// A refresh token belonging to **another** user is ignored silently:
+        /// never an oracle, never a cross-user delete.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub refresh_token: Option<String>,
+        /// Revoke *every* session and refresh token of the calling user, not
+        /// just the presented ones. This is the lost-machine answer.
+        #[serde(default)]
+        pub all: bool,
     }
 
     /// A request to begin the GitHub device flow.

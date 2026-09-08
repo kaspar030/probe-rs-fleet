@@ -264,6 +264,34 @@ async fn a_completed_device_flow_yields_a_working_session_token() {
         .await
         .expect("the device-flow session token must authenticate on /client");
     drop((tx, rx));
+
+    // ...and the login carries the durable credential that ends the 12-hour
+    // cliff. Without this the workstation in the reported failure would still
+    // have to re-`login` twice a day.
+    let refresh = granted["refresh_token"]
+        .as_str()
+        .expect("a device flow must mint a refresh token");
+    assert!(refresh.starts_with("prfr1_"), "{refresh}");
+
+    // It works, and it is the *only* thing it does — it mints a session and
+    // opens nothing itself.
+    let (status, body) = fleet
+        .http(
+            "POST",
+            "/auth/token",
+            Some(json!({ "grant_type": "refresh_token", "refresh_token": refresh }).to_string()),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let minted: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let renewed = minted["token"].as_str().unwrap();
+    assert!(renewed.starts_with("prfs1_"));
+    assert_eq!(fleet.upgrade_status("/client", Some(renewed)).await, 101);
+    assert_eq!(
+        fleet.upgrade_status("/client", Some(refresh)).await,
+        403,
+        "the refresh token itself must open nothing"
+    );
 }
 
 /// First login creates the user *and* a personal org with the user as admin;

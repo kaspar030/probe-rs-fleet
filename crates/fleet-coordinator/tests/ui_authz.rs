@@ -243,3 +243,46 @@ async fn every_action_the_ui_performs_needs_the_csrf_header() {
         );
     }
 }
+
+/// The `/api/v1` surface is the one place a **cookie** is an accepted
+/// credential, so it needs its own version of "a refresh token opens nothing":
+/// a `prfr1_` must be refused there over both carriers.
+///
+/// This closes the last of the five `allowed` lists. `api::api_auth` names
+/// `[TokenKind::Session]` and must keep naming exactly that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_token_reaches_no_api_route_over_either_carrier() {
+    let fleet = TestCoordinator::start().await;
+    let now = i64::try_from(fleet.coord.now()).unwrap();
+    // A genuinely valid refresh token: it mints sessions on `/auth/token`, so
+    // the refusals below are about the route rather than a dead credential.
+    let refresh = fleet
+        .seed_refresh_token("acme", "alice", now + 86_400)
+        .await;
+
+    for path in ["/api/v1/session", "/api/v1/org", "/api/v1/nodes"] {
+        // As a bearer.
+        let (status, body) = fleet.http_auth("GET", path, Some(&refresh), None).await;
+        assert_eq!(
+            status, 403,
+            "GET {path} with a bearer refresh token: {body}"
+        );
+
+        // As the session cookie, the carrier the browser uses. `browser_session`
+        // is not usable here (it derives a CSRF token for a session), so the
+        // cookie is built directly — which is the point: an attacker would do
+        // exactly this.
+        let (status, _, body) = fleet
+            .http_full(
+                "GET",
+                path,
+                &[("cookie", &format!("prfs_session={refresh}"))],
+                None,
+            )
+            .await;
+        assert_eq!(
+            status, 403,
+            "GET {path} with a cookie refresh token: {body}"
+        );
+    }
+}

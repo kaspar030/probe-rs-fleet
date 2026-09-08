@@ -48,7 +48,7 @@ use crate::paths;
 use crate::roles::auth_key::{identity_epilogue, normalise_identity_name, PURPOSE_AGENT_ALIAS};
 
 /// Open the coordinator's database from its config file.
-async fn open_db(config_dir: Option<std::path::PathBuf>) -> Result<(Db, OrgId, u64)> {
+async fn open_db(config_dir: Option<std::path::PathBuf>) -> Result<(Db, OrgId, u64, u64)> {
     let config_dir = match config_dir {
         Some(dir) => dir,
         None => paths::coordinator_config_dir()?,
@@ -64,7 +64,12 @@ async fn open_db(config_dir: Option<std::path::PathBuf>) -> Result<(Db, OrgId, u
     let db = Db::connect(&sqlite)
         .await
         .with_context(|| format!("opening coordinator database {sqlite}"))?;
-    Ok((db, config.default_org.clone(), config.session_ttl_secs))
+    Ok((
+        db,
+        config.default_org.clone(),
+        config.session_ttl_secs,
+        config.refresh_token_ttl_secs,
+    ))
 }
 
 /// Current time in epoch seconds.
@@ -184,7 +189,7 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
         }
     };
 
-    let (db, default_org, _) = open_db(args.config_dir.clone()).await?;
+    let (db, default_org, _, _) = open_db(args.config_dir.clone()).await?;
     let explicit_org = args.org.is_some();
     let org = args.org.clone().map_or(default_org, OrgId);
     db.ensure_org(&org, org_kind(explicit_org))
@@ -301,7 +306,7 @@ fn print_auth_key(
 ///
 /// Returns an error if the config or database cannot be opened.
 pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
-    let (db, default_org, _) = open_db(args.config_dir).await?;
+    let (db, default_org, _, _) = open_db(args.config_dir).await?;
     let org = args.org.map_or(default_org, OrgId);
     let keys = db
         .list_auth_keys(&org)
@@ -370,7 +375,7 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
 /// Returns an error if the config or database cannot be opened, the prefix
 /// matches nothing, or it matches more than one key.
 pub async fn auth_key_revoke(args: crate::cli::AuthKeyRevokeArgs) -> Result<()> {
-    let (db, default_org, _) = open_db(args.config_dir).await?;
+    let (db, default_org, _, _) = open_db(args.config_dir).await?;
     let org = args.org.map_or(default_org, OrgId);
     let prefix = args.prefix.trim().to_ascii_lowercase();
     anyhow::ensure!(!prefix.is_empty(), "a hash prefix is required");
@@ -434,7 +439,7 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
          flow) is."
     );
 
-    let (db, default_org, default_ttl) = open_db(args.config_dir).await?;
+    let (db, default_org, default_ttl, refresh_ttl) = open_db(args.config_dir).await?;
     let explicit_org = args.org.is_some();
     let org = args.org.map_or(default_org, OrgId);
     let role: Role = args.role.into();
@@ -455,6 +460,23 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
         .await
         .context("recording the session")?;
 
+    // The durable half. Minted here too, deliberately: this is the
+    // interim/air-gapped path, and leaving it without renewal would make the
+    // escape hatch a second-class citizen of the very feature that ends the
+    // 12-hour cliff — an operator using it would still be re-running this
+    // command twice a day.
+    let refresh = OpaqueToken::mint(TokenKind::Refresh);
+    let refresh_expires = now.saturating_add(i64::try_from(refresh_ttl).unwrap_or(i64::MAX));
+    db.insert_refresh_token(
+        refresh.hash().as_str(),
+        &org,
+        &args.login,
+        now,
+        refresh_expires,
+    )
+    .await
+    .context("recording the refresh token")?;
+
     println!(
         "Session token for '{}' in org '{org}' ({role}):",
         args.login
@@ -464,11 +486,22 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     println!();
     println!("  expires: {expires} (epoch seconds)");
     println!();
-    println!("Point `ctl` and the probe-rs shim at the fleet with it:");
-    println!("  probe-rs-fleet login --fleet-url <url> --token <token>");
+    println!("Refresh token (renews the session without a browser):");
     println!();
-    println!("This token is a bearer credential and is not stored anywhere (only its");
-    println!("hash). Copy it now.");
+    println!("  {}", refresh.to_secret_string());
+    println!();
+    println!("  expires: {refresh_expires} (epoch seconds)");
+    println!();
+    println!("Point `ctl` and the probe-rs shim at the fleet with both:");
+    println!("  probe-rs-fleet login --fleet-url <url> \\");
+    println!("      --token <session token> --refresh-token <refresh token>");
+    println!();
+    println!("The refresh token can do exactly one thing: mint session tokens for this");
+    println!("user. It opens no connection and enrolls nothing, and");
+    println!("`probe-rs-fleet logout --all` revokes it.");
+    println!();
+    println!("Both are bearer credentials and are not stored anywhere (only their");
+    println!("hashes). Copy them now.");
     Ok(())
 }
 
