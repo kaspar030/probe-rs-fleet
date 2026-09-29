@@ -141,6 +141,29 @@ impl Fleet {
         token.to_secret_string()
     }
 
+    /// Live (undecided, unexpired) pending node registrations, as
+    /// `(user_code, node_name)` — what a human reads off the node's terminal.
+    pub async fn live_pending_codes(&self) -> Vec<(String, String)> {
+        let now = i64::try_from(self.coord.now()).unwrap();
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT user_code, payload FROM forgs_pending_device \
+             WHERE approved_at IS NULL AND consumed_at IS NULL AND expires > ?1",
+        )
+        .bind(now)
+        .fetch_all(self.coord.db().pool_for_test())
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(code, payload)| {
+                let name = payload
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+                    .and_then(|v| v.get("node_name")?.as_str().map(ToOwned::to_owned))
+                    .unwrap_or_default();
+                (code, name)
+            })
+            .collect()
+    }
+
     /// A single-use `node` key with `tags`, in the default org.
     pub async fn node_key(&self, tags: &[&str]) -> String {
         self.api_key(
@@ -155,7 +178,10 @@ impl Fleet {
 }
 
 /// Start a fleet with the default config (plus `github_actions`).
-pub async fn start_fleet_with(seed: [u8; 32], github_actions: Option<GithubActionsConfig>) -> Fleet {
+pub async fn start_fleet_with(
+    seed: [u8; 32],
+    github_actions: Option<GithubActionsConfig>,
+) -> Fleet {
     let config = CoordinatorConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         sqlite_path: ":memory:".into(),

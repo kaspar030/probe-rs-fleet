@@ -35,17 +35,12 @@
 // runtime. This mirrors `fleet_config`'s tests, which carry the same note.
 #![allow(clippy::await_holding_lock)]
 
-use std::sync::{Arc, Mutex, PoisonError};
+mod common;
 
-use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{OrgId, Role};
+use std::sync::{Mutex, PoisonError};
+
+use common::{start_fleet, Fleet};
+use fleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -54,76 +49,23 @@ const SEED: [u8; 32] = [31u8; 32];
 /// them from reading each other's fleet files.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// A live coordinator serving its real router on loopback.
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-async fn start_fleet() -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
-}
-
 /// Seed a user with an **already expired** session and a live refresh token:
 /// the exact state of the workstation in the reported failure.
 async fn seed_expired_with_refresh(fleet: &Fleet, login: &str) -> (String, String) {
-    let org = OrgId("default".to_owned());
-    let db = fleet.coord.db();
-    db.ensure_user_member(&org, login, Role::Admin)
+    let user = fleet
+        .member(login, common::DEFAULT_ORG, FleetRole::Admin)
+        .await;
+    let now = fleet.coord.now();
+    let session = fleet_bin::tokens::mint(forgs::TokenKind::Session);
+    fleet
+        .coord
+        .db()
+        .forgs()
+        .insert_session(&session.hash(), user, now - 86_400, now - 60)
         .await
         .unwrap();
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-
-    let session = OpaqueToken::mint(TokenKind::Session);
-    db.insert_session(session.hash().as_str(), &org, login, now - 86_400, now - 60)
-        .await
-        .unwrap();
-
-    let refresh = OpaqueToken::mint(TokenKind::Refresh);
-    db.insert_refresh_token(
-        refresh.hash().as_str(),
-        &org,
-        login,
-        now,
-        now + 30 * 24 * 3600,
-    )
-    .await
-    .unwrap();
-
-    (session.to_secret_string(), refresh.to_secret_string())
+    let refresh = fleet.refresh(login).await;
+    (session.to_secret_string(), refresh)
 }
 
 /// Does this token open `/client`? The honest liveness check: it goes through
@@ -146,8 +88,9 @@ fn write_fleet_file(base_url: &str, session: &str, refresh: Option<&str>, expire
         base_url.clone_into(&mut f.url);
         f.user = Some(fleet_bin::fleet_config::UserSection {
             session_token: session.to_owned(),
-            org: "default".to_owned(),
-            login: Some("kaspar".to_owned()),
+            username: Some("kaspar".to_owned()),
+            user_id: None,
+            org: Some(common::DEFAULT_ORG.to_owned()),
             expires,
             refresh_token: refresh.map(ToOwned::to_owned),
         });
@@ -171,7 +114,7 @@ async fn the_sidecar_renews_an_expired_user_session_and_persists_it() {
     let prev_token = std::env::var_os("PROBE_RS_FLEET_TOKEN");
     std::env::remove_var("PROBE_RS_FLEET_TOKEN");
 
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let (expired, refresh) = seed_expired_with_refresh(&fleet, "kaspar").await;
     let now = fleet.coord.now();
     write_fleet_file(
@@ -235,7 +178,7 @@ async fn a_file_without_a_refresh_token_behaves_exactly_as_before() {
     let prev_token = std::env::var_os("PROBE_RS_FLEET_TOKEN");
     std::env::remove_var("PROBE_RS_FLEET_TOKEN");
 
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let (expired, _refresh) = seed_expired_with_refresh(&fleet, "kaspar").await;
     let now = fleet.coord.now();
     write_fleet_file(
@@ -280,39 +223,12 @@ async fn logout_all_revokes_both_credentials_end_to_end() {
     // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
     std::env::set_var("XDG_CONFIG_HOME", tmp.path());
 
-    let fleet = start_fleet().await;
-    let org = OrgId("default".to_owned());
-    fleet
-        .coord
-        .db()
-        .ensure_user_member(&org, "kaspar", Role::Admin)
-        .await
-        .unwrap();
-    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let fleet = start_fleet(SEED).await;
+    let session = fleet.session("kaspar", FleetRole::Admin).await;
+    let refresh = fleet.refresh("kaspar").await;
+    let now = fleet.coord.now();
 
-    let session = OpaqueToken::mint(TokenKind::Session);
-    fleet
-        .coord
-        .db()
-        .insert_session(session.hash().as_str(), &org, "kaspar", now, now + 3_600)
-        .await
-        .unwrap();
-    let refresh = OpaqueToken::mint(TokenKind::Refresh);
-    fleet
-        .coord
-        .db()
-        .insert_refresh_token(refresh.hash().as_str(), &org, "kaspar", now, now + 86_400)
-        .await
-        .unwrap();
-    let session = session.to_secret_string();
-    let refresh = refresh.to_secret_string();
-
-    write_fleet_file(
-        &fleet.base_url,
-        &session,
-        Some(&refresh),
-        Some(u64::try_from(now + 3_600).unwrap()),
-    );
+    write_fleet_file(&fleet.base_url, &session, Some(&refresh), Some(now + 3_600));
     assert!(token_works(&fleet, &session).await);
 
     let path = fleet_bin::paths::fleet_config_path("default").unwrap();
@@ -351,9 +267,9 @@ async fn logout_all_revokes_both_credentials_end_to_end() {
 /// rather than a hand-rolled request, so the test exercises the same code path
 /// `ensure_fresh_session` does.
 async fn redeem(fleet: &Fleet, refresh: &str) -> (u16, String) {
-    match fleet_auth::http_client::redeem_refresh_token(&fleet.base_url, None, refresh).await {
+    match common::client(fleet).redeem_refresh_token(refresh).await {
         Ok(response) => (200, response.token),
-        Err(fleet_auth::http_client::ClientError::Rejected { status, code }) => (status, code),
+        Err(forgs_client::ClientError::Rejected { status, code }) => (status, code),
         Err(e) => panic!("unexpected transport failure: {e}"),
     }
 }

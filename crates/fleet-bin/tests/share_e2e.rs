@@ -10,85 +10,22 @@
 //! covered against a stub GitHub in `fleet-coordinator/tests/device_flow.rs`,
 //! and these tests are about what the CLI writes and whether it works.
 
-use std::sync::Arc;
+mod common;
 
-use fleet_auth::{OpaqueToken, TokenKind};
+use common::{start_fleet, Fleet};
 use fleet_bin::cli::{AdoptArg, LoginArgs, NodeUpFlags, ShareArgs};
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{NodeId, OrgId, Role};
+use fleet_coordinator::FleetRole;
+use fleet_proto::ids::NodeId;
 use fleet_proto::AdoptPolicy;
 
 const SEED: [u8; 32] = [23u8; 32];
-
-/// A live coordinator serving its real router on loopback.
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-async fn start_fleet() -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
-}
 
 /// Mint a session token the way `coordinator user-token` does — including the
 /// membership, without which the token authenticates and then authorizes
 /// nothing (and `share` would be refused with a 403).
 async fn mint_user_token(fleet: &Fleet, org: &str, login: &str) -> String {
-    let org = OrgId(org.to_owned());
-    fleet
-        .coord
-        .db()
-        .ensure_user_member(&org, login, Role::Admin)
-        .await
-        .unwrap();
-    let token = OpaqueToken::mint(TokenKind::Session);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_session(token.hash().as_str(), &org, login, now, now + 3_600)
-        .await
-        .unwrap();
-    token.to_secret_string()
+    fleet.member(login, org, FleetRole::Admin).await;
+    fleet.session(login, FleetRole::Admin).await
 }
 
 /// Run `login --token` into `config_dir`, returning the session token written.
@@ -100,6 +37,7 @@ async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str) ->
         token: Some(token.clone()),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     })
@@ -110,6 +48,7 @@ async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str) ->
 
 fn share_args(config_dir: &std::path::Path, node_name: &str) -> ShareArgs {
     ShareArgs {
+        org: None,
         fleet: "default".to_owned(),
         node_name: Some(node_name.to_owned()),
         tag: vec![],
@@ -127,7 +66,7 @@ fn share_args(config_dir: &std::path::Path, node_name: &str) -> ShareArgs {
 /// probe — needs no further steps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn login_then_share_yields_a_working_node_owned_by_the_user() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     let session = login(&fleet, &config_dir, "alice").await;
@@ -190,7 +129,7 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
             .await
             .unwrap()
             .as_deref(),
-        Some("alice")
+        Some(fleet.user("alice").await.to_string().as_str())
     );
     assert_eq!(
         fleet
@@ -208,7 +147,7 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
 /// `--adopt declared` is honoured: `auto` is the default, not the only choice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn share_honours_an_explicit_adopt_policy() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
@@ -242,7 +181,7 @@ async fn share_honours_an_explicit_adopt_policy() {
 /// in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn share_without_a_login_names_the_remedy() {
-    let _fleet = start_fleet().await;
+    let _fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
 
@@ -264,7 +203,7 @@ async fn share_without_a_login_names_the_remedy() {
 /// machine somebody depends on that is not something to do by accident.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sharing_twice_without_force_is_refused() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
@@ -334,7 +273,7 @@ async fn sharing_twice_without_force_is_refused() {
 /// not drift: the same node row, the same policy, the same scaffolding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_up_self_registers_from_an_existing_session() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
@@ -372,7 +311,7 @@ async fn node_up_self_registers_from_an_existing_session() {
             .await
             .unwrap()
             .as_deref(),
-        Some("alice")
+        Some(fleet.user("alice").await.to_string().as_str())
     );
     assert_eq!(
         fleet
@@ -393,7 +332,7 @@ async fn node_up_self_registers_from_an_existing_session() {
 /// token it is currently connected with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_up_reuses_an_existing_node_credential() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
@@ -486,25 +425,25 @@ async fn node_up_with_no_credential_at_all_explains_itself() {
 /// Documented as a deliberate deviation from §4.2's listed ordering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_explicit_auth_key_beats_an_incidental_session() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
 
-    let org = OrgId("default".to_owned());
-    let key = OpaqueToken::mint(TokenKind::AuthKey);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_auth_key(&org, key.hash().as_str(), &[], true, None, None, now)
-        .await
-        .unwrap();
+    let key = fleet
+        .api_key(
+            common::DEFAULT_ORG,
+            "node",
+            serde_json::json!({ "tags": [] }),
+            true,
+            None,
+        )
+        .await;
 
     fleet_bin::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
-            auth_key: Some(key.to_secret_string()),
+            auth_key: Some(key),
             node_name: Some("ci-runner".to_owned()),
             tag: vec![],
             adopt: None,

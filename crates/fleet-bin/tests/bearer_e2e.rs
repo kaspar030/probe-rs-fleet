@@ -20,104 +20,32 @@
 //! against a stub GitHub in `fleet-coordinator/tests/device_flow.rs`, and these
 //! tests are about the *file* the CLI writes.
 
-use std::sync::Arc;
+mod common;
 
-use fleet_auth::{OpaqueToken, TokenKind};
+use common::{start_fleet, Fleet};
 use fleet_bin::cli::{LoginArgs, NodeUpFlags};
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{OrgId, Role};
+use fleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [11u8; 32];
 
-/// A live coordinator serving its real router on loopback.
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-async fn start_fleet() -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
-}
-
 /// Mint an auth key the way `coordinator auth-key` does.
 async fn mint_auth_key(fleet: &Fleet, org: &str) -> String {
-    let org = OrgId(org.to_owned());
-    fleet.coord.db().ensure_org(&org, "personal").await.unwrap();
-    let token = OpaqueToken::mint(TokenKind::AuthKey);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
     fleet
-        .coord
-        .db()
-        .insert_auth_key(&org, token.hash().as_str(), &[], true, None, None, now)
+        .api_key(org, "node", serde_json::json!({ "tags": [] }), true, None)
         .await
-        .unwrap();
-    token.to_secret_string()
 }
 
 /// Mint a session token the way `coordinator user-token` does — including the
 /// membership provisioning, without which the token authenticates and then
 /// authorizes nothing.
 async fn mint_user_token(fleet: &Fleet, org: &str, login: &str) -> String {
-    let org = OrgId(org.to_owned());
-    fleet
-        .coord
-        .db()
-        .ensure_user_member(&org, login, Role::Admin)
-        .await
-        .unwrap();
-    let token = OpaqueToken::mint(TokenKind::Session);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_session(token.hash().as_str(), &org, login, now, now + 3_600)
-        .await
-        .unwrap();
-    token.to_secret_string()
+    fleet.member(login, org, FleetRole::Admin).await;
+    fleet.session(login, FleetRole::Admin).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_key_to_node_up_yields_a_working_node_token() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let key = mint_auth_key(&fleet, "default").await;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -190,7 +118,8 @@ async fn auth_key_to_node_up_yields_a_working_node_token() {
         .coord
         .db()
         .node_by_token_hash(
-            OpaqueToken::parse(&node.node_token)
+            fleet_bin::tokens::format()
+                .parse(&node.node_token)
                 .unwrap()
                 .hash()
                 .as_str(),
@@ -198,12 +127,12 @@ async fn auth_key_to_node_up_yields_a_working_node_token() {
         .await
         .unwrap()
         .expect("node row");
-    assert_eq!(org.0, "default");
+    assert_eq!(org, fleet.default_org().await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn user_token_to_login_yields_a_client_that_can_list() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let token = mint_user_token(&fleet, "default", "alice").await;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -215,6 +144,7 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
         token: Some(token.clone()),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.clone()),
     })
@@ -269,14 +199,14 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
 /// that only fails later, when the agent is running unattended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_up_refuses_an_invalid_auth_key_and_writes_nothing() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("agent");
 
     let result = fleet_bin::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
-            auth_key: Some(OpaqueToken::mint(TokenKind::AuthKey).to_secret_string()),
+            auth_key: Some(fleet_bin::tokens::mint_string(forgs::TokenKind::ApiKey)),
             node_name: Some("rpi-1".to_owned()),
             tag: vec![],
             adopt: None,
@@ -310,7 +240,7 @@ async fn node_up_refuses_an_invalid_auth_key_and_writes_nothing() {
 /// equivalent to a user account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let key = mint_auth_key(&fleet, "default").await;
     let session = mint_user_token(&fleet, "default", "alice").await;
 
@@ -324,6 +254,7 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
         token: Some(session.clone()),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.clone()),
     })

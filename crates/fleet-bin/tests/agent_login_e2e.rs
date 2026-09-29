@@ -26,18 +26,13 @@
 //! `#[tokio::test]` runtime, so there is no task to starve.
 #![allow(clippy::await_holding_lock)]
 
-use std::sync::{Arc, Mutex};
+mod common;
 
-use fleet_auth::{OpaqueToken, TokenKind};
+use std::sync::Mutex;
+
+use common::{start_fleet, Fleet};
 use fleet_bin::cli::{AgentLoginArgs, LoginArgs};
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{OrgId, Role};
+use fleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -97,97 +92,27 @@ impl Drop for XdgHome {
     }
 }
 
-/// A live coordinator serving its real router on loopback.
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-async fn start_fleet() -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
-}
-
-/// Mint a session token with its membership, as `coordinator user-token` does.
-///
-/// An hour of life: comfortably outside `REFRESH_SKEW_SECS`, so the `[user]`
-/// half of the file is never itself refreshed by anything here.
+/// A session token for `login`, a member of the default org, as
+/// `coordinator user-token` mints it. forgs' default lifetime is comfortably
+/// outside `REFRESH_SKEW_SECS`, so the `[user]` half of the file is never
+/// itself refreshed by anything here.
 async fn mint_user_token(fleet: &Fleet, login: &str) -> String {
-    let org = OrgId("default".to_owned());
-    fleet
-        .coord
-        .db()
-        .ensure_user_member(&org, login, Role::Member)
-        .await
-        .unwrap();
-    let token = OpaqueToken::mint(TokenKind::Session);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_session(token.hash().as_str(), &org, login, now, now + 3_600)
-        .await
-        .unwrap();
-    token.to_secret_string()
+    fleet.session(login, FleetRole::Member).await
 }
 
 /// Mint an `--purpose agent --as <name>` auth key directly in the coordinator's
 /// database, as `auth-key create` does over the API.
 async fn mint_agent_key(fleet: &Fleet, name: &str, single_use: bool) -> String {
-    let org = OrgId("default".to_owned());
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    let key = OpaqueToken::mint(TokenKind::AuthKey);
     fleet
-        .coord
-        .db()
-        .insert_auth_key_with_purpose(
-            &org,
-            key.hash().as_str(),
-            &["nrf52".to_owned()],
-            single_use,
-            Some(now + 86_400),
-            None,
-            now,
+        .api_key(
+            common::DEFAULT_ORG,
             // `agent` is CLI sugar; the database holds `ci`.
             "ci",
-            &[],
+            serde_json::json!({ "tags": ["nrf52"], "ops": [] }),
+            single_use,
             Some(name),
         )
         .await
-        .unwrap();
-    key.to_secret_string()
 }
 
 fn agent_login_args(fleet: &Fleet, key: &str, name: Option<&str>) -> AgentLoginArgs {
@@ -205,7 +130,7 @@ fn agent_login_args(fleet: &Fleet, key: &str, name: Option<&str>) -> AgentLoginA
 async fn an_agent_login_writes_a_session_that_renews_itself() {
     let _guard = lock_env();
     let xdg = XdgHome::set();
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
 
     // The sandbox's operator is a logged-in human on this same machine: the
     // `[user]` table must survive, since that is the read-modify-write rule the
@@ -217,6 +142,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
         token: Some(session.clone()),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         // The XDG path, deliberately: `ensure_fresh_agent_session` writes there
         // and nowhere else, so the two halves must agree on one file.
@@ -260,15 +186,21 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
 
     // The redemption synthesised the identity's grant, which is what makes the
     // sandbox's access ordinary and revocable.
+    let ns = fleet_coordinator::subject::ns_of(&fleet.default_org().await).unwrap();
     let grants = fleet
         .coord
         .db()
-        .scoped(OrgId("default".to_owned()))
+        .forgs()
+        .scoped(ns)
         .list_grants()
         .await
         .unwrap();
     assert_eq!(grants.len(), 1);
-    assert_eq!(grants[0].subject, "default/workload:agent:desk-bot");
+    assert!(
+        grants[0].subject.ends_with("workload:agent:desk-bot"),
+        "{}",
+        grants[0].subject
+    );
 
     // --- the renewal ---------------------------------------------------
     //
@@ -310,7 +242,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
 async fn a_peer_process_refresh_is_shared_rather_than_duplicated() {
     let _guard = lock_env();
     let xdg = XdgHome::set();
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
 
     let key = mint_agent_key(&fleet, "desk-bot", false).await;
     fleet_bin::roles::agent_login::run(
@@ -355,7 +287,7 @@ async fn a_peer_process_refresh_is_shared_rather_than_duplicated() {
 async fn a_single_use_key_is_refused_and_writes_nothing() {
     let _guard = lock_env();
     let xdg = XdgHome::set();
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
 
     let key = mint_agent_key(&fleet, "desk-bot", true).await;
     let err = fleet_bin::roles::agent_login::run(
@@ -386,7 +318,7 @@ async fn a_single_use_key_is_refused_and_writes_nothing() {
 async fn a_wrong_kind_of_credential_never_reaches_the_coordinator() {
     let _guard = lock_env();
     let xdg = XdgHome::set();
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
 
     let session = mint_user_token(&fleet, "alice").await;
     let err = fleet_bin::roles::agent_login::run(
@@ -396,6 +328,6 @@ async fn a_wrong_kind_of_credential_never_reaches_the_coordinator() {
     )
     .await
     .expect_err("a session token is not an auth key");
-    assert!(format!("{err:#}").contains("prffk1_"), "got: {err:#}");
+    assert!(format!("{err:#}").contains("prfk1_"), "got: {err:#}");
     assert!(!xdg.fleet_file().exists());
 }

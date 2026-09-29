@@ -19,98 +19,30 @@
 //! this test's to fix; staying out of the `REFRESH_SKEW_SECS` window keeps the
 //! test's writes inside its tempdir.
 
-use std::sync::Arc;
+mod common;
 
-use fleet_auth::{OpaqueToken, TokenKind};
+use common::{start_fleet, Fleet};
 use fleet_bin::cli::{
     AuthKeyCreateArgs, AuthKeyListArgs, AuthKeyRevokeCliArgs, LoginArgs, NodeUpFlags,
 };
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{OrgId, Role};
+use fleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [29u8; 32];
 
-/// A live coordinator serving its real router on loopback.
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-async fn start_fleet() -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
-}
-
-/// Mint a session token with its membership, as `coordinator user-token` does.
+/// Run `login --token` into `config_dir`, acting in the default org.
 ///
-/// An hour of life: comfortably outside the refresh window (see the module
-/// docs), so nothing is ever written to the real XDG path.
-async fn mint_user_token(fleet: &Fleet, login: &str, role: Role) -> String {
-    let org = OrgId("default".to_owned());
-    fleet
-        .coord
-        .db()
-        .ensure_user_member(&org, login, role)
-        .await
-        .unwrap();
-    let token = OpaqueToken::mint(TokenKind::Session);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_session(token.hash().as_str(), &org, login, now, now + 3_600)
-        .await
-        .unwrap();
-    token.to_secret_string()
-}
-
-/// Run `login --token` into `config_dir`.
-async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str, role: Role) {
-    let token = mint_user_token(fleet, login_name, role).await;
+/// The session is minted with forgs' default lifetime: comfortably outside
+/// the refresh window (see the module docs), so nothing is ever written to
+/// the real XDG path.
+async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str, role: FleetRole) {
+    let token = fleet.session(login_name, role).await;
     fleet_bin::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     })
@@ -132,6 +64,7 @@ fn create_args(config_dir: &std::path::Path, tags: &[&str]) -> AuthKeyCreateArgs
         // enrollment confers no subject for one to attach to.
         subject_name: None,
         ops: None,
+        org: None,
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     }
@@ -139,6 +72,7 @@ fn create_args(config_dir: &std::path::Path, tags: &[&str]) -> AuthKeyCreateArgs
 
 fn list_args(config_dir: &std::path::Path) -> AuthKeyListArgs {
     AuthKeyListArgs {
+        org: None,
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     }
@@ -147,6 +81,7 @@ fn list_args(config_dir: &std::path::Path) -> AuthKeyListArgs {
 fn revoke_args(config_dir: &std::path::Path, prefix: &str) -> AuthKeyRevokeCliArgs {
     AuthKeyRevokeCliArgs {
         prefix: prefix.to_owned(),
+        org: None,
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     }
@@ -158,18 +93,18 @@ fn revoke_args(config_dir: &std::path::Path, prefix: &str) -> AuthKeyRevokeCliAr
 /// the session `login` wrote into a tempdir.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let laptop = tmp.path().join("laptop");
-    login(&fleet, &laptop, "alice", Role::Member).await;
+    login(&fleet, &laptop, "alice", FleetRole::Member).await;
 
     let created = fleet_bin::roles::auth_key::create(&create_args(&laptop, &["lab", "nrf52"]))
         .await
         .expect("auth-key create");
-    assert!(created.key.starts_with("prffk1_"));
-    assert_eq!(created.org, "default");
+    assert!(created.key.starts_with("prfk1_"));
+    assert_eq!(created.namespace, fleet.default_org().await.0);
     assert!(created.single_use);
-    assert!(created.expires.is_some(), "an API-minted key must expire");
+    assert!(created.expires > 0, "an API-minted key must expire");
 
     // The Pi: a *different* config dir, with no login of its own — exactly the
     // headless machine the ladder's rungs 1 and 3 cannot serve.
@@ -221,7 +156,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(org.0, "default");
+    assert_eq!(org, fleet.default_org().await);
 
     // ... and the listing now shows the key as consumed, attributed to alice.
     let list = fleet_bin::roles::auth_key::list(&list_args(&laptop))
@@ -233,7 +168,8 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
         .find(|k| k.key_hash == created.key_hash)
         .expect("the minted key is listed");
     assert!(row.consumed_at.is_some(), "single use means consumed");
-    assert_eq!(row.created_by.as_deref(), Some("alice"));
+    let alice = fleet.user("alice").await.to_string();
+    assert_eq!(row.created_by.as_deref(), Some(alice.as_str()));
     // A listing is not a credential.
     assert_ne!(row.key_hash, created.key);
 }
@@ -242,10 +178,10 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
 /// enrolling anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_a_minted_key_stops_it_enrolling() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let laptop = tmp.path().join("laptop");
-    login(&fleet, &laptop, "alice", Role::Member).await;
+    login(&fleet, &laptop, "alice", FleetRole::Member).await;
 
     let created = fleet_bin::roles::auth_key::create(&create_args(&laptop, &[]))
         .await
@@ -279,7 +215,7 @@ async fn revoking_a_minted_key_stops_it_enrolling() {
     .await
     .expect_err("a revoked key must not enroll a node");
     assert!(
-        format!("{err:#}").contains("401"),
+        format!("{err:#}").contains("not accepted"),
         "expected a rejected exchange, got: {err:#}"
     );
 }
@@ -303,10 +239,10 @@ async fn creating_without_a_login_says_so() {
 /// the user is not bounced off a 400 from the coordinator.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forever_key_is_refused_with_the_reason() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let laptop = tmp.path().join("laptop");
-    login(&fleet, &laptop, "alice", Role::Member).await;
+    login(&fleet, &laptop, "alice", FleetRole::Member).await;
 
     let mut args = create_args(&laptop, &[]);
     args.ttl = "0".to_owned();

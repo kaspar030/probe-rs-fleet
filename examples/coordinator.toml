@@ -21,11 +21,14 @@
 #   GET  /agent        WebSocket upgrade — a node's persistent control plane
 #   GET  /client       WebSocket upgrade — ctl, the probe-rs sidecar, and a CI
 #                      workload token (architecture §6.7)
-#   POST /auth/token   JSON credential exchange (node enrollment, session
-#                      refresh, CI workload identity)
-#   GET  /auth/github/start, /auth/github/callback
-#                      browser login for the web UI — offered only when the
-#                      [github] block sets callback_registered = true (below)
+#   POST /auth/token   JSON credential exchange (session refresh, API keys,
+#                      CI workload identity)
+#   POST /node/enroll, /node/self-register, /node/register/{start,poll,approve}
+#                      node enrollment (auth key, existing login, approval)
+#   GET  /auth/{provider}/start, /auth/{provider}/callback
+#                      browser login, one pair per [[auth.providers]] entry
+#   POST /auth/device/{start,poll}
+#                      the CLI's device login (`probe-rs-fleet login`)
 #
 # Every non-browser principal presents `Authorization: Bearer …` on the upgrade.
 # There are no client certificates, no private CA, and no mTLS.
@@ -37,20 +40,23 @@
 # below only when you are self-hosting with no proxy.
 #
 # Bootstrap (the normal path):
-#   1. Register a GitHub OAuth app with DEVICE FLOW ENABLED. The CLI login needs
-#      no callback URL to fill in: the device flow has no redirect_uri.
-#      Registering one is optional and buys only the BROWSER login — see the
-#      [github] block below.
-#   2. Put its client id in the [github] block below.
+#   1. Register an OAuth app with a login provider (GitHub, Codeberg, GitLab
+#      or any OIDC issuer) with the callback URL
+#      <public_url>/auth/<name>/callback.
+#   2. Put it in an [[auth.providers]] entry below.
 #   3. coordinator init && coordinator
+#      (`init` also writes the cookie/CSRF secret — see csrf_secret_path)
 #   4. On your laptop: probe-rs-fleet login --fleet-url <url>
-#      → first login creates your user and a personal org of one.
+#      → the CLI prints a code and a link; you sign in with the provider in a
+#        browser, pick a username on first login, and get a personal org of
+#        one named after it. Team orgs: `coordinator org create <name>
+#        --admin <username>`, then `login --org <name>`.
 #   5. For a node: on your laptop, probe-rs-fleet auth-key create --tag lab
 #      (prints an auth key; needs only a login, no shell on this host)
 #      on the node: node up --fleet-url <url> --auth-key <key>
 #
 # Bootstrap without GitHub (air-gapped, or development):
-#   coordinator user-token <you>            (prints a session token) [INTERIM]
+#   coordinator user-token --username <you> (prints a session token) [INTERIM]
 #   probe-rs-fleet login --fleet-url <url> --token <token>
 #   coordinator auth-key                    (prints an auth key)
 #
@@ -59,10 +65,10 @@
 # the only way to mint a key that never expires (`--ttl 0`).
 #
 # `user-token` is INTERIM: it creates a credential from a shell on this host,
-# bypassing any login flow, and it keys the user by the login string you type
-# rather than by a GitHub id — so `user-token alice` and alice's own `login` are
-# two DIFFERENT subjects, and a lease held under one cannot be released by the
-# other. It is the escape hatch, not the front door.
+# bypassing any login flow. It creates (or reuses) a LOCAL user with that
+# username, one with no linked provider identity, and makes it a member of
+# `--org` (default: default_org below). It is the escape hatch, not the front
+# door.
 
 # ---------------------------------------------------------------------------
 # Required keys
@@ -78,10 +84,9 @@ listen_addr = "127.0.0.1:7000"
 # The externally reachable base URL agents and clients DIAL to reach this
 # coordinator — what you pass to `login --fleet-url` / `node up --fleet-url`.
 #
-# For the CLI device flow this is NOT an OAuth callback origin: that flow has no
-# redirect_uri and nothing here is registered with GitHub. For the BROWSER login
-# it is: the callback is derived from this value as
-# `<public_url>/auth/github/callback` — and never from the request's `Host` or
+# It is also the OAuth callback origin: every provider's callback is derived
+# from this value as `<public_url>/auth/<name>/callback` — and never from the
+# request's `Host` or
 # `X-Forwarded-Host`. That is deliberate: behind a proxy the coordinator does
 # not see its own public name, and a Host-derived callback would let anyone who
 # can set that header point a login at an origin they control, which is an
@@ -183,13 +188,24 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # table refuses legitimate enrollments too, until abandoned rows age out.
 # max_pending_nodes = 256
 
-# The org the INTERIM admin verbs (`auth-key`, `user-token`) default to when the
-# operator names none. Default: "default".
+# The NAME of the deployment's shared org, created at startup, and the org the
+# INTERIM admin verbs (`auth-key`, `user-token`) default to when the operator
+# names none. Default: "default".
 #
 # This is NOT consulted when a connection authenticates: a node's org comes from
-# its own row and a user's from the session token's, so a credential cannot be
-# replayed into another tenant.
+# its own row and a user acts in the org their client names (their personal org
+# when it names none) and only if they are a member there, so a credential
+# cannot be replayed into another tenant.
 # default_org = "default"
+
+# The cookie/CSRF secret: a file holding at least 32 bytes (hex or raw), 0600.
+# REQUIRED to run the daemon — it signs the browser login's state and session
+# cookies — and deliberately NOT derived from the signing key. `coordinator
+# init` writes one next to the signing seed.
+#
+# Commented here only because the path must exist for the file to load: a
+# config naming a missing secret refuses to start rather than inventing one.
+# csrf_secret_path = "/var/lib/probe-rs-fleet/coordinator/csrf.secret"
 
 # ---------------------------------------------------------------------------
 # Coordinator-terminated TLS (optional; self-hosted only)
@@ -231,88 +247,63 @@ max_concurrent_per_subject = 2
 default_ttl_secs = 900
 
 # ---------------------------------------------------------------------------
-# GitHub OAuth app (optional): what backs `probe-rs-fleet login` and the web UI
+# Login providers (optional): what backs `probe-rs-fleet login` and the web UI
 # ---------------------------------------------------------------------------
 #
-# Omitting this whole block is a SUPPORTED deployment, not a broken one: an
+# Omitting every provider is a SUPPORTED deployment, not a broken one: an
 # air-gapped or development fleet bootstraps with `coordinator user-token`
-# instead. The device-flow routes then answer 503 with the code
-# `device_flow_unconfigured`, and the CLI turns that into a sentence telling the
-# user to ask you for an app or use the escape hatch.
+# instead, and the login page says no provider is configured.
 #
-# Register the app at https://github.com/settings/developers with
-#   "Enable Device Flow" TICKED.
+# A provider PROVES who someone is; it does not NAME them. The username is
+# picked on first login and is the fleet's own — so a user can later link a
+# second provider to the same account, and renaming on GitHub changes nothing
+# here.
 #
-# For the CLI login that is all: there is NO callback URL to configure, because
-# the device flow has no redirect_uri.
+# Each entry needs an OAuth app registered with the provider whose callback URL
+# is exactly
+#   <public_url>/auth/<name>/callback
+# (e.g. https://fleet.example/auth/github/callback). The CLI never talks to the
+# provider: it runs a device login against THIS coordinator, and the browser
+# half of it goes through the same callback.
 #
-# For the web UI's BROWSER login there is exactly one extra step — the only
-# per-deployment setup the device flow did not need. Add
-#   <public_url>/auth/github/callback
-# (e.g. https://fleet.example/auth/github/callback) as the app's Authorization
-# callback URL, set a client secret, and set `callback_registered = true` below.
-# Skipping all of that is a SUPPORTED deployment: the web UI then falls back to
-# the in-page device-code login — the same code-and-link dance `login
-# --headless` prints — which is uglier but needs no registration at all.
-#
-# The coordinator brokers both flows; the CLI never talks to GitHub. So these
-# credentials stay on this host, and the user's GitHub access token never leaves
-# this process (it is spent on one `GET /user` and discarded).
+# The coordinator brokers the flow; the provider's access token never leaves
+# this process.
 
-# [github]
-# # The OAuth app's client id. Not a secret — it travels in the device-flow
-# # request and in the browser redirect — but without it there is no flow.
+# [[auth.providers]]
+# # `github` | `codeberg` | `gitlab` | `oidc` (any OpenID Connect issuer).
+# kind = "github"
+# # Instance name, used in the URLs above. Default: the kind. Set it to run two
+# # providers of one kind (e.g. two GitLab instances).
+# # name = "github"
+# # The OAuth app's client id. Not a secret — it travels in the browser redirect.
 # client_id = "Iv1.0123456789abcdef"
-#
-# # Only if your app requires one. OAuth Apps do not need a secret for the
-# # device flow; some GitHub App configurations do. It becomes REQUIRED once
-# # `callback_registered = true`: GitHub refuses the authorization-code exchange
-# # without it, and GitHub implements no PKCE, so the secret is also what makes
-# # an intercepted code unspendable. The validator rejects that combination
-# # rather than letting every browser login fail at its last step.
+# # The client secret. Prefer the path form, which keeps it out of this file;
+# # set exactly one of the two.
+# client_secret_path = "/var/lib/probe-rs-fleet/coordinator/github.secret"
 # # client_secret = "…"
-#
-# # Scope to request. Empty (the default) is correct for identity-only login:
-# # `GET /user` needs no scope, and asking for more than you use is a permission
-# # the user cannot easily take back.
-# # scope = ""
-#
-# # You have added <public_url>/auth/github/callback to the OAuth app's
-# # callback URLs. Default: false.
-# #
-# # An ASSERTION, not something the coordinator can verify: GitHub does not tell
-# # an app which callbacks it has registered. True, and the web UI offers the
-# # one-click browser login; false or omitted, and it offers the device-code
-# # fallback instead. That is why false is the default — a deployment that has
-# # not done the registration sends nobody into a redirect that dead-ends on
-# # GitHub's "redirect_uri is not associated with this application" page.
-# #
-# # The callback origin comes from `public_url` above, never from the request's
-# # Host / X-Forwarded-Host header — see the note there.
-# # callback_registered = false
-#
-# # Endpoint overrides, for GitHub Enterprise (or a test stub). Defaults shown.
-# # device_code_url  = "https://github.com/login/device/code"
-# # access_token_url = "https://github.com/login/oauth/access_token"
+# # `oidc`: the issuer (REQUIRED). `codeberg` / `gitlab`: overrides the public
+# # instance. `github`: a GitHub Enterprise origin.
+# # issuer = "https://gitlab.example"
+# # GitHub only: explicit endpoints, all three or none (GHES, or a test stub).
 # # authorize_url    = "https://github.com/login/oauth/authorize"
+# # access_token_url = "https://github.com/login/oauth/access_token"
 # # api_base         = "https://api.github.com"
 
 # ---------------------------------------------------------------------------
 # GitHub Actions workload identity (optional): what backs `ci login`
 # ---------------------------------------------------------------------------
 #
-# Independent of [github] above, and unrelated to it: a fleet may have CI
-# without user login, or the reverse. They are also two DIFFERENT identity
-# systems. User login is plain OAuth2 — no ID token, no JWKS, nothing to
-# verify. This one is real OIDC: a job with `permissions: id-token: write`
+# Independent of [[auth.providers]] above, and unrelated to it: a fleet may
+# have CI without user login, or the reverse. They are also two DIFFERENT
+# identity systems. User login proves a person to this coordinator in a
+# browser. This one is real OIDC: a job with `permissions: id-token: write`
 # mints a signed JWT, and this coordinator verifies its signature against
 # GitHub's published keys. No secret ever enters the runner, which is the
 # entire point of the CI path.
 #
 # Omitting this whole block is a SUPPORTED deployment. `POST /auth/token` then
-# answers 503 with the code `workload_oidc_unconfigured` — the same shape as
-# `device_flow_unconfigured` — and `ci login` turns that into a sentence naming
-# the missing block.
+# answers 503 with the code `workload_unconfigured`, and `ci login` turns that
+# into a sentence naming the missing block.
 #
 # A verified token proves "a job in repo owner/name". Reaching hardware
 # additionally needs an explicit PER-REPO grant:
@@ -320,7 +311,9 @@ default_ttl_secs = 900
 #   probe-rs-fleet grant --repo owner/name --select 'tag=nrf52' --ops flash
 #
 # The owner is deliberately NOT sufficient — a fork, or a new repo under a
-# granted owner, is a different subject and matches no grant (403 no_grant).
+# granted owner, is a different subject and matches no grant. It is refused
+# as `401 invalid_grant`, like every other failed exchange (no oracle); the
+# coordinator's audit log names the repository.
 # See docs/ci-github-actions.md.
 
 # [github_actions]

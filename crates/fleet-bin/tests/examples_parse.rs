@@ -28,10 +28,14 @@ fn fleet_example_parses_with_all_three_tables() {
 
     assert_eq!(file.url, "https://fleet.example.com");
     let user = file.user.expect("[user] table");
-    // The org is the immutable-id-derived one, not the login: the example is
-    // where people learn which of the two goes here.
-    assert_eq!(user.org, "gh-4242");
-    assert_eq!(user.login.as_deref(), Some("kaspar"));
+    // The username is the fleet's own name; no provider id appears anywhere.
+    assert_eq!(user.username.as_deref(), Some("kaspar"));
+    // Acting in the personal org is the default, so `org` is shown commented.
+    assert!(user.org.is_none());
+    assert!(
+        !text.contains("gh-"),
+        "no GitHub-derived ids in the reference"
+    );
     // The durable half of `[user]`. Shown populated because the example is
     // where a reader learns the field exists at all — and because it must be
     // parseable, not merely described in prose.
@@ -43,7 +47,7 @@ fn fleet_example_parses_with_all_three_tables() {
     assert_ne!(refresh, user.session_token);
 
     let node = file.node.expect("[node] table");
-    assert_eq!(node.node_id, "gh-4242/rpi-lab-1");
+    assert!(node.node_id.ends_with("/rpi-lab-1"), "{}", node.node_id);
     assert_eq!(node.coordinator_token_pubkey.len(), 64);
     // The two credentials are distinct values, which is the property the
     // example's prose is about.
@@ -56,6 +60,7 @@ fn fleet_example_parses_with_all_three_tables() {
     // what this assertion is for.
     assert!(agent.expires > 0);
     assert_ne!(agent.auth_key, agent.workload_token);
+    assert!(agent.auth_key.starts_with("prfk1_"), "{}", agent.auth_key);
 }
 
 /// The `[agent]` block must teach the two rules a reader cannot infer from the
@@ -160,11 +165,16 @@ fn the_node_example_documents_both_adopt_policies_and_they_parse() {
 }
 
 /// `examples/coordinator.toml` must load through the real loader, including the
-/// `[github]` block once uncommented — the block is the one part of it a reader
-/// has to edit, so a typo there costs the most.
+/// `[[auth.providers]]` block once uncommented — the block is the one part of
+/// it a reader has to edit, so a typo there costs the most.
 #[test]
-fn coordinator_example_loads_and_its_github_block_works_uncommented() {
+fn coordinator_example_loads_and_its_providers_block_works_uncommented() {
     let path = examples_dir().join("coordinator.toml");
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("github.secret");
+    std::fs::write(&secret, "s3cret\n").unwrap();
+    let csrf = dir.path().join("csrf.secret");
+    std::fs::write(&csrf, "cd".repeat(32)).unwrap();
     // The example points `signing_key_path` at a deployment path that does not
     // exist in a checkout, so swap in an inline seed. Everything else — every
     // key a reader might typo — is loaded verbatim.
@@ -185,19 +195,24 @@ fn coordinator_example_loads_and_its_github_block_works_uncommented() {
     cfg.validate().unwrap();
     // Commented out, so login is unconfigured — which the example says is a
     // supported deployment.
-    assert!(cfg.github.is_none());
+    assert!(cfg.auth.providers.is_empty());
+    assert!(cfg.csrf_secret.is_none());
 
-    // Uncomment the `[github]` block the way a reader would.
+    // Uncomment the provider block (and the csrf secret) the way a reader
+    // would: strip one `# ` from the header and from every *key* line, leaving
+    // prose comments (which start `# #`) as comments. The deployment paths are
+    // swapped for files that exist.
     let uncommented: String = text
         .lines()
         .map(|line| {
             let t = line.trim_start();
-            if t.starts_with("# [github]")
+            if t.starts_with("# client_secret_path") {
+                format!("client_secret_path = \"{}\"", secret.display())
+            } else if t.starts_with("# csrf_secret_path") {
+                format!("csrf_secret_path = \"{}\"", csrf.display())
+            } else if t.starts_with("# [[auth.providers]]")
+                || t.starts_with("# kind")
                 || t.starts_with("# client_id")
-                || t.starts_with("# scope")
-                || t.starts_with("# device_code_url")
-                || t.starts_with("# access_token_url")
-                || t.starts_with("# api_base")
             {
                 t.trim_start_matches("# ").to_owned()
             } else {
@@ -209,10 +224,12 @@ fn coordinator_example_loads_and_its_github_block_works_uncommented() {
 
     let cfg = fleet_bin::config::load_coordinator_config_from_str(&uncommented).unwrap();
     cfg.validate().unwrap();
-    let gh = cfg.github.expect("[github] parsed once uncommented");
-    assert_eq!(gh.client_id, "Iv1.0123456789abcdef");
-    assert_eq!(gh.device_code_url, "https://github.com/login/device/code");
-    assert_eq!(gh.api_base, "https://api.github.com");
+    assert_eq!(cfg.auth.providers.len(), 1);
+    let p = &cfg.auth.providers[0];
+    assert_eq!(p.name, "github");
+    assert_eq!(p.client_id, "Iv1.0123456789abcdef");
+    assert_eq!(p.client_secret, "s3cret");
+    assert_eq!(cfg.csrf_secret.as_deref().map(<[u8]>::len), Some(32));
 }
 
 /// The commented `refresh_token_ttl_secs` line must uncomment into a value the
@@ -259,7 +276,7 @@ fn the_coordinator_example_documents_the_refresh_token_ttl() {
 }
 
 /// The `[github_actions]` block must uncomment into TOML the **real** loader
-/// accepts, exactly as the `[github]` block above must.
+/// accepts, exactly as the `[[auth.providers]]` block above must.
 ///
 /// The two blocks earn this treatment for the same reason: they are the parts
 /// of the file a reader has to edit, so a typo in one costs the most. This one
@@ -291,7 +308,7 @@ fn coordinator_example_github_actions_block_works_uncommented() {
     // Uncomment the block the way a reader would: strip one `# ` from the
     // table header and from every *key* line, leaving the prose comments
     // (which start `# #`) as comments. That is the same mechanical rule the
-    // `[github]` test above uses, which is why the two blocks' comment style
+    // providers test above uses, which is why the two blocks' comment style
     // must stay identical.
     let uncommented: String = text
         .lines()

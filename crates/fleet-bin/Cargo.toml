@@ -52,6 +52,9 @@ axum = { workspace = true }
 # a real RS256 JWT for the coordinator to verify.
 jsonwebtoken = { workspace = true }
 base64 = { workspace = true }
+# The approve e2e reads forgs' pending-registration table for the code a human
+# would read off the node's terminal.
+sqlx = { workspace = true }
 
 [lints]
 workspace = true

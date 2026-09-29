@@ -259,8 +259,12 @@ pub(crate) fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
             "the coordinator refused the credential. It does not say why (that \
              is deliberate — no oracle); the reason is in ITS log. The usual \
              causes are an --audience that does not match the coordinator's \
-             configured one, a clock far out of step, or an auth key that has \
-             expired or been revoked"
+             configured one, a clock far out of step, an auth key that has \
+             expired or been revoked, or — for a GitHub workload identity — a \
+             repository with no grant. That grant is PER REPO: being under a \
+             granted owner is deliberately not enough, so a fork or a new repo \
+             needs its own (`probe-rs-fleet grant --repo <owner>/<name> \
+             --select '<selector>' --ops flash`)"
         }
         "forbidden" => {
             "that auth key is not a CI key, or carries no tags. A key that can \
@@ -393,6 +397,10 @@ mod tests {
         let text = describe(&e, "exchanging").to_string();
         assert!(text.contains("no oracle"), "{text}");
         assert!(text.contains("audience"), "{text}");
+        // forgs answers a grantless repo with this same code, so the per-repo
+        // rule has to be named here too.
+        assert!(text.contains("PER REPO"), "{text}");
+        assert!(text.contains("grant --repo"), "{text}");
     }
 
     // --- tiny env helper --------------------------------------------------

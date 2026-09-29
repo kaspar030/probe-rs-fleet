@@ -15,6 +15,10 @@ use forgs::{OpaqueToken, TokenFormat, TokenKind, TokenUse};
 pub const NODE_KIND: &str = "node";
 
 /// fleet's token format: brand `prf`, plus the `node` app kind (tag `n`).
+///
+/// # Panics
+///
+/// Never: the format is a constant and a unit test builds it.
 #[must_use]
 pub fn format() -> &'static TokenFormat {
     static FORMAT: OnceLock<TokenFormat> = OnceLock::new();

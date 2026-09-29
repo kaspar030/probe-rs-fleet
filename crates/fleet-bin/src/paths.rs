@@ -235,7 +235,7 @@ fn tilde_rest(path: &Path) -> Option<&str> {
 fn expand_tilde_with(path: &Path, home: &Path) -> PathBuf {
     match tilde_rest(path) {
         // `~/` (and `~//`) name the home directory itself.
-        Some(rest) if rest.is_empty() => home.to_path_buf(),
+        Some("") => home.to_path_buf(),
         Some(rest) => home.join(rest),
         None => path.to_path_buf(),
     }

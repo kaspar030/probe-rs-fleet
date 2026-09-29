@@ -29,21 +29,17 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod common;
+
 use axum::extract::State;
 use axum::routing::get;
 use axum::{Json, Router};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
+use common::Fleet;
 use fleet_bin::cli::CiLoginArgs;
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, GithubActionsConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::OrgId;
+use fleet_coordinator::config::GithubActionsConfig;
 use fleet_proto::token::AllowedOp;
 
 /// Serialises the tests in this file, which all mutate the same env vars.
@@ -253,68 +249,59 @@ fn percent_decode(s: &str) -> String {
 // The coordinator
 // ---------------------------------------------------------------------------
 
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
 async fn start_fleet(github_actions: Option<GithubActionsConfig>) -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        github_actions,
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
+    common::start_fleet_with(SEED, github_actions).await
 }
 
 /// Grant `REPO` access to the default org's `nrf52`-tagged boards.
-async fn grant_repo(fleet: &Fleet) -> OrgId {
-    let org = OrgId("default".to_owned());
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    let key = fleet_proto::ids::workload_subject_key(REPO);
+async fn grant_repo(fleet: &Fleet) {
+    let org = fleet.default_org().await;
+    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let repo = forgs::subject::normalise_repo(REPO).unwrap();
+    let now = fleet.coord.now();
     fleet
         .coord
         .db()
-        .scoped(org.clone())
+        .forgs()
+        .scoped(ns)
         .insert_grant(
-            &"a".repeat(32),
-            &key,
-            "tag=nrf52",
-            &[AllowedOp::Flash, AllowedOp::Attach],
-            Some(now + 86_400),
-            None,
+            &forgs_store::NewGrant {
+                subject: forgs::subject::workload_subject_key(&repo),
+                selector: "tag=nrf52".to_owned(),
+                ops: fleet_coordinator::state::join_ops(&[AllowedOp::Flash, AllowedOp::Attach]),
+                expires: Some(now + 86_400),
+                created_by: None,
+            },
             now,
         )
         .await
         .unwrap();
-    org
+}
+
+/// Mint a multi-use `ci` auth key over the default org's `nrf52` boards.
+async fn mint_ci_key(fleet: &Fleet, name: Option<&str>) -> String {
+    fleet
+        .api_key(
+            common::DEFAULT_ORG,
+            "ci",
+            json!({ "tags": ["nrf52"], "ops": [] }),
+            false,
+            name,
+        )
+        .await
+}
+
+/// The default org's grants, straight from the store.
+async fn grants(fleet: &Fleet) -> Vec<forgs_store::GrantRow> {
+    let ns = fleet_coordinator::subject::ns_of(&fleet.default_org().await).unwrap();
+    fleet
+        .coord
+        .db()
+        .forgs()
+        .scoped(ns)
+        .list_grants()
+        .await
+        .unwrap()
 }
 
 fn args(fleet: &Fleet, config_dir: &std::path::Path) -> CiLoginArgs {
@@ -505,26 +492,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
     // No `[github_actions]` table: the auth-key path involves no issuer, and
     // must work on a coordinator that has never heard of GitHub Actions.
     let fleet = start_fleet(None).await;
-    let org = OrgId("default".to_owned());
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    let key = fleet_auth::OpaqueToken::mint(fleet_auth::TokenKind::AuthKey);
-    fleet
-        .coord
-        .db()
-        .insert_auth_key_with_purpose(
-            &org,
-            key.hash().as_str(),
-            &["nrf52".to_owned()],
-            false,
-            Some(now + 86_400),
-            None,
-            now,
-            "ci",
-            &[],
-            None,
-        )
-        .await
-        .unwrap();
+    let key = mint_ci_key(&fleet, None).await;
 
     let dir = tempfile::tempdir().unwrap();
     let github_env = dir.path().join("github.env");
@@ -534,7 +502,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
     let _no_identity = RunnerEnv::unset(&["ACTIONS_ID_TOKEN_REQUEST_URL"]);
 
     let mut a = args(&fleet, dir.path());
-    a.auth_key = Some(key.to_secret_string());
+    a.auth_key = Some(key);
     fleet_bin::roles::ci::run(a)
         .await
         .expect("ci login --auth-key");
@@ -548,9 +516,8 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
 
     // Redemption synthesised an ordinary grant, which is what makes the key
     // revocable through the normal path rather than a special case.
-    let grants = fleet.coord.db().scoped(org).list_grants().await.unwrap();
+    let grants = grants(&fleet).await;
     assert_eq!(grants.len(), 1);
-    assert!(grants[0].id.starts_with("ci-"));
     assert_eq!(grants[0].selector, "tag=nrf52");
 }
 
@@ -561,26 +528,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
 async fn a_named_ci_auth_key_authenticates_as_its_identity() {
     let _guard = lock_env();
     let fleet = start_fleet(None).await;
-    let org = OrgId("default".to_owned());
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    let key = fleet_auth::OpaqueToken::mint(fleet_auth::TokenKind::AuthKey);
-    fleet
-        .coord
-        .db()
-        .insert_auth_key_with_purpose(
-            &org,
-            key.hash().as_str(),
-            &["nrf52".to_owned()],
-            false,
-            Some(now + 86_400),
-            None,
-            now,
-            "ci",
-            &[],
-            Some("builder"),
-        )
-        .await
-        .unwrap();
+    let key = mint_ci_key(&fleet, Some("builder")).await;
 
     let dir = tempfile::tempdir().unwrap();
     let github_env = dir.path().join("github.env");
@@ -589,7 +537,7 @@ async fn a_named_ci_auth_key_authenticates_as_its_identity() {
     let _no_identity = RunnerEnv::unset(&["ACTIONS_ID_TOKEN_REQUEST_URL"]);
 
     let mut a = args(&fleet, dir.path());
-    a.auth_key = Some(key.to_secret_string());
+    a.auth_key = Some(key);
     fleet_bin::roles::ci::run(a)
         .await
         .expect("ci login --auth-key");
@@ -597,11 +545,12 @@ async fn a_named_ci_auth_key_authenticates_as_its_identity() {
     let written = std::fs::read_to_string(&github_env).unwrap();
     assert!(written.contains("PROBE_RS_FLEET_TOKEN=prfw1_"), "{written}");
 
-    let grants = fleet.coord.db().scoped(org).list_grants().await.unwrap();
+    let grants = grants(&fleet).await;
     assert_eq!(grants.len(), 1);
-    assert_eq!(
-        grants[0].subject, "default/workload:agent:builder",
-        "the runner speaks as the identity, not as the key hash"
+    assert!(
+        grants[0].subject.ends_with("workload:agent:builder"),
+        "the runner speaks as the identity, not as the key hash: {}",
+        grants[0].subject
     );
     assert_eq!(grants[0].selector, "tag=nrf52");
 }

@@ -15,87 +15,25 @@
 //!
 //! **How the approver learns the code.** `node up` prints it, and a sibling
 //! task cannot read another task's stdout. So the laptop side polls
-//! `Db::live_pending_codes` — the same query a `node list-pending` verb would
+//! the pending-registration table (`Fleet::live_pending_codes`) — the same query a `node list-pending` verb would
 //! use — which is the seam that lets this test cover the interesting half
 //! rather than being weakened into asserting the boring one.
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
-use fleet_auth::{OpaqueToken, TokenKind};
+use common::{start_fleet, Fleet};
 use fleet_bin::cli::{LoginArgs, NodeApproveArgs, NodeUpFlags};
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{NodeId, OrgId, Role};
+use fleet_coordinator::FleetRole;
+use fleet_proto::auth_api::NodeRegisterStartRequest;
+use fleet_proto::ids::NodeId;
 
 const SEED: [u8; 32] = [31u8; 32];
 
-/// A live coordinator serving its real router on loopback.
-struct Fleet {
-    coord: Arc<Coordinator>,
-    base_url: String,
-    server: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
-}
-
-async fn start_fleet() -> Fleet {
-    let config = CoordinatorConfig {
-        listen_addr: "127.0.0.1:0".parse().unwrap(),
-        sqlite_path: ":memory:".into(),
-        signing_key: SigningKeySource::Seed(SEED),
-        ..CoordinatorConfig::default()
-    };
-    let db = Db::connect_in_memory().await.unwrap();
-    let coord = Arc::new(Coordinator::new(
-        config,
-        Scheduler::new(Policy::default()),
-        db,
-        Ed25519Signer::from_seed(&SEED),
-        Arc::new(SystemClock),
-    ));
-
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
-    });
-
-    Fleet {
-        coord,
-        base_url: format!("http://{addr}"),
-        server,
-    }
-}
-
 /// Mint a session token with its membership, as `coordinator user-token` does.
 async fn mint_user_token(fleet: &Fleet, login: &str) -> String {
-    let org = OrgId("default".to_owned());
-    fleet
-        .coord
-        .db()
-        .ensure_user_member(&org, login, Role::Member)
-        .await
-        .unwrap();
-    let token = OpaqueToken::mint(TokenKind::Session);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_session(token.hash().as_str(), &org, login, now, now + 3_600)
-        .await
-        .unwrap();
-    token.to_secret_string()
+    fleet.session(login, FleetRole::Member).await
 }
 
 /// Run `login --token` into `config_dir`.
@@ -107,6 +45,7 @@ async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str) {
         token: Some(token),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     })
@@ -139,6 +78,9 @@ fn approve_args(config_dir: &std::path::Path, code: &str) -> NodeApproveArgs {
         // way. That refusal has its own unit test in `node_approve`.
         yes: true,
         replace: false,
+        // The approver's personal org is the default target; these tests
+        // enroll into the shared org.
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(config_dir.to_path_buf()),
     }
@@ -148,8 +90,7 @@ fn approve_args(config_dir: &std::path::Path, code: &str) -> NodeApproveArgs {
 /// its code — what the human would read off the Pi's terminal.
 async fn await_pending_code(fleet: &Fleet, node_name: &str) -> String {
     for _ in 0..100 {
-        let now = i64::try_from(fleet.coord.now()).unwrap();
-        let live = fleet.coord.db().live_pending_codes(now).await.unwrap();
+        let live = fleet.live_pending_codes().await;
         if let Some((code, _)) = live.into_iter().find(|(_, name)| name == node_name) {
             return code;
         }
@@ -162,7 +103,7 @@ async fn await_pending_code(fleet: &Fleet, node_name: &str) -> String {
 /// a working node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let laptop = tmp.path().join("laptop");
     let pi = tmp.path().join("pi");
@@ -191,7 +132,8 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
         .unwrap()
         .node
         .expect("[node] was written");
-    assert_eq!(node.node_id, "default/rpi-lab-3");
+    let default_org = fleet.default_org().await;
+    assert_eq!(node.node_id, format!("{}/rpi-lab-3", default_org.0));
 
     // The credential works against the live coordinator: a real token, not a
     // plausible-looking string.
@@ -215,7 +157,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(org.0, "default");
+    assert_eq!(org, default_org);
     assert_eq!(adopt, fleet_proto::AdoptPolicy::Auto);
     assert_eq!(
         fleet
@@ -225,26 +167,19 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
             .await
             .unwrap()
             .as_deref(),
-        Some("alice"),
+        Some(fleet.user("alice").await.to_string().as_str()),
         "the node is owned by the human who approved it"
     );
 
     // The pending row is spent: the same code cannot enroll a second machine.
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    assert!(fleet
-        .coord
-        .db()
-        .live_pending_codes(now)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(fleet.live_pending_codes().await.is_empty());
 }
 
 /// Denial is a first-class outcome: `node up` stops with a clear message
 /// rather than spinning until the code expires.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_denied_machine_is_told_and_gives_up() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let laptop = tmp.path().join("laptop");
     let pi = tmp.path().join("pi");
@@ -279,33 +214,28 @@ async fn a_denied_machine_is_told_and_gives_up() {
 /// that org. A member of another org cannot take it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approving_requires_membership_of_the_org_the_node_would_join() {
-    let fleet = start_fleet().await;
+    let fleet = start_fleet(SEED).await;
     let tmp = tempfile::tempdir().unwrap();
     let stranger_dir = tmp.path().join("stranger");
 
-    // A session for a user who is *not* a member of the org it names.
-    let org = OrgId("default".to_owned());
-    fleet.coord.db().ensure_org(&org, "personal").await.unwrap();
+    // A session for a user who is *not* a member of the org it names: mallory
+    // belongs to another org (and her personal one), never to `default`.
+    fleet.create_org("elsewhere").await;
     fleet
-        .coord
-        .db()
-        .ensure_user_member(&OrgId("elsewhere".to_owned()), "mallory", Role::Member)
+        .member("mallory", "elsewhere", FleetRole::Member)
+        .await;
+    let mallory = fleet.user("mallory").await;
+    let token = forgs_http::session::mint_session(fleet.coord.auth(), mallory, "test")
         .await
-        .unwrap();
-    let token = OpaqueToken::mint(TokenKind::Session);
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    fleet
-        .coord
-        .db()
-        .insert_session(token.hash().as_str(), &org, "mallory", now, now + 3_600)
-        .await
-        .unwrap();
+        .unwrap()
+        .token;
     fleet_bin::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
-        token: Some(token.to_secret_string()),
+        token: Some(token),
         refresh_token: None,
         no_browser: true,
+        org: Some(common::DEFAULT_ORG.to_owned()),
         fleet: "default".to_owned(),
         config_dir: Some(stranger_dir.clone()),
     })
@@ -313,12 +243,14 @@ async fn approving_requires_membership_of_the_org_the_node_would_join() {
     .expect("login --token");
 
     // Start a registration directly: no `node up` task to leave running.
-    let grant = fleet_auth::http_client::node_register_start(
-        &fleet.base_url,
-        None,
-        "rpi-lab-5",
-        vec![],
-        None,
+    let client = fleet_bin::node_client::client(&fleet.base_url, None).unwrap();
+    let grant = fleet_bin::node_client::register_start(
+        &client,
+        &NodeRegisterStartRequest {
+            node_name: "rpi-lab-5".to_owned(),
+            tags: vec![],
+            adopt: None,
+        },
     )
     .await
     .expect("node register start");

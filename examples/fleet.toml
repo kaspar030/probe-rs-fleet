@@ -111,16 +111,19 @@ url = "https://fleet.example.com"
 # and writes the replacement back here.
 session_token = "prfs1_…"
 
-# The org ID this session belongs to.
-#
-# For a personal org this is `gh-<github_user_id>` — the IMMUTABLE NUMERIC id,
-# not your login. GitHub logins can be renamed and then claimed by someone else,
-# so keying identity off the name is a documented account-takeover vector: the
-# person who takes your old login would be provisioned into your org.
-org = "gh-4242"
+# Your fleet username, as the coordinator reported it at login. It is the
+# fleet's own name for you, picked on first login — not a provider login — and
+# it is also the name of your personal org.
+username = "kaspar"
 
-# Your GitHub login, cached for display only. Nothing keys off it.
-login = "kaspar"
+# Your immutable user id (a ULID), if the coordinator reported it.
+# user_id = "01J9Z3K4M5N6P7Q8R9S0T1V2W3"
+
+# The org `ctl`, `auth-key` and `share` act in, set by `login --org <name>`.
+# Omitted means your personal org (named after the username). A session is
+# not bound to one org: you act in any org you are a member of, and the
+# coordinator checks that membership on every request.
+# org = "acme"
 
 # When the session token expires (epoch seconds), if known.
 expires = 1788600000
@@ -135,7 +138,7 @@ expires = 1788600000
 # hours. Redemption is non-rotating, so this value stays valid and concurrent
 # processes do not race each other for it.
 #
-# What it can do: mint session tokens for you, in this org. That is the whole
+# What it can do: mint session tokens for you. That is the whole
 # list. What revokes it: `probe-rs-fleet logout --all`, or its own expiry.
 refresh_token = "prfr1_…"
 
@@ -155,10 +158,11 @@ refresh_token = "prfr1_…"
 # writer here is read-modify-write: a rotation must not clobber [user].
 node_token = "prfn1_…"
 
-# The node id the coordinator assigned at enrollment. Advisory: the coordinator
+# The node id the coordinator assigned at enrollment: `<org id>/<node name>`,
+# where the org id is the org's immutable ULID, not its name. Advisory: the coordinator
 # identifies this node by the token it presents and refuses the connection if
 # this field contradicts it.
-node_id = "gh-4242/rpi-lab-1"
+node_id = "01J9Z3K4M5N6P7Q8R9S0T1V2W3/rpi-lab-1"
 
 # Hex-encoded ed25519 public key of the coordinator's capability-token signer,
 # returned by enrollment. Used to verify the per-lease tokens the agent is
@@ -191,7 +195,7 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # propagate between the concurrent processes sharing the machine.
 #
 # Written by:
-#   probe-rs-fleet agent login --fleet-url <url> --auth-key prffk1_… --as <name>
+#   probe-rs-fleet agent login --fleet-url <url> --auth-key prfk1_… --as <name>
 #
 # THE KEY MUST BE `--multi-use`. A single-use key breaks on the second PROCESS,
 # not merely the second hour, so `agent login` refuses one — it detects this by
@@ -206,7 +210,7 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # redemption mints an independent token and upserts the same grant row. That is
 # why concurrent processes here need no locking, and why there is no
 # `previous_workload_token` field to mirror [node]'s.
-auth_key = "prffk1_…"
+auth_key = "prfk1_…"
 
 # The `--as` identity the key speaks as. DISPLAY ONLY, and not verified: the
 # redemption response does not echo the subject name, so this is what the
