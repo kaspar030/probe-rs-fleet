@@ -839,7 +839,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::too_many_lines)]
     async fn session_leases_opens_channel_and_splices() {
-        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
+        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
         use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
         use fleet_proto::LeaseId;
 
@@ -886,7 +886,7 @@ mod tests {
                     lease: LeaseId(1),
                     board: board_ref_for_peer.clone(),
                     node: NodeId("a".to_owned()),
-                    holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
+                    holder: SubjectKey::new(None, SubjectKind::User, "p").unwrap(),
                     expires: 9999,
                     token: vec![0xab, 0xcd],
                 }),
@@ -992,7 +992,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extend_reply_does_not_steal_the_control_channel() {
-        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
+        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
         use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
         use fleet_proto::LeaseId;
 
@@ -1036,7 +1036,7 @@ mod tests {
                     lease: LeaseId(1),
                     board: BoardRef::new(OrgId("default".to_owned()), NodeId("a".to_owned()), "b1"),
                     node: NodeId("a".to_owned()),
-                    holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
+                    holder: SubjectKey::new(None, SubjectKind::User, "p").unwrap(),
                     expires: 9999,
                     token: vec![0xab],
                 }),

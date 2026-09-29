@@ -39,8 +39,8 @@
 //!
 //! ## Ownership
 //!
-//! Leases are owned by a [`Subject`] and identified for ownership purposes by
-//! its [`SubjectKey`] (`(org, kind, id)` — groups excluded). Extending and
+//! Leases are owned by, and identified for ownership purposes by, the holder's
+//! [`SubjectKey`] (`[<ns>/]<kind>:<id>`, the wire mirror of forgs' key). Extending and
 //! releasing a lease require the holder's key; a non-holder gets
 //! [`LeaseAuthError::NotHolder`]. The org-admin override
 //! of architecture §6.5 lives in the coordinator, which knows the membership
@@ -66,7 +66,7 @@
 use std::collections::BTreeMap;
 
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{BoardRef, LeaseId, NodeId, Subject, SubjectKey};
+use fleet_proto::ids::{BoardRef, LeaseId, NodeId, SubjectKey};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 use crate::access::{selector_matches, Access};
@@ -101,7 +101,7 @@ pub struct GrantedLease {
     /// The node that owns the board.
     pub node: NodeId,
     /// The subject that now holds the lease.
-    pub holder: Subject,
+    pub holder: SubjectKey,
     /// Expiry as epoch seconds.
     pub expires: u64,
 }
@@ -119,7 +119,7 @@ pub struct ExpiredLease {
     /// The node that owns the board.
     pub node: NodeId,
     /// The subject that had held the lease.
-    pub holder: Subject,
+    pub holder: SubjectKey,
 }
 
 /// An opaque, caller-minted handle for "which connection asked".
@@ -220,7 +220,7 @@ pub struct ExpireResult {
 #[derive(Debug, Clone)]
 struct LeaseInfo {
     board: BoardRef,
-    holder: Subject,
+    holder: SubjectKey,
     priority: Priority,
     expires: u64,
     /// The **granted** hold length in seconds (already `cap_duration`-clamped
@@ -233,7 +233,7 @@ struct LeaseInfo {
 /// A queued request waiting for a matching board to free up.
 #[derive(Debug, Clone)]
 struct Waiter {
-    holder: Subject,
+    holder: SubjectKey,
     /// Which connection asked. Opaque here; see [`RequesterId`].
     requester: RequesterId,
     /// The requester's access as it stood when the request was queued.
@@ -322,13 +322,11 @@ impl Scheduler {
 
     /// Count the leases currently held by the subject identified by `key`.
     ///
-    /// Keyed by [`SubjectKey`] rather than the whole [`Subject`] so a group
-    /// change does not silently reset a caller's concurrency budget.
     fn active_for(&self, key: &SubjectKey) -> u32 {
         u32::try_from(
             self.leases
                 .values()
-                .filter(|info| info.holder.key() == *key)
+                .filter(|info| info.holder == *key)
                 .count(),
         )
         .unwrap_or(u32::MAX)
@@ -336,7 +334,7 @@ impl Scheduler {
 
     /// The subject holding `lease`, if it is active.
     #[must_use]
-    pub fn lease_holder(&self, lease: LeaseId) -> Option<&Subject> {
+    pub fn lease_holder(&self, lease: LeaseId) -> Option<&SubjectKey> {
         self.leases.get(&lease).map(|info| &info.holder)
     }
 
@@ -420,7 +418,7 @@ impl Scheduler {
     fn grant(
         &mut self,
         board_id: &BoardRef,
-        holder: Subject,
+        holder: SubjectKey,
         priority: Priority,
         now: u64,
         duration: u64,
@@ -506,7 +504,7 @@ impl Scheduler {
     /// invents one and never decides who may reach what.
     pub fn request_lease(
         &mut self,
-        subject: Subject,
+        subject: SubjectKey,
         requester: RequesterId,
         access: &Access,
         request: LeaseRequest,
@@ -535,7 +533,7 @@ impl Scheduler {
     /// surprising, so it is stated here and at the one call site that matters.
     pub fn try_lease(
         &mut self,
-        subject: Subject,
+        subject: SubjectKey,
         access: &Access,
         request: LeaseRequest,
         now: u64,
@@ -547,14 +545,14 @@ impl Scheduler {
     /// [`Scheduler::try_lease`]; `enqueue` is the only difference between them.
     fn decide(
         &mut self,
-        subject: Subject,
+        subject: SubjectKey,
         requester: RequesterId,
         access: &Access,
         request: LeaseRequest,
         now: u64,
         enqueue: bool,
     ) -> LeaseDecision {
-        let held = self.active_for(&subject.key());
+        let held = self.active_for(&subject);
         let cap = self.policy.max_concurrent_per_subject;
         if held >= cap {
             // Before any candidacy work, so the message can honestly say the
@@ -638,7 +636,7 @@ impl Scheduler {
     pub fn leases_held_by(&self, key: &SubjectKey) -> Vec<(LeaseId, BoardRef)> {
         self.leases
             .iter()
-            .filter(|(_, info)| info.holder.key() == *key)
+            .filter(|(_, info)| info.holder == *key)
             .map(|(id, info)| (*id, info.board.clone()))
             .collect()
     }
@@ -677,7 +675,7 @@ impl Scheduler {
     pub fn refresh_waiter_access(&mut self, key: &SubjectKey, access: &Access) -> usize {
         let mut refreshed = 0;
         for waiter in &mut self.queue {
-            if waiter.holder.key() == *key {
+            if waiter.holder == *key {
                 waiter.access = access.clone();
                 refreshed += 1;
             }
@@ -728,7 +726,7 @@ impl Scheduler {
         now: u64,
     ) -> Result<u64, LeaseAuthError> {
         let info = self.leases.get_mut(&lease).ok_or(LeaseAuthError::Unknown)?;
-        if info.holder.key() != *by {
+        if info.holder != *by {
             return Err(LeaseAuthError::NotHolder);
         }
         let new_expires = now + self.policy.cap_duration(info.priority, info.duration);
@@ -766,7 +764,7 @@ impl Scheduler {
     ) -> Result<Option<Promotion>, LeaseAuthError> {
         match self.leases.get(&lease) {
             None => return Err(LeaseAuthError::Unknown),
-            Some(info) if info.holder.key() != *by => return Err(LeaseAuthError::NotHolder),
+            Some(info) if info.holder != *by => return Err(LeaseAuthError::NotHolder),
             Some(_) => {}
         }
         let Some(info) = self.leases.remove(&lease) else {
@@ -858,7 +856,7 @@ impl Scheduler {
             .enumerate()
             .filter(|(_, w)| {
                 Self::is_candidate(board, &w.access, &w.request.select, now)
-                    && self.active_for(&w.holder.key()) < self.policy.max_concurrent_per_subject
+                    && self.active_for(&w.holder) < self.policy.max_concurrent_per_subject
             })
             .max_by(|(_, a), (_, b)| {
                 a.request
@@ -885,7 +883,7 @@ mod tests {
     use super::*;
     use crate::access::GrantScope;
     use fleet_proto::board::PowerKind;
-    use fleet_proto::ids::{BoardName, Group, OrgId, SubjectKind};
+    use fleet_proto::ids::{BoardName, OrgId, SubjectKind};
     use fleet_proto::token::AllowedOp;
 
     const ORG: &str = "org1";
@@ -919,13 +917,17 @@ mod tests {
         }
     }
 
-    /// A `User` subject in the default test org.
-    fn subject(name: &str) -> Subject {
+    /// A subject in the default test org.
+    fn subject(name: &str) -> SubjectKey {
         subject_in(ORG, name)
     }
 
-    fn subject_in(org_name: &str, name: &str) -> Subject {
-        Subject::new(org(org_name), SubjectKind::User, name)
+    /// A subject namespaced by `org_name`, so the same name in two orgs is two
+    /// subjects and [`request_as`] can derive the org it is a member of from
+    /// the key. (A production user key has no namespace; this shape is the
+    /// node/agent one and exists only to keep the fixtures compact.)
+    fn subject_in(org_name: &str, name: &str) -> SubjectKey {
+        SubjectKey::new(Some(org_name), SubjectKind::User, name).unwrap()
     }
 
     fn sched() -> Scheduler {
@@ -940,11 +942,11 @@ mod tests {
     /// `request_lease` directly with a minted id.
     fn request_as(
         s: &mut Scheduler,
-        subject: Subject,
+        subject: SubjectKey,
         request: LeaseRequest,
         now: u64,
     ) -> LeaseDecision {
-        let access = Access::own_org(subject.org.clone());
+        let access = Access::own_org(org(subject.ns().expect("fixture subjects are namespaced")));
         s.request_lease(subject, RequesterId::DETACHED, &access, request, now)
     }
 
@@ -1299,7 +1301,7 @@ mod tests {
 
         assert_eq!(s.remove_waiters(ghost), 1);
         let promoted = s
-            .release_lease(g.lease, &subject("holder").key(), 10)
+            .release_lease(g.lease, &subject("holder"), 10)
             .expect("holder may release")
             .expect("the surviving waiter is promoted");
         assert_eq!(promoted.grant.holder, subject("next"));
@@ -1333,7 +1335,7 @@ mod tests {
             0,
         );
         let promoted = s
-            .release_lease(g.lease, &subject("p1").key(), 10)
+            .release_lease(g.lease, &subject("p1"), 10)
             .expect("holder may release")
             .expect("a waiter promoted");
         assert_eq!(promoted.grant.holder, subject("inter"));
@@ -1365,7 +1367,7 @@ mod tests {
             0,
         );
         let promoted = s
-            .release_lease(g.lease, &subject("p1").key(), 10)
+            .release_lease(g.lease, &subject("p1"), 10)
             .expect("holder may release")
             .expect("a waiter promoted");
         assert_eq!(promoted.grant.holder, subject("first"));
@@ -1418,7 +1420,7 @@ mod tests {
         // Extend at now=50; the new expiry re-applies the lease's *own* granted
         // duration (100s), not the Ci class cap.
         let new = s
-            .extend_lease(g.lease, &subject("p1").key(), 50)
+            .extend_lease(g.lease, &subject("p1"), 50)
             .expect("extended");
         assert_eq!(new, 50 + 100);
         if let BoardState::Leased { expires, .. } = &s.board(&board_ref(ORG, "b1")).unwrap().state {
@@ -1429,7 +1431,7 @@ mod tests {
         // An expire before the new expiry does nothing.
         assert!(s.expire(100).freed.is_empty());
         assert_eq!(
-            s.extend_lease(LeaseId(999), &subject("p1").key(), 0),
+            s.extend_lease(LeaseId(999), &subject("p1"), 0),
             Err(LeaseAuthError::Unknown)
         );
     }
@@ -1454,7 +1456,7 @@ mod tests {
         };
         assert_eq!(g.expires, 900);
         let new = s
-            .extend_lease(g.lease, &subject("p1").key(), 500)
+            .extend_lease(g.lease, &subject("p1"), 500)
             .expect("extended");
         assert_eq!(new, 500 + 900);
         let cap = crate::policy::Policy::default().max_duration_interactive;
@@ -1480,7 +1482,7 @@ mod tests {
         let ci_cap = crate::policy::Policy::default().max_duration_ci;
         assert_eq!(g.expires, ci_cap);
         assert_eq!(
-            s.extend_lease(g.lease, &subject("p1").key(), 1_000),
+            s.extend_lease(g.lease, &subject("p1"), 1_000),
             Ok(1_000 + ci_cap)
         );
     }
@@ -1503,10 +1505,7 @@ mod tests {
         };
         let ttl = crate::policy::Policy::default().default_ttl_secs;
         assert_eq!(g.expires, ttl);
-        assert_eq!(
-            s.extend_lease(g.lease, &subject("p1").key(), 700),
-            Ok(700 + ttl)
-        );
+        assert_eq!(s.extend_lease(g.lease, &subject("p1"), 700), Ok(700 + ttl));
     }
 
     /// A subject that does not hold the lease cannot extend it, and the
@@ -1525,11 +1524,11 @@ mod tests {
             other => panic!("expected a grant, got {other:?}"),
         };
         assert_eq!(
-            s.extend_lease(g.lease, &subject("bob").key(), 50),
+            s.extend_lease(g.lease, &subject("bob"), 50),
             Err(LeaseAuthError::NotHolder)
         );
         // Expiry unchanged, on both the lease index and the board.
-        assert_eq!(s.extend_lease(g.lease, &subject("alice").key(), 0), Ok(100));
+        assert_eq!(s.extend_lease(g.lease, &subject("alice"), 0), Ok(100));
         let BoardState::Leased { expires, by, .. } = &s.board(&board_ref(ORG, "b1")).unwrap().state
         else {
             panic!("still leased");
@@ -1554,7 +1553,7 @@ mod tests {
             other => panic!("expected a grant, got {other:?}"),
         };
         assert_eq!(
-            s.release_lease(g.lease, &subject("bob").key(), 10),
+            s.release_lease(g.lease, &subject("bob"), 10),
             Err(LeaseAuthError::NotHolder)
         );
         let BoardState::Leased { by, lease, .. } = &s.board(&board_ref(ORG, "b1")).unwrap().state
@@ -1585,7 +1584,7 @@ mod tests {
             other => panic!("expected a grant, got {other:?}"),
         };
         // Same id, different org: still someone else.
-        let intruder = subject_in("org-a", "alice").key();
+        let intruder = subject_in("org-a", "alice");
         assert_eq!(
             s.extend_lease(g.lease, &intruder, 50),
             Err(LeaseAuthError::NotHolder)
@@ -1594,27 +1593,6 @@ mod tests {
             s.release_lease(g.lease, &intruder, 50),
             Err(LeaseAuthError::NotHolder)
         );
-    }
-
-    /// Groups are not part of a subject's identity: gaining a group must not
-    /// orphan the lease it holds.
-    #[test]
-    fn groups_do_not_affect_holder_identity() {
-        let mut s = sched();
-        s.upsert_board(board("b1", "nrf52", &[]));
-        let g = match request_as(
-            &mut s,
-            subject("alice"),
-            req(by_id("b1"), 100, Priority::Ci),
-            0,
-        ) {
-            LeaseDecision::Granted(g) => g,
-            other => panic!("expected a grant, got {other:?}"),
-        };
-        let mut regrouped = subject("alice");
-        regrouped.groups.push(Group("firmware".to_owned()));
-        assert_ne!(regrouped, subject("alice"));
-        assert_eq!(s.extend_lease(g.lease, &regrouped.key(), 50), Ok(50 + 100));
     }
 
     #[test]
@@ -1667,7 +1645,7 @@ mod tests {
         // ask again and is served immediately. (Nothing is promoted: the
         // at-cap request was refused, not parked.)
         let promoted = s
-            .release_lease(g1.lease, &subject("p1").key(), 10)
+            .release_lease(g1.lease, &subject("p1"), 10)
             .expect("holder may release");
         assert!(promoted.is_none(), "nothing was ever queued");
         let d4 = request_as(
@@ -1836,7 +1814,7 @@ mod tests {
         assert_eq!(removed.id, board_ref(ORG, "b1"));
         // Lease is gone: extend fails as unknown.
         assert_eq!(
-            s.extend_lease(g.lease, &subject("p1").key(), 0),
+            s.extend_lease(g.lease, &subject("p1"), 0),
             Err(LeaseAuthError::Unknown)
         );
     }
@@ -1975,7 +1953,7 @@ mod tests {
 
         // Release: the board must come back Idle, with nobody promoted.
         let promoted = s
-            .release_lease(g.lease, &alice.key(), 10)
+            .release_lease(g.lease, &alice, 10)
             .expect("holder may release");
         assert!(
             promoted.is_none(),
@@ -2027,7 +2005,7 @@ mod tests {
         };
         let _ = request_as(&mut s, bob.clone(), req(by_id("b1"), 100, Priority::Ci), 0);
         let promoted = s
-            .release_lease(g.lease, &alice.key(), 10)
+            .release_lease(g.lease, &alice, 10)
             .expect("holder may release")
             .expect("same-org waiter promoted");
         assert_eq!(promoted.grant.holder, bob);
@@ -2042,7 +2020,7 @@ mod tests {
     /// An access with one live grant from `org_name` covering `tag`.
     fn granted(subject_org: &str, org_name: &str, tag: &str, expires: Option<u64>) -> Access {
         Access {
-            own_org: Some(org(subject_org)),
+            member_of: vec![org(subject_org)],
             grants: vec![GrantScope {
                 id: "g1".to_owned(),
                 org: org(org_name),
@@ -2137,7 +2115,7 @@ mod tests {
         assert_eq!(d, LeaseDecision::Queued { position: 0 });
 
         let promoted = s
-            .release_lease(g.lease, &alice.key(), 10)
+            .release_lease(g.lease, &alice, 10)
             .expect("holder may release")
             .expect("the grantee is promoted");
         assert_eq!(promoted.grant.holder, bob);
@@ -2173,7 +2151,7 @@ mod tests {
             0,
         );
         let promoted = s
-            .release_lease(g.lease, &alice.key(), 60)
+            .release_lease(g.lease, &alice, 60)
             .expect("holder may release");
         assert!(
             promoted.is_none(),
@@ -2223,12 +2201,12 @@ mod tests {
 
         // Revoked: bob's access is now his own org only.
         assert_eq!(
-            s.refresh_waiter_access(&bob.key(), &Access::own_org(org("org-b"))),
+            s.refresh_waiter_access(&bob, &Access::own_org(org("org-b"))),
             1
         );
 
         let promoted = s
-            .release_lease(g.lease, &alice.key(), 10)
+            .release_lease(g.lease, &alice, 10)
             .expect("holder may release")
             .expect("carol is still queued");
         assert_eq!(
@@ -2288,21 +2266,21 @@ mod tests {
 
         // Alice revokes her grant. Bob keeps his own org's membership.
         assert_eq!(
-            s.refresh_waiter_access(&bob.key(), &Access::own_org(org("org-b"))),
+            s.refresh_waiter_access(&bob, &Access::own_org(org("org-b"))),
             2,
             "both of bob's waiters are refreshed, neither is dropped"
         );
 
         // The shared board: bob is no longer eligible.
         assert!(
-            s.release_lease(shared.lease, &alice.key(), 10)
+            s.release_lease(shared.lease, &alice, 10)
                 .expect("holder may release")
                 .is_none(),
             "bob must not be promoted onto the board he lost access to"
         );
         // His own org's board: still his, still queued, still promoted.
         let promoted = s
-            .release_lease(mine.lease, &bob_boss.key(), 10)
+            .release_lease(mine.lease, &bob_boss, 10)
             .expect("holder may release")
             .expect("bob is still queued for his own org's board");
         assert_eq!(
@@ -2329,7 +2307,7 @@ mod tests {
             panic!("expected grant");
         };
         let both = Access {
-            own_org: Some(org("org-b")),
+            member_of: vec![org("org-b")],
             grants: vec![
                 GrantScope {
                     id: "g1".to_owned(),
@@ -2358,10 +2336,10 @@ mod tests {
         // g1 is revoked; g2 still covers the board.
         let mut remaining = both.clone();
         remaining.grants.retain(|g| g.id == "g2");
-        assert_eq!(s.refresh_waiter_access(&bob.key(), &remaining), 1);
+        assert_eq!(s.refresh_waiter_access(&bob, &remaining), 1);
 
         let promoted = s
-            .release_lease(g.lease, &alice.key(), 10)
+            .release_lease(g.lease, &alice, 10)
             .expect("holder may release")
             .expect("the second grant still covers the board");
         assert_eq!(promoted.grant.holder, bob);
@@ -2395,16 +2373,14 @@ mod tests {
         };
 
         assert_eq!(
-            s.leases_held_by(&bob.key()),
+            s.leases_held_by(&bob),
             vec![(gb.lease, board_ref("org-a", "b2"))]
         );
         assert_eq!(
-            s.leases_held_by(&alice.key()),
+            s.leases_held_by(&alice),
             vec![(ga.lease, board_ref("org-a", "b1"))]
         );
-        assert!(s
-            .leases_held_by(&subject_in("org-c", "nobody").key())
-            .is_empty());
+        assert!(s.leases_held_by(&subject_in("org-c", "nobody")).is_empty());
     }
 
     /// Deny by default, stated as a test: an access that confers nothing can

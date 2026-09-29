@@ -1,43 +1,40 @@
-//! Identifier newtypes and the authenticated [`Subject`] used across the fleet
-//! wire protocol.
+//! Identifier newtypes and the wire form of a caller's identity
+//! ([`SubjectKey`]) used across the fleet protocol.
 //!
-//! Revision 2 of the architecture (`docs/architecture.md` §6.1) makes the fleet
-//! **multi-tenant**: every object belongs to exactly one org, and every caller
-//! acts within one. That has two consequences visible in this module:
+//! Identity, orgs and membership are owned by **forgs** (the coordinator's
+//! identity layer); this crate only mirrors the shapes that cross the wire, so
+//! the node, sidecar and CLI never link an identity store:
 //!
-//! * `Principal(String)` — a bare certificate CN with no org, no kind and no
-//!   groups — is gone, replaced by [`Subject`].
+//! * [`OrgId`] carries a forgs namespace-node id (a 26-character ULID
+//!   rendering) — fleet's only namespace kind is `org`.
+//! * [`SubjectKey`] is the wire mirror of `forgs::SubjectKey`, with identical
+//!   rendering and parse rules. The coordinator converts between the two by
+//!   rendering and re-parsing.
 //! * A board is keyed `(org, node, name)` ([`BoardRef`]), not by a globally
 //!   unique string. The node-local half of that key is a [`BoardName`], which
 //!   is all a node knows about itself.
 
 use serde::{Deserialize, Serialize};
 
-/// An org id. Every object in the fleet belongs to exactly one org; a personal
-/// org (an org of one) is created on first login.
+/// An org id: the rendering of a forgs namespace-node id (`NsNodeId`, a
+/// 26-character ULID such as `01J0000000000000000000ORG1`).
+///
+/// Every object in the fleet belongs to exactly one org; a personal org (an
+/// org of one) exists for every user. The id is immutable — an org's *path*
+/// (its display name) can be renamed, its id cannot — so it is what boards,
+/// nodes and grants are keyed by.
 ///
 /// There is deliberately **no** user-owned/org-owned branch: one scoping rule
 /// everywhere, so no code path can forget the org check (architecture §6.1).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OrgId(pub String);
 
-/// A user id. Stable across GitHub login renames (the `user` row carries the
-/// immutable numeric GitHub id separately).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct UserId(pub String);
-
 /// A node id — a machine offering probes to the fleet.
 ///
-/// Namespaced by org (`gh-1/rpi-1`, see `state.rs::node_id_for`), so the same
-/// machine name in two tenants is two nodes.
+/// Namespaced by org (`<org id>/rpi-1`, see `state.rs::node_id_for`), so the
+/// same machine name in two tenants is two nodes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct NodeId(pub String);
-
-/// A group a subject belongs to. Groups are carried for future grant
-/// evaluation; they are deliberately **not** part of a subject's identity (see
-/// [`SubjectKey`]).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Group(pub String);
 
 /// Identifies an active lease. Allocated by the coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -97,20 +94,37 @@ impl BoardRef {
     ///
     /// * nothing — a bare `dk-3`;
     /// * the node's short name — `rpi-1/dk-3`;
-    /// * the full node id — `gh-1/rpi-1/dk-3`;
-    /// * org + node id — `gh-1/gh-1/rpi-1/dk-3`, which is this type's own
+    /// * the full node id — `<org id>/rpi-1/dk-3`;
+    /// * org + node id — `<org id>/<org id>/rpi-1/dk-3`, which is this type's own
     ///   [`std::fmt::Display`], so a key copied out of `ctl list` works verbatim.
     ///
     /// # Why counting segments does not work
     ///
-    /// A production [`NodeId`] is **already org-prefixed** (`gh-1/rpi-1`):
+    /// A production [`NodeId`] is **already org-prefixed** (`<org id>/rpi-1`):
     /// node ids are namespaced by org so the same machine name in two tenants
     /// is two nodes. So a `BoardRef` has a variable number of segments, and the
     /// obvious `split('/')` into `[org, node, name]` cannot address a real
     /// board at all. Peel the name off the end instead, and compare the
     /// remainder as a whole.
+    ///
+    /// See [`BoardRef::answers_to_in`] for the additional org-path spelling
+    /// the coordinator can offer when it knows the org's display name.
     #[must_use]
     pub fn answers_to(&self, typed: &str) -> bool {
+        self.answers_to_in(typed, None)
+    }
+
+    /// [`BoardRef::answers_to`], additionally accepting the org's **path**
+    /// (its human display name, e.g. `ariel-os`) in front of the node's short
+    /// name: `ariel-os/rpi-1/dk-3`.
+    ///
+    /// An [`OrgId`] is an opaque ULID nobody types, so this is the spelling a
+    /// human actually uses to disambiguate two same-named boards. Only the
+    /// coordinator knows the path (it lives in forgs), so it is a parameter
+    /// rather than part of the key; `None` behaves exactly like
+    /// [`BoardRef::answers_to`].
+    #[must_use]
+    pub fn answers_to_in(&self, typed: &str, org_path: Option<&str>) -> bool {
         let (qualifier, name) = match typed.rsplit_once('/') {
             Some((qualifier, name)) => (Some(qualifier), name),
             None => (None, typed),
@@ -127,171 +141,145 @@ impl BoardRef {
         qualifier == self.node.0
             || qualifier == node_short
             || qualifier == format!("{}/{}", self.org.0, self.node.0)
+            || org_path
+                .is_some_and(|path| !path.is_empty() && qualifier == format!("{path}/{node_short}"))
     }
 }
 
-/// Which authentication path produced a [`Subject`].
+/// Which authentication path produced a caller's identity.
+///
+/// The wire mirror of `forgs::SubjectKind`, with fleet's one app kind (`node`)
+/// spelled out as a variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SubjectKind {
     /// A human, authenticated by a user session.
     User,
     /// A node (the machine hosting probes), authenticated by its node
-    /// credential.
+    /// credential. forgs sees this as the app kind `node`.
     Node,
     /// A CI workload, authenticated by an exchanged workload token.
     Workload,
 }
 
-impl std::fmt::Display for SubjectKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            SubjectKind::User => "user",
-            SubjectKind::Node => "node",
-            SubjectKind::Workload => "workload",
-        })
-    }
-}
-
-/// The org role a subject holds.
-///
-/// A `Member` may add a node and use the org's boards; an `Admin` additionally
-/// acts on other members' leases and reads the audit log (architecture §6.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum Role {
-    /// May use the org's boards and add nodes.
-    Member,
-    /// Everything a member may do, plus acting on others' leases and reading
-    /// the audit log.
-    Admin,
-}
-
-impl Role {
-    /// Whether this role satisfies a `required` minimum. `Admin` implies
-    /// `Member`.
-    #[must_use]
-    pub fn satisfies(self, required: Role) -> bool {
-        self >= required
-    }
-
-    /// The DB/wire label for this role.
+impl SubjectKind {
+    /// The label this kind renders as (`user` | `node` | `workload`).
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Role::Member => "member",
-            Role::Admin => "admin",
+            SubjectKind::User => "user",
+            SubjectKind::Node => "node",
+            SubjectKind::Workload => "workload",
         }
     }
 
-    /// Parse a role from its DB/wire label.
-    #[must_use]
-    pub fn from_label(s: &str) -> Option<Self> {
+    fn from_label(s: &str) -> Option<Self> {
         match s {
-            "member" => Some(Role::Member),
-            "admin" => Some(Role::Admin),
+            "user" => Some(SubjectKind::User),
+            "node" => Some(SubjectKind::Node),
+            "workload" => Some(SubjectKind::Workload),
             _ => None,
         }
     }
 }
 
-impl std::fmt::Display for Role {
+impl std::fmt::Display for SubjectKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
-/// An authenticated caller, resolved identically no matter how it proved
-/// itself (architecture §6.1).
+/// The stable identity of an authenticated caller, as it crosses the wire:
+/// the lease holder, a grant's subject, an audit row's actor.
 ///
-/// All three authentication paths — user session, node token, workload token —
-/// resolve to this one shape, so authorization is a single mechanism. A
-/// `Subject` is deliberately **not** constructible from a bare string (no
-/// `Default`, no `From<String>`): it may only be minted where the org is known,
-/// which in the coordinator is a single resolution seam.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Subject {
-    /// The org this subject acts within.
-    pub org: OrgId,
-    /// How the subject authenticated.
-    pub kind: SubjectKind,
-    /// The subject's id, unique within `(org, kind)`.
-    pub id: String,
-    /// Groups the subject belongs to. Advisory: excluded from [`SubjectKey`].
-    pub groups: Vec<Group>,
-}
-
-impl Subject {
-    /// Build a subject with no groups.
-    #[must_use]
-    pub fn new(org: OrgId, kind: SubjectKind, id: impl Into<String>) -> Self {
-        Self {
-            org,
-            kind,
-            id: id.into(),
-            groups: Vec::new(),
-        }
-    }
-
-    /// This subject's **stable identity**: `(org, kind, id)`.
-    ///
-    /// `groups` is deliberately excluded, so adding or removing a group does
-    /// not orphan a lease the subject holds.
-    #[must_use]
-    pub fn key(&self) -> SubjectKey {
-        SubjectKey {
-            org: self.org.clone(),
-            kind: self.kind,
-            id: self.id.clone(),
-        }
-    }
-
-    /// Whether the subject belongs to `group`.
-    #[must_use]
-    pub fn in_group(&self, group: &Group) -> bool {
-        self.groups.contains(group)
-    }
-}
-
-/// The stable identity of a [`Subject`], used for equality wherever ownership
-/// matters (lease holder checks, the per-subject concurrency cap, audit rows).
+/// The wire mirror of `forgs::SubjectKey`, rendering identically as
+/// `[<ns>/]<kind>:<id>`:
 ///
-/// Excludes `groups` by construction: a group change must never transfer or
-/// orphan a lease.
+/// * `user:01J…` — a user, by immutable forgs user id (no namespace: a user is
+///   not addressed "in" an org);
+/// * `01J…/node:01J…/rpi-1` — a node, scoped by its org's namespace id;
+/// * `gha/workload:owner/repo` — a GitHub Actions workload (`gha` is a
+///   reserved namespace slot, not an org);
+/// * `01J…/workload:agent:builder` / `01J…/workload:key:<hash8>` — an
+///   API-key identity, scoped by the org that minted it.
+///
+/// [`SubjectKey::parse`] splits at the first `/` **only when it comes before
+/// the first `:`**, then at the first `:`, so ids may contain `/` and `:` and
+/// still round-trip while a namespace can contain neither. The fields are
+/// private so a key cannot be assembled in a shape that would not round-trip;
+/// build one with [`SubjectKey::new`] or [`SubjectKey::parse`].
+///
+/// Deserialisation does **not** re-validate: the struct form only ever comes
+/// from a peer that built it through these constructors, and every consumer
+/// compares keys by equality, never by re-rendering into another key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SubjectKey {
-    /// The org the subject acts within.
-    pub org: OrgId,
-    /// How the subject authenticated.
-    pub kind: SubjectKind,
-    /// The subject's id, unique within `(org, kind)`.
-    pub id: String,
+    ns: Option<String>,
+    kind: SubjectKind,
+    id: String,
 }
 
 impl SubjectKey {
-    /// Parse a rendered subject key (`<org>/<kind>:<id>`).
+    /// A key from parts.
     ///
-    /// The inverse of [`std::fmt::Display`], used to read back the `subject`
-    /// column of a grant row. Returns `None` on any shape or kind it does not
-    /// recognise — a grant whose subject will not parse must be dropped closed,
-    /// never widened into a match-anything.
+    /// Returns `None` if the parts would not round-trip through
+    /// [`SubjectKey::parse`]: an empty namespace or id, a namespace containing
+    /// `/`, `:` or a control character, or an id containing a control
+    /// character. Same rules as `forgs::SubjectKey::new`.
     #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        let (org, rest) = s.split_once('/')?;
-        let (kind, id) = rest.split_once(':')?;
-        if org.is_empty() || id.is_empty() {
+    pub fn new(ns: Option<&str>, kind: SubjectKind, id: &str) -> Option<Self> {
+        if let Some(ns) = ns {
+            if ns.is_empty() || ns.contains(['/', ':']) || has_control(ns) {
+                return None;
+            }
+        }
+        if id.is_empty() || has_control(id) {
             return None;
         }
-        let kind = match kind {
-            "user" => SubjectKind::User,
-            "node" => SubjectKind::Node,
-            "workload" => SubjectKind::Workload,
-            _ => return None,
-        };
-        Some(SubjectKey {
-            org: OrgId(org.to_owned()),
+        Some(Self {
+            ns: ns.map(str::to_owned),
             kind,
             id: id.to_owned(),
         })
     }
+
+    /// The namespace slot, if any (`gha`, or an org's namespace id).
+    #[must_use]
+    pub fn ns(&self) -> Option<&str> {
+        self.ns.as_deref()
+    }
+
+    /// How the subject authenticated.
+    #[must_use]
+    pub fn kind(&self) -> SubjectKind {
+        self.kind
+    }
+
+    /// The id, unique within `(ns, kind)`.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Parse a rendered subject key (`[<ns>/]<kind>:<id>`).
+    ///
+    /// The inverse of [`std::fmt::Display`], and equivalent to
+    /// `forgs::SubjectKey::parse_with(s, &["node"])`. Returns `None` on any
+    /// shape or kind it does not recognise — a grant whose subject will not
+    /// parse must be dropped closed, never widened into a match-anything.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let colon = s.find(':')?;
+        let (ns, rest) = match s.find('/') {
+            Some(slash) if slash < colon => (Some(&s[..slash]), &s[slash + 1..]),
+            _ => (None, s),
+        };
+        let (kind, id) = rest.split_once(':')?;
+        Self::new(ns, SubjectKind::from_label(kind)?, id)
+    }
+}
+
+fn has_control(s: &str) -> bool {
+    s.chars().any(char::is_control)
 }
 
 impl std::fmt::Display for OrgId {
@@ -300,19 +288,7 @@ impl std::fmt::Display for OrgId {
     }
 }
 
-impl std::fmt::Display for UserId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::fmt::Display for Group {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -332,172 +308,10 @@ impl std::fmt::Display for BoardRef {
 
 impl std::fmt::Display for SubjectKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}/{}:{}", self.org.0, self.kind, self.id)
-    }
-}
-
-impl std::fmt::Display for Subject {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.key(), f)
-    }
-}
-
-/// The reserved namespace a GitHub Actions workload subject lives in
-/// (architecture §6.7).
-///
-/// A workload token proves "a job in repo `owner/name`", and that fact is
-/// **org-independent**: the same repo may be granted hardware by several orgs,
-/// and belongs to none of them. So the subject key is
-/// `gha/workload:<owner>/<repo>` — `gha` occupies the namespace slot a
-/// [`SubjectKey`] would otherwise fill with an org id, and there is no `org`
-/// row named `gha` that anything is scoped to.
-///
-/// Two properties make this safe rather than a collision waiting to happen:
-///
-/// * the namespace is **reserved at every org-creation path**
-///   (`Db::ensure_org` refuses it, and `CoordinatorConfig::validate` refuses
-///   `default_org = "gha"`), so no tenant can ever occupy it;
-/// * a grant is matched on the **whole rendered key**, so even a hypothetical
-///   `gha/user:x` could not be reached by a workload token, which always
-///   renders `gha/workload:…`.
-///
-/// `repository_owner` is deliberately *not* part of the trust decision: a fork
-/// or a newly created repo under a granted owner produces a different id here
-/// and therefore matches no grant.
-pub const WORKLOAD_NS_GHA: &str = "gha";
-
-/// Validate and normalise a GitHub `owner/name` repository string.
-///
-/// Returns the **lowercased** repo, or `None` if it is not exactly one
-/// `owner/name` pair over a conservative charset (`[A-Za-z0-9._-]`).
-///
-/// # Why lowercase, and why in one function
-///
-/// GitHub repository names are case-*preserving* but case-*insensitive*, so
-/// `Ariel-OS/ariel-os` and `ariel-os/ariel-os` are the same repo. A grant
-/// stores this id and a workload token's claim is matched against it by exact
-/// string equality, so a case difference between the two spellings would
-/// become a silent denial that looks like a coordinator bug. Both sides call
-/// **this** function — `grant --repo` on the way in and the OIDC claim on the
-/// way in — so they cannot disagree.
-///
-/// The charset is enforced because the result becomes a subject id that is
-/// rendered into `<ns>/<kind>:<id>`: a `/` or `:` in the wrong place would let
-/// a repo name impersonate another subject shape. One slash is allowed (the
-/// separator itself), and [`SubjectKey::parse`] splits at the *first* `/` and
-/// the *first* `:`, so the result round-trips.
-#[must_use]
-pub fn normalise_repo(repo: &str) -> Option<String> {
-    let repo = repo.trim();
-    let (owner, name) = repo.split_once('/')?;
-    if owner.is_empty() || name.is_empty() {
-        return None;
-    }
-    // 39 is GitHub's owner limit and 100 its repo-name limit; the cap is here
-    // to bound what a claim can write into a subject id, not to mirror GitHub
-    // exactly.
-    if owner.len() > 64 || name.len() > 128 {
-        return None;
-    }
-    let ok = |s: &str| {
-        s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    };
-    if !ok(owner) || !ok(name) {
-        return None;
-    }
-    Some(format!(
-        "{}/{}",
-        owner.to_ascii_lowercase(),
-        name.to_ascii_lowercase()
-    ))
-}
-
-/// The [`SubjectKey`] a GitHub Actions job in `repo` authenticates as.
-///
-/// `repo` must already have passed [`normalise_repo`]. The single constructor,
-/// so the grant-creation path (`grant --repo`) and the token-exchange path
-/// cannot produce two different spellings of the same identity.
-#[must_use]
-pub fn workload_subject_key(repo: &str) -> SubjectKey {
-    SubjectKey {
-        org: OrgId(WORKLOAD_NS_GHA.to_owned()),
-        kind: SubjectKind::Workload,
-        id: repo.to_owned(),
-    }
-}
-
-/// Length cap on an auth-key identity name (`auth-key create --as <name>`).
-///
-/// Bounds what an operator-chosen string can write into a subject id, in the
-/// same spirit as [`normalise_repo`]'s owner/name caps. 64 characters is far
-/// more than a readable agent name needs and far less than anything that could
-/// make a rendered key unwieldy in a terminal, a log line or an audit row.
-pub const MAX_AGENT_NAME_LEN: usize = 64;
-
-/// Validate and normalise an auth-key identity name.
-///
-/// Returns the **lowercased** name, or `None` if it is not a non-empty string
-/// of at most [`MAX_AGENT_NAME_LEN`] characters over `[a-z0-9._-]` starting
-/// with `[a-z0-9]`. Never repairs: a name that does not pass is refused at mint
-/// time, with the rule named, rather than silently becoming a different
-/// identity.
-///
-/// # Why each rule exists
-///
-/// * **Lowercasing.** An identity is a name an operator retypes months later
-///   when rotating the credential. `Builder` and `builder` producing two
-///   subjects would silently fork the audit trail and the concurrency budget —
-///   which is exactly the bug named identities exist to remove. Same reasoning
-///   as [`normalise_repo`]'s lowercasing, and normalising in one function is
-///   what stops the mint path and the redemption path from disagreeing.
-/// * **The charset.** The name is rendered into `<org>/workload:agent:<name>`.
-///   Excluding `:` makes it structurally impossible to spell the unnamed
-///   `key:<hash8>` form (`--as key:deadbeef` is refused, not accepted as a
-///   look-alike) or to introduce a second separator into the rendered key.
-///   Excluding `/` makes it impossible to be mistaken for a
-///   `gha/workload:owner/repo` repo subject.
-/// * **The first character.** A leading `-` reads as a flag in every message,
-///   shell recipe and CLI example that quotes the name, and a leading `.`
-///   invites `.` or `..`, which look like paths.
-///
-/// The name is **org-scoped**: the subject carries the org, so two tenants may
-/// each have a `builder` without collision.
-#[must_use]
-pub fn normalise_agent_name(name: &str) -> Option<String> {
-    let name = name.trim().to_ascii_lowercase();
-    if name.is_empty() || name.len() > MAX_AGENT_NAME_LEN {
-        return None;
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
-        return None;
-    }
-    if !name.starts_with(|c: char| c.is_ascii_alphanumeric()) {
-        return None;
-    }
-    Some(name)
-}
-
-/// The [`SubjectKey`] an auth key minted with `--as <name>` speaks as.
-///
-/// `name` must already have passed [`normalise_agent_name`]. The **only** place
-/// the `agent:` prefix is spelled, for the reason [`workload_subject_key`]'s
-/// doc comment gives: two spellings of one identity is the failure mode, and
-/// here it would fork precisely the audit trail and concurrency budget the
-/// named identity exists to keep whole.
-///
-/// Org-scoped, so it can never collide with a `gha/workload:owner/repo` repo
-/// subject, and — because the charset excludes `:` — never with the unnamed
-/// `key:<hash8>` spelling either.
-#[must_use]
-pub fn agent_subject_key(org: &OrgId, name: &str) -> SubjectKey {
-    SubjectKey {
-        org: org.clone(),
-        kind: SubjectKind::Workload,
-        id: format!("agent:{name}"),
+        if let Some(ns) = &self.ns {
+            write!(f, "{ns}/")?;
+        }
+        write!(f, "{}:{}", self.kind, self.id)
     }
 }
 
@@ -505,197 +319,107 @@ pub fn agent_subject_key(org: &OrgId, name: &str) -> SubjectKey {
 mod tests {
     use super::*;
 
-    fn subject(org: &str, id: &str) -> Subject {
-        Subject::new(OrgId(org.to_owned()), SubjectKind::User, id)
+    const ORG_A: &str = "01J0000000000000000000ORG1";
+    const ORG_B: &str = "01J0000000000000000000ORG2";
+    const USER: &str = "01J00000000000000000USER01";
+
+    fn org(id: &str) -> OrgId {
+        OrgId(id.to_owned())
     }
 
     #[test]
-    fn key_excludes_groups() {
-        let mut a = subject("acme", "alice");
-        let b = a.clone();
-        a.groups.push(Group("firmware".to_owned()));
+    fn a_user_key_renders_without_a_namespace() {
+        let key = SubjectKey::new(None, SubjectKind::User, USER).unwrap();
+        assert_eq!(key.to_string(), format!("user:{USER}"));
+        assert_eq!(key.ns(), None);
+        assert_eq!(key.kind(), SubjectKind::User);
+        assert_eq!(key.id(), USER);
+    }
+
+    #[test]
+    fn same_id_in_different_namespaces_is_a_different_subject() {
+        let a = SubjectKey::new(Some(ORG_A), SubjectKind::Node, "rpi-1").unwrap();
+        let b = SubjectKey::new(Some(ORG_B), SubjectKind::Node, "rpi-1").unwrap();
         assert_ne!(a, b);
-        assert_eq!(a.key(), b.key());
     }
 
     #[test]
-    fn same_id_in_different_orgs_is_a_different_subject() {
-        assert_ne!(subject("a", "alice").key(), subject("b", "alice").key());
-    }
-
-    #[test]
-    fn subject_key_renders_org_kind_id() {
-        assert_eq!(
-            subject("acme", "alice").key().to_string(),
-            "acme/user:alice"
-        );
-    }
-
-    #[test]
-    fn subject_key_parses_back_from_its_rendering() {
-        for s in [
-            subject("acme", "alice").key(),
-            Subject::new(OrgId("gh-42".to_owned()), SubjectKind::Node, "rpi-1").key(),
-            Subject::new(OrgId("gh-42".to_owned()), SubjectKind::Workload, "ci").key(),
+    fn subject_keys_parse_back_from_their_rendering() {
+        for key in [
+            SubjectKey::new(None, SubjectKind::User, USER).unwrap(),
+            SubjectKey::new(Some(ORG_A), SubjectKind::Node, &format!("{ORG_A}/rpi-1")).unwrap(),
+            SubjectKey::new(Some("gha"), SubjectKind::Workload, "ariel-os/ariel-os").unwrap(),
+            SubjectKey::new(Some(ORG_A), SubjectKind::Workload, "agent:builder").unwrap(),
+            SubjectKey::new(Some(ORG_A), SubjectKind::Workload, "key:deadbeef").unwrap(),
         ] {
-            assert_eq!(SubjectKey::parse(&s.to_string()), Some(s));
+            assert_eq!(SubjectKey::parse(&key.to_string()), Some(key));
         }
     }
 
-    /// An id containing `:` still parses: the split is at the *first* colon
-    /// after the first slash, and ids are opaque.
+    /// The renderings forgs produces, verbatim: the coordinator converts
+    /// between the two types by rendering one and parsing the other.
     #[test]
-    fn subject_key_parse_splits_at_the_first_separators() {
-        let k = SubjectKey::parse("acme/user:gh-1:2").unwrap();
-        assert_eq!(k.id, "gh-1:2");
-        assert_eq!(k.org, OrgId("acme".to_owned()));
+    fn forgs_renderings_parse_to_the_expected_parts() {
+        let k = SubjectKey::parse("gha/workload:ariel-os/ariel-os").unwrap();
+        assert_eq!(
+            (k.ns(), k.kind(), k.id()),
+            (Some("gha"), SubjectKind::Workload, "ariel-os/ariel-os")
+        );
+        let k = SubjectKey::parse(&format!("{ORG_A}/node:{ORG_A}/rpi-1")).unwrap();
+        assert_eq!(k.ns(), Some(ORG_A));
+        assert_eq!(k.kind(), SubjectKind::Node);
+        assert_eq!(k.id(), format!("{ORG_A}/rpi-1"));
+    }
+
+    /// An id containing `:` still parses, and a `/` after the first `:`
+    /// belongs to the id, not the namespace.
+    #[test]
+    fn parse_splits_at_the_first_separators() {
+        let k = SubjectKey::parse("acme/user:x:2").unwrap();
+        assert_eq!(k.id(), "x:2");
+        assert_eq!(k.ns(), Some("acme"));
+        let k = SubjectKey::parse("workload:a/b").unwrap();
+        assert_eq!(k.ns(), None);
+        assert_eq!(k.id(), "a/b");
     }
 
     #[test]
     fn malformed_subject_keys_are_rejected_not_guessed() {
         for bad in [
             "acme/user",
-            "acme:user:alice",
             "acme/root:alice",
             "/user:alice",
             "acme/user:",
+            "user:",
             "alice",
-        ] {
-            assert_eq!(SubjectKey::parse(bad), None, "{bad} should not parse");
-        }
-    }
-
-    /// The workload subject shape, and the property that makes it work with no
-    /// schema change: an id containing a slash round-trips through
-    /// `SubjectKey::parse`, because the parse splits at the *first* separators.
-    #[test]
-    fn a_workload_subject_key_round_trips_through_parse() {
-        let key = workload_subject_key(&normalise_repo("ariel-os/ariel-os").unwrap());
-        assert_eq!(key.to_string(), "gha/workload:ariel-os/ariel-os");
-        assert_eq!(SubjectKey::parse(&key.to_string()), Some(key.clone()));
-        assert_eq!(key.org, OrgId(WORKLOAD_NS_GHA.to_owned()));
-        assert_eq!(key.kind, SubjectKind::Workload);
-    }
-
-    /// Case-insensitivity is normalised on **both** sides (grant creation and
-    /// claim ingestion) by this one function, so a repo whose GitHub spelling
-    /// is mixed-case cannot become a silent denial.
-    #[test]
-    fn repo_normalisation_lowercases_and_validates() {
-        assert_eq!(
-            normalise_repo("Ariel-OS/Ariel-OS").as_deref(),
-            Some("ariel-os/ariel-os")
-        );
-        assert_eq!(normalise_repo("  a/b ").as_deref(), Some("a/b"));
-        assert_eq!(
-            normalise_repo("a_b.c/d-e.f").as_deref(),
-            Some("a_b.c/d-e.f")
-        );
-
-        for bad in [
             "",
-            "owner",
-            "owner/",
-            "/name",
-            // A second slash, or a colon, would let a repo name impersonate
-            // another subject shape once it is rendered into a subject key.
-            "owner/name/extra",
-            "own:er/name",
-            "owner/na:me",
-            "owner/na me",
-            "owner/na\nme",
+            "a/b/user:x",
+            "user:a\nb",
+            "Node:x",
         ] {
-            assert_eq!(normalise_repo(bad), None, "{bad:?} should not normalise");
+            assert_eq!(SubjectKey::parse(bad), None, "{bad:?} should not parse");
         }
-        assert_eq!(normalise_repo(&format!("{}/b", "x".repeat(65))), None);
-        assert_eq!(normalise_repo(&format!("a/{}", "x".repeat(129))), None);
     }
 
-    /// The rule set that makes a chosen name safe to render into a subject id,
-    /// and the lowercasing that keeps a rotation from forking the identity.
     #[test]
-    fn agent_name_normalisation_lowercases_and_validates() {
-        assert_eq!(normalise_agent_name("Builder").as_deref(), Some("builder"));
-        assert_eq!(normalise_agent_name("  ci-2 ").as_deref(), Some("ci-2"));
-        assert_eq!(normalise_agent_name("a_b.c-9").as_deref(), Some("a_b.c-9"));
-
-        for bad in [
-            "",
-            " ",
-            "a b",
-            // A `/` would make the name look like a `gha/workload:owner/repo`
-            // repo subject once rendered.
-            "a/b",
-            // A `:` would let a name spell the unnamed `key:<hash>` form.
-            "key:deadbeef",
-            "a:b",
-            // A leading `-` reads as a flag; a leading `.` invites `..`.
-            "-x",
-            "..",
-            ".hidden",
-            "naïve",
-            "a\nb",
-        ] {
-            assert_eq!(
-                normalise_agent_name(bad),
-                None,
-                "{bad:?} should not normalise"
-            );
-        }
-        assert_eq!(
-            normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN)).as_deref(),
-            Some("x".repeat(MAX_AGENT_NAME_LEN).as_str())
-        );
-        assert_eq!(
-            normalise_agent_name(&"x".repeat(MAX_AGENT_NAME_LEN + 1)),
-            None
-        );
-    }
-
-    /// The named identity's shape, and that it round-trips through
-    /// `SubjectKey::parse` — which is what lets a grant row store it as text
-    /// and read it back as the same subject.
-    #[test]
-    fn an_agent_subject_key_round_trips_through_parse() {
-        let key = agent_subject_key(&OrgId("acme".to_owned()), "builder");
-        assert_eq!(key.to_string(), "acme/workload:agent:builder");
-        assert_eq!(SubjectKey::parse(&key.to_string()), Some(key.clone()));
-        assert_eq!(key.kind, SubjectKind::Workload);
-        // Org-scoped: the same name in two orgs is two subjects.
-        assert_ne!(
-            key,
-            agent_subject_key(&OrgId("other".to_owned()), "builder")
-        );
-        // And it cannot collide with the unnamed spelling, whose id starts
-        // `key:` and which the charset rule makes unrepresentable as a name.
-        assert_ne!(key.id, "key:deadbeef");
+    fn new_rejects_shapes_that_would_not_round_trip() {
+        assert!(SubjectKey::new(Some("a/b"), SubjectKind::User, "x").is_none());
+        assert!(SubjectKey::new(Some("a:b"), SubjectKind::User, "x").is_none());
+        assert!(SubjectKey::new(Some(""), SubjectKind::User, "x").is_none());
+        assert!(SubjectKey::new(Some("a\tb"), SubjectKind::User, "x").is_none());
+        assert!(SubjectKey::new(None, SubjectKind::User, "").is_none());
+        assert!(SubjectKey::new(None, SubjectKind::User, "a\nb").is_none());
     }
 
     #[test]
     fn board_ref_renders_all_three_parts() {
-        let r = BoardRef::new(
-            OrgId("acme".to_owned()),
-            NodeId("rpi-1".to_owned()),
-            "nrf52840-dk-3",
-        );
-        assert_eq!(r.to_string(), "acme/rpi-1/nrf52840-dk-3");
+        let r = BoardRef::new(org(ORG_A), NodeId("rpi-1".to_owned()), "nrf52840-dk-3");
+        assert_eq!(r.to_string(), format!("{ORG_A}/rpi-1/nrf52840-dk-3"));
         assert_eq!(r.board_name(), BoardName("nrf52840-dk-3".to_owned()));
     }
 
-    #[test]
-    fn admin_implies_member() {
-        assert!(Role::Admin.satisfies(Role::Member));
-        assert!(Role::Admin.satisfies(Role::Admin));
-        assert!(Role::Member.satisfies(Role::Member));
-        assert!(!Role::Member.satisfies(Role::Admin));
-    }
-
-    #[test]
-    fn role_label_roundtrip() {
-        for role in [Role::Member, Role::Admin] {
-            assert_eq!(Role::from_label(role.as_str()), Some(role));
-        }
-        assert_eq!(Role::from_label("root"), None);
+    fn prefixed_board(org_id: &str, node: &str, name: &str) -> BoardRef {
+        BoardRef::new(org(org_id), NodeId(format!("{org_id}/{node}")), name)
     }
 
     /// A production node id is org-prefixed (`state.rs::node_id_for`), so a
@@ -704,19 +428,15 @@ mod tests {
     /// counting segments cannot address a real board at all.
     #[test]
     fn a_board_answers_to_every_qualified_spelling() {
-        let board = BoardRef::new(
-            OrgId("gh-1".to_owned()),
-            NodeId("gh-1/rpi-1".to_owned()),
-            "dk-3",
-        );
+        let board = prefixed_board(ORG_A, "rpi-1", "dk-3");
         for spelling in [
-            "dk-3",                 // bare node-local name
-            "rpi-1/dk-3",           // the node's short name
-            "gh-1/rpi-1/dk-3",      // the full node id
-            "gh-1/gh-1/rpi-1/dk-3", // org + node id: this type's own Display
+            "dk-3".to_owned(),                     // bare node-local name
+            "rpi-1/dk-3".to_owned(),               // the node's short name
+            format!("{ORG_A}/rpi-1/dk-3"),         // the full node id
+            format!("{ORG_A}/{ORG_A}/rpi-1/dk-3"), // org + node id: Display
         ] {
             assert!(
-                board.answers_to(spelling),
+                board.answers_to(&spelling),
                 "{spelling} should reach the board"
             );
         }
@@ -726,42 +446,45 @@ mod tests {
 
     #[test]
     fn a_board_refuses_a_qualifier_that_is_not_its_own() {
-        let board = BoardRef::new(
-            OrgId("gh-1".to_owned()),
-            NodeId("gh-1/rpi-1".to_owned()),
-            "dk-3",
-        );
+        let board = prefixed_board(ORG_A, "rpi-1", "dk-3");
         for spelling in [
-            "dk-4",                 // wrong board
-            "rpi-2/dk-3",           // wrong node
-            "gh-2/rpi-1/dk-3",      // right node name, wrong org prefix
-            "gh-2/gh-1/rpi-1/dk-3", // wrong org
-            "gh-1/dk-3",            // an org alone does not qualify a board
-            "/dk-3",                // empty qualifier
-            "dk-3/",                // empty name
-            "",
+            "dk-4".to_owned(),                     // wrong board
+            "rpi-2/dk-3".to_owned(),               // wrong node
+            format!("{ORG_B}/rpi-1/dk-3"),         // right node name, wrong org prefix
+            format!("{ORG_B}/{ORG_A}/rpi-1/dk-3"), // wrong org
+            format!("{ORG_A}/dk-3"),               // an org alone does not qualify a board
+            "/dk-3".to_owned(),                    // empty qualifier
+            "dk-3/".to_owned(),                    // empty name
+            String::new(),
         ] {
             assert!(
-                !board.answers_to(spelling),
+                !board.answers_to(&spelling),
                 "{spelling} must not reach the board"
             );
         }
+    }
+
+    /// The org **path** spelling (`ariel-os/rpi-1/dk-3`) works only when the
+    /// caller supplies the path, and only that path.
+    #[test]
+    fn a_board_answers_to_its_org_path_when_given_one() {
+        let board = prefixed_board(ORG_A, "rpi-1", "dk-3");
+        assert!(board.answers_to_in("ariel-os/rpi-1/dk-3", Some("ariel-os")));
+        assert!(!board.answers_to("ariel-os/rpi-1/dk-3"));
+        assert!(!board.answers_to_in("other/rpi-1/dk-3", Some("ariel-os")));
+        assert!(!board.answers_to_in("ariel-os/rpi-2/dk-3", Some("ariel-os")));
+        assert!(!board.answers_to_in("ariel-os/dk-3", Some("ariel-os")));
+        assert!(!board.answers_to_in("/rpi-1/dk-3", Some("")));
+        // The other spellings keep working alongside it.
+        assert!(board.answers_to_in("rpi-1/dk-3", Some("ariel-os")));
     }
 
     /// The whole reason the qualified form exists: two boards of the same name
     /// in different orgs must be separable.
     #[test]
     fn qualified_names_separate_same_named_boards_in_two_orgs() {
-        let mine = BoardRef::new(
-            OrgId("gh-1".to_owned()),
-            NodeId("gh-1/rpi-1".to_owned()),
-            "dk-3",
-        );
-        let shared = BoardRef::new(
-            OrgId("gh-2".to_owned()),
-            NodeId("gh-2/lab-pi".to_owned()),
-            "dk-3",
-        );
+        let mine = prefixed_board(ORG_A, "rpi-1", "dk-3");
+        let shared = prefixed_board(ORG_B, "lab-pi", "dk-3");
         // The bare name is ambiguous: both answer to it, which is why the
         // coordinator tiers own-org first.
         assert!(mine.answers_to("dk-3") && shared.answers_to("dk-3"));
@@ -772,11 +495,11 @@ mod tests {
         assert!(!shared.answers_to("rpi-1/dk-3"));
     }
 
-    /// A node id with no org prefix (as `boards.toml` fixtures and older rows
-    /// can have) still works, so the grammar is not coupled to the prefix.
+    /// A node id with no org prefix (as `boards.toml` fixtures can have) still
+    /// works, so the grammar is not coupled to the prefix.
     #[test]
     fn an_unprefixed_node_id_still_resolves() {
-        let board = BoardRef::new(OrgId("acme".to_owned()), NodeId("rpi-1".to_owned()), "dk-3");
+        let board = BoardRef::new(org("acme"), NodeId("rpi-1".to_owned()), "dk-3");
         for spelling in ["dk-3", "rpi-1/dk-3", "acme/rpi-1/dk-3"] {
             assert!(board.answers_to(spelling), "{spelling} should resolve");
         }

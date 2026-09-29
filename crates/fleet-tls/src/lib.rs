@@ -11,8 +11,8 @@
 //! * [`client_trust_config`] — the single trust path every outbound connection
 //!   in the tree uses. `WebPKI` roots by default; optionally a pinned server-leaf
 //!   SHA-256 for a self-hosted coordinator with no public DNS name. Both the WS
-//!   dialer (`fleet_wire::client`) and the `POST /auth/token` HTTP client
-//!   (`fleet_auth::http_client`) build from this one function, so
+//!   dialer (`fleet_wire::client`) and the CLI's HTTP client for the `/auth/*`
+//!   and `/node/*` surfaces build from this one function, so
 //!   `--server-cert-sha256` covers both. If that ever forks, pinning silently
 //!   stops covering the token exchange.
 //! * [`PinnedServerCertVerifier`] — the pin itself, no longer a *bootstrap*

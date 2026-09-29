@@ -15,7 +15,7 @@
 //! fingerprint)`. The **in-memory [`LeaseCache`]** is keyed on the real
 //! [`SubjectKey`], recovered from the stored record.
 //!
-//! The sidecar never sees a `Subject` before it leases — the subject is
+//! The sidecar never sees its subject before it leases — the subject is
 //! resolved coordinator-side from the bearer token — so a *pre-lease* lookup
 //! cannot use a `SubjectKey`. What the sidecar always has is the coordinator URL
 //! and the bearer token, hence:
@@ -148,7 +148,7 @@ mod unix_imp {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest as _, Sha256};
 
-    use fleet_proto::ids::{BoardRef, NodeId, Subject, SubjectKey, SubjectKind};
+    use fleet_proto::ids::{BoardRef, NodeId, SubjectKey, SubjectKind};
     use fleet_proto::lease::{Constraint, LeaseGrant};
     use fleet_proto::LeaseId;
 
@@ -162,7 +162,12 @@ mod unix_imp {
     /// the fleet-wide `AgentId` → `NodeId` rename. A version-1 file would fail
     /// to deserialize anyway (the field is not optional); bumping makes the
     /// miss deliberate and quiet rather than a "corrupt store" debug line.
-    const FORMAT_VERSION: u32 = 2;
+    ///
+    /// 2 → 3: identity moved to forgs. A record's `holder` is the new
+    /// [`SubjectKey`] shape (optional namespace, no org) and org ids are
+    /// namespace ULIDs, so a version-2 record names a subject and board no
+    /// v12 coordinator knows. Dropping them quietly is the honest outcome.
+    const FORMAT_VERSION: u32 = 3;
 
     /// The runtime sub-directory everything lives in.
     const DIR_NAME: &str = "probe-rs-fleet";
@@ -189,8 +194,7 @@ mod unix_imp {
         pub node: NodeId,
         /// The lease itself.
         pub lease: LeaseId,
-        /// The grant's holder, as the stable [`SubjectKey`] (not the whole
-        /// `Subject`: groups must not affect lease identity).
+        /// The grant's holder, as its stable [`SubjectKey`].
         pub holder: SubjectKey,
         /// Expiry, epoch seconds, as last reported by the coordinator.
         pub expires: u64,
@@ -216,12 +220,7 @@ mod unix_imp {
                 lease: self.lease,
                 board: self.board.clone(),
                 node: self.node.clone(),
-                holder: Subject {
-                    org: self.holder.org.clone(),
-                    kind: self.holder.kind,
-                    id: self.holder.id.clone(),
-                    groups: Vec::new(),
-                },
+                holder: self.holder.clone(),
                 expires: self.expires,
                 token: Vec::new(),
             }
@@ -354,8 +353,10 @@ mod unix_imp {
                 let digest = record.key().digest();
                 let mut cached = CachedLease::new(record.grant());
                 cached.refresh_margin_secs = record.refresh_margin_secs;
-                self.cache
-                    .insert(&select, &cache_key_for(&record.holder, &digest), cached);
+                let Some(cache_key) = cache_key_for(&record.holder, &digest) else {
+                    continue;
+                };
+                self.cache.insert(&select, &cache_key, cached);
                 self.records.insert(digest, record);
             }
         }
@@ -390,7 +391,7 @@ mod unix_imp {
             // the same synthetic subject `adopt` inserted it with, so one
             // record's expiry can never be read for another's.
             self.cache
-                .get(select, &cache_key_for(&record.holder, &digest), now_secs)?;
+                .get(select, &cache_key_for(&record.holder, &digest)?, now_secs)?;
             let guard = self.lock_use(&digest)?;
             Some((record, guard))
         }
@@ -418,9 +419,9 @@ mod unix_imp {
             select: &Constraint,
             grant: &LeaseGrant,
         ) -> bool {
-            if grant.holder.kind != SubjectKind::User {
+            if grant.holder.kind() != SubjectKind::User {
                 tracing::debug!(
-                    kind = %grant.holder.kind,
+                    kind = %grant.holder.kind(),
                     "not caching a non-user lease; it is released at exit"
                 );
                 return false;
@@ -433,7 +434,7 @@ mod unix_imp {
                 board: grant.board.clone(),
                 node: grant.node.clone(),
                 lease: grant.lease,
-                holder: grant.holder.key(),
+                holder: grant.holder.clone(),
                 expires: grant.expires,
                 refresh_margin_secs: CachedLease::DEFAULT_REFRESH_MARGIN_SECS,
             };
@@ -549,12 +550,16 @@ mod unix_imp {
     /// record's digest folded into the id, so records that share a selector and
     /// a subject but differ in coordinator or token never alias. See
     /// [`LeaseStore::adopt`].
-    fn cache_key_for(holder: &SubjectKey, digest: &str) -> SubjectKey {
-        SubjectKey {
-            org: holder.org.clone(),
-            kind: holder.kind,
-            id: format!("{}#{digest}", holder.id),
-        }
+    ///
+    /// `None` only if the holder could not have been built through
+    /// [`SubjectKey::new`] in the first place (a hand-edited file); such a
+    /// record is simply not cached.
+    fn cache_key_for(holder: &SubjectKey, digest: &str) -> Option<SubjectKey> {
+        SubjectKey::new(
+            holder.ns(),
+            holder.kind(),
+            &format!("{}#{digest}", holder.id()),
+        )
     }
 
     /// Resolve the runtime directory: `$XDG_RUNTIME_DIR/probe-rs-fleet`, or a
@@ -708,7 +713,7 @@ mod unix_imp {
                     "b1",
                 ),
                 node: NodeId("node-a".to_owned()),
-                holder: Subject::new(OrgId("default".to_owned()), kind, "alice"),
+                holder: SubjectKey::new(None, kind, "alice").unwrap(),
                 expires,
                 token: vec![0xde, 0xad, 0xbe, 0xef],
             }
@@ -1086,7 +1091,7 @@ mod unix_imp {
 /// existed (lease and release per invocation).
 #[cfg(not(unix))]
 mod other_imp {
-    use fleet_proto::ids::{BoardRef, NodeId, Subject, SubjectKey};
+    use fleet_proto::ids::{BoardRef, NodeId, SubjectKey};
     use fleet_proto::lease::{Constraint, LeaseGrant};
     use fleet_proto::LeaseId;
 
@@ -1129,12 +1134,7 @@ mod other_imp {
                 lease: self.lease,
                 board: self.board.clone(),
                 node: self.node.clone(),
-                holder: Subject {
-                    org: self.holder.org.clone(),
-                    kind: self.holder.kind,
-                    id: self.holder.id.clone(),
-                    groups: Vec::new(),
-                },
+                holder: self.holder.clone(),
                 expires: self.expires,
                 token: Vec::new(),
             }

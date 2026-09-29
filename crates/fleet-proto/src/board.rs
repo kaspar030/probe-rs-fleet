@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BoardRef, LeaseId, NodeId, Subject};
+use crate::ids::{BoardRef, LeaseId, NodeId, SubjectKey};
 
 /// A leasable board, as known to the coordinator (reconciled from a node's
 /// `boards.toml` plus live probe discovery).
@@ -46,7 +46,7 @@ pub enum BoardState {
     /// Held by a subject until `expires` (epoch seconds). Extendable.
     Leased {
         lease: LeaseId,
-        by: Subject,
+        by: SubjectKey,
         expires: u64,
     },
     /// Quarantined after a fault; not leasable until cleared.

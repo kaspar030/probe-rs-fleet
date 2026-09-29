@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
+use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
 use fleet_proto::{LeaseId, PROTOCOL_VERSION};
 use fleet_sidecar::lease_store::Disposition;
@@ -34,7 +34,7 @@ fn grant(expires: u64) -> LeaseGrant {
         lease: LeaseId(1),
         board: BoardRef::new(OrgId("default".to_owned()), NodeId("a".to_owned()), "b1"),
         node: NodeId("a".to_owned()),
-        holder: Subject::new(OrgId("default".to_owned()), SubjectKind::User, "p"),
+        holder: SubjectKey::new(None, SubjectKind::User, "p").unwrap(),
         expires,
         token: vec![0xab],
     }

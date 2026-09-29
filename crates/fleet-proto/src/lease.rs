@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{BoardName, BoardRef, LeaseId, NodeId, Subject};
+use crate::ids::{BoardName, BoardRef, LeaseId, NodeId, SubjectKey};
 
 /// A request to lease a board, by id or by constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,7 +266,7 @@ pub struct LeaseGrant {
     pub lease: LeaseId,
     pub board: BoardRef,
     pub node: NodeId,
-    pub holder: Subject,
+    pub holder: SubjectKey,
     /// Expiry as epoch seconds; extend via heartbeat before this.
     pub expires: u64,
     /// Opaque signed capability token (see `fleet-coordinator` auth).

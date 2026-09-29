@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Subject, SubjectKind};
+use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
 use fleet_proto::lease::{Constraint, LeaseGrant};
 use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken, SIGNATURE_LEN};
 use fleet_proto::{ChannelId, ChannelKind, LeaseId, PROTOCOL_VERSION};
@@ -39,7 +39,7 @@ fn grant_for(lease: u64, board_name: &str, expires: u64, kind: SubjectKind) -> L
         lease: LeaseId(lease),
         board: board(board_name),
         node: NodeId("node-a".to_owned()),
-        holder: Subject::new(OrgId("default".to_owned()), kind, "alice"),
+        holder: SubjectKey::new(None, kind, "alice").unwrap(),
         expires,
         // The delegation artefact. Nothing on the reuse path may hand this to a
         // probe-rs child; `a_cache_hit_still_takes_a_fresh_channel_token` pins
@@ -800,10 +800,11 @@ async fn an_invocation_ending_closes_its_channel_with_the_lease_kept() {
     let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
-    let opened = fleet_sidecar::open_channel_verified(&session, LeaseId(1), ChannelKind::Data, None)
-        .await
-        .unwrap()
-        .expect("no expected board, so it always verifies");
+    let opened =
+        fleet_sidecar::open_channel_verified(&session, LeaseId(1), ChannelKind::Data, None)
+            .await
+            .unwrap()
+            .expect("no expected board, so it always verifies");
     assert_eq!(opened.serve_token, "serve-tok");
 
     // One invocation's worth of work, returning as the probe-rs child would.

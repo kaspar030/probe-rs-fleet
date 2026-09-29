@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod admin;
 pub mod adopt;
+pub mod auth_api;
 pub mod board;
 pub mod ids;
 pub mod lease;
@@ -23,10 +24,7 @@ pub use admin::{
 };
 pub use adopt::AdoptPolicy;
 pub use board::{Board, BoardState, PowerKind};
-pub use ids::{
-    normalise_repo, workload_subject_key, BoardName, BoardRef, Group, LeaseId, NodeId, OrgId, Role,
-    Subject, SubjectKey, SubjectKind, UserId, WORKLOAD_NS_GHA,
-};
+pub use ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey, SubjectKind};
 pub use lease::{parse_constraint, Constraint, ConstraintParseError, LeaseGrant, LeaseRequest};
 pub use node_api::{
     BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe, LogLevel,
@@ -67,7 +65,7 @@ pub struct ChannelId(pub u64);
 ///   list` reports probes it cannot open). postcard is positional, so adding a
 ///   field changes the encoding of every `NodeReport::Inventory`; `#[serde(default)]`
 ///   would not have saved it.
-/// * 3 → 4: revision-2 identity. `Principal` is replaced by [`ids::Subject`]
+/// * 3 → 4: revision-2 identity. `Principal` is replaced by `ids::Subject`
 ///   (org + kind + id + groups) and the flat `BoardId` is split into a
 ///   fleet-unique [`ids::BoardRef`] (`(org, node, name)`) and a node-local
 ///   [`ids::BoardName`]. postcard is positional, so every envelope carrying
@@ -134,4 +132,14 @@ pub struct ChannelId(pub u64);
 ///   bug this split fixes). postcard is positional, so the inserted field
 ///   re-encodes every `OpenSession` and every `ChannelOpened`; neither end can
 ///   decode the other's frames across the bump.
-pub const PROTOCOL_VERSION: u32 = 11;
+/// * 11 → 12: identity moved to **forgs**. `ids::Subject` (org + kind + id +
+///   groups), `Group`, `Role` and `UserId` are gone; every holder on the wire
+///   ([`LeaseGrant::holder`], `BoardState::Leased::by`, the admin summaries) is
+///   now an [`ids::SubjectKey`] — the mirror of `forgs::SubjectKey`, rendering
+///   `[<ns>/]<kind>:<id>` with an *optional* namespace (a user is `user:<ulid>`,
+///   not addressed in an org). [`ids::OrgId`] now carries a forgs namespace id
+///   (a ULID) instead of `gh-<n>`, and [`admin::GrantSummary`] gained display
+///   fields. postcard is positional, so every envelope carrying a holder
+///   re-encodes, and every stored org id / subject from a v11 coordinator is
+///   meaningless to a v12 one (its database starts fresh).
+pub const PROTOCOL_VERSION: u32 = 12;

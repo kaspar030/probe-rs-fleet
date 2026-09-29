@@ -142,7 +142,7 @@ pub struct FleetConfig {
     ///
     /// One credential, whatever the principal is: a user session token, or a
     /// **workload token** exchanged per CI job (architecture §6.7, obtained by
-    /// `probe-rs-fleet ci login`). The coordinator resolves it to a `Subject`;
+    /// `probe-rs-fleet ci login`). The coordinator resolves it to a subject;
     /// the client has no say in who it is — which is exactly why the CI path
     /// needed no change here at all. A workload token arrives in
     /// `PROBE_RS_FLEET_TOKEN` like any other.

@@ -8,7 +8,7 @@
 //!   whose selector matches the board.
 //!
 //! [`Access`] is the value object holding both, resolved once per request from
-//! the authenticated `Subject` and never from anything the caller says. It is
+//! the authenticated subject and never from anything the caller says. It is
 //! deliberately pure: no I/O, no clock (`now` is always a parameter), so the
 //! whole (subject, object, op) → allow/deny matrix is a table-driven unit test.
 //!
@@ -73,11 +73,12 @@ impl GrantScope {
 /// production builder.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Access {
-    /// `Some(org)` iff the subject is a **member** of that org, which is what
-    /// the ownership path requires. Membership, not merely acting within the
-    /// org: a `Subject` carries an org unconditionally, so using `subject.org`
-    /// here would let a non-member through.
-    pub own_org: Option<OrgId>,
+    /// Every org the subject is a **member** of, which is what the ownership
+    /// path requires. Membership, not merely the org a request names: a
+    /// request's target org is a claim, so trusting it here would let a
+    /// non-member through. Empty for nodes-as-callers and workloads, which
+    /// reach boards only through grants.
+    pub member_of: Vec<OrgId>,
     /// Live grants issued *to* this subject, from any org.
     pub grants: Vec<GrantScope>,
 }
@@ -89,11 +90,11 @@ impl Access {
         Self::default()
     }
 
-    /// Membership of one org and no grants — every caller before this task.
+    /// Membership of exactly one org and no grants.
     #[must_use]
     pub fn own_org(org: OrgId) -> Self {
         Self {
-            own_org: Some(org),
+            member_of: vec![org],
             grants: Vec::new(),
         }
     }
@@ -101,13 +102,13 @@ impl Access {
     /// Whether this access confers nothing at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.own_org.is_none() && self.grants.is_empty()
+        self.member_of.is_empty() && self.grants.is_empty()
     }
 
     /// Whether the subject owns `board` by membership.
     #[must_use]
     pub fn owns(&self, board: &Board) -> bool {
-        self.own_org.as_ref() == Some(&board.id.org)
+        self.member_of.contains(&board.id.org)
     }
 
     /// Whether the subject may use `board` at all (for any operation).
@@ -248,7 +249,7 @@ mod tests {
 
         let member_of_a = Access::own_org(org("a"));
         let granted_flash = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant(
                 "a",
                 tags(&["nrf52"]),
@@ -257,7 +258,7 @@ mod tests {
             )],
         };
         let expired = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant(
                 "a",
                 tags(&["nrf52"]),
@@ -266,11 +267,11 @@ mod tests {
             )],
         };
         let selector_miss = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant("a", tags(&["stm32"]), &[AllowedOp::Attach], None)],
         };
         let by_board_name = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant(
                 "a",
                 Constraint::Id(BoardName("b1".to_owned())),
@@ -279,7 +280,7 @@ mod tests {
             )],
         };
         let by_chip = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant(
                 "a",
                 Constraint::Chip("nRF52840_xxAA".to_owned()),
@@ -291,7 +292,7 @@ mod tests {
         // A grant written against a board *model*: the requirement this whole
         // selector exists for (`grant bob --select 'board=nrf52840dk'`).
         let by_model = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant(
                 "a",
                 Constraint::Model("nrf52840dk".to_owned()),
@@ -469,7 +470,7 @@ mod tests {
     fn may_use_is_lease_time_and_effective_ops_is_op_time() {
         let a_board = board("a", "b1", "chip", &["nrf52"]);
         let access = Access {
-            own_org: Some(org("b")),
+            member_of: vec![org("b")],
             grants: vec![grant("a", tags(&["nrf52"]), &[AllowedOp::Attach], None)],
         };
         assert!(access.may_use(&a_board, NOW));
@@ -491,7 +492,7 @@ mod tests {
     fn overlapping_grants_union_their_ops() {
         let a_board = board("a", "b1", "chip", &["nrf52", "lab"]);
         let access = Access {
-            own_org: None,
+            member_of: Vec::new(),
             grants: vec![
                 grant("a", tags(&["nrf52"]), &[AllowedOp::Attach], None),
                 grant("a", tags(&["lab"]), &[AllowedOp::Gdb], None),
@@ -518,7 +519,7 @@ mod tests {
     fn a_grant_works_without_any_membership() {
         let a_board = board("a", "b1", "chip", &["nrf52"]);
         let access = Access {
-            own_org: None,
+            member_of: Vec::new(),
             grants: vec![grant("a", tags(&["nrf52"]), &[AllowedOp::Attach], None)],
         };
         assert!(!access.is_empty());

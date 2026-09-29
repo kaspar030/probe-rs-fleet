@@ -24,9 +24,7 @@ use fleet_proto::lease::{Constraint, LeaseGrant};
 pub struct CacheKey {
     /// Canonical, stable string form of the board selector.
     pub selector: String,
-    /// The stable identity of the subject that holds the lease. Deliberately
-    /// the `SubjectKey`, not the whole `Subject`: a group change must not
-    /// invalidate a cached lease.
+    /// The stable identity of the subject that holds the lease.
     pub subject: SubjectKey,
 }
 
@@ -171,14 +169,14 @@ impl LeaseCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, Subject, SubjectKind};
+    use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey, SubjectKind};
 
-    fn subject(holder: &str) -> Subject {
+    fn subject(holder: &str) -> SubjectKey {
         subject_in("default", holder)
     }
 
-    fn subject_in(org: &str, holder: &str) -> Subject {
-        Subject::new(OrgId(org.to_owned()), SubjectKind::User, holder)
+    fn subject_in(ns: &str, holder: &str) -> SubjectKey {
+        SubjectKey::new(Some(ns), SubjectKind::User, holder).unwrap()
     }
 
     fn grant(expires: u64, holder: &str) -> LeaseGrant {
@@ -203,7 +201,7 @@ mod tests {
     #[test]
     fn insert_then_get_when_valid() {
         let mut cache = LeaseCache::new();
-        let p = subject("dev").key();
+        let p = subject("dev");
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         // now well before expiry minus margin.
         let got = cache.get(&board_sel(), &p, 500);
@@ -214,7 +212,7 @@ mod tests {
     #[test]
     fn expired_entry_is_evicted_on_get() {
         let mut cache = LeaseCache::new();
-        let p = subject("dev").key();
+        let p = subject("dev");
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         // now past expiry.
         assert!(cache.get(&board_sel(), &p, 2000).is_none());
@@ -233,8 +231,8 @@ mod tests {
     #[test]
     fn key_includes_subject() {
         let mut cache = LeaseCache::new();
-        let alice = subject("alice").key();
-        let bob = subject("bob").key();
+        let alice = subject("alice");
+        let bob = subject("bob");
         cache.insert(&board_sel(), &alice, CachedLease::new(grant(1000, "alice")));
         // bob shares the selector but must NOT see alice's lease.
         assert!(cache.get(&board_sel(), &bob, 500).is_none());
@@ -246,8 +244,8 @@ mod tests {
     #[test]
     fn key_includes_org() {
         let mut cache = LeaseCache::new();
-        let alice_a = subject_in("org-a", "alice").key();
-        let alice_b = subject_in("org-b", "alice").key();
+        let alice_a = subject_in("org-a", "alice");
+        let alice_b = subject_in("org-b", "alice");
         cache.insert(
             &board_sel(),
             &alice_a,
@@ -260,7 +258,7 @@ mod tests {
     #[test]
     fn key_includes_selector() {
         let mut cache = LeaseCache::new();
-        let p = subject("dev").key();
+        let p = subject("dev");
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         let other = Constraint::Chip("STM32F407".to_owned());
         assert!(cache.get(&other, &p, 500).is_none());
@@ -285,7 +283,7 @@ mod tests {
         assert_ne!(fingerprint(&id), fingerprint(&model));
 
         let mut cache = LeaseCache::new();
-        let p = subject("dev").key();
+        let p = subject("dev");
         cache.insert(&id, &p, CachedLease::new(grant(1000, "dev")));
         assert!(cache.get(&model, &p, 500).is_none());
     }
@@ -293,7 +291,7 @@ mod tests {
     #[test]
     fn remove_returns_entry() {
         let mut cache = LeaseCache::new();
-        let p = subject("dev").key();
+        let p = subject("dev");
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         let removed = cache.remove(&board_sel(), &p);
         assert!(removed.is_some());
@@ -303,7 +301,7 @@ mod tests {
     #[test]
     fn evict_expired_drops_only_stale() {
         let mut cache = LeaseCache::new();
-        let p = subject("dev").key();
+        let p = subject("dev");
         cache.insert(&board_sel(), &p, CachedLease::new(grant(1000, "dev")));
         cache.insert(
             &Constraint::Chip("c".to_owned()),

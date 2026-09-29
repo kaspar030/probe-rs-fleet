@@ -21,7 +21,7 @@ pub struct Policy {
     /// Maximum lease duration (seconds) for [`Priority::Interactive`] requests.
     pub max_duration_interactive: u64,
     /// Maximum number of concurrently-held leases per subject, keyed by
-    /// [`fleet_proto::ids::SubjectKey`] (so a group change does not reset it).
+    /// [`fleet_proto::ids::SubjectKey`].
     pub max_concurrent_per_subject: u32,
     /// Default TTL (seconds) applied when a request's `duration_secs` is `0`.
     pub default_ttl_secs: u64,

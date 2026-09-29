@@ -307,8 +307,8 @@ pub enum SidecarToCoord {
     /// Share a subset of this org's boards with another subject
     /// (`grant <subject> --select … --ops …`). Admin-gated.
     GrantCreate {
-        /// The grantee: a GitHub login, a bare `gh-<id>`, or a rendered
-        /// `SubjectKey`. Resolved to an immutable user id coordinator-side.
+        /// The grantee: a username, `repo:owner/name`, or a rendered
+        /// `SubjectKey`. Resolved to an immutable subject coordinator-side.
         subject: String,
         /// The canonical selector string (see `Constraint`'s `Display`).
         selector: String,

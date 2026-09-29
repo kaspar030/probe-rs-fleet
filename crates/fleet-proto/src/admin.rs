@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adopt::AdoptPolicy;
 use crate::board::PowerKind;
-use crate::ids::{BoardRef, LeaseId, NodeId, OrgId, Subject, SubjectKey};
+use crate::ids::{BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
 use crate::token::AllowedOp;
 
 /// A coarse, operator-facing lifecycle label for a board in `ctl list`.
@@ -55,7 +55,7 @@ pub struct BoardSummary {
     /// Coarse availability.
     pub availability: BoardAvailability,
     /// If leased, the current holder.
-    pub holder: Option<Subject>,
+    pub holder: Option<SubjectKey>,
     /// If leased, the lease id.
     pub lease: Option<LeaseId>,
     /// If leased, the expiry (epoch seconds).
@@ -111,7 +111,7 @@ pub struct LeaseHolderSummary {
     /// The board held.
     pub board: BoardRef,
     /// The subject holding it.
-    pub holder: Subject,
+    pub holder: SubjectKey,
     /// Expiry as epoch seconds.
     pub expires: u64,
 }
@@ -140,10 +140,16 @@ pub struct LogLine {
 pub struct GrantSummary {
     /// Opaque grant id (32 hex chars). Revoked by id prefix.
     pub id: String,
-    /// The org whose hardware is being shared.
+    /// The org whose hardware is being shared (its namespace id).
     pub org: OrgId,
+    /// The org's current path (display name), if the coordinator resolved
+    /// one. Display only: `org` is the identity.
+    pub org_name: Option<String>,
     /// Who the hardware is shared with.
     pub subject: SubjectKey,
+    /// A human rendering of `subject` (a user's username rather than
+    /// `user:<ulid>`), if the coordinator resolved one. Display only.
+    pub subject_display: Option<String>,
     /// The canonical selector string.
     pub selector: String,
     /// The operations granted.

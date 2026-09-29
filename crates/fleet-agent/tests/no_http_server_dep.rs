@@ -17,17 +17,40 @@
 
 use std::process::Command;
 
-/// Crates that would mean an HTTP server framework has crept into the agent.
-const FORBIDDEN: &[&str] = &["axum", "axum-core", "hyper", "hyper-util", "tower-http"];
+/// Crates that would mean an HTTP server framework — or the coordinator's
+/// identity store (forgs + sqlx) — has crept into the agent.
+const FORBIDDEN: &[&str] = &[
+    "axum",
+    "axum-core",
+    "hyper",
+    "hyper-util",
+    "tower-http",
+    "forgs-store",
+    "forgs-http",
+    "sqlx",
+];
+
+/// What must never reach the sidecar (it runs on every developer machine and
+/// CI runner, next to `probe-rs`): the forgs server half and its database.
+const SIDECAR_FORBIDDEN: &[&str] = &["forgs-http", "forgs-store", "axum", "sqlx"];
 
 #[test]
 fn agent_does_not_depend_on_an_http_server_framework() {
-    for crate_name in FORBIDDEN {
+    assert_graph_excludes("fleet-agent", FORBIDDEN);
+}
+
+#[test]
+fn sidecar_does_not_depend_on_the_identity_server() {
+    assert_graph_excludes("fleet-sidecar", SIDECAR_FORBIDDEN);
+}
+
+fn assert_graph_excludes(package: &str, forbidden: &[&str]) {
+    for crate_name in forbidden {
         let output = Command::new(env!("CARGO"))
             .args([
                 "tree",
                 "-p",
-                "fleet-agent",
+                package,
                 "--edges",
                 "normal,build",
                 "-i",
@@ -49,9 +72,10 @@ fn agent_does_not_depend_on_an_http_server_framework() {
                 continue;
             }
             panic!(
-                "fleet-agent depends on `{crate_name}`, which breaks the layering rule that \
-                 keeps the WireTx/WireRx seam honest. The axum adapter belongs in \
-                 fleet-coordinator (see crates/fleet-coordinator/src/ws_axum.rs).\n\n{stdout}"
+                "{package} depends on `{crate_name}`, which breaks the layering rule: HTTP \
+                 server frameworks (the axum adapter lives in \
+                 crates/fleet-coordinator/src/ws_axum.rs) and the forgs identity store belong \
+                 to the coordinator only.\n\n{stdout}"
             );
         }
     }
