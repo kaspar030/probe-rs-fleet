@@ -8,9 +8,13 @@ of `docs/architecture.md` — decisions *with their costs*, accepted risks
 recorded rather than fixed, and explicit "please do not 'fix' this" notes where
 a future reader would otherwise undo something deliberate.
 
-The implementation lives in `crates/fleet-coordinator/src/browser_auth.rs`
-(cookies, CSRF, the two login flows), `src/api.rs` (the `/api/v1` handlers),
-`src/assets.rs` (the asset routes) and `web/` (the UI itself). Where this
+Since the forgs switch (task 3892) login, signup, cookies and CSRF are
+**forgs'** (`forgs-http`, merged into the coordinator's router under `/auth/*`;
+see `docs/architecture.md` §6). fleet's side lives in
+`crates/fleet-coordinator/src/identity.rs` (the `AuthContext`: cookie brand
+`prfs`, CSRF header `x-fleet-csrf`, cookie prefix `/api/v1/`, post-login
+redirect `/ui/`), `src/api.rs` (the `/api/v1` handlers), `src/assets.rs` (the
+asset routes) and `web/` (the UI itself). Where this
 document and the code disagree, the code is the fact and this document is the
 bug; the sections below were amended as each phase landed rather than left as
 the older plan.
@@ -47,7 +51,8 @@ still informational (see [§7](#7-changes-required-in-existing-files)), but `/ui
 and the `/api/v1` surface now sit alongside it. Users had asked for a web UI
 where they could see their devices and agents, approve machines, and hand out
 access. This document is the design for that; the code it produced is the
-`browser_auth.rs` / `api.rs` / `assets.rs` / `web/` set named in the preamble.
+`api.rs` / `assets.rs` / `web/` set named in the preamble (the original
+`browser_auth.rs` moved into forgs).
 
 ---
 
@@ -55,105 +60,100 @@ access. This document is the design for that; the code it produced is the
 
 ### D1. Browser identity
 
-**Decided: GitHub authorization-code flow (PKCE + `state`) as the preferred
-browser login, with an in-page device-code fallback; the session is carried by
-an `HttpOnly` cookie holding the *existing* `prfs1_` session token.**
+**Decided: login through forgs' browser flow with any configured provider; the
+session is carried by an `HttpOnly` cookie holding the same `prfs1_` session
+token the CLI uses.**
 
-- New route `GET /auth/github/start` → 302 to GitHub's authorize endpoint;
-  `GET /auth/github/callback` exchanges the code and mints a session through the
-  same `mint_session_for_user` path `login` uses.
-- The CLI's device flow (`POST /auth/device/{start,poll}`) is **unchanged**. No
-  deployed CLI, agent or sidecar behaviour moves.
-- **Fallback**: a deployment that has not registered a callback URL still gets a
-  working, uglier browser login — the page shows a device code and a link to
-  github.com, exactly as `login --headless` does. See
-  [§3 Session](#session) for its two routes and why they exist rather than the
-  page calling `/auth/device/*` directly.
-- The session carrier is the **`session` table row** that already exists
-  (`crates/fleet-coordinator/migrations/0001_init.sql`), delivered as
+History, kept because the reversal below is only legible against it: revision
+2 offered GitHub's authorization-code flow at `/auth/github/{start,callback}`
+with an in-page device-code fallback, implemented in fleet's own
+`browser_auth.rs`. The forgs switch (task 3892) replaced all of it with forgs'
+generic browser surface. What the page does now:
+
+- The login page lists the configured providers from `GET /auth/providers`
+  (JSON; forgs also renders an HTML list at `GET /auth/login`) and links each
+  to `GET /auth/{provider}/start?return_to=/ui/`. There is **no in-page device
+  fallback** any more: every provider has an authorization-code flow, and the
+  device flow is the CLI's.
+- `GET /auth/{provider}/callback` either sets the session cookies and
+  redirects to `/ui/` (a known identity) or, on **first login**, redirects to
+  forgs' signup page (`/auth/signup`), where the user chooses a username. The
+  ticket rides a sealed `HttpOnly` cookie; signup creates the user, the
+  identity, the personal org and the admin membership in one transaction and
+  then logs in. Login without a verified email is refused. fleet renders
+  neither page; they are forgs' HTML, same-origin.
+- The CLI's device flow (`POST /auth/device/{start,poll}`) is also forgs':
+  the user confirms the code on forgs' `/auth/device` page after logging in
+  in the browser with any provider.
+- The session carrier is forgs' session row, delivered as
   `Set-Cookie: prfs_session=<prfs1_…>; HttpOnly; Secure; SameSite=Lax; Path=/`.
-  Revocation stays "a row delete" (§6.2). The cookie is **a second carrier of
-  the same credential, not a second credential kind**: `fleet_auth::authenticate`
-  resolves it byte-for-byte as it resolves the `Authorization` header today.
+  Revocation stays "a row delete". The cookie is **a second carrier of the
+  same credential, not a second credential kind**: `forgs_http::authenticate_request`
+  resolves it exactly as it resolves the `Authorization` header.
 
-**The reversal, stated loudly.** Architecture §6.4 says "No callback origin is
-involved … there is no callback URL to fill in", §4.2 says node approval is a
-CLI verb *because* "a page served by the coordinator cannot know who is looking
-at it", and the module documentation of
-`crates/fleet-coordinator/src/http.rs` says in as many words:
-
-> approving from a browser would mean adding an OAuth redirect flow and cookies
-> to the coordinator … Please do not "fix" it by bolting a session onto the
-> coordinator.
-
-That instruction was **correct for a coordinator with no web UI**, and it is
-what this document changes. The cost is exactly the one it named: one
-per-deployment setup step — registering `<public_url>/auth/github/callback` in
-the OAuth app — which the device flow did not need. `[github]` stays optional,
-and a deployment that skips the registration falls back to the device flow, so
-the step is a nicety rather than a new requirement.
-
-Those three passages must be amended when the implementation lands. That
-amendment is **a follow-up task's job, not this document's**; until it happens,
-this file is the newer decision and they are the older one.
+**The reversal, stated loudly.** Before this UI, the architecture said "no
+callback origin is involved", node approval was a CLI verb *because* "a page
+served by the coordinator cannot know who is looking at it", and the module
+documentation of `crates/fleet-coordinator/src/http.rs` said not to bolt a
+session onto the coordinator. That instruction was **correct for a coordinator
+with no web UI**, and this document changed it. The cost is one
+per-deployment setup step per provider: registering
+`<public_url>/auth/<name>/callback` in its OAuth app. Since the forgs switch
+that step is no longer optional — CLI login also completes in the browser —
+and the architecture (§6.4) says so.
 
 **The seam this uses already exists, by design.** `http.rs::decide_pending_node`
 takes an *already-resolved* subject precisely so a cookie-authenticated handler
-can resolve its subject its own way and call the same function. No schema
-change, no second binding site. The web approval flow in
+can call the same function as the CLI route. The web approval flow in
 [phase 2](#6-phased-plan) is that commitment being cashed in.
 
 **`redirect_uri` is derived from `public_url`, never from the request.** Not
 `Host`, not `X-Forwarded-Host`. The coordinator runs behind a reverse proxy
 (§3.5) and does not see its own public name; a Host-derived callback is a
 host-header-injection route to an attacker-controlled OAuth redirect. The
-callback path is fixed (`/auth/github/callback`) and the origin is configuration.
+callback path is fixed (`/auth/{provider}/callback`) and the origin is
+configuration. `return_to` is accepted only as a same-origin path.
 
-**`Secure` is unconditional.** The example config's `public_url` is
-`http://127.0.0.1:7000`, and that still works: browsers treat
-`http://localhost` and `http://127.0.0.1` as secure contexts, so a `Secure`
-cookie is set and returned there. Any *other* plain-HTTP deployment is
-**unsupported for the UI** rather than silently downgraded to a non-`Secure`
-cookie. Please do not make `Secure` conditional on the scheme — that is the
-obvious "fix" and it would hand every session to anyone on the path.
+**`Secure` is unconditional.** Browsers treat `http://localhost` and
+`http://127.0.0.1` as secure contexts, so local development still works. Any
+*other* plain-HTTP deployment is **unsupported for the UI** rather than
+silently downgraded. Please do not make `Secure` conditional on the scheme —
+that is the obvious "fix" and it would hand every session to anyone on the
+path.
 
-**Session lifetime: no silent refresh in v1.** `session_ttl_secs` defaults to
-12h. The cookie's `Max-Age` tracks the row's `expires`, so the browser never
-holds a cookie the database has already forgotten, and a `401` from any
-`/api/v1/*` endpoint means "log in again" — the UI bounces to
-`/auth/github/start`. `POST /auth/token` with `grant_type: refresh` stays a
-**CLI-only** path: a cookie-driven refresh endpoint would be a CSRF target that
-mints a fresh credential, in exchange for saving a redirect the user notices
-twice a day.
+**Session lifetime: no silent refresh.** `session_ttl_secs` defaults to 12h.
+The cookie's `Max-Age` tracks the session's `expires`, and a `401` from any
+`/api/v1/*` endpoint means "log in again" — the UI bounces to its login page.
+Refresh is **CLI-only**: the browser path issues no refresh token, because a
+cookie-driven credential that mints is a strictly worse CSRF and XSS target
+than a 12h session, and the CLI's justification (a `probe-rs` shim with no
+human to re-run anything) does not apply to a tab whose user is in front of
+it. `POST /api/v1/session/logout` therefore revokes just the session.
 
-That stayed true when **refresh tokens** were added (`architecture.md` §6.4).
-They are minted only on the CLI login paths — the device flow and `coordinator
-user-token` — and the authorization-code path here deliberately issues none, for
-exactly the D1 reason above: a browser holding a 30-day mint-capable credential
-is a strictly worse CSRF and XSS target than one holding a 12h session, and the
-CLI's justification (a `probe-rs` shim with no human to re-run anything) does
-not apply to a tab whose user is sitting in front of it. So this paragraph is
-current, not stale: `grant_type: refresh_token` is CLI-only too, and
-`POST /api/v1/session/logout` is unchanged because the browser has no refresh
-token to revoke.
+**The acting org is chosen per request.** A session is not bound to an org.
+Every `/api/v1` call takes an optional `?org=<name or id>`; without it the call
+acts in the user's personal org. Membership is checked there, and an org you
+do not belong to answers exactly like one that does not exist (`403`). When
+`GET /api/v1/session` lists more than one membership, the UI shows an **org
+switcher** in the header and appends the chosen org to every call.
 
 **CSRF.** Two independent controls:
 
-1. A **double-submit token**: `prfs_csrf` = `HMAC(k, session_token_hash)`, set as
-   a non-`HttpOnly` cookie and echoed by the UI in an `X-Fleet-Csrf` header on
-   every mutating call. Derived, so there is **no schema change** and no
-   server-side CSRF table.
+1. A **double-submit token**: `prfs_csrf` = `hex(HMAC-SHA256(k, session_token_hash))`,
+   set as a non-`HttpOnly` cookie beside the session and echoed by the UI in an
+   `X-Fleet-Csrf` header on every mutating call. Nothing is stored server-side.
 2. The header must be **present** on every mutating call at all. A custom header
    cannot be sent cross-origin without a preflight, and the coordinator emits no
    CORS headers anywhere, so the preflight fails. The UI is same-origin by
    construction.
 
-`k` is derived from the coordinator's existing ed25519 signing seed
-(`signing.seed`, `config::SigningKeySource`) with a domain-separation label —
-**not** a per-process random. A per-process key would log every open tab out on
-every restart, and the first implementer to hit that would "fix" it by
-persisting a second secret. Rotating the signing seed invalidates open tabs'
-CSRF tokens, which is correct and is already true of every capability token.
+`k` comes from a **dedicated secret** (`csrf_secret_path`, ≥ 32 bytes, written
+as `csrf.secret` by `coordinator init`), domain-separated by the app label.
+Revision 2 derived it from the capability-signing seed; the forgs switch gave it
+its own file so rotating one secret does not silently rotate the other. It is
+**not** a per-process random: that would log every open tab out on every
+restart. (A coordinator built without one — tests only — does get a random
+key; `fleet-bin` refuses to start without the file.)
 
 **Bearer-from-JS was rejected.** `Authorization: Bearer` from JavaScript needs
 no CSRF machinery, which is its whole appeal — but a token readable by JS is a
@@ -161,12 +161,15 @@ token exfiltrable by one XSS, and this credential can power-cycle real hardware.
 `HttpOnly` plus the CSRF pair is the trade this design takes. See
 [§5 Threat notes](#5-threat-notes).
 
-**Blast radius of the cookie is exactly `/api/v1/*`.** Cookie authentication is
-accepted there and nowhere else. It is rejected on `/agent`, `/client` and
-`/delegate` — a browser must never drive a control-plane WebSocket by ambient
-authority, and `/delegate` mints no `Subject` at all — and also on
-`/auth/token` and `/auth/keys`, the existing CLI JSON endpoints, which keep
-requiring an explicit bearer.
+**Blast radius of the cookie is exactly `/api/v1/*`** (forgs'
+`Carrier::ApiCookie` with fleet's `cookie_api_prefix`), plus forgs' own
+explicitly marked browser pages (signup, device verification, identity
+linking, `/auth/session/logout`), each of which checks CSRF itself. It is
+rejected on `/agent`, `/client` and `/delegate` — a browser must never drive a
+control-plane WebSocket by ambient authority, and `/delegate` mints no subject
+at all — and on the JSON `/auth/*` routes (`/auth/token`, `/auth/keys`,
+`/auth/logout`, `/auth/members`, `/auth/rename`), which keep requiring an
+explicit bearer.
 
 ### D2. API shape
 
@@ -203,8 +206,8 @@ adopt-policy / delete, member list (node *list* has since gained one:
 `list_nodes_core`). Those are
 new `Coordinator` methods plus new `state.rs` / `OrgDb` queries — real
 implementation work in the follow-up tasks, not plumbing. Every new query goes
-through `OrgDb` so the tenancy fence holds by construction (`audit_log.org_id`
-is `NOT NULL REFERENCES org(id)` and the table is reachable only through
+through `OrgDb` so the tenancy fence holds by construction (`audit_log.ns_node_id`
+is `NOT NULL REFERENCES forgs_ns_node(id)` and the table is reachable only through
 `OrgDb`; that combination is what makes "no code path can forget the org check"
 true).
 
@@ -320,8 +323,9 @@ create / list / revoke, auth-key mint / list / revoke.
   browser. That would mean a second relay ingress with a browser-shaped
   credential.
 - **No `delegate`.** It hands out a capability token; see the threat notes.
-- **No org creation and no invites.** The personal org is auto-created on first
-  login (§6.1); membership is **read-only** in v1.
+- **No org creation and no invites.** The personal org is created at signup
+  (architecture §6.1); membership is **read-only** in the UI. The org switcher
+  only picks among existing memberships.
 - **No capability token ever reaches the browser.** Not `LeaseGrant::token`, not
   `ChannelOpened::token`, not the `/delegate` bearer. This should be enforced by
   a test over the API response types, not by review vigilance.
@@ -336,8 +340,10 @@ create / list / revoke, auth-key mint / list / revoke.
 ## 3. Endpoint table
 
 Everything under `/api/v1/*` accepts the session cookie (D1) **or** an
-`Authorization: Bearer <session>` header, resolves to a `Subject` through the
-same construction site as today, and returns `application/json`. Mutating calls
+`Authorization: Bearer <session>` header, is authenticated by
+`forgs_http::authenticate_request` (the one place a credential becomes a
+subject), acts in the org named by `?org=` (default: the personal org;
+membership checked), and returns `application/json`. Mutating calls
 require the `X-Fleet-Csrf` header. Errors keep the existing shape:
 `{"error":"<code>"}`, coarse by design (§4).
 
@@ -350,41 +356,39 @@ Two path-shape decisions, both forced by the id grammar:
   exactly as the wire verbs do, and the coordinator resolves it within the
   caller's access.
 - **Node ids contain a slash** for the same reason, so node endpoints address a
-  node by its node-local `name`, which is `UNIQUE (org_id, name)`, resolved
-  within the caller's org.
+  node by its node-local `name`, which is `UNIQUE (ns_node_id, name)`, resolved
+  within the acting org.
 
 ### Session
 
-| Method + path | Request | Response | Calls | Who |
-|---|---|---|---|---|
-| `GET /api/v1/auth/methods` | — | `{"login":"authorization_code"\|"device"\|"none"}` | config only | anyone (unauthenticated; reveals only which login this deployment offers) |
-| `GET /auth/github/start` | — | `302` to GitHub; PKCE verifier + `state` in a short-lived `HttpOnly` cookie | new | anyone |
-| `GET /auth/github/callback?code&state` | — | `302 /ui`, `Set-Cookie: prfs_session`, `Set-Cookie: prfs_csrf` | `mint_session_for_user` | anyone with a valid `state` |
-| `POST /api/v1/session/device/start` | `{}` | `{"user_code","verification_uri","interval","expires_in"}` — **no `device_code` in the body**; it is stashed in a short-lived `HttpOnly` cookie | `http::auth_device_start` (as `/auth/device/start`) | anyone |
-| `POST /api/v1/session/device/poll` | `{}` | `{"status":"pending"\|"ok"}`; on `ok`, `Set-Cookie` as above. **Never returns a token.** | `http::auth_device_poll` + `mint_session_for_user` | anyone holding the device cookie |
-| `GET /api/v1/session` | — | `{"user","login","org","org_slug","role","expires"}` | `db.role_of` | any session |
-| `POST /api/v1/session/logout` | `{}` | `204`, cookies cleared | `Db::delete_session` | any session |
-
-The device fallback deliberately does **not** have the page call
-`/auth/device/{start,poll}` directly: those return the `device_code` and then the
-session token *in the response body*, i.e. to JavaScript, which is precisely the
-exposure D1 rejects. The two `/api/v1/session/device/*` routes are the same
-stateless brokering with both secrets moved into `HttpOnly` cookies. No new
-table; the device code still round-trips through the client, so a coordinator
-restart mid-login is still survivable. The `http::` names above are the
-coordinator handlers; the CLI calls the same two routes through
-`fleet_auth::http_client::{device_start, device_poll}`.
-
-Which login the page offers is chosen by `GET /api/v1/auth/methods`, driven by
-one config field (see [§7](#7-changes-required-in-existing-files)) — not by a
-bundle, since D3 means there is no build to branch in.
-
-### Orgs and membership (read-only in v1)
+Login itself is forgs' (D1); these are the routes the UI touches.
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/org` | — | `{"id","slug","kind","role"}` | `Db::org_slug`, `Db::role_of` | member |
-| `GET /api/v1/org/members` | — | `[{"user_id","login","role"}]` | **new** `OrgDb::list_members` | member |
+| `GET /auth/providers` | — | the configured provider names (JSON) | forgs | anyone (reveals only which logins this deployment offers) |
+| `GET /auth/{provider}/start?return_to=/ui/` | — | `302` to the provider; `state` (+ PKCE verifier) in a sealed `HttpOnly` flow cookie | forgs | anyone |
+| `GET /auth/{provider}/callback?code&state` | — | known identity: `302 /ui/`, `Set-Cookie: prfs_session`, `Set-Cookie: prfs_csrf`; first login: `302 /auth/signup` with a sealed ticket cookie | forgs | anyone with a valid `state` |
+| `GET`/`POST /auth/signup` | username | forgs' HTML form; on success the cookies above | forgs | holder of a signup ticket |
+| `GET /api/v1/session[?org=]` | — | `{"user_id","username","memberships":[{"id","name","role"}],"org":{"id","name","role"}\|null,"expires"}` | forgs store | any session |
+| `POST /api/v1/session/logout` | `{}` | `204`, cookies cleared | `forgs_http::session::logout` | any session |
+
+`memberships` drives the org switcher; `org` is the org this request acted in
+(`?org=`, default the personal org), `null` if the user does not belong to the
+requested one. `expires` lets the UI bounce to login *before* the next call
+`401`s. The page never sees a token: no route on this surface returns one in a
+body (the old `/api/v1/session/device/*` and `/api/v1/auth/methods` routes are
+gone with the device fallback).
+
+### Orgs and membership (read-only in the UI)
+
+| Method + path | Request | Response | Calls | Who |
+|---|---|---|---|---|
+| `GET /api/v1/org[?org=]` | — | `{"id","name","role"}` | forgs store | member |
+| `GET /api/v1/org/members[?org=]` | — | `[{"user_id","username","role"}]` | `NsScope::list_members` | member |
+
+Org creation and membership changes are not in the UI: team orgs are created
+with `coordinator org create <name> --admin <username>`, and membership is
+managed through forgs' `/auth/members` (bearer-only).
 
 ### Nodes
 
@@ -406,10 +410,10 @@ per-board presence; adding it would widen this payload for a display nicety.
 
 There is deliberately **no** `GET /api/v1/nodes/pending`. An earlier revision of
 this table had one; it is dropped, for the reason §4 now records:
-`pending_node.org_id` is `NULL` until an approval binds it, so there is no
+a pending row's namespace is `NULL` until an approval binds it, so there is no
 attribution to filter a listing on, and a member-visible list of live codes
 would be exactly the cross-tenant index §4 forbids. Approval stays code-driven.
-Adding an org column to `pending_node` is a separate design question, not
+Attributing pending rows to an org is a separate design question, not
 something to smuggle in alongside a listing.
 
 `DELETE` is a revocation, not a tidy-up: deleting the `node` row invalidates its
@@ -502,16 +506,18 @@ contract rather than from a hardcoded `365` that goes stale silently (and from
 the *coordinator's* clock, not the browser's — that difference is exactly what
 turns "one minute from now" into a `400`).
 
-### Auth keys
+### Auth keys (forgs API keys)
+
+All three take `?org=` like every other call; the key belongs to the acting org.
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/auth-keys` | — | `AuthKeyList` (hashes only) | `http::list_auth_keys` (**unchanged**) | member |
-| `POST /api/v1/auth-keys` | `{"tags":[…],"ttl_secs":N,"multi_use":false,"purpose":"node"\|"ci","ops":[…],"subject_name":"builder"\|null}` | `AuthKeyCreated` — **the only time the secret exists** | `http::create_auth_key` (**unchanged**) | member |
-| `DELETE /api/v1/auth-keys/{hash_prefix}` | — | `AuthKeyRevoked` | `http::revoke_auth_key` (**unchanged**) | key creator, or admin |
+| `GET /api/v1/auth-keys` | — | `ApiKeyList` (hashes only) | `forgs_http::keys::list` | member |
+| `POST /api/v1/auth-keys` | `{"tags":[…],"ttl_secs":N,"multi_use":false,"purpose":"node"\|"ci","ops":[…],"subject_name":"builder"\|null}` | `ApiKeyCreated` — **the only time the secret (`prfk1_…`) exists** | `forgs_http::keys::create` (tags/ops become the key's payload) | member |
+| `DELETE /api/v1/auth-keys/{hash_prefix}` | — | `ApiKeyRevoked` | `forgs_http::keys::revoke` | key creator, or admin |
 
 `ttl_secs = 0` is a `400` and the TTL is capped at 30 days
-(`MAX_API_AUTH_KEY_TTL_SECS`), exactly as on `POST /auth/keys` — the same
+(`Ttls::api_key_max`), exactly as on `/auth/keys` — the same
 function is called, so `purpose` outside `node` / `ci` is a `400`, a `ci` key
 with no tags is a `400`, and revoking a `ci` key cascades into the grant its
 redemption synthesised. The prefix must be at least 8 hex characters. Both
@@ -529,12 +535,12 @@ three are that same shared function's rules:
   for a name to attach to, so it is refused rather than stored inert;
 - a name outside `[a-z0-9._-]`, not starting with a letter or digit, empty, or
   longer than 64 characters. Names are **lowercased** on the way in, so the
-  echoed `AuthKeyCreated.subject_name` may differ from what was sent — display
+  echoed `ApiKeyCreated.subject_name` may differ from what was sent — display
   the echo, not the input;
 - `"purpose":"agent"`. That spelling is **CLI-only sugar** for `ci` and is not a
   wire value; the allowlist here is still exactly `node` / `ci`.
 
-`AuthKeyCreated` and each `AuthKeyInfo` echo `subject_name`, so a listing can
+`ApiKeyCreated` and each `ApiKeyInfo` echo `subject_name`, so a listing can
 show which keys share an identity. That is worth surfacing rather than hiding:
 keys sharing a name share **one grant**, so revoking any one of them tears that
 grant down and releases every live lease under the identity — including another
@@ -598,10 +604,10 @@ against the *target object's* org through the existing evaluator —
 | grant create | **admin** | `require_role(Admin)` |
 | grant list | membership | `require_role(Member)` |
 | grant revoke | **creator, or admin** | `Coordinator::grant_revoke_core` |
-| auth-key mint / list | membership | `http::require_membership_for_auth_keys` |
-| auth-key revoke | **creator, or admin** | `http::revoke_auth_key` |
-| audit log | **admin** | `Coordinator::logs_core` (+ `OrgDb` scoping, a second independent fence) |
-| org / member list | membership | new, `require_role(Member)` |
+| auth-key mint / list | membership | `forgs_http::keys` (membership of the target org) |
+| auth-key revoke | **creator, or admin** | `forgs_http::keys::revoke` |
+| audit log | **admin** | `Coordinator::logs_core` (+ `OrgDb` scoping, a second independent fence; forgs' identity audit rows are merged in, unfiltered view only) |
+| org / member list | membership | `require_role(Member)` in the acting org |
 | pending-node approve / deny | membership | §6.4, `decide_pending_node` (there is no listing; see §3/§4) |
 | node list | membership | new |
 | node tags / adopt / delete | **owner (`node.owner_user_id`), or admin** | **new policy, fixed here** (rename is refused; see §3) |
@@ -623,9 +629,9 @@ behind a 15-minute TTL, the same audit row, and the same "the enrolling machine
 prints which org it landed in" control that lets the victim notice.
 
 What the browser must not do is make it *better-indexed*, and that is why
-**there is no pending-registration listing**. `pending_node.org_id` is `NULL`
-until an approval binds it (`migrations/0005_pending_node.sql`) and
-`Db::live_pending_codes` is org-blind, so a listing has no attribution to filter
+**there is no pending-registration listing**. A pending row's namespace
+(`forgs_pending_device.ns_node_id`) is `NULL` until an approval binds it, so a
+listing has no attribution to filter
 on: it could only show *every* live code in the deployment. That is precisely
 the cross-tenant index this section forbids, and it would strictly worsen the
 accepted risk above — turning "guess ~40 bits" into "read the list". So `GET
@@ -674,7 +680,7 @@ where an XSS can read it. So: no `delegate` endpoint, no lease acquisition, no
 API's response types rather than by remembering.
 
 The one long-lived secret this surface *does* return —
-`POST /api/v1/auth-keys`'s `AuthKeyCreated.key` — is not one of these, and the
+`POST /api/v1/auth-keys`'s `ApiKeyCreated.key` — is not one of these, and the
 enforcing test knows the difference by name rather than by prefix class: an auth
 key is org-scoped, expiring, listable, revocable (cascading into any grant it
 synthesised) and confers only the right to enroll. D4 accepts it explicitly.
@@ -695,12 +701,12 @@ attacker-chosen OAuth redirect, i.e. an account takeover.
 **Inherited, not introduced.** The web surface adopts these existing accepted
 risks unchanged, and adds no new mitigation for them:
 
-- **No rate limiting anywhere in the coordinator.** `/auth/github/start` and the
-  device fallback are as unauthenticated as `/auth/device/start` is today, with
-  the same quota-exhaustion exposure and no credential exposure.
-- **Device-flow remote phishing** (RFC 8628 §5.4), for the fallback login and,
+- **No rate limiting anywhere in the coordinator.** `/auth/{provider}/start` is
+  as unauthenticated as `/auth/device/start`, with no credential exposure.
+- **Device-flow remote phishing** (RFC 8628 §5.4), for CLI login and,
   sharpened, for node approval (§6.4).
-- **Unauthenticated `pending_node` growth**, capped by `max_pending_nodes`
+- **Unauthenticated pending-row growth** (CLI logins and node registrations
+  share forgs' pending table), capped by `max_pending_nodes`
   (default 256) and reclaimed by the TTL sweep.
 
 Adding rate limiting is a coordinator-wide change and belongs in its own task,
@@ -744,7 +750,10 @@ creation, invites and membership management.
 
 Named so follow-up tasks could be scoped precisely; all of them have now been
 made. Retained as the record of what each phase was expected to touch — and, at
-the bottom, of the one item that was deliberately *not* touched.
+the bottom, of the one item that was deliberately *not* touched. (The forgs
+switch later moved the login routes, cookies and CSRF out of `http.rs` /
+`browser_auth.rs` into forgs, and replaced the `[github]` table with
+`[[auth.providers]]`; the entries below describe the original UI work.)
 
 - **`crates/fleet-coordinator/src/http.rs`** — the new `/api/v1/*` and
   `/auth/github/*` routes; a cookie-aware sibling of `authenticate_request`

@@ -114,7 +114,7 @@ messages over HTTPS.** Drivers, in order of force:
 2. **Bearer auth gets a natural carrier** — `Authorization: Bearer …` on the
    WebSocket upgrade request, rather than an auth frame hand-rolled into the
    `Hello` handshake.
-3. **OAuth device flow needs HTTP endpoints anyway** (§6.4); they share the port
+3. **Browser and device login need HTTP endpoints anyway** (§6.4); they share the port
    and the proxy.
 4. **Port 443 traverses corporate firewalls and lab NAT**, which a custom port
    does not.
@@ -133,23 +133,21 @@ Routes:
 | `GET /agent` (WS upgrade) | nodes | persistent dial-out control + data |
 | `GET /client` (WS upgrade) | ctl + sidecar | leases, relay channels, admin surface |
 | `GET /delegate` (WS upgrade) | a sandboxed agent | **relay only**, authorised by a capability token; no principal (§6.5) |
-| `POST /auth/device/*` | `login` | GitHub device-flow start/poll (§6.4) |
-| `POST /auth/token` | CI, nodes, `login`ed users | token exchange (workload OIDC, auth keys, session refresh, **refresh-token redemption**) |
-| `POST /auth/logout` | org members | revoke this session (`--all`: every session and refresh token of the caller) |
-| `POST /auth/keys` | org members | mint / list / revoke the org's auth keys (§6.4) |
+| `/auth/*` | — | **forgs' router**, merged in: `/auth/providers`, `/auth/login`, `/auth/{p}/start` + `/callback`, `/auth/signup`, `/auth/device/*` (CLI login), `/auth/token` (refresh, refresh-token, workload OIDC and `ci` API-key exchange), `/auth/logout`, `/auth/session`, `/auth/keys`, `/auth/members`, `/auth/rename` (§6.4) |
 | `POST /node/register/start` | headless nodes | begin an approval-pending registration (§4.2 rung 3) |
 | `POST /node/register/poll` | headless nodes | redeem an approved registration for a node token |
 | `POST /node/register/approve` | org members | inspect / approve / deny a pending registration |
+| `POST /node/enroll` | holder of a `node` API key | redeem it for a node token (§6.4) |
+| `POST /node/self-register` | org members (session) | register the calling machine (`share`) |
 | `GET /node/approve` | anyone | static page: what to run to approve one (and a link to `/ui/approve`) |
-| `GET /auth/github/start` | a browser | 302 to GitHub's authorize endpoint (browser login, `docs/web-ui.md` D1) |
-| `GET /auth/github/callback` | a browser holding a valid `state` | exchange the code, set the session cookies, 302 `/ui` |
 | `GET /api/v1/*` | a browser session, or a bearer | the browser-facing JSON API (`docs/web-ui.md` §3) |
 | `GET /` , `GET /ui` | a browser | 302 to `/ui/` |
 | `GET /ui/` and each client-side route, with or without a trailing slash | a browser | the web UI's shell, embedded in the binary (`docs/web-ui.md` D3) |
 | `GET /ui/a/{hash}/*` | a browser | one embedded asset, immutably cacheable |
 | `GET /healthz` | proxy | liveness |
 
-`/auth/github/*`, `/api/v1/*` and `/ui*` are the **browser surface**, added by
+The browser pages under `/auth/*` (login, callback, signup, device
+verification), `/api/v1/*` and `/ui*` are the **browser surface**, added by
 `docs/web-ui.md` and designed there rather than here — named by prefix rather
 than by position, so the next row anyone adds to this table does not silently
 leave this sentence pointing at the wrong rows. Three properties of it belong
@@ -159,7 +157,8 @@ here rather than only in that document:
   credential. Every other route in this table requires an explicit
   `Authorization: Bearer`, including `/agent`, `/client` and `/delegate` (a
   browser must never drive a control-plane WebSocket by ambient authority) and
-  the CLI's `/auth/token`, `/auth/keys` and `/auth/logout`.
+  the JSON `/auth/*` routes (`/auth/token`, `/auth/keys`, `/auth/logout`, …);
+  forgs' own browser pages under `/auth/*` are the explicitly marked exception.
 * Mutating `/api/v1` calls whose credential arrived in a cookie must also carry
   an `X-Fleet-Csrf` header, and the coordinator emits **no CORS headers
   anywhere**, which is what makes that header a second independent control.
@@ -240,14 +239,16 @@ database default to `~/.local/share/probe-rs-fleet/coordinator/`.
 
 - generates a fresh ed25519 capability-token signing seed
   (`signing.seed`, 64 hex chars, `0600`);
-- generates a fresh secret for signing user session tokens (`session.seed`,
-  `0600`);
+- generates a fresh cookie/CSRF secret (`csrf.secret`, `0600`, ≥ 32 bytes),
+  referenced by `csrf_secret_path` — dedicated, **not** derived from the
+  signing seed (§6.2);
 - writes a populated `coordinator.toml`: `listen_addr` (loopback by default,
   since an HTTPS reverse proxy fronts it), `public_url` (the externally
-  reachable origin handed to clients and nodes), the GitHub OAuth app's
-  `[github]` block, and the lease policy. Omitting `[github]` is a supported
-  deployment (air-gapped, or development): the device-flow routes then answer a
-  named `503` and `coordinator user-token` remains the bootstrap path.
+  reachable origin handed to clients and nodes, and the only source of OAuth
+  `redirect_uri`s), a commented `[[auth.providers]]` example (§6.4), and the
+  lease policy. An empty provider list is a supported deployment (air-gapped,
+  or development): nobody can log in through a browser or `login`, and
+  `coordinator user-token --username X` remains the bootstrap path.
 
 It no longer generates a client CA, a server cert, or a server key: TLS is the
 reverse proxy's job (§3.5). `init` refuses to overwrite existing files unless
@@ -257,9 +258,9 @@ reverse proxy's job (§3.5). `init` refuses to overwrite existing files unless
 for unattended nodes (§6.4) and as an admin escape hatch; it is no longer on the
 normal path for either users or CI. Its old CSR-issuing behaviour is gone.
 
-Since `POST /auth/keys` landed, minting an auth key **no longer requires a shell
+Since `/auth/keys` landed, minting an API key **no longer requires a shell
 on the coordinator host at all**: any org member mints one with
-`probe-rs-fleet auth-key create`, authenticated by their `[user]` session. The
+`probe-rs-fleet auth-key create [--org O]`, authenticated by their `[user]` session. The
 `coordinator auth-key` / `auth-keys` / `auth-key-revoke` verbs remain for the
 self-hosted operator, for the air-gapped case, and for the one thing the API
 refuses — a key that never expires. `coordinator auth-key` takes the same
@@ -290,35 +291,30 @@ url = "https://fleet.example.com"
 # server_cert_sha256 = "…"
 
 [user]                 # present once `login` has run
-session_token = "…"    # short-TTL bearer, refreshable
-org = "gh-4242"        # the org **id**, not the login (see below)
-login = "kaspar"       # cached for display only
+session_token = "…"    # prfs1_…, short-TTL bearer, refreshable
+username = "kaspar"    # display only; identity is the immutable user id
 expires = 1788600000
-refresh_token = "…"    # optional: the DURABLE credential that renews the
-                       # session above without a browser (§6.4). Absent in
-                       # every file written before it existed, and absent
-                       # against a coordinator too old to mint one.
+refresh_token = "…"    # prfr1_…: the DURABLE credential that renews the
+                       # session above without a browser (§6.4)
 
 [node]                 # present once `share` / `node up` has run
-node_token = "…"       # long-lived machine bearer, auto-rotating
-node_id = "gh-4242/kaspar-laptop"
+node_token = "…"       # prfn1_…, long-lived machine bearer, auto-rotating
+node_id = "01J9Z…/kaspar-laptop"   # "<org id (ULID)>/<name>"
 coordinator_token_pubkey = "…"   # verifies per-lease capability tokens
 
 [agent]                # present once `agent login` has run (§6.7)
-auth_key = "…"         # the DURABLE credential, re-redeemed on demand
+auth_key = "…"         # prfk1_…, the DURABLE credential, re-redeemed on demand
 name = "desk-bot"      # the `--as` identity; display only, not verified
 workload_token = "…"   # the current short-lived session
 expires = 1788999999   # required here, so staleness is knowable offline
 ```
 
-**`org` is `gh-<github_user_id>`, never the login.** This is load-bearing, not
-cosmetic. Org creation is `ON CONFLICT DO NOTHING`, so if a personal org were
-keyed by login slug then: bob renames on GitHub → alice claims the freed `bob`
-login → alice logs in → the create no-ops → **alice is provisioned into bob's
-org**. GitHub documents login reuse as exactly this account-takeover vector.
-`user.id` and `org.id` are therefore both derived from the immutable numeric id;
-`org.slug` and `user.login` are display columns, refreshed on every login and
-consulted by nothing.
+**`[user]` names no org.** A session is not bound to one: each command acts in
+the org named by `--org` (a name or id), defaulting to the user's personal org
+(§6.1). Ids are immutable ULIDs and names are handles, so nothing stored here
+goes stale when a user or org is renamed, and nothing is keyed on a provider
+login — revision 2's `gh-<github id>` scheme, and the login-reuse takeover it
+guarded against, are gone with it.
 
 A laptop that both consumes and provides simply has **both tables**. A headless
 Pi has only `[node]`. A CI runner has neither (it exchanges a workload token per
@@ -353,9 +349,9 @@ tab, whereas clobbering a node credential is a physical visit to the Pi.
 invocation and every `probe-rs` shim invocation on a sandbox re-redeems the
 stored auth key once the workload token is within `REFRESH_SKEW_SECS` (60s) of
 expiry. It needs no locking, for a reason specific to it: re-redeeming a
-**multi-use** auth key is not a rotation. `consume_auth_key` stamps
+**multi-use** API key is not a rotation. forgs' `consume_api_key` stamps
 `consumed_at` only when `single_use != 0`, so each redemption mints an
-independent `workload_token` row and upserts the *same* grant row — nothing is
+independent workload token and upserts the *same* grant row — nothing is
 invalidated, N concurrent redemptions all succeed, and every resulting token
 stays valid. There is no correctness race to lose, only churn.
 
@@ -366,24 +362,26 @@ buy correctness that is not at stake. Correspondingly there is no
 `previous_workload_token` mirroring `[node]`'s: that field exists because
 rotation can lose an ack, and nothing here is ever invalidated.
 
-There is **no migration path** from the revision-1 trees. The database is wiped
-for revision 2; the documented upgrade is to delete
-`~/.config/probe-rs-fleet/{agent,client}/`.
+There is **no migration path** from the revision-1 trees, nor from revision 2's
+pre-forgs database: both switches wiped the database. The documented upgrade is
+to delete `~/.config/probe-rs-fleet/{agent,client}/` (revision 1), and to
+re-`login` and re-enroll every node after the forgs switch.
 
 #### End-to-end deployment flow (revision 2)
 
 ```sh
-# 1. On the coordinator host: scaffold signing keys + config.
+# 1. On the coordinator host: scaffold signing key, CSRF secret + config.
 probe-rs-fleet coordinator init --public-url https://fleet.example.com
-#    Register a GitHub OAuth app with **Device Flow enabled**, put its
-#    client_id in coordinator.toml's [github] block, then start the
-#    coordinator behind your HTTPS reverse proxy. (No callback URL is
-#    needed — see §6.4.)
+#    Register an OAuth app with any provider (GitHub, Codeberg, GitLab, OIDC)
+#    whose callback is <public_url>/auth/<name>/callback, add it as an
+#    [[auth.providers]] entry in coordinator.toml, then start the
+#    coordinator behind your HTTPS reverse proxy.
 probe-rs-fleet coordinator
 
-# 2. On your laptop: log in. Opens a browser (or prints a code when headless).
+# 2. On your laptop: log in. Opens a browser (or prints a URL + code when
+#    headless); log in with any provider, choose a username the first time.
 probe-rs-fleet login --fleet-url https://fleet.example.com
-#    → personal org created on first login; session cached in fleets/default.toml
+#    → personal org created at signup; session cached in fleets/default.toml
 
 # 3. Offer this machine's probes to the fleet. No token, no out-of-band step:
 #    it reuses the session from step 2.
@@ -401,17 +399,17 @@ probe-rs-fleet ctl lease --select 'tag=nrf52'
 #    approval time. For an unattended image, use 5b instead.
 probe-rs-fleet node up --fleet-url https://fleet.example.com
 
-# 5b. …or, for an unattended image, a pre-minted auth key. Mint it on your
-#     laptop with the login from step 2 — no shell on the coordinator:
-probe-rs-fleet auth-key create --tag lab --tag nrf52 --ttl 24h
-probe-rs-fleet node up --auth-key prffk1_…
+# 5b. …or, for an unattended image, a pre-minted `node` API key. Mint it on
+#     your laptop with the login from step 2 — no shell on the coordinator:
+probe-rs-fleet auth-key create --org acme --tag lab --tag nrf52 --ttl 24h
+probe-rs-fleet node up --auth-key prfk1_…
 #     Self-hosted, or air-gapped, or for a key that never expires, the same
 #     thing from a shell on the coordinator host:
 probe-rs-fleet coordinator auth-key --org acme --tag lab --ttl 24h
 #     Same verb, same flags as the API path, for a CI key that never expires:
 probe-rs-fleet coordinator auth-key --org acme --tag lab --purpose ci --ttl 0
 
-# 6. Give a colleague access to some of your boards.
+# 6. Give a colleague access to some of your boards (by their username).
 probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
 
 # 7. Hand a sandboxed agent one board, with no fleet identity of its own.
@@ -624,12 +622,13 @@ It obtains a node token by whichever of these applies, in order:
    machine where they are already logged in (`probe-rs-fleet node approve
    ABCD-1234`). This is the headless-Pi path, and it replaces the copy-paste of
    a bootstrap token.
-4. **An auth key** (`--auth-key`) — org-scoped, expiring, optionally
-   single-use, carrying default tags. This is the unattended/image path.
+4. **An API key of purpose `node`** (`--auth-key`, redeemed at
+   `POST /node/enroll`) — org-scoped, expiring, optionally single-use,
+   carrying default tags in its payload. This is the unattended/image path.
 
 > **Implementation status (task 3451).** All four rungs ship. Rung 3's approval
 > was a **CLI verb, not a browser form**, and that was a decision rather than an
-> unfinished edge: `login` is the GitHub *device* flow, which by design has no
+> unfinished edge: `login` was then the brokered GitHub *device* flow, which had no
 > `redirect_uri` and no cookie session (§6.4), so a page served by the
 > coordinator could not know who was looking at it. Building one would have
 > meant an OAuth redirect flow plus cookies in the coordinator, which
@@ -660,7 +659,7 @@ It obtains a node token by whichever of these applies, in order:
 >   cannot become a confused-deputy surface, and the URL every deployed agent
 >   prints keeps meaning what it meant. Phase 2 added a static link from it to
 >   `/ui/approve`, which is where the form lives.
-> * **There is no pending-registration listing.** `pending_node.org_id` is
+> * **There is no pending-registration listing.** A pending row's namespace is
 >   `NULL` until approval binds it, so a listing could only show every live
 >   code in the deployment: a cross-tenant index that would turn §6.4's
 >   "guess ~40 bits" into "read the list". Approval stays code-driven
@@ -901,420 +900,455 @@ The server→client direction rides the same WebSocket: the coordinator writes
 command frames down the node's dial-out connection, multiplexed with the opaque
 data channel by the `fleet-wire` envelopes.
 
-## 6. Identity, auth & leases (revision 2)
+## 6. Identity, auth & leases (revision 3: on forgs)
 
 Revision 1 had authentication (mTLS client cert → `Principal`) and **no
-authorization**: nothing consulted the authenticated principal. This section
-replaces the whole credential model and adds the missing authorization layer.
+authorization**. Revision 2 replaced the credential model with bearer tokens,
+rooted user identity in GitHub, and added the missing authorization layer.
+Revision 3 (task 3892) moves every generic piece of that — users, orgs,
+memberships, sessions, refresh tokens, API keys, workload tokens, grants, the
+device flow, browser login, cookies and CSRF — into **forgs**
+(`../forgs`, `docs/design.md`), and keeps in fleet only what is about
+hardware: nodes, boards, leases, capability tokens, the board selector and op
+vocabulary, and the two hooks through which forgs asks fleet a question.
 
-### 6.1 Identity model (revision 2)
+**There is no migration.** The switch wiped the database: migrations
+0001–0011 were deleted and replaced by a fresh `0001_fleet.sql` holding fleet's
+four tables. Pre-forgs tokens (`gh-…` ids, old sessions, auth keys, node
+tokens) are all invalid; every user logs in again and every node re-enrolls.
 
-The fleet is **multi-tenant**. Every object belongs to an org; every subject acts
-within one.
+### 6.1 Identity model
+
+The fleet is **multi-tenant**. Every hardware object belongs to an org; every
+user request acts within one org it names.
+
+forgs owns the identity tables (all prefixed `forgs_`, created by
+`forgs_store::migrate` before fleet's own migrator runs, in the same SQLite
+file). fleet's tables hold real foreign keys into them:
 
 ```
-org      { id, slug, kind: personal | team }
-user     { id, personal_org_id, github_user_id, login, email }
-member   { org_id, user_id, role: admin | member }
-node     { id, org_id, owner_user_id, name, tags[], token_hash,
-           adopt_policy, last_seen }
-board    { org_id, node_id, name, chip, tags[], … }   -- PK (org_id, node_id, name)
-grant    { id, org_id, subject, selector, ops[], expires }
-auth_key { org_id, key_hash, tags[], single_use, expires, created_by,
-           purpose: node | ci, ops[], subject_name? }
+-- forgs (generic)
+forgs_user      { id (ULID), username UNIQUE, … }
+forgs_identity  { user_id, provider, provider_subject, email, email_verified }
+                  UNIQUE (provider, provider_subject)
+forgs_ns_node   { id (ULID), parent_id NULL, kind = 'org', name, … }
+forgs_membership{ ns_node_id, user_id, role: member | admin }
+forgs_grant     { id (ULID), ns_node_id, subject, selector, ops, expires, created_by }
+forgs_api_key   { ns_node_id, key_hash, purpose, payload, single_use, expires,
+                  created_by, subject_name? }
+forgs_session / forgs_refresh_token / forgs_workload_token / forgs_pending_device /
+forgs_audit / …
+
+-- fleet (crates/fleet-coordinator/migrations/0001_fleet.sql)
+node      { id "<org id>/<name>", ns_node_id → forgs_ns_node,
+            owner_user_id → forgs_user NULL, name, tags, token_hash,
+            token_issued_at, adopt_policy, last_seen }   UNIQUE (ns_node_id, name)
+board     { ns_node_id, node_id → node, name, chip, model, tags, … }
+leases    { lease, ns_node_id, node_id, board_name, holder (subject key), … }
+audit_log { ts, ns_node_id NOT NULL, subject, action, node_id, board, lease, detail }
 ```
 
-A workload subject's id has three shapes, all of them rendered into the same
-`<ns>/<kind>:<id>` key: `gha/workload:<owner>/<repo>` for the GitHub Actions
-OIDC path (§6.7), `<org>/workload:key:<hash8>` for an unnamed `ci` auth key, and
-`<org>/workload:agent:<name>` for one minted `--as <name>` — an identity that
-survives rotating the credential. `auth_key.subject_name` is nullable, and NULL
-means the hash-derived spelling, so no pre-existing key changes meaning.
+The decisions that are load-bearing:
 
-Three decisions are load-bearing:
+- **Ids are immutable ULIDs; names are handles.** A user is `user:<ULID>`, an
+  org is a `forgs_ns_node` ULID. Usernames and org names can be renamed; every
+  stored reference (membership, grant, node, lease, audit row) is an id, and a
+  handle is resolved to an id **once**, where the reference is written (e.g.
+  `grant bob …` resolves `bob` at grant creation). A released name is
+  tombstoned forever, so a rename cannot hand the old path to a squatter.
+  `OrgId` in `fleet-proto` keeps its name but now carries the ns-node ULID
+  text; there is no `gh-<id>` anywhere any more.
+- **A login provider proves who you are; it does not name you.** Providers
+  (GitHub, Codeberg/Forgejo, GitLab, generic OIDC — §6.4) supply
+  `(provider, immutable subject id, verified email)`. The identity is keyed on
+  `(provider, provider_subject)` — for GitHub the numeric user id — **never**
+  on the login or the email, both of which get reassigned. The **username is
+  chosen by the user at first login** (forgs signup); the provider's login is
+  offered only as a suggestion.
+- **One namespace kind, `org`, at the root; everyone has a personal one.**
+  fleet's forgs schema is
+  `Schema::builder().kind("org", KindSpec::root().personal_for_users())`.
+  Signup creates the user's personal org, named like the username, with the
+  user as `admin`, in the same transaction. Team orgs sit beside personal ones
+  in the same root name space (so a user and an org cannot share a name) and
+  are created by `coordinator org create <name> --admin <username>`. The
+  config's `default_org` is an org **name** the coordinator ensures exists at
+  startup; it is consulted only by operator verbs, never by an authenticated
+  request. There is still no user-owned/org-owned branch: one scoping rule
+  everywhere.
+- **Reserved names**, enforced by forgs at every creation path (signup,
+  rename, org create, `default_org`): `gha`, `api`, `auth`, `ui`, `admin`,
+  `login`, `system`, `node`, `agent`, `client`, `delegate`, `healthz`
+  (`state.rs::RESERVED_NAMES`). `gha` matters most: it is the namespace
+  segment of GitHub Actions workload subjects (§6.7), and no tenant may ever
+  be named that.
+- **Roles are a two-rung ladder, `member < admin`**
+  (`RoleLadder::new(&["member","admin"])`, `subject::FleetRole`). Membership
+  is enough to add a node, use the org's boards and mint an API key; admin is
+  needed to create grants, read the audit log, and act on others' objects.
+- **The acting org is chosen per request.** A session is no longer bound to
+  one org at mint time. A user request names its org — `/client?org=<path or
+  id>`, `/api/v1/…?org=`, an `org` field in `SelfRegister` /
+  `NodeApprovalRequest`, `--org` on the CLI — defaulting to the user's
+  personal org, and membership is checked there (`http::acting_subject`). An
+  org you are not a member of and one that does not exist are the same `403`.
+  A node acts in its node row's org; a workload acts in **none** and reaches
+  boards only through grants.
+- **Boards are keyed `(org, node, name)`**, and a node id is already
+  org-namespaced (`state.rs::node_id_for` → `"<org id>/<name>"`), so the same
+  machine name in two tenants is two nodes.
+- **Subjects.** forgs builds a `forgs::Subject` from a credential;
+  `fleet-proto::ids::SubjectKey` is its wire mirror and renders identically,
+  `[<ns>/]<kind>:<id>`:
 
-- **Everyone is always in an org; yours is an org of one.** A personal org is
-  created on first login (decided). There is no user-owned/org-owned branch —
-  one scoping rule everywhere, so no code path can forget the org check. Moving
-  a node from personal to team use is a move, not a migration.
-- **Boards are keyed `(org, node, name)`**, not by a globally unique string.
-  Revision 1's flat `BoardId` breaks under both multi-tenancy and auto-adoption
-  (two people plug in an `nrf52840-dk`).
-- **`Principal(String)` is replaced by a `Subject`:**
+  | kind | key | from |
+  |---|---|---|
+  | user | `user:<ULID>` | session token |
+  | node | `<org id>/node:<node id>` | node token (fleet's app kind) |
+  | workload | `gha/workload:<owner>/<repo>` | GitHub Actions OIDC (§6.7) |
+  | workload | `<org id>/workload:key:<hash8>` | unnamed `ci` API key |
+  | workload | `<org id>/workload:agent:<name>` | `ci` key minted `--as <name>` |
 
-  ```rust
-  struct Subject { org: OrgId, kind: SubjectKind, id: String, groups: Vec<Group> }
-  enum SubjectKind { User, Node, Workload }
-  ```
-
-  All three authentication paths resolve to this one shape, so authorization is
-  a single mechanism regardless of how the caller proved itself.
+  The coordinator attaches the acting org to it (`subject::Subject`) and
+  converts forgs ↔ wire keys by render + parse; a key that does not survive
+  the round trip is dropped closed. Lease holders on the wire and in the
+  `leases` table are these keys.
 
 **A note on test fixtures.** Domain identifiers in tests are built with the
-production constructor, at the layer that would actually build them — a node id
-via `state.rs::node_id_for`, never a hand-rolled `format!("{org}/{name}")`. A
-fixture that spells an identifier itself is a second, unversioned definition of
-that identifier, and it drifts: the coordinator's board fixture built bare node
-ids (`node-a`) where production builds `gh-1/rpi-1` for long enough that every
-qualified-name resolution test passed while addressing boards the fleet cannot
-produce. The rule is *construct it the way the producing side does*, not "always
-prefix": an agent genuinely does not know its own org, so the `BoardName` it
-mints is correctly unprefixed, and mechanically prefixing it would manufacture a
-shape production never emits. Where the constructor is out of reach — the agent
-crate does not depend on the coordinator — the fixture names the shape in one
-documented constant rather than repeating a literal.
+production constructor, at the layer that would actually build them — users
+via `create_local_user`, orgs via forgs' `create_node`, a node id via
+`state.rs::node_id_for` — never a hand-rolled `format!("{org}/{name}")` or a
+literal id. A fixture that spells an identifier itself is a second,
+unversioned definition of that identifier, and it drifts: the coordinator's
+board fixture once built bare node ids (`node-a`) where production built
+org-qualified ones for long enough that every qualified-name resolution test
+passed while addressing boards the fleet cannot produce. The rule is
+*construct it the way the producing side does*, not "always prefix": an agent
+genuinely does not know its own org, so the `BoardName` it mints is correctly
+unprefixed. Where the constructor is out of reach — the agent crate does not
+depend on the coordinator — the fixture names the shape in one documented
+constant rather than repeating a literal.
 
-### 6.2 Connection auth: bearer tokens (revision 2)
+### 6.2 Connection auth: bearer tokens
 
-**The private CA and mTLS are withdrawn.** Deleted: `client_ca` /
-`client_ca_key`, CSR generation and signing, `EnrollRequest` cert issuance,
-cert-fingerprint pinning, the `agent_pins` table, the bootstrap-TLS pinning
-verifier, and the optional-client-auth listener branch.
+**The private CA and mTLS are withdrawn** (revision 2) — deleted: client CA,
+CSR signing, cert pinning, the `agent_pins` table. Under bearer tokens
+revocation is a row delete, which the CA never offered.
 
-Rationale: with user identity rooted in GitHub, the CA bought nothing that
-bearer tokens do not, while imposing a cert ceremony on every enrollment and
-leaving **no revocation story at all** — revision 1 issued client certs that
-could not be withdrawn short of rotating the CA and re-enrolling the fleet.
-Under bearer tokens revocation is a row delete.
+Every credential is a **prefix-typed opaque token**, minted by forgs'
+`TokenFormat` with fleet's brand `prf` plus one app kind:
 
-All three principal kinds present `Authorization: Bearer …` on the WebSocket
-upgrade (§3.5):
+| Token | Prefix | Kind | Lifetime | Revocation |
+|---|---|---|---|---|
+| session (user) | `prfs1_` | connection | `session_ttl_secs`, default 12h | `logout`, or expiry |
+| refresh (user, CLI only) | `prfr1_` | redeem-only | `refresh_token_ttl_secs`, default 30d | `logout` (`--all`), or expiry |
+| API key | `prfk1_` | redeem-only | ≤ 30d over the API; a shell may mint a forever-key | `auth-key revoke` |
+| workload (CI) | `prfw1_` | connection | one job: default 1h, capped at 12h, **no refresh** | expiry, or revoking the grant |
+| device secret | `prfd1_` | redeem-only | the pending-approval TTL | consumed once |
+| **node** | **`prfn1_`** | connection (fleet's app kind `node`, tag `n`) | long-lived, auto-rotating | delete / rotate the node row |
 
-| Kind | Token | Lifetime | Revocation |
-|---|---|---|---|
-| User | session token, minted after GitHub login | short, refreshable | delete session |
-| **Refresh** (user, CLI only) | fleet-issued `prfr1_`, minted by `login` beside the session | `refresh_token_ttl_secs`, default 30d | `probe-rs-fleet logout --all`, or expiry |
-| Node | node token, minted at registration | long, auto-rotating | delete node row |
-| Workload (CI) | exchanged from a GH Actions OIDC JWT, or from a `ci` auth key (§6.7) | one job: `workload_token_ttl_secs`, default 1h, capped at 12h, **no refresh path** | expiry, or revoking the per-repo grant (which tears down live leases) |
+forgs stores only SHA-256 hashes of secrets, shows a secret once, redacts
+them in `Debug`, and logs an 8-hex hash prefix. A redeem-only kind is refused
+**from its prefix alone, before any database access**, and each route names
+the kinds it admits (`authenticate_request(…, allowed: &[TokenKind], …)`); a
+wrong kind is a `403`. So `/agent` admits node tokens only, `/client` session
+or workload, `/api/v1` session only, and a refresh token or API key opens
+nothing but the exchange that redeems it.
 
-The cost, stated honestly: bearer tokens are pure bearer credentials, so a leak
-is immediately usable. Short user sessions, rotating node tokens, and per-job CI
-tokens bound the window. The refresh token is the deliberate exception to that
-bounding, and §6.4's "A self-renewing user session" states what it buys and
-what it costs.
+**Node tokens are fleet's, verified through forgs' seam.** forgs knows the
+kind's prefix; the lookup is fleet's `tokens::NodeTokens`, an
+`AppTokenLookup` over `node.token_hash` that answers the subject
+`<org id>/node:<node id>`. The org comes from the node **row**, which is what
+stops a node token being replayed into another tenant. Rotation over the
+node's WebSocket (`node_token_rotate_secs`) is unchanged.
+
+**There is exactly one place a credential becomes a subject:**
+`forgs_http::authenticate_request` (and its `Authenticated` extractor).
+fleet's handlers call it and then resolve the acting org; nothing in fleet
+parses a bearer into a subject on its own. The one authenticated route that
+builds **no** subject is `/delegate`, which verifies a capability token
+instead (§6.5).
+
+The cost, stated honestly: bearer tokens are pure bearer credentials, so a
+leak is immediately usable. Short sessions, rotating node tokens and per-job
+workload tokens bound the window; the refresh token is the deliberate
+exception (§6.4).
 
 **One extra carrier for the user token (`docs/web-ui.md` D1).** A browser
-cannot hold an `Authorization` header the way `ctl` does, so a user session
-token also travels in a `prfs_session` cookie — `HttpOnly`, `Secure`,
-`SameSite=Lax`, `Path=/`, with `Max-Age` tracking the `session` row's own
+cannot hold an `Authorization` header the way `ctl` does, so the session token
+also travels in a `prfs_session` cookie — `HttpOnly`, `Secure`
+(unconditionally), `SameSite=Lax`, `Path=/`, `Max-Age` tracking the session's
 expiry. This is a **second carrier of the same credential, not a second
-credential kind**: the same `prfs1_` string, resolved byte-for-byte by the same
-`fleet_auth::authenticate`, through the same single `Subject` construction site
-(`http::authenticate_request_with`). The table above is unchanged — same token,
-same lifetime, same "delete session" revocation.
+credential kind**: the same `prfs1_` string, resolved by the same
+`authenticate_request`. What the carrier changes is where it is accepted and
+what else must be proven:
 
-What the carrier changes is what else the caller must prove, and where it is
-accepted:
+* it is accepted **only under `/api/v1/`** (forgs' `Carrier::ApiCookie` with
+  fleet's `cookie_api_prefix`), plus forgs' own explicitly marked browser
+  pages (`/auth/device`, `/auth/session/logout`, …). It is refused on
+  `/agent`, `/client`, `/delegate` and the JSON `/auth/*` routes, because a
+  cookie is ambient; a header, when present, wins over the cookie;
+* a mutating call carrying it must also carry `X-Fleet-Csrf`, a double-submit
+  token `hex(HMAC-SHA256(k_csrf, session_token_hash))` also set as the
+  non-`HttpOnly` `prfs_csrf` cookie. Nothing is stored. The key comes from a
+  **dedicated injected secret** (`csrf_secret_path`, ≥ 32 bytes, written as
+  `csrf.secret` by `coordinator init`), domain-separated by the app label
+  `probe-rs-fleet`. It is **no longer derived from the capability-signing
+  seed**: one secret per job, so rotating either does not silently rotate the
+  other. A bearer-authenticated `/api/v1` call needs no CSRF header;
+* no route emits CORS headers, which makes the mandatory custom header a
+  second, independent control.
 
-* it is accepted **only under `/api/v1/*`** (§3.5), because a cookie is ambient
-  — the browser attaches it to every request to this origin, including ones
-  another site caused;
-* a mutating call carrying one must also carry `X-Fleet-Csrf`, a double-submit
-  token `HMAC`-derived from the coordinator's existing signing seed and the
-  session token's hash. Nothing is stored: no CSRF table, no second secret. A
-  **bearer**-authenticated `/api/v1` call needs no such header, because that
-  credential is not ambient.
-
-The trade recorded with it: `HttpOnly` costs the CSRF machinery, and buys that a
-single XSS cannot walk away with a credential that can power-cycle real
-hardware. `Authorization: Bearer` from JavaScript would need no CSRF at all and
-was rejected for exactly that reason (`docs/web-ui.md` §5).
+`HttpOnly` costs the CSRF machinery and buys that one XSS cannot walk away
+with a credential that can power-cycle real hardware; `Authorization: Bearer`
+from JavaScript was rejected for exactly that reason (`docs/web-ui.md` §5).
 
 ### 6.3 Capability tokens (unchanged)
 
 The coordinator mints an ed25519-signed `CapabilityToken { lease, board,
 allowed_ops, expires }` per lease; the node verifies the signature **locally**
-with the coordinator's public key, so there is no per-operation round trip. This
-survives revision 2 untouched — it was always orthogonal to connection auth, and
-it is exactly the attenuated, lease-bound, expiring credential the sandboxed-agent
-story needs (§6.5).
+with the coordinator's public key, so there is no per-operation round trip.
+This is orthogonal to connection auth and did not move to forgs: it is the
+attenuated, lease-bound, expiring credential the sandboxed-agent story needs
+(§6.5). Its seed (`signing.seed`) now signs only capability tokens and derives
+the serve token; it keys nothing else.
 
-### 6.4 Bootstrapping: one ceremony, several flavours (revision 2)
+### 6.4 Bootstrapping: one ceremony, several flavours
 
-Revision 1's enrollment was **coordinator-operator-rooted**: someone with a shell
-on the coordinator minted a single-use secret and sent it out of band. Every path
-— user, agent, CI — went through that one manual funnel.
-
-Revision 2 inverts it to be **user-rooted**: a human authenticates once against
-GitHub, and every other credential is derived from that authority.
-
-```
-probe-rs-fleet login
-  → GitHub device flow (browser, or URL + code when headless)
-  → personal org created on first login
-  → session token cached in the per-fleet config
-```
-
-**No callback origin is involved *for the CLI*.** The device flow (RFC 8628)
-has no `redirect_uri` at all, so §10's unresolved "where does the hosted control
-plane run" question does not gate `probe-rs-fleet login` and nothing in the CLI
-path hardcodes a hostname. Register the OAuth app with **Device Flow enabled**;
-for the CLI there is no callback URL to fill in, and this is still the whole
-story for every deployed agent, sidecar and `ctl`.
-
-**A callback origin *is* involved for the browser (`docs/web-ui.md` D1).** The
-web UI cannot use the device flow as its primary login — a page that makes you
-type a code into another tab is a poor front door — so the coordinator also
-offers the GitHub **authorization-code** flow at `GET /auth/github/{start,
-callback}`. That reverses the sentence above for one surface, and it costs
-exactly one thing: a per-deployment setup step, registering
-`<public_url>/auth/github/callback` in the OAuth app. Three things bound it:
-
-* the step is **opt-in** (`github.callback_registered`). A deployment that skips
-  it falls back to an in-page device-code login, which is uglier and works, so
-  `[github]` stays optional and no existing deployment is broken by this;
-* `redirect_uri` is derived from `public_url`, **never** from `Host` or
-  `X-Forwarded-Host`. Behind the reverse proxy of §3.5 the coordinator does not
-  see its own public name, and a Host-derived callback is a host-header
-  injection into an attacker-chosen OAuth redirect — an account takeover. The
-  callback path is fixed and the origin is configuration;
-* GitHub does **not** implement PKCE (it ignores `code_challenge` /
-  `code_verifier`). The parameters are sent anyway, because they are harmless
-  and correct for a GHES or other-IdP future, but what actually protects the
-  callback is the `state` value bound to a short-lived `HttpOnly` cookie plus
-  the `client_secret` — which is therefore effectively **required** once
-  browser login is enabled, unlike the device flow. Please do not record this as
-  "PKCE-protected"; it is not.
-
-The device-flow paragraphs below are unchanged and describe the CLI path, which
-nothing here moves.
-
-**The coordinator brokers; the CLI never talks to GitHub.** The OAuth app's
-client id/secret stay server-side, the user's GitHub *access token* never leaves
-the coordinator (it is spent on one `GET /user` and discarded), and a
-self-hosted deployment can use its own OAuth app without anyone rebuilding the
-CLI. Brokering is stateless — the `device_code` round-trips through the client —
-so a coordinator restart mid-login is survivable and there is no expiry sweep.
-
-Two risks that come with the ceremony, accepted rather than fixed in v1 (there
-is no rate limiting in the coordinator yet):
-
-- **Quota exhaustion.** `/auth/device/start` is necessarily unauthenticated, so
-  anyone who can reach it can burn the OAuth app's device-code rate limit and
-  block logins. No credential is exposed.
-- **Remote phishing** (RFC 8628 §5.4). An attacker starts a flow and
-  social-engineers a victim into typing the `user_code`; the attacker's poll then
-  returns a session token *as the victim*. This is inherent to every device flow
-  — the mitigation is the warning GitHub shows on its own approval page, plus
-  short session TTLs.
+Enrollment is **user-rooted**: a human authenticates once, and every other
+credential is derived from that authority.
 
 | Principal | Bootstrap | Ceremony |
 |---|---|---|
-| **User** (laptop) | `login` — GitHub device flow | browser, once |
-| **Node, user present** | `share` — reuses the session to self-register | zero extra steps |
-| **Node, headless** | `node up` prints a URL + code; a member runs `node approve <code>` | no token copy-paste |
-| **Node, unattended** | pre-minted **auth key** (org-scoped, expiring, tagged) | one paste, revocable |
-| **CI worker** | GH Actions workload OIDC, exchanged at `/auth/token`, plus a per-repo grant (§6.7) | zero secrets |
-| **CI worker, no workload identity** | a `--purpose ci` **auth key** redeemed at `/auth/token` (§6.7, the weak path) | one paste, revocable |
+| **User**, browser | `/auth/login` → any configured provider (authorization-code flow) | browser |
+| **User**, CLI (`login`) | forgs' own device flow: a code confirmed in a browser logged in with any provider | browser, once |
+| **Node, user present** | `share` → `POST /node/self-register` with the session | zero extra steps |
+| **Node, headless** | `node up` prints a URL + code; a member runs `node approve <code>` (or `/ui/approve`) | no token copy-paste |
+| **Node, unattended** | an API key of purpose `node` redeemed at `POST /node/enroll` | one paste, revocable |
+| **CI worker** | GH Actions workload OIDC exchanged at `POST /auth/token`, plus a per-repo grant (§6.7) | zero secrets |
+| **CI worker, no workload identity** | an API key of purpose `ci` redeemed at `POST /auth/token` (§6.7, the weak path) | one paste, revocable |
 | **Sandboxed agent** | *no enrollment* — lease-bound capability token | one command |
 
-**Interactive node approval** (`node up` rung 3, §4.2) reuses this ceremony's
-shape for a machine rather than a human, and inherits a sharper version of its
-second risk. The mechanics: the machine posts to `/node/register/start`, prints
-a ~40-bit Crockford-base32 `user_code` (`ABCD-1234`) and polls; a member runs
-`probe-rs-fleet node approve ABCD-1234` from a machine where they are logged in,
-which binds the pending row to **their** org and user; the machine's next poll
-mints its node token through the same code path `share` uses, so the resulting
-`node` row is identical. Three decisions and three accepted risks:
+#### Login providers, and choosing a username
 
-- **Approval is a CLI verb, *and now also* a browser form** — but not the one
-  this bullet originally forbade. The original reason stands and is recorded in
-  §4.2: the *device* flow has no cookie session, so a coordinator-served page
-  driven by it could not know who was looking at it. What changed is that the
-  coordinator gained a real browser session of its own (`docs/web-ui.md` D1,
-  which reverses this section's "no browser session" premise and records its
-  cost), so `POST /api/v1/nodes/pending/{code}` resolves its subject from that
-  cookie and calls the same `decide_pending_node` the CLI route calls, with the
-  same membership check and the same audit rows.
+Providers are **configured**, not hardcoded:
 
-  `GET /node/approve` is **still** informational and **reflects nothing** — no
-  code in the URL, no query parameter echoed — so it cannot become a
-  confused-deputy surface, and the URL deployed agents print keeps its meaning.
-  Phase 2 of `docs/web-ui.md` added one static paragraph linking it to
-  `/ui/approve`, where the same JSON endpoint is driven from a real form behind
-  the session; that is a link, not a form, and the page still renders
-  byte-identically whatever the query string. Please do not "finish the job" by
-  putting the form there.
+```toml
+[[auth.providers]]
+kind = "github"              # github | codeberg | gitlab | oidc
+name = "github"              # instance name; appears in /auth/{name}/start
+client_id = "…"
+client_secret_path = "…"     # required: GitHub ignores PKCE
+# issuer = "https://…"       # oidc (required); codeberg/gitlab override; GHES origin
+```
 
-  There is deliberately **no** browser listing of pending registrations:
-  `pending_node.org_id` is `NULL` until approval binds it, so a listing could
-  only be a cross-tenant index of every live code — which would turn the
-  enumeration risk below from "guess ~40 bits" into "read the list"
-  (`docs/web-ui.md` §3/§4). The phishing warning the CLI prints rides on the
-  JSON `inspect` response for the same reason: with nothing to browse, that
-  response is all the approver has.
-- **Membership is sufficient to approve**, as it is to `share`, and the node is
-  owned by the approver (`node.owner_user_id`).
-- **Approval refuses to take over an existing node.** The requesting machine
-  chooses its own `node_name` *before any org is known*, and `register_node_full`
-  is an upsert, so approving a name the approver's org already uses would
-  re-credential the running machine and knock it off the fleet. The handler (not
-  just the CLI) refuses that with `409 node_name_taken` unless `--replace` is
-  passed, and the approval output names the collision loudly.
+Two instances of the same software are two providers whose subject ids never
+mix. GitHub is OAuth2-only: forgs requests `read:user user:email`, reads
+`GET /user/emails` and takes the `primary && verified` address. Codeberg /
+Forgejo, GitLab and generic OIDC are OIDC (discovery, `id_token`,
+`email_verified`). **Login without a verified email is refused**
+(`no_verified_email`). The provider's access token is spent once and never
+stored or logged. An empty provider list is a supported (air-gapped /
+development) deployment: users are then created with `coordinator user-token
+--username X`, which goes through forgs' `create_local_user` — the same code
+path, minus an identity row.
 
-Accepted risks, recorded rather than fixed:
+The browser flow (all forgs routes, merged into fleet's router):
 
-- **Remote phishing** (RFC 8628 §5.4) again, and worse than for login: the
-  approver grants *hardware access in their org to a machine they cannot see*,
-  on the strength of a code somebody read out. Mitigations: the approval verb
-  inspects first and prints the requested name, tags, adoption policy, source IP
-  and age; it says in as many words that you cannot see the machine and should
-  approve only an enrollment you started; confirmation defaults to **no** and a
-  non-tty is refused rather than defaulted. Every field it prints comes from an
-  unauthenticated request, so names and tags are charset-validated server-side
-  and neutered again client-side — otherwise ANSI escapes in a name could
-  repaint the warning itself.
-- **Cross-tenant code enumeration.** An authenticated member who guesses a
-  `user_code` can inspect, and approve into their own org, a registration
-  somebody in another org started. Bounded by ~40 bits behind a 15-minute TTL
-  (blind enumeration is infeasible even unthrottled), by every attempt being
-  audited, and — the control that lets the *victim* notice rather than only an
-  auditor afterwards — by the enrolling machine printing which org it landed in.
-- **Unauthenticated database growth.** This is **not** covered by the device
-  flow's quota-exhaustion bullet above, and conflating the two is how the gap
-  would survive review: the device flow is *stateless*, whereas
-  `/node/register/start` writes a row holding caller-chosen strings.
-  `max_pending_nodes` (default 256) caps the live set and the TTL sweep reclaims
-  it; there is no per-source throttle. The honest cost of the cap is that a full
-  table refuses legitimate enrollments until abandoned rows age out.
+```
+GET /auth/login  (or GET /auth/providers → JSON)  → pick a provider
+GET /auth/{p}/start       → 302 to the provider; state in a sealed HttpOnly flow cookie
+GET /auth/{p}/callback    → identity known?  yes → session cookies, 302 /ui/
+                                             no  → pending signup (sealed ticket cookie)
+GET/POST /auth/signup     → choose a username (policy + reserved names + tombstones)
+                          → ONE transaction: user, identity, email, personal org,
+                            admin membership → session
+```
 
-**Auth keys are mintable by any member, over the API** (`POST /auth/keys`,
-`probe-rs-fleet auth-key create|list|revoke`). This closes the last surviving
-piece of the revision-1 operator-rooted funnel: minting used to require a shell
-on the coordinator host, which a hosted customer does not have, so "node,
-unattended" was unreachable for them at all. ("Node, headless" — §4.2 rung 3 —
-now ships too, and is the better path when a human is available to approve; a
-key is the right answer for a disk image.) Three decisions, recorded:
+* `redirect_uri` is derived from the configured `public_url` **only**, never
+  from `Host` / `X-Forwarded-Host`: behind the reverse proxy a Host-derived
+  callback is a host-header injection into an attacker-chosen OAuth redirect.
+* `state` is bound to a sealed `HttpOnly` flow cookie. PKCE is sent but GitHub
+  ignores it, so the `client_secret` is what makes an intercepted code
+  unspendable; do not call this "PKCE-protected".
+* **No auto-linking on email.** A new identity whose verified email matches an
+  existing user is refused (`email_in_use`), not linked: auto-linking turns
+  "an attacker controls a provider that asserts your email" into account
+  takeover. A second login method is linked only from an authenticated
+  session (`POST /auth/identities/link/{provider}`).
 
-- **Membership is sufficient to mint and to list**, consistent with "membership
-  is enough to add a node" in §6.5. A key grants nothing a member could not
-  already do with `share`; it only lets them do it on a machine they are not
-  sitting at.
-- **A key can never exceed the caller's org**, structurally rather than by
-  checking: the org is read from the authenticated session, and there is no org
-  field on the wire and no `--org` flag.
-- **API-minted keys must expire**, TTL capped at 30 days; `ttl_secs = 0` is a
-  `400`. Auth keys are the weak link in the credential model — long-lived bearer
-  secrets that end up in CI config and disk images. A forever-key minted from a
-  shell is an operator's informed choice (`coordinator auth-key --ttl 0` still
-  allows it); a hosted member's is not.
+#### CLI login is forgs' own device flow
 
-**Revocation follows the lease-ownership rule of §6.5:** the key's creator may
-revoke it, and an org admin may revoke any of the org's keys — including the
-shell-minted ones, whose `created_by` is `NULL` and which would otherwise be
-unrevokable over the API. A prefix shorter than 8 hex characters is refused
-before the delete, because the underlying `LIKE` on an empty prefix would match
-every key in the org; an ambiguous prefix is a `409` that deletes nothing.
+fleet no longer brokers GitHub's device flow (not every provider has one).
+forgs is itself the device authorization server:
 
-One exchange endpoint, several proofs. Note that **GitHub is two identity
-systems**, and v1 needs both verifiers:
+```
+CLI  POST /auth/device/start → { device_secret (prfd1_), user_code, verification_uri }
+user opens verification_uri → logs in with ANY provider (incl. first-login signup)
+     → confirms the user code on /auth/device
+CLI  POST /auth/device/poll { device_secret } → pending | session + refresh + username
+```
 
-- *User login* is **OAuth2, not OIDC** — no discovery document, no ID token, no
-  JWKS. The device flow yields an access token; identity comes from calling
-  `GET /user`. Store `github_user_id` (the immutable numeric id), **never** the
-  login name, which can be renamed and reused. Concretely: `user.id` and
-  `org.id` are `gh-<github_user_id>`; `login` and `org.slug` are display columns
-  (§4.1).
-- *CI* is **real OIDC** — a signed JWT with a JWKS endpoint and claims
-  `repository`, `repository_owner`, `ref`, `job_workflow_ref`. No secret ever
-  enters the runner.
+The CLI stores `session_token`, `refresh_token` and `username` in the fleet
+file's `[user]` table. The one requirement is a browser-reachable
+`public_url`. Accepted risks, recorded rather than fixed (there is still no
+rate limiting): **remote phishing** (RFC 8628 §5.4 — an attacker talks a
+victim into confirming their code; the verification page never approves from
+a link alone), and **unauthenticated growth** — `start` writes a row. CLI
+login and node registration share one pending table and one cap
+(`max_pending_nodes`, default 256) and TTL (`pending_node_ttl_secs`); a full
+table refuses new logins and enrollments until rows age out.
 
-**CI trust rule (v1):** a workload token proves "a job in repo `owner/name` at
-ref X". Mapping that to a fleet org requires an explicit **per-repo** grant.
-`repository_owner` alone is deliberately *not* sufficient — a fork or a new repo
-under the same owner must not inherit hardware access.
+#### Interactive node approval
+
+`node up` rung 3 (§4.2) reuses forgs' generic **pending-approval machine** for a
+machine rather than a human. `POST /node/register/start` stores a pending row
+whose JSON payload is the requested `{node_name, tags, adopt}` (charset-validated
+before it is stored, since it is unauthenticated and rendered to a human); the
+machine prints a ~40-bit Crockford-base32 `user_code` (`ABCD-1234`) and polls
+`/node/register/poll` with its device secret. A member runs `probe-rs-fleet
+node approve ABCD-1234 [--org O]` (or uses `/ui/approve`), which calls
+`/node/register/approve` → forgs' `decide`, binding the row to the approver
+and the chosen org. fleet's `PendingApprovalHook` (`identity::FleetNodeApprovals`)
+is where fleet's policy lives:
+
+- **authorize**: membership in the target org is sufficient, as it is to
+  `share`; the node is owned by the approver (`node.owner_user_id`);
+- **redeem**: the machine's next poll registers the node and mints its
+  `prfn1_` token through the same `register_node_and_mint` every enrollment
+  path uses, so the resulting row is identical.
+
+Three decisions and three accepted risks carry over unchanged:
+
+- **Approval is a CLI verb and a browser form** (`POST /api/v1/nodes/pending/{code}`
+  calls the same `http::decide_pending_node`). `GET /node/approve` stays
+  informational and **reflects nothing** — no code in the URL, no query
+  parameter echoed — so it cannot become a confused-deputy surface. Please do
+  not "finish the job" by putting the form there.
+- **There is no listing of pending registrations**: a row's namespace is
+  `NULL` until approval binds it, so a listing could only be a cross-tenant
+  index of every live code. The phishing warning therefore rides on the
+  `inspect` response, the only thing the approver sees.
+- **Approval refuses to take over an existing node.** The machine chooses its
+  `node_name` before any org is known, so approving a name the org already
+  uses would re-credential a running machine. The handler (not just the CLI)
+  refuses with `409 node_name_taken` unless `replace` is set.
+- *Risk:* **remote phishing**, sharper than for login — the approver grants
+  hardware access to a machine they cannot see. `node approve` inspects first
+  and prints name, tags, adoption policy, source IP and age, says to approve
+  only an enrollment you started, defaults to **no**, refuses a non-tty; every
+  printed field is validated server-side and neutered client-side.
+- *Risk:* **cross-tenant code enumeration** — a member who guesses a live code
+  can approve it into their own org. Bounded by ~40 bits behind a short TTL,
+  by every attempt being audited, and by the enrolling machine printing which
+  org it landed in.
+- *Risk:* **unauthenticated row growth**, bounded by the shared cap above.
+
+#### API keys (`auth-key`)
+
+The unattended paths redeem a forgs **API key** (`prfk1_`). A key belongs to
+one org, has a `purpose` and an app-defined `payload`, and fleet's
+`ApiKeyPurposes` (`identity::FleetPurposes`) defines two purposes:
+
+| purpose | redeemed at | payload | yields |
+|---|---|---|---|
+| `node` | `POST /node/enroll {auth_key, node_name}` (fleet) | `{"tags":[…]}` — stamped on every node it enrolls | a node token |
+| `ci` | `POST /auth/token`, `grant_type: api_key` (forgs) | `{"tags":[…], "ops":[…]}` — the synthesised grant's selector and ops | a workload token (§6.7) |
+
+`check_payload` validates and canonicalises the payload at mint time; a
+payload that no longer forms a selector at redemption is refused, never
+widened. The rules, all enforced by forgs' `/auth/keys` (and by
+`/api/v1/auth-keys`, which calls the same functions):
+
+- **Membership is sufficient to mint and to list.** The key's org is a
+  *target* (`--org`, default the personal org) checked for membership, so a
+  key can never exceed the caller's own access; "not a member" and "no such
+  org" are the same `403`.
+- **Keys minted over the API must expire**, capped at 30 days
+  (`Ttls::api_key_max`); `ttl_secs = 0` is refused, not silently capped. A
+  never-expiring key is an operator's informed choice from a shell on the
+  coordinator host (`coordinator auth-key --ttl 0`).
+- **Revocation is creator-or-admin**, by hash prefix of ≥ 8 hex characters;
+  an ambiguous prefix is a `409` that deletes nothing. Revoking a `ci` key
+  cascades into its grant (§6.7).
 
 #### A self-renewing user session (`login` + refresh tokens)
 
-A user session lives `session_ttl_secs` (default 12h) and `ensure_fresh_session`
-slides that window forward — but only on the surfaces that call it: `ctl`,
-`share`, `node up`, `node approve`, `auth-key`. The `probe-rs` sidecar shim did
-not, so **a workstation whose only fleet use is `laze` → shim → `probe-rs`
-expired every 12 hours no matter how heavily it was used**, surfacing through
-the build tool as a bare `401 Unauthorized`. The heaviest user of the fleet was
-the only one that could not keep its own credential alive, and there was no path
-between "valid session" and "open a browser": nothing durable survived a login,
-so re-establishing identity meant another device-flow round trip.
+A session lives `session_ttl_secs` (12h). The `probe-rs` shim, `ctl`, `share`
+and friends renew it with `ensure_fresh_session` from the `[user]
+refresh_token` (`POST /auth/token`, `grant_type: refresh_token`), so a
+workstation whose only fleet use is `laze` → shim → `probe-rs` no longer hits
+a 12-hour cliff.
 
-The fix is a fleet-issued **refresh token** (`prfr1_`), minted beside the session
-by `login` and stored in `[user].refresh_token`.
+- **What it can do:** mint session tokens for its user. **What it cannot:**
+  open `/agent`, `/client` or `/delegate`, reach `/api/v1`, mint keys, approve
+  or enroll anything. It is refused from its prefix before any database
+  access, and no route admits it.
+- **fleet/forgs-issued, never the provider's.** Storing a GitHub access token
+  would make the fleet a custodian of a credential it cannot revoke, and would
+  not exist for other providers.
+- **Redemption does not rotate — the load-bearing choice.** Two concurrent
+  `probe-rs` invocations would race a rotating token and one would hold a
+  revoked credential mid-build. A non-rotating token lets N concurrent
+  redemptions all succeed. **The cost:** a leaked refresh token is usable for
+  its whole TTL (30 days), with no reuse detection; it is bounded only by the
+  TTL and by revocation.
+- **Revocation:** `probe-rs-fleet logout` → `POST /auth/logout` deletes the
+  presented session and its refresh token; `--all` deletes every session and
+  refresh token of the user, on every machine — the lost-machine answer.
+- **CLI only.** Refresh tokens come from the device flow and `coordinator
+  user-token`; the browser path issues none (`docs/web-ui.md` D1).
 
-**What it can do:** mint session tokens for one user, in one org, at
-`POST /auth/token` with `grant_type = refresh_token`.
+#### The laptop dual-role case
 
-**What it cannot do:** open `/agent`, `/client` or `/delegate`; reach
-`/api/v1`; mint an auth key; approve an enrollment; enroll anything; outlive
-`refresh_token_ttl_secs`. It is refused **from its prefix alone, before any
-database access** — `fleet_auth::verify::authenticate` answers `WrongKind` for
-it the way it already does for auth keys and node-device secrets — and no
-route's `allowed: &[TokenKind]` list contains it.
+A laptop is routinely both a user and a node:
 
-**Why fleet-issued rather than GitHub's access token.** Storing the GitHub
-access token was considered and rejected. With the default empty `scope` its
-blast radius is small, but it can only be revoked **at GitHub**, not by the
-fleet; it would make the fleet a custodian of somebody else's credentials for no
-gain; and it would not work at all for a future non-GitHub identity provider. A
-fleet-issued token is revocable by `DELETE`, auditable, org-scoped, and
-identical in shape whatever the login path.
-
-**Why redemption does not rotate — the load-bearing choice.** OAuth would rotate
-a refresh token on every use and detect reuse. This one does not. The reason is
-concurrency: the session refresh at `grant_type = refresh` *replaces* — it
-deletes the presented session immediately — which is precisely why the sidecar
-path was never allowed to refresh, since two concurrent `probe-rs` invocations
-would race and one would hold a deleted token mid-build. A non-rotating refresh
-token has the same safety property as a `--multi-use` auth key: N concurrent
-redemptions all succeed and every minted session is independently valid. That
-property is what makes fixing the sidecar possible at all.
-
-**The cost, stated plainly:** a leaked refresh token is usable for its whole
-TTL. There is no reuse detection to notice the leak, because there is no
-rotation to detect reuse against. This is the same trade a `--multi-use` auth
-key already makes, and it is bounded by two things and no others: the TTL
-(`refresh_token_ttl_secs`, default 30 days — the same figure
-`MAX_API_AUTH_KEY_TTL_SECS` already places on a durable bearer credential a
-member may hold, and a refresh token is strictly weaker than an auth key), and
-revocation.
-
-**What revokes it:** `probe-rs-fleet logout` → `POST /auth/logout`. Plain, it
-deletes the session the caller authenticated with and, if presented, that
-caller's own refresh token. `--all` deletes **every** session and refresh token
-of the calling user, on every machine — the lost-machine answer, and the only
-one available: the coordinator never learns another machine's secret, so
-"revoke that one specifically" is not expressible. Deliberately not built: a
-"list my sessions" verb, and any way for a re-`login` to reach the previous
-machine's credential. `--all` plus the 30-day TTL is the whole story.
-
-**CLI only.** Refresh tokens are minted on the device flow and by
-`coordinator user-token`. The browser's authorization-code path is unchanged and
-issues none — `docs/web-ui.md` D1 rules out a cookie-driven credential that
-mints — so `POST /api/v1/session/logout` has nothing extra to revoke and stays
-as it is.
-
-**Compatibility.** The grant rides `POST /auth/token`, which is HTTP+JSON, so
-`PROTOCOL_VERSION` is untouched. A new client against an old coordinator gets
-the unknown variant rejected and falls back to today's behaviour (use the
-session token; tell the user to `login` when it expires). An old client against
-a new coordinator simply never asks for one.
-
-#### The laptop dual-role case (resolved)
-
-A laptop is routinely both a user and a node. Revision 1 forced two unrelated
-enrollments producing two unrelated identities (`alice` as a client CN,
-`alice-laptop` as a pinned agent fingerprint) in two config trees. Revision 2:
-
-- **Config is per fleet, not per role** (§4.1) — one file, an optional `[user]`
-  table and an optional `[node]` table. A laptop has both.
+- **Config is per fleet, not per role** (§4.1) — one file, an optional
+  `[user]` table and an optional `[node]` table.
 - **The node is owned by the user** (`node.owner_user_id`), so "my laptop's
-  boards" is expressible and revoking the user cascades sensibly.
+  boards" is expressible.
 - **The two credentials stay distinct.** The node token is machine-scoped and
-  survives reboots; the session token is human-scoped and short-lived. Merging
-  them would make a compromised Pi equivalent to a compromised you.
-- **One command:** `probe-rs-fleet share` — "this machine now offers its probes
-  to the fleet", using the login you already have. Self-approving: membership in
-  the org the session authenticated into is sufficient, and is *checked* (a
-  non-member is a 403 — `authz::require_role` denies one everywhere else, so a
-  node created for one would be an orphan its owner could never use).
+  long-lived; the session is human-scoped and short-lived. Merging them would
+  make a compromised Pi equivalent to a compromised you.
+- **One command:** `probe-rs-fleet share` → `POST /node/self-register`, in the
+  org named by `--org` (default: personal). Membership there is *checked*; a
+  non-member is a `403`.
+
+#### Security properties carried over
+
+The switch was a move, not a rewrite; these properties (forgs
+`docs/fleet-survey.md` §5.4) hold on the new code and should not be "fixed":
+
+* identity keyed on the immutable provider subject, never a login or email;
+  handles resolved to ids once, where a reference is stored;
+* everyone is always in an org; a personal org of one, user admin of it;
+* tenancy by type (`OrgDb` binds the org for every fleet table; forgs'
+  `NsScope` likewise), foreign keys on, provisioning in one transaction; the
+  few deliberately unscoped queries (grants by subject, pre-approval pending
+  rows, tenant-less workload tokens) are documented as such;
+* only SHA-256 hashes of secrets stored, secrets shown once, revocation is a
+  row delete;
+* prefix-typed tokens, redeem-only kinds refused before DB access, per-route
+  allowed kinds, wrong kind → `403`;
+* no oracle: one coarse error body, detail only in the audit log, cross-org
+  indistinguishable from not-found;
+* fail closed on DB errors and unparseable rows (grants, subjects, roles,
+  payloads);
+* browser: `HttpOnly` + unconditional `Secure` + `SameSite=Lax` cookie
+  carrying the same session token, accepted only under `/api/v1/`,
+  double-submit CSRF plus mandatory header, no CORS, no bearer in JS, strict
+  CSP;
+* `redirect_uri` from `public_url` only; `state` in a sealed cookie; not
+  "PKCE-protected";
+* OIDC: pinned `RS256`, mandatory `kid`, explicit audience, injected clock;
+  trust per exact repo, never owner; one shared lowercase normaliser;
+* API keys: membership to mint, must expire over the API, creator-or-admin
+  revoke, prefix ≥ 8 hex, ambiguous `409`; a named identity survives rotation;
+* reserved names enforced at every creation path;
+* attacker-controlled strings charset-validated server-side and rendered as
+  text; approval inspects first and refuses takeover without `replace`;
+* grants: admin to create, must expire (≤ 365 days), namespace fence in every
+  check, canonical selector stored.
 
 ### 6.5 Authorization (new)
 
@@ -1333,12 +1367,15 @@ The model, deliberately minimal:
   a node, to use the org's boards, and to mint an org-scoped auth key (decided;
   finer roles can come later without a data migration).
 - **Ownership checks**, unconditionally: a lease may be extended, released, or
-  channel-opened only by its holder (or an org admin). **Auth-key revocation
-  over `POST /auth/keys` follows the same rule** (§6.4): the creator, or an org
-  admin — the latter also covering keys minted from a shell, which have no
-  recorded creator.
-- **Grants** carry sharing: `grant { subject, selector, ops[], expires }`, where
-  the selector is the existing tag/chip constraint language. `grant bob --select
+  channel-opened only by its holder (or an org admin). **API-key revocation
+  follows the same rule** (§6.4): the creator, or an org admin — the latter
+  also covering keys minted from a shell, which have no recorded creator.
+- **Grants** carry sharing. They are forgs grant rows (`forgs_grant { ns,
+  subject, selector, ops, expires, created_by }`): forgs stores them and
+  evaluates liveness, the subject and the namespace fence, while the
+  **selector** is fleet's `Constraint` rendered as canonical text and the
+  **ops** are newline-joined `AllowedOp` labels — payloads forgs treats as
+  opaque. The selector is the existing tag/chip constraint language. `grant bob --select
   'tag=nrf52' --ops flash,attach` is the "give access to other people" path, and
   it is revocable and audited. Individual-board grants are a degenerate
   selector.
@@ -1389,10 +1426,15 @@ into a selector.
 **Evaluation is a pure value object** (`fleet_core::access::Access`): ownership
 (a member of the board's org) or a live grant, deny by default, with `now`
 always a parameter — so the whole (subject, object, op) matrix is a
-table-driven unit test. The tenancy fence **moved rather than weakened**: board
-matching is now org-blind, and the org comparison lives in exactly one place,
-`grant.org == board.id.org`. A grant issued in org A saying `tag=nrf52`
-therefore cannot reach org C's identically tagged board.
+table-driven unit test. `Access { member_of: Vec<OrgId>, grants }` is built
+per request from the user's forgs memberships plus `grants_for_subject`
+mapped to fleet `GrantScope`s; a grant row whose selector or ops will not
+re-parse is dropped **closed**. Ownership is `board.org ∈ member_of` (a session
+is no longer bound to one org). The tenancy fence **moved rather than
+weakened**: board matching is org-blind, and the org comparison lives in
+exactly one place, `grant.org == board.id.org` — forgs' namespace fence. A
+grant issued in org A saying `tag=nrf52` therefore cannot reach org C's
+identically tagged board.
 
 **Grants attenuate the capability token.** The token minted for a lease carries
 the grantee's effective ops, recomputed at every mint (lease and each channel
@@ -1418,15 +1460,25 @@ when the implication fires, and refuses an empty op set — a security verb must
 not silently mint a dud.
 
 **Creating a grant requires `admin`; listing needs only membership.** A
-deliberate divergence from `POST /auth/keys`, where membership is enough to
-mint. The two verbs have different blast radii: an auth key cannot exceed the
+deliberate divergence from API keys, where membership is enough to
+mint. The two verbs have different blast radii: an API key cannot exceed the
 caller's own org, while a grant points *outward*, handing the org's hardware to
 someone who is not in it at all. In a personal org you are the admin, so the
-single-user story is unchanged. Grants must expire (the API refuses an unbounded
-one), mirroring the auth-key TTL discipline: an unbounded share of somebody
+single-user story is unchanged. Grants must expire, at most 365 days out
+(`Coordinator::MAX_GRANT_TTL_SECS`; the API refuses an unbounded one),
+mirroring the API-key TTL discipline: an unbounded share of somebody
 else's hardware is exactly the artefact that outlives its reason.
 
-**Revocation is creator-or-admin, and it is real.** The rule matches auth-key
+**Grantees are named by handle and stored by id.** `grant <grantee>` resolves,
+in order (`core.rs::resolve_grantee`): `repo:<owner>/<name>` → the workload key
+`gha/workload:<owner>/<name>` (§6.7); a rendered subject key (`user:01J…`,
+`<org id>/node:…`, `<org id>/workload:agent:builder`); otherwise a **username**,
+looked up once and stored as `user:<ULID>`, so the grant survives a rename and
+never follows a reused name. An unknown name is `no such user \`x\``. There is no
+GitHub-login lookup any more. Grant ids are forgs ULIDs; `grant revoke` takes a
+prefix of at least 8 characters of one.
+
+**Revocation is creator-or-admin, and it is real.** The rule matches API-key
 revocation verbatim, including the `grant.revoke.denied` audit. Deleting the row
 is not enough — it would leave the grantee relaying bytes until the lease's TTL
 ran out — so revocation recomputes the grantee's access and, for every lease it
@@ -1469,7 +1521,10 @@ slash-separated segments, not three. Splitting a typed name into `[org, node,
 name]` therefore cannot address a single real board. Instead the board name is
 the **last** segment and any prefix is matched against the node's short name,
 its full id, or `org/node-id` — the last being the `BoardRef`'s own `Display`,
-so a key pasted out of `ctl list` works verbatim. The grammar lives on
+so a key pasted out of `ctl list` works verbatim. Since org ids became ULIDs,
+the coordinator also accepts the org's **name** as the qualifier
+(`ariel-os/rpi-1/dk-3`), looking up names only for orgs the caller may reach
+(`BoardRef::answers_to_in`). The grammar lives on
 `BoardRef::answers_to` so the coordinator's resolver and `ctl release`'s lookup
 cannot drift apart. All of it is resolver-side: `BoardName` stays an opaque wire
 string.
@@ -1579,12 +1634,12 @@ in reply to a `KillSession` — so a reused server kept the previous invocation'
   only its reach changed; here the caller is gone.
 - **Fairness v1:** FIFO queue + per-subject concurrency cap + priority classes
   (interactive dev > nightly CI > soak).
-- Leases are now **org-scoped**, and the per-principal concurrency cap is keyed
-  by `Subject` rather than by a bare string.
+- Leases are **org-scoped** (by the board's org), and the per-subject
+  concurrency cap is keyed by the rendered `SubjectKey`.
 - Lease records are the natural basis for future metering (lease-seconds per
   org); no billing is built now, but the data is recoverable by construction.
 
-### 6.7 CI: workload identity (revision 2)
+### 6.7 CI: workload identity
 
 §6.4's bootstrap table has a "CI worker" row and a three-sentence trust rule.
 This section is what that row turned into.
@@ -1611,22 +1666,18 @@ a membership that does not exist. So the token row records the credential and
 the claims, and every authorization decision goes through `grant` — the one
 lookup in the tree that is deliberately subject-scoped rather than org-scoped.
 
-The namespace nevertheless gets a **real `org` row**, of kind `system`, created
-by migration 0007. Leaving it row-less is the tempting version and it does not
-survive contact with the code: `core.rs::tear_down_lease` and `extend_lease`
-both fall back to the *acting subject's* org when the board's org cannot be
-resolved (a lease being released as its board goes away), and
-`audit_log.org_id` is `NOT NULL REFERENCES org(id)`. A row-less namespace turns
-that rare release/extend race into a foreign-key error surfacing as a
-coordinator error instead of "no such lease". The row converts a scattered
-invariant ("never write an org-scoped row keyed on a workload's namespace") into
-a structural one, and costs nothing: nobody is ever a member of it. The name is
-reserved at **both** creation paths — `Db::ensure_org` refuses it and
-`CoordinatorConfig::validate` refuses `default_org = "gha"` — because a reserved
-name only one of two paths respects is a trap for the next change.
+`gha` is **not** an org row: it is a reserved name in fleet's forgs schema
+(§6.1), so no user or org can ever be called that, at any creation path
+(signup, rename, `org create`, `default_org`). A workload acts in no org
+(`Subject::org()` is `None`); where a lease path wants an org for its audit row
+(`extend_lease`, `tear_down_lease`) it uses the **board's** org, falling back
+to the acting org only when there is one, and otherwise skips the row rather
+than inventing a namespace — so no org-scoped
+row is ever keyed on `gha`. (Revision 2 needed a `system` org row for this;
+the forgs switch removed it.)
 
-A subject id containing a slash works with no schema change because
-`SubjectKey::parse` splits at the *first* `/` and the *first* `:`, so
+A subject id containing a slash round-trips because `SubjectKey::parse` splits
+at the first `/` only if it precedes the first `:`, so
 `gha/workload:ariel-os/ariel-os` round-trips exactly.
 
 #### `repository_owner` is verified, recorded, and never consulted
@@ -1637,11 +1688,12 @@ This is the security-relevant decision of the whole path.
 token row and into the audit detail — and it takes no part in any authorization
 decision. Access needs an explicit **per-repo** grant
 (`grant --repo owner/name`). A fork, or a newly created repo under a granted
-owner, produces a different subject key, matches no grant, and is refused with
-`403 no_grant`. There is deliberately no `--repo-owner` flag to type.
+owner, produces a different subject key, matches no grant, and is refused
+(`401 invalid_grant`, audited as `workload.reject.no_grant` with repo and
+owner). There is deliberately no `--repo-owner` flag to type.
 
 Repo strings are lowercased on both sides — grant creation and claim ingestion —
-by one shared function (`fleet_proto::ids::normalise_repo`). GitHub repo names
+by one shared function (`forgs::subject::normalise_repo`). GitHub repo names
 are case-preserving but case-insensitive, and a case difference between the two
 spellings would become a silent denial that looks like a coordinator bug.
 
@@ -1683,20 +1735,19 @@ audience explicitly (`ci login --audience`).
 
 | condition | answer |
 |---|---|
-| no `[github_actions]` table | `503 workload_oidc_unconfigured`, mirroring `device_flow_unconfigured` |
+| no `[github_actions]` table | `503 workload_unconfigured` |
 | any verification failure | a flat `401 invalid_grant` |
-| verified token, no grant | `403 no_grant` |
+| verified token, no live grant | `401 invalid_grant` too (audited as `workload.reject.no_grant`) |
 
 Every verification failure — expiry, audience, issuer, signature, missing claim,
-unknown `kid` — answers the same flat `401`, with the reason in the coordinator's
-log and never in the body. No oracle.
+unknown `kid` — answers the same flat `401`, with the reason in the audit log
+and never in the body. No oracle.
 
-`403 no_grant` is deliberately *not* folded into that: the credential **is**
-valid, and conflating the two sends an operator hunting a signing problem when
-the answer is `grant --repo`. It leaks only that a repo is not granted, which
-that repo's own maintainers already know. The coordinator's log names the repo
-and the owner beside it, so the "but I granted the org!" case is diagnosable in
-one line.
+**Changed by the forgs switch:** revision 2 answered a grantless repo with a
+distinguishable `403 no_grant`. forgs folds it into the flat `401` and records
+`workload.reject.no_grant` with the repo and the owner beside it, so the "but I
+granted the org!" case is still one audit line to diagnose — but the operator
+has to read the coordinator's audit/log to tell it from a signing problem.
 
 #### Token TTL, and the bound with no refresh path
 
@@ -1738,9 +1789,9 @@ now says so (`AtCap`) instead of reporting contention.
 
 #### The verb surface behind `/client`, walked
 
-The route allowlist now admits `Session` **and** `Workload` on `/client`;
-`/agent` and `/auth/keys` stay Session/Node, so a CI job cannot enroll a node or
-mint credentials. But a route allowlist is only a fence if the verbs behind the
+The route allowlist admits `Session` **and** `Workload` on `/client`;
+`/agent` admits node tokens only and `/auth/keys` sessions only, so a CI job
+cannot enroll a node or mint credentials. But a route allowlist is only a fence if the verbs behind the
 route have been walked, so they were:
 
 | verb | gate | workload |
@@ -1776,34 +1827,33 @@ strictly smaller change than withdrawing it.
 `close_reason` — and `holder` is the rendered subject key. So a released CI lease
 survives as a row with `holder = "gha/workload:owner/repo"` and
 `granted_at`/`closed_at` set: lease-seconds per repo, recoverable by
-construction. Beside it, each exchange writes one `workload.token.mint` audit
-row **per granting org** (each of them is lending hardware to this job, and each
-operator must be able to answer "who used what, for how long" from their own
-audit log alone), whose detail carries repo, owner, ref, workflow, run id and
-the matching grant ids. No billing is built.
+construction. Beside it, each exchange writes a `workload.token.mint` row to
+forgs' audit table, and the token row records the verified claims (repo,
+owner, ref, workflow, run id). No billing is built.
 
 #### The auth-key fallback, which is the weak path
 
 A self-hosted Jenkins box has no workload identity to offer, and heterogeneous
-runners are a stated requirement, so `auth_key` grew a `purpose` (`node` | `ci`)
-and an `ops` column. `purpose` defaults to `node`, so no existing key changes
-meaning — widening what an auth key means would silently have turned every
-enrollment key in every deployment into a board-access credential.
+runners are a stated requirement, so an API key has a `purpose`: `node` keys
+enroll machines, `ci` keys (payload `{"tags":[…],"ops":[…]}`) are workload
+credentials. The purposes are disjoint — forgs checks the purpose **before**
+the consume, so a `node` key presented at `/auth/token` is refused without
+burning a single-use key, and a `ci` key cannot enroll a node.
 
-Redeeming a `ci` key at `grant_type: workload_key` does **not** widen
-`board_access`. It upserts an *ordinary grant* — the same row `grant --repo`
-writes, evaluated by the same code and revocable by the same verb — to an
-org-scoped subject `<org>/workload:key:<hash8>` (or
-`<org>/workload:agent:<name>` for a key minted `--as <name>` — see below), and
-then mints a workload
-token. The grant's id is deterministic (`ci-<key hash prefix>`), so a multi-use
-key redeemed by twenty runners upserts one row, one grant and one concurrency
-budget; the `ci-` prefix is a namespace no human-created grant id can occupy,
-since those are 32 random hex characters, which keeps `grant revoke <prefix>`
-unambiguous between the two. That verb accepts the `ci-` spelling explicitly
-(`ci-` plus at least 8 hex characters) — `grant list` prints these ids, and a
-listing whose ids its own revoke verb rejects would be a dead end. Revoking the
-**key** does the same teardown and more, since it takes the credential with it.
+Redeeming a `ci` key (`POST /auth/token`, `grant_type: api_key`) does **not**
+widen `board_access`. forgs consumes the key and derives the subject
+`<org>/workload:key:<hash8>` (or `<org>/workload:agent:<name>` for a key minted
+`--as <name>` — see below); fleet's `on_workload_redeemed` hook then upserts
+an *ordinary grant* — the same kind of row `grant --repo` writes, evaluated by
+the same code and revocable by the same verb — whose selector and ops come from
+the key's payload; forgs then mints the workload token. The grant's id is
+deterministic (`identity::ci_grant_id`: a ULID-shaped digest of
+`(org, subject)`), so a multi-use key redeemed by twenty runners upserts one
+row, one grant and one concurrency budget, and the revocation cascade computes
+the same id from the same key. `grant list` prints it like any other grant id
+and `grant revoke <prefix>` accepts it. Revoking the **key** does the same
+teardown and more (forgs' `on_revoked` hook → fleet deletes the grant and runs
+the §6.5 cascade), since it takes the credential with it.
 
 Stated plainly: this is a **long-lived bearer secret sitting in somebody else's
 CI configuration**, usable by anyone who reads that configuration or a leaked
@@ -1820,23 +1870,23 @@ Prefer the OIDC path wherever the runner can mint an identity.
 
 #### Named identities: an agent that survives key rotation
 
-Both the subject (`key:<hash8>`) and the grant id (`ci-<hash[..29]>`) above are
-functions of the *credential*. So rotating a key — mint a new one, retire the
+For an unnamed key, both the subject (`key:<hash8>`) and hence the grant id
+above are functions of the *credential*. So rotating a key — mint a new one, retire the
 old — produces a **new subject and a new grant row**: the audit trail forks, the
 per-subject concurrency cap resets, and the old grant lingers. A long-running
 agent or CI runner has no persistent identity at all.
 
 `auth-key create --purpose ci --as <name>` gives it one. The name is stored in
-`auth_key.subject_name`, and redemption then builds the subject
-`<org>/workload:agent:<name>` and a grant id derived from `(org, name)`. Because
-`upsert_grant` is keyed on the grant id, a re-minted key with the same `--as`
+`forgs_api_key.subject_name` (NULL, not `''`, means "no name"), and redemption
+then builds the subject `<org>/workload:agent:<name>` and a grant id derived
+from `(org, subject)`. Because the upsert is keyed on the grant id, a re-minted key with the same `--as`
 re-upserts the **same row**: same audit history, same concurrency budget, same
 revocation handle. Nothing downstream changes — `board_access`, `Access`, the
 scheduler and the audit log are all subject-key-generic, and `SubjectKey::parse`
 splits at the *first* `:`, so `agent:<name>` round-trips exactly as
 `key:<hash8>` does.
 
-The name is validated at mint time (`normalise_agent_name`) with the same
+The name is validated at mint time (`forgs::subject::normalise_service_name`) with the same
 discipline as `normalise_repo`: trimmed, **lowercased** — so a rotation typed
 months later is the same identity rather than a silent fork — restricted to
 `[a-z0-9._-]` starting with a letter or digit, and capped at 64 characters. The
@@ -1845,16 +1895,13 @@ charset is what makes a chosen name structurally unable to spell the
 repo subject (no `/`). It is org-scoped, since the subject carries the org, so
 two tenants may each have a `builder`.
 
-**The grant id mixes the org into a digest, and that is not decoration.**
-`grant.id` is a *global* `PRIMARY KEY`, and `upsert_grant`'s `ON CONFLICT(id)`
-updates the selector, ops and expiry without touching `org_id`. An id spelled
-from the name alone would therefore let org B's redemption silently rewrite org
-A's grant row while leaving it owned by A — a cross-tenant write. So the id is
-`ci-` plus 29 hex characters of `SHA-256(org, "agent:", name)`: globally unique,
-inside the `ci-` namespace no human-created id occupies, and still **hex**, so
-`grant revoke`'s ≥8-hex-character floor accepts it untouched. The cost is that
-the id is opaque; the row's `subject` column, which `grant list` also prints,
-shows `<org>/workload:agent:<name>` in clear text.
+**The grant id mixes the org into a digest, and that is not decoration.** A
+grant id is a *global* key. An id spelled from the name alone would let org B's
+redemption address org A's row; forgs additionally refuses an upsert whose id
+exists in another namespace (`GrantConflict`, surfaced as `403`), but the
+digest over `(org, subject)` is what makes the collision impossible in the
+first place. The cost is that the id is opaque; the row's `subject`, which
+`grant list` also prints, shows `<org>/workload:agent:<name>` in clear text.
 
 A named identity is also an ordinary grantee, so
 `grant acme/workload:agent:builder --select …` works and gives it access beyond
@@ -1869,7 +1916,7 @@ shared grant and every live lease held under the name — including another key'
 runner, mid-job. It does not end the identity: a surviving key with the same
 name re-creates the grant on its next redemption, and workload tokens already
 minted stay **authenticated** for the rest of their TTL (nothing deletes
-`workload_token` rows on revocation; the sweep only removes expired ones), so
+`forgs_workload_token` rows on revocation; the sweep only removes expired ones), so
 the moment any surviving key redeems, that still-live token has access again
 without having redeemed itself. Revoking one key of a shared identity is
 therefore a **disruption, not a revocation**. To actually retire the agent:
@@ -1900,17 +1947,17 @@ with lives `workload_token_ttl_secs` (default 1h) and, per the subsection above,
 `ci login` hourly — a cron job or retry wrapper reimplemented per sandbox, which
 does not even propagate between the concurrent processes sharing the machine.
 
-`probe-rs-fleet agent login --fleet-url <url> --auth-key prffk1_… [--as <name>]`
+`probe-rs-fleet agent login --fleet-url <url> --auth-key prfk1_… [--as <name>]`
 closes that. It stores the durable key in the fleet file's `[agent]` table
 (§4.1), and `ctl` and the `probe-rs` shim re-**redeem** it whenever the stored
 token is within 60s of expiry.
 
 **The mechanism is re-redemption, not refresh, and that distinction is what
 keeps the earlier subsection literally true.** Nothing gained a refresh path;
-`Refresh` is still session-only. Each renewal is an ordinary `workload_key`
+`Refresh` is still session-only. Each renewal is an ordinary `api_key`
 exchange — the same request `ci login --auth-key` makes, verified the same way,
 upserting the same grant row — which also explains why concurrency here needs no
-locking: a multi-use key is never consumed (`consume_auth_key` stamps
+locking: a multi-use key is never consumed (forgs' `consume_api_key` stamps
 `consumed_at` only for `single_use != 0`), so N processes renewing at once all
 succeed and every token they mint stays valid. The only cost is churn, damped by
 re-reading the fleet file before redeeming (§4.1).
@@ -1919,7 +1966,7 @@ re-reading the fleet file before redeeming (§4.1).
 breaks on the second *process*, not merely the second hour. Nothing on the wire
 reveals single-use-ness — `TokenResponse` has no such field — so `agent login`
 detects it by redeeming **twice**: a multi-use key yields two valid tokens (the
-first is left orphaned until its TTL expires, one wasted `workload_token` row
+first is left orphaned until its TTL expires, one wasted workload-token row
 per login), while a single-use key's second redemption is rejected. That
 rejection, and only a rejection, produces the refusal; a transport failure on
 the second call persists the first token and warns that the property could not
@@ -2164,10 +2211,10 @@ that the agent must be restarted.
 probe-rs-fleet/
 ├─ Cargo.toml                  # workspace
 ├─ crates/
-│  ├─ fleet-proto/             # shared wire types + Subject/ids (no I/O)
+│  ├─ fleet-proto/             # shared wire types + ids / SubjectKey mirror, auth_api (no I/O)
 │  ├─ fleet-core/              # Board/Lease/Policy domain + scheduler (pure, unit-testable)
 │  ├─ fleet-tls/               # client trust config (WebPKI + optional pin); no client certs
-│  ├─ fleet-auth/              # NEW: GitHub OAuth/OIDC verifiers, token mint/verify, grants
+│  ├─ fleet-wire/              # WS codec + tokio-tungstenite dial-out client
 │  ├─ fleet-agent/            # probe-rs process control, USB power, boards.toml
 │  ├─ fleet-coordinator/      # sqlite state, scheduler, authz, relay, HTTP/WS surface
 │  ├─ fleet-sidecar/          # probe-rs CLI shim + relay client
@@ -2176,8 +2223,12 @@ probe-rs-fleet/
 ```
 
 `fleet-core` stays pure so the scheduler is testable without sockets or USB.
-`fleet-auth` is likewise pure-ish (verification logic behind traits, HTTP calls
-at the edges) so token and grant evaluation is unit-testable without a network.
+There is no `fleet-auth` any more: identity lives in the sibling **forgs**
+workspace (`forgs` pure core, `forgs-store`, `forgs-http`, `forgs-idp`,
+`forgs-client`). `fleet-coordinator` links the server half; `fleet-bin` links
+`forgs` + `forgs-client`; `fleet-agent`, `fleet-sidecar`, `fleet-proto`,
+`fleet-core` and `fleet-wire` link **no** forgs crate (see
+`docs/cross-compiling.md`).
 
 ## 10. Open questions / decisions to confirm
 
@@ -2189,7 +2240,7 @@ at the edges) so token and grant evaluation is unit-testable without a network.
   probe-rs invocations, not lease-per-run (§6.6).
 - *myelin* is **dropped**: postcard for both planes (§3).
 
-**Resolved (revision 2 — this revision):**
+**Resolved (revision 2):**
 
 - *Deployment model* = **hosted, multi-tenant**, behind an HTTPS reverse proxy.
 - *Transport* = **WebSocket over HTTPS**, replacing the bespoke length-prefixed
@@ -2197,7 +2248,7 @@ at the edges) so token and grant evaluation is unit-testable without a network.
 - *Connection auth* = **bearer tokens**; the private CA, CSR issuance, client
   certs and cert pinning are **deleted** (§6.2).
 - *Identity root* = **GitHub only** at v1 — OAuth2 device flow for users, GH
-  Actions workload OIDC for CI (§6.4).
+  Actions workload OIDC for CI (§6.4). *Superseded by revision 3* below.
 - *Tenancy* = every subject and object is org-scoped; a **personal org is
   auto-created on first login** (§6.1). The DB is **wiped**, not migrated.
 - *Node registration* = **self-approving on membership**; no admin approval step
@@ -2206,6 +2257,15 @@ at the edges) so token and grant evaluation is unit-testable without a network.
   lab nodes (§4.2, §8).
 - *Capability tokens* are unchanged and remain the sandbox-delegation mechanism
   (§6.3, §6.5).
+
+**Resolved (revision 3 — identity on forgs, task 3892):**
+
+- *Identity* = **forgs**. Login providers (GitHub, Codeberg/Forgejo, GitLab,
+  generic OIDC) prove identity with a verified email; the username is chosen
+  at signup; ids are immutable ULIDs (§6.1).
+- *CLI login* = forgs' own device flow, provider-agnostic (§6.4).
+- *Org choice* = per request (`--org` / `?org=`), default the personal org.
+- The DB is **wiped** again; no migration.
 
 **Still open:**
 
@@ -2240,10 +2300,10 @@ at the edges) so token and grant evaluation is unit-testable without a network.
    possibly per lease for isolation. Confirm per-lease vs per-board-reused.
 5. **Sidecar install UX.** argv0 `probe-rs` shim on PATH vs explicit
    `fleet sidecar run -- …` wrapper. Which install story do you want?
-6. **Where the hosted control plane runs.** Still open — but it no longer gates
-   `login`: the device flow has no `redirect_uri`, so there is no callback
-   origin to register and nothing is hardcoded (§6.4). The only hostname
-   involved is the coordinator's own `public_url`, which is configuration.
+6. **Where the hosted control plane runs.** Still open. Browser login and CLI
+   login both need the coordinator's browser-reachable `public_url` (the OAuth
+   callback is `<public_url>/auth/<provider>/callback`), but that is
+   configuration: nothing is hardcoded (§6.4).
 7. **Data-plane latency budget.** All traffic relays through the coordinator; if
    remote debugging proves unusably slow at WAN RTT, direct workstation↔node
    brokering (with relay as fallback) stops being an optimisation and becomes

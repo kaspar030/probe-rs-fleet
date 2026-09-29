@@ -112,11 +112,11 @@ Verified crates (all `default-features = false`, `ring` only):
 |---|---|
 | `axum` 0.8 (`http1,tokio,ws,json`) | the coordinator's router + WS upgrade |
 | `tokio-tungstenite` 0.29 (`connect,handshake,rustls-tls-webpki-roots`) | the dial-out client, via `fleet-wire` |
-| `hyper` 1 + `hyper-util` (`client-legacy`, `server-auto`) | the `POST /auth/token` client; the TLS-terminating server loop |
+| `hyper` 1 + `hyper-util` (`client-legacy`, `server-auto`) | the HTTP client (`forgs-client`: login, refresh, API keys, `/node/*`); the TLS-terminating server loop |
 | `hyper-rustls` 0.27 (`ring,tls12,webpki-tokio`) | HTTPS for that client |
 | `tokio-rustls` / `rustls` 0.23 (`ring`) | TLS |
 | `webpki-roots` | trust anchors, compiled in rather than read from the platform |
-| `jsonwebtoken` 10 (`rust_crypto`) | the GitHub Actions OIDC verifier (§6.7), behind `fleet-auth`'s `oidc` feature — see below |
+| `jsonwebtoken` 10 (`rust_crypto`) | the GitHub Actions OIDC verifier (§6.7), behind `forgs-idp`'s `oidc` feature — see below |
 
 Reproduce it (this is the exact invocation, not a paraphrase):
 
@@ -164,6 +164,27 @@ cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf --edges normal \
 link only the client half. `crates/fleet-agent/tests/no_http_server_dep.rs`
 enforces this.
 
+**The same test fences identity.** Since the forgs switch there is no
+`fleet-auth` crate; identity lives in the sibling forgs workspace, and its
+crates are split exactly along this line:
+
+| crate | linked by | what it pulls |
+|---|---|---|
+| `forgs` (pure core, no IO) | `fleet-coordinator`, `fleet-bin` | serde, sha2, ulid |
+| `forgs-store` | `fleet-coordinator` only | sqlx (SQLite) |
+| `forgs-http` | `fleet-coordinator` only | axum |
+| `forgs-idp` (`client`, `oidc`) | `fleet-coordinator` only | hyper client, `jsonwebtoken` |
+| `forgs-client` | `fleet-bin` only (CLI login, keys, `/node/*` calls) | hyper client + rustls/ring; **no** axum, no sqlx |
+
+`fleet-agent`, `fleet-sidecar`, `fleet-proto`, `fleet-core` and `fleet-wire`
+link **no forgs crate at all**: they only ever *present* a bearer token and
+stay prefix-agnostic, and fleet-proto carries its own serde mirror of the
+subject key. The test forbids `axum`, `hyper`, `forgs-store`, `forgs-http` and
+`sqlx` in `fleet-agent`'s graph, and `forgs-http`, `forgs-store`, `axum` and
+`sqlx` in `fleet-sidecar`'s. forgs keeps the same pure-Rust, `ring`,
+`default-features = false` discipline as this workspace, so none of it changes
+the musl build; the `aws-lc` check above covers it.
+
 To be accurate about what that buys: it is **not** what keeps the Pi build
 working — `fleet-bin` links the coordinator, so axum ships on the Pi regardless.
 It is a layering rule. A library that discovers probes and dials outward should
@@ -175,7 +196,7 @@ bearing and the next transport change has to be made twice.
 
 Architecture §6.7 added GitHub Actions workload-identity verification, which
 means **`jsonwebtoken`** and its signature-algorithm tail: `rsa`,
-`num-bigint-dig`, `p256`, `p384`, `ed25519-dalek`. It sits behind `fleet-auth`'s
+`num-bigint-dig`, `p256`, `p384`, `ed25519-dalek`. It sits behind `forgs-idp`'s
 off-by-default `oidc` feature, enabled by exactly one crate — `fleet-coordinator`,
 the only one that verifies a token.
 

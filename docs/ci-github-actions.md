@@ -44,24 +44,37 @@ that audience explicitly. Everything else (`issuer`, `jwks_url`,
 working default.
 
 Omitting the block entirely is a supported deployment. `POST /auth/token` then
-answers `503 workload_oidc_unconfigured`, and `ci login` turns that into a
+answers `503 workload_unconfigured`, and `ci login` turns that into a
 sentence naming the missing block.
+
+The block is independent of the login providers (`[[auth.providers]]`): a fleet
+may have CI without browser login, or the reverse.
 
 ### 2. Grant the repository
 
 ```sh
-probe-rs-fleet grant --repo ariel-os/ariel-os \
+probe-rs-fleet grant --org acme --repo ariel-os/ariel-os \
     --select 'tag=nrf52' \
     --ops flash \
     --ttl 30d
 ```
 
-`--repo` conflicts with the positional subject; exactly one of the two is
-required. It sends `repo:owner/name` as the wire subject and validation stays
-server-side, so a client cannot talk the coordinator into a subject key it would
-not build itself. The command prints the resolved subject key
-(`gha/workload:ariel-os/ariel-os`) and a one-line reminder that the **owner** is
-not granted.
+The grant is issued by the org you act in (`--org`, a name or id; default your
+personal org) and covers only that org's boards. `--repo` conflicts with the
+positional grantee; exactly one of the two is required. The grantee syntax is
+the same everywhere (`grant`, `POST /api/v1/grants`):
+
+| grantee | resolves to |
+|---|---|
+| `--repo owner/name`, or `repo:owner/name` | `gha/workload:owner/name` (lowercased) — a CI repository |
+| a username, e.g. `bob` | `user:<ULID>`, looked up **once** at grant time, so the grant survives a rename and never follows a reused name |
+| a subject key, e.g. `<org id>/workload:agent:builder`, `<org id>/node:…`, `user:01J…` | itself |
+
+Usernames are fleet usernames (chosen at first login), **not** GitHub logins;
+an unknown one is `no such user`. Validation stays server-side, so a client
+cannot talk the coordinator into a subject key it would not build itself. The
+command prints the resolved subject key (`gha/workload:ariel-os/ariel-os`) and
+a one-line reminder that the **owner** is not granted.
 
 That reminder is the whole trust rule, and it is worth reading twice:
 
@@ -74,16 +87,17 @@ that anyone who can create a repo under your GitHub org, or fork yours, inherits
 your lab hardware.
 
 Creating a grant needs `admin` in the org (in a personal org, that is you).
-Grants must expire; `--ttl` defaults to 30 days. `grant list` shows them,
+Grants must expire (at most 365 days); `--ttl` defaults to 30 days. `grant list` shows them,
 `grant revoke <id-prefix>` withdraws one — and revocation is real: leases the
 grantee holds on boards it may no longer reach are released and their relay
 channels torn down, rather than left running until the TTL expires.
 
 ### 3. What you will see when it works
 
-One `workload.token.mint` audit row per granting org, per job, carrying the
-repo, owner, ref, workflow, run id and the grant ids that matched. Plus the
-ordinary `lease.grant` / `lease.release` rows, whose `holder` is
+Each exchange writes a `workload.token.mint` row to the identity audit
+(`forgs_audit`), and the workload token row records the verified claims (repo,
+owner, ref, workflow, run id). Plus the
+ordinary `lease.grant` / `lease.release` rows in the granting org's audit log, whose `holder` is
 `gha/workload:owner/repo`. `leases` rows are never deleted, so "which repo held
 which board, for how long" is answerable after the fact. No billing is built.
 
@@ -220,30 +234,25 @@ changes that: the fleet relays bytes, it does not interpret them.
 | `coordinator declined: still queued at position N after 300s; giving up` | every board matching your selector was busy for the whole wait | raise `PROBE_RS_FLEET_QUEUE_WAIT`, narrow the matrix (`max-parallel`) so fewer legs compete, or ask for a bigger pool. Nothing is left queued behind the failure |
 | `coordinator declined: no board matches \`<selector>\`; ctl list shows N boards you can reach` | the selector matches nothing you have access to — a typo, or a grant you do not have | run `ctl list` and select from what it shows. Waiting cannot fix this, which is why it fails immediately |
 | `coordinator declined: you already hold N leases (cap max_concurrent_per_subject = N); release one or raise the cap` | your **repo** is at its concurrency cap; the fleet may well be idle | bound the matrix with `max-parallel`, release a lease, or ask the fleet admin to raise the cap for your subject |
-| `403 no_grant` | the token verified fine; this **repo** has no grant | the fleet admin runs `grant --repo <owner>/<name> …`. Being under a granted owner is deliberately not enough |
-| `401 invalid_grant` | the coordinator refused the credential and will not say why | check `--audience` against the coordinator's configured one, then the runner's clock; the real reason is in the **coordinator's** log |
-| `503 workload_oidc_unconfigured` | that coordinator has no `[github_actions]` block | the operator adds one, or use `ci login --auth-key` |
+| `401 invalid_grant` | the coordinator refused the credential and will not say why — a bad token, **or a valid token for a repo with no grant** | check that the fleet admin ran `grant --repo <owner>/<name> …` (being under a granted owner is deliberately not enough), then `--audience` against the coordinator's configured one, then the runner's clock; the real reason is in the **coordinator's** audit log |
+| `503 workload_unconfigured` | that coordinator has no `[github_actions]` block | the operator adds one, or use `ci login --auth-key` |
 | `ACTIONS_ID_TOKEN_REQUEST_URL is not set` | the job has no workload identity | add `permissions: id-token: write` to the job |
 
 The flat `401` is deliberate. Expiry, wrong audience, wrong issuer, bad
-signature, a missing claim and an unknown key id all answer identically, so the
-endpoint is not an oracle for probing which part of a forged token was wrong.
-The reason is logged coordinator-side with a stable label (`oidc.reject.*`).
+signature, a missing claim, an unknown key id — and, since the forgs switch, a
+verified token for a repo with no live grant — all answer identically, so the
+endpoint is not an oracle. The reason is recorded coordinator-side with a
+stable label (`oidc.reject.*`, `workload.reject.no_grant`).
 
-`403 no_grant` is deliberately *distinguishable* from that, because the
-credential genuinely is valid and the operator's next action is a specific
-command. It leaks only that a repo is not granted, which that repo's own
-maintainers already know.
+(Revision 2 answered the grantless case with a distinguishable `403 no_grant`;
+forgs folds it into the `401` and keeps the distinction in the audit row.)
 
 ### Telling "fork denied" apart from everything else
 
-A fork of a granted repo, or a new repo under a granted owner, gets
-`403 no_grant`. The coordinator's log names it exactly:
-
-```
-WARN repository=acme/firmware-fork repository_owner=acme
-     no grant for this repository; the owner is deliberately not sufficient
-```
+A fork of a granted repo, or a new repo under a granted owner, gets the flat
+`401`. The audit log names it exactly: a `workload.reject.no_grant` row whose
+subject is the repo's workload key and whose detail is
+`repository=acme/firmware-fork owner=acme`.
 
 The owner is logged beside the repo so the "but I granted the org!" case is one
 line to diagnose. The fix is a grant for that repo, if you actually want the
@@ -261,10 +270,10 @@ above stores no secret anywhere at all. Prefer it whenever the runner can mint
 an identity.
 
 Mint the key (any org member can, over the API, with the login they already
-have):
+have). It is a forgs API key of purpose `ci`, belonging to the org you name:
 
 ```sh
-probe-rs-fleet auth-key create --purpose ci \
+probe-rs-fleet auth-key create --org acme --purpose ci \
     --tag nrf52 \
     --ops flash,attach \
     --ttl 7d
@@ -273,7 +282,7 @@ probe-rs-fleet auth-key create --purpose ci \
 Then, on the runner:
 
 ```sh
-probe-rs-fleet ci login --fleet-url https://fleet.example --auth-key prffk1_…
+probe-rs-fleet ci login --fleet-url https://fleet.example --auth-key prfk1_…
 ```
 
 Read the key from the CI system's secret store, not from a literal on the
@@ -281,9 +290,9 @@ command line: argv is visible to every process on the box.
 
 What bounds the damage, and nothing else does:
 
-- **org scope** — a key can never exceed the org of the member who minted it,
-  structurally: the org comes from the authenticated session and there is no
-  `--org` flag.
+- **org scope** — a key belongs to one org (`--org`, default your personal
+  org), which must be one you are a member of: it can never exceed your own
+  access, and its grant covers only that org's boards.
 - **the selector** — the key's `--tag`s become the selector of the grant its
   redemption synthesises. A `ci` key with **no tags is refused**, at the mint and
   again at redemption, because an empty tag set is an empty selector and would
@@ -301,28 +310,27 @@ What bounds the damage, and nothing else does:
   intended.
 
 Mechanically, redeeming a `ci` key does not widen anything: it upserts an
-**ordinary grant** — the same row `grant --repo` writes, evaluated by the same
-code, revocable by the same verb — to an org-scoped subject
+**ordinary grant** (a forgs grant row; the key's tags and ops, stored as its
+payload, become the grant's selector and ops) — evaluated by the same
+code as a `grant --repo` row and revocable by the same verb — to an org-scoped subject
 `<org>/workload:key:<hash8>`, and then mints an ordinary workload token. Every
 runner redeeming the same key is the same subject, so they share one grant row
-and one concurrency budget.
+(its id is derived deterministically from org and subject) and one concurrency budget.
 
-That grant shows up in `grant list` with an id spelled `ci-<hex>`, and
-`probe-rs-fleet grant revoke ci-<8 hex>` withdraws it — leaving the key itself
+That grant shows up in `grant list` like any other, and
+`probe-rs-fleet grant revoke <id prefix>` withdraws it — leaving the key itself
 valid, so the next runner to redeem it simply recreates the grant. To retire the
 runner's access for good, revoke the **key**: that takes the credential and the
 grant together.
 
-A `node` key cannot be redeemed this way (`403 forbidden`). That is the entire
-reason `purpose` exists: widening what an auth key means would have silently
-turned every existing enrollment key in every deployment into a board-access
-credential. Existing keys default to `purpose = "node"` and change meaning not at
-all.
+A `node` key cannot be redeemed this way, and a `ci` key cannot enroll a node:
+the purpose is checked before the key is consumed, so a mis-aimed single-use
+key is not burned. That separation is the entire reason `purpose` exists.
 
 ### A named identity, so rotating the key does not fork the agent
 
 Everything above derives the runner's identity from the **credential**: the
-subject is `key:<hash8>` and the grant id is `ci-<hash prefix>`. So rotating the
+subject is `key:<hash8>`, and the grant id is derived from it. So rotating the
 key — mint a new one, deploy it, retire the old — gives you a *new subject and a
 new grant row*. The audit trail forks, the concurrency budget resets, and the
 old grant lingers until it expires. For a long-running agent, that is the wrong
@@ -341,7 +349,7 @@ probe-rs-fleet auth-key create --purpose agent --as builder \
 path, better vocabulary for a key that is not per job. Listings show `ci`.)
 
 That key redeems as `<org>/workload:agent:builder`, and its grant id is derived
-from `(org, name)` rather than from the hash. The rotation then looks like this,
+from `(org, <org>/workload:agent:builder)` rather than from the hash. The rotation then looks like this,
 and the identity never moves:
 
 ```sh
