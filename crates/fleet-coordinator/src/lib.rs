@@ -40,9 +40,10 @@
 //! The lease/relay/auth decision logic lives in [`core::Coordinator`] and is
 //! unit-testable over in-memory channels; [`http`] is the route surface,
 //! [`server`] the per-connection I/O shell, and [`sweep`] the background expiry
-//! task. The browser surface (`docs/web-ui.md`) is split off rather than grown
-//! into `http`: [`browser_auth`] holds the cookie/CSRF machinery and the two
-//! login flows, [`api`] the `/api/v1` JSON handlers, and [`assets`] the
+//! task. Identity — login, sessions, API keys, the device flow, cookies and
+//! CSRF — is forgs' ([`identity`] builds its `AuthContext`, and
+//! `forgs_http::router()` is merged into ours). [`api`] holds the `/api/v1`
+//! JSON handlers, and [`assets`] the
 //! hand-written UI itself — embedded in this binary with `include_dir!`, so
 //! there is no build step and `cargo build` never needs node (`docs/web-ui.md`
 //! D3).
@@ -51,17 +52,18 @@ pub mod api;
 pub mod assets;
 pub mod auth;
 pub mod authz;
-pub mod browser_auth;
 pub mod clock;
 pub mod config;
 pub mod core;
 pub mod error;
 pub mod http;
+pub mod identity;
 pub mod proto;
 pub mod registry;
 pub mod relay;
 pub mod server;
 pub mod state;
+pub mod subject;
 pub mod sweep;
 pub mod tokens;
 pub mod ws_axum;
@@ -77,6 +79,7 @@ pub use crate::config::{CoordinatorConfig, SigningKeySource, TlsConfig};
 pub use crate::core::{Coordinator, SharedCoordinator};
 pub use crate::error::{CoordinatorError, Result};
 pub use crate::state::{node_id_for, Db, OrgDb};
+pub use crate::subject::{FleetRole, Subject};
 
 use fleet_core::scheduler::Scheduler;
 
@@ -96,6 +99,13 @@ use fleet_core::scheduler::Scheduler;
 pub async fn build(config: CoordinatorConfig) -> Result<SharedCoordinator> {
     config.validate()?;
 
+    if config.csrf_secret.is_none() {
+        return Err(CoordinatorError::Config(
+            "no CSRF secret configured (csrf_secret_path): browser login needs a \
+             dedicated secret of at least 32 bytes"
+                .to_owned(),
+        ));
+    }
     let db = Db::connect(
         config
             .sqlite_path
@@ -110,10 +120,15 @@ pub async fn build(config: CoordinatorConfig) -> Result<SharedCoordinator> {
 
     let scheduler = Scheduler::new(config.policy.clone());
     let clock: SharedClock = Arc::new(SystemClock);
+    db.ensure_org_named(&config.default_org, clock.now_secs())
+        .await?;
+    let providers = identity::build_providers(&config.auth.providers).await?;
 
-    Ok(Arc::new(Coordinator::new(
-        config, scheduler, db, signer, clock,
-    )))
+    let coord = Arc::new(Coordinator::with_providers(
+        config, scheduler, db, signer, clock, providers,
+    )?);
+    coord.attach();
+    Ok(coord)
 }
 
 /// Build and run the coordinator: serve HTTP and the expiry sweep concurrently

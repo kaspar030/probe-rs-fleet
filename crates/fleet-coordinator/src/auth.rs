@@ -37,7 +37,7 @@ const SERVE_TOKEN_LABEL: &[u8] = b"probe-rs-fleet/serve-token/v1";
 /// per-channel capability token, which the node verifies at every open.
 ///
 /// **Derived, not stored.** It mirrors
-/// [`crate::browser_auth`]'s CSRF key: an HMAC over the signing seed the
+/// the old browser CSRF key: an HMAC over the signing seed the
 /// coordinator already holds. That buys the property that actually matters —
 /// stable for the whole lease, across every channel open, with no per-lease map
 /// to populate, expire, or forget to clean up in `tear_down_lease`,
@@ -196,7 +196,7 @@ fn hex32(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use fleet_proto::ids::{BoardRef, LeaseId, OrgId, Subject, SubjectKind};
+    use fleet_proto::ids::{BoardRef, LeaseId, OrgId};
 
     /// RFC 8032 ed25519 test-vector seed. The node's verifier tests
     /// (`fleet-agent/src/token.rs`) use the same seed, so a token signed here
@@ -288,7 +288,7 @@ mod tests {
             lease: LeaseId(11),
             board: BoardRef::new(org.clone(), node.clone(), "b1"),
             node,
-            holder: Subject::new(org, SubjectKind::User, "alice"),
+            holder: crate::subject::user_key(forgs::UserId::from_parts(1, 1)),
             expires: 2_000_000_000,
         };
         let grant = s.grant_to_wire(&granted, all_allowed_ops()).unwrap();

@@ -4,7 +4,6 @@ members = [
     "crates/fleet-proto",
     "crates/fleet-core",
     "crates/fleet-tls",
-    "crates/fleet-auth",
     "crates/fleet-wire",
     "crates/fleet-agent",
     "crates/fleet-coordinator",
@@ -31,7 +30,14 @@ repository = "https://github.com/ariel-os/probe-rs-fleet"
 fleet-proto = { path = "crates/fleet-proto" }
 fleet-core = { path = "crates/fleet-core" }
 fleet-tls = { path = "crates/fleet-tls" }
-fleet-auth = { path = "crates/fleet-auth" }
+
+# identity / auth (forgs). Path deps into the sibling forgs checkout; in a
+# task worktree `../forgs` is a symlink to it.
+forgs = { path = "../forgs/crates/forgs" }
+forgs-store = { path = "../forgs/crates/forgs-store" }
+forgs-http = { path = "../forgs/crates/forgs-http" }
+forgs-idp = { path = "../forgs/crates/forgs-idp" }
+forgs-client = { path = "../forgs/crates/forgs-client" }
 fleet-wire = { path = "crates/fleet-wire" }
 fleet-agent = { path = "crates/fleet-agent" }
 fleet-coordinator = { path = "crates/fleet-coordinator" }
@@ -130,8 +136,8 @@ rand_core = "0.6"
 # its decoding keys from a JWKS, and the tests sign with a committed DER
 # fixture through `EncodingKey::from_rsa_der`.
 #
-# Only `fleet-auth`'s OFF-BY-DEFAULT `oidc` feature pulls this in, so the Pi
-# binary's graph is unchanged (see crates/fleet-auth/Cargo.toml).
+# Only forgs-idp's OFF-BY-DEFAULT `oidc` feature (enabled by the coordinator)
+# pulls this in, so the Pi agent's graph is unchanged.
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 
 # async traits (object-safe dyn impls)

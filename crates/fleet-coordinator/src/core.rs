@@ -32,7 +32,9 @@ use fleet_core::access::Access;
 use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Promotion, RequesterId, Scheduler};
 use fleet_proto::adopt::AdoptPolicy;
 use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, Role, Subject, SubjectKey};
+use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
+
+use crate::subject::{FleetRole, Subject};
 use fleet_proto::lease::LeaseRequest;
 use fleet_proto::node_api::NodeReport;
 
@@ -58,13 +60,10 @@ pub struct Coordinator {
     sidecars: SidecarRegistry,
     channels: ChannelTable,
     clock: SharedClock,
-    /// The GitHub Actions JWKS cache, built lazily from `config` on first use.
-    ///
-    /// Lazy, and behind a `OnceLock`, so [`Coordinator::new`]'s signature does
-    /// not change: every test harness in the tree constructs one, and a fleet
-    /// with no `[github_actions]` table must not pay for a cache it will never
-    /// consult.
-    jwks: std::sync::OnceLock<Arc<fleet_auth::oidc::JwksCache>>,
+    /// forgs' auth surface: token format, store, hooks, providers.
+    auth: forgs_http::AuthContext,
+    /// How forgs' hooks reach back into this coordinator.
+    link: crate::identity::CoordinatorLink,
 }
 
 /// What one [`Coordinator::reconcile_inventory`] pass did.
@@ -148,6 +147,11 @@ impl OpError {
 
 impl Coordinator {
     /// Build a coordinator from its parts.
+    ///
+    /// # Panics
+    ///
+    /// If the auth configuration derived from `config` is invalid (use
+    /// [`Coordinator::with_providers`] to get an error instead).
     #[must_use]
     pub fn new(
         config: CoordinatorConfig,
@@ -156,7 +160,29 @@ impl Coordinator {
         signer: Ed25519Signer,
         clock: SharedClock,
     ) -> Self {
-        Self {
+        Self::with_providers(config, scheduler, db, signer, clock, Vec::new())
+            .expect("the coordinator's auth configuration is valid")
+    }
+
+    /// [`Coordinator::new`] with login providers (built by
+    /// [`crate::identity::build_providers`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CoordinatorError::AuthConfig`] for an unusable `public_url`,
+    /// CSRF secret or provider name.
+    pub fn with_providers(
+        config: CoordinatorConfig,
+        scheduler: Scheduler,
+        db: Db,
+        signer: Ed25519Signer,
+        clock: SharedClock,
+        providers: Vec<Arc<dyn forgs_idp::IdentityProvider>>,
+    ) -> Result<Self> {
+        let link: crate::identity::CoordinatorLink = Arc::default();
+        let auth =
+            crate::identity::build_context(&config, &db, Arc::clone(&clock), providers, &link)?;
+        Ok(Self {
             config,
             scheduler: Mutex::new(scheduler),
             db,
@@ -165,25 +191,21 @@ impl Coordinator {
             sidecars: SidecarRegistry::new(),
             channels: ChannelTable::new(),
             clock,
-            jwks: std::sync::OnceLock::new(),
-        }
+            auth,
+            link,
+        })
     }
 
-    /// The GitHub Actions JWKS cache, or `None` when CI is unconfigured.
-    ///
-    /// Built on first use from `[github_actions]`. One cache per coordinator,
-    /// so the rotation refetch and its rate limit are fleet-wide rather than
-    /// per request — which is what makes the amplification bound real.
+    /// Point forgs' hooks at this (shared) coordinator. Idempotent;
+    /// [`crate::http::router`] calls it, as does [`crate::build`].
+    pub fn attach(self: &Arc<Self>) {
+        let _ = self.link.set(Arc::downgrade(self));
+    }
+
+    /// forgs' auth context (the router state's `FromRef` target).
     #[must_use]
-    pub fn jwks_cache(&self) -> Option<&Arc<fleet_auth::oidc::JwksCache>> {
-        let gha = self.config.github_actions.as_ref()?;
-        Some(self.jwks.get_or_init(|| {
-            Arc::new(fleet_auth::oidc::JwksCache::new(
-                gha.jwks_url.clone(),
-                std::time::Duration::from_secs(gha.jwks_refresh_secs),
-                std::time::Duration::from_secs(gha.jwks_min_refetch_secs),
-            ))
-        }))
+    pub fn auth(&self) -> &forgs_http::AuthContext {
+        &self.auth
     }
 
     /// The static configuration.
@@ -793,10 +815,29 @@ impl Coordinator {
     /// reported only for a tie *within* the winning tier, where every candidate
     /// is already reachable by the caller so naming the nodes leaks nothing.
     async fn resolve_board(&self, access: &Access, name: &BoardName, now: u64) -> BoardLookup {
+        // An org **path** qualifier (`ariel-os/rpi-1/dk-3`) needs the orgs'
+        // display names, which live in forgs; look them up (outside the
+        // scheduler lock) only for a qualified name, and only for orgs the
+        // caller may reach at all.
+        let mut org_paths: std::collections::HashMap<OrgId, String> =
+            std::collections::HashMap::new();
+        if name.0.contains('/') {
+            let mut orgs: Vec<OrgId> = access.member_of.clone();
+            orgs.extend(access.grants.iter().map(|g| g.org.clone()));
+            orgs.sort();
+            orgs.dedup();
+            for org in orgs {
+                if let Ok(Some(path)) = self.db.org_name(&org).await {
+                    org_paths.insert(org, path);
+                }
+            }
+        }
         let sched = self.scheduler.lock().await;
         let candidates: Vec<&fleet_proto::board::Board> = sched
             .boards()
-            .filter(|b| b.id.answers_to(&name.0))
+            .filter(|b| {
+                b.id.answers_to_in(&name.0, org_paths.get(&b.id.org).map(String::as_str))
+            })
             .filter(|b| access.may_use(b, now))
             .collect();
 
@@ -938,18 +979,16 @@ impl Coordinator {
         &self,
         subject: &Subject,
     ) -> std::result::Result<Vec<crate::state::MemberRow>, OpError> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Member)
             .await
             .is_err()
         {
             return Err(OpError::Denied);
         }
-        self.db
-            .scoped(org)
-            .list_members()
-            .await
-            .map_err(OpError::Internal)
+        self.db.list_members(&org).await.map_err(OpError::Internal)
     }
 
     /// The org's machines, with live connection state.
@@ -980,8 +1019,10 @@ impl Coordinator {
         &self,
         subject: &Subject,
     ) -> std::result::Result<Vec<NodeStatus>, OpError> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Member)
             .await
             .is_err()
         {
@@ -1049,7 +1090,9 @@ impl Coordinator {
         tags: Option<&[String]>,
         adopt: Option<AdoptPolicy>,
     ) -> std::result::Result<NodeStatus, OpError> {
-        let org = subject.org.clone();
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
         let row = self
             .authorize_node_mutation(subject, name, "node.update.denied")
             .await?;
@@ -1152,7 +1195,9 @@ impl Coordinator {
         subject: &Subject,
         name: &str,
     ) -> std::result::Result<NodeId, OpError> {
-        let org = subject.org.clone();
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
         let row = self
             .authorize_node_mutation(subject, name, "node.delete.denied")
             .await?;
@@ -1187,7 +1232,7 @@ impl Coordinator {
                     .filter(|b| b.node == node_id)
                     .filter_map(|b| match &b.state {
                         BoardState::Leased { lease, by, .. } => {
-                            Some((*lease, b.id.clone(), by.key()))
+                            Some((*lease, b.id.clone(), by.clone()))
                         }
                         _ => None,
                     })
@@ -1263,8 +1308,10 @@ impl Coordinator {
         name: &str,
         denied_action: &str,
     ) -> std::result::Result<crate::state::NodeRow, OpError> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Member)
             .await
             .is_err()
         {
@@ -1279,7 +1326,7 @@ impl Coordinator {
             .ok_or_else(|| OpError::NotFound(format!("no node named {name}")))?;
 
         // `owner_user_id = NULL` is admin-only, not everyone-owns-it.
-        let owned = row.owner_user_id.as_deref() == Some(subject.id.as_str());
+        let owned = row.owner_user_id.is_some() && row.owner_user_id == subject.user_id();
         if !owned && !authz::is_org_admin(&self.db, subject).await {
             self.audit(
                 &org,
@@ -1359,19 +1406,51 @@ impl Coordinator {
         subject: &Subject,
         board: Option<&BoardName>,
     ) -> std::result::Result<Vec<fleet_proto::admin::LogLine>, OpError> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Admin)
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Admin)
             .await
             .is_err()
         {
             return Err(OpError::Denied);
         }
-        let board = board.map(|b| b.0.as_str());
-        self.db
-            .scoped(org)
-            .recent_audit(board, 200)
+        let board_name = board.map(|b| b.0.as_str());
+        let mut lines = self
+            .db
+            .scoped(org.clone())
+            .recent_audit(board_name, 200)
             .await
-            .map_err(OpError::Internal)
+            .map_err(OpError::Internal)?;
+        // Identity events (keys, members, logins) live in forgs' audit table;
+        // they concern no board, so they join only the unfiltered view.
+        if board_name.is_none() {
+            if let Some(ns) = crate::subject::ns_of(&org) {
+                let rows = self
+                    .db
+                    .forgs()
+                    .scoped(ns)
+                    .recent_audit(200)
+                    .await
+                    .map_err(|e| OpError::Internal(e.into()))?;
+                lines.extend(rows.into_iter().map(|r| fleet_proto::admin::LogLine {
+                    ts: i64::try_from(r.ts).unwrap_or(i64::MAX),
+                    action: r.action,
+                    board: None,
+                    detail: {
+                        let parts: Vec<String> = [r.subject, r.target, r.detail]
+                            .into_iter()
+                            .flatten()
+                            .collect();
+                        (!parts.is_empty()).then(|| parts.join(" "))
+                    },
+                }));
+                // Newest first, as each source already is; stable on ties.
+                lines.sort_by_key(|l| std::cmp::Reverse(l.ts));
+                lines.truncate(200);
+            }
+        }
+        Ok(lines)
     }
 
     /// Wire adapter for [`Coordinator::logs_core`].
@@ -1536,8 +1615,10 @@ impl Coordinator {
     ) -> std::result::Result<fleet_proto::GrantSummary, OpError> {
         use fleet_proto::lease::parse_constraint;
 
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Admin)
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Admin)
             .await
             .is_err()
         {
@@ -1579,25 +1660,29 @@ impl Coordinator {
             .await
             .map_err(OpError::Internal)?
         else {
-            return Err(OpError::Invalid(format!(
-                "no such user `{grantee}`; ask them to run `probe-rs-fleet login` first"
-            )));
+            return Err(OpError::Invalid(format!("no such user `{grantee}`")));
         };
 
-        let id = crate::state::new_grant_id();
-        self.db
-            .scoped(org.clone())
+        let ns = crate::subject::ns_of(&org).ok_or(OpError::Denied)?;
+        let forgs_key = crate::subject::to_forgs(&key)
+            .ok_or_else(|| OpError::Invalid(format!("`{grantee}` is not a grantable subject")))?;
+        let id = self
+            .db
+            .forgs()
+            .scoped(ns)
             .insert_grant(
-                &id,
-                &key,
-                &selector,
-                &ops,
-                Some(i64::try_from(expires).unwrap_or(i64::MAX)),
-                Some(subject.id.as_str()),
-                self.now_i64(),
+                &forgs_store::NewGrant {
+                    subject: forgs_key,
+                    selector: selector.clone(),
+                    ops: crate::state::join_ops(&ops),
+                    expires: Some(expires),
+                    created_by: subject.user_id(),
+                },
+                now,
             )
             .await
-            .map_err(OpError::Internal)?;
+            .map_err(|e| OpError::Internal(e.into()))?
+            .to_string();
         self.audit(
             &org,
             "grant.create",
@@ -1613,14 +1698,18 @@ impl Coordinator {
         .await
         .map_err(OpError::Internal)?;
 
+        let org_name = self.db.org_name(&org).await.ok().flatten();
+        let subject_display = self.subject_display(&key).await;
         Ok(fleet_proto::GrantSummary {
             id,
             org,
+            org_name,
             subject: key,
+            subject_display,
             selector,
             ops,
             expires: Some(expires),
-            created_by: Some(subject.id.clone()),
+            created_by: subject.user_id().map(|u| u.to_string()),
             created_at: now,
         })
     }
@@ -1649,48 +1738,72 @@ impl Coordinator {
 
     /// Resolve a grantee spelling to a [`SubjectKey`].
     ///
-    /// Four accepted forms, narrowing in precision:
+    /// Three accepted forms, narrowing in precision:
     ///
-    /// * `repo:<owner>/<name>` — a **CI repository** (architecture §6.7). It is
-    ///   first so it can never be shadowed by the `SubjectKey::parse` branch,
-    ///   and it is a distinct spelling rather than a bare `owner/name` because
-    ///   granting hardware to a repo should not be something a typo produces;
-    /// * a rendered `SubjectKey` (`gh-2/user:gh-2`) — unambiguous, and the way
-    ///   to name a node subject;
-    /// * a bare `gh-<id>` — a user's immutable id, personal org implied;
-    /// * a GitHub login — looked up in the `user` table and immediately
-    ///   resolved to the immutable id.
-    ///
-    /// The repo form is validated and lowercased by the **same** function the
-    /// OIDC claim path uses (`fleet_proto::ids::normalise_repo`), so the two
-    /// sides of the per-repo trust rule cannot disagree about spelling. Note
-    /// that a grant names exactly one repo: `repository_owner` is never a
-    /// grantee, so a fork or a new repo under the same owner matches nothing.
+    /// * `repo:<owner>/<name>` — a **CI repository** (architecture §6.7),
+    ///   first so it can never be shadowed by the key-parsing branch. Validated
+    ///   and lowercased by the **same** function the OIDC claim path uses
+    ///   (`forgs::subject::normalise_repo`), so the two sides of the per-repo
+    ///   trust rule cannot disagree about spelling. A grant names exactly one
+    ///   repo: the owner is never a grantee.
+    /// * a rendered subject key (`user:01J…`, `<org>/node:…`,
+    ///   `<org>/workload:agent:ci`) — unambiguous, and the way to name a node;
+    /// * a **username** — resolved to the immutable user id **once**, here, so
+    ///   the stored grant survives a rename and never follows a reused name.
     async fn resolve_grantee(&self, spec: &str) -> Result<Option<SubjectKey>> {
+        let spec = spec.trim();
         if let Some(repo) = spec.strip_prefix("repo:") {
-            return Ok(fleet_proto::ids::normalise_repo(repo)
-                .as_deref()
-                .map(fleet_proto::ids::workload_subject_key));
+            return Ok(forgs::subject::normalise_repo(repo)
+                .map(|r| forgs::subject::workload_subject_key(&r))
+                .as_ref()
+                .and_then(crate::subject::to_proto));
         }
-        if let Some(key) = SubjectKey::parse(spec) {
-            return Ok(Some(key));
+        if let Some(key) = forgs::SubjectKey::parse_with(spec, &[crate::subject::NODE_KIND]) {
+            return Ok(crate::subject::to_proto(&key));
         }
-        if let Some((user, org)) = self.db.user_by_login(spec).await? {
-            return Ok(Some(SubjectKey {
-                org,
-                kind: fleet_proto::ids::SubjectKind::User,
-                id: user,
-            }));
+        if spec.contains([':', '/']) {
+            return Ok(None);
         }
-        // A bare `gh-<id>`: the user's id is also its personal org's id (§6.4).
-        if spec.starts_with("gh-") {
-            return Ok(Some(SubjectKey {
-                org: OrgId(spec.to_owned()),
-                kind: fleet_proto::ids::SubjectKind::User,
-                id: spec.to_owned(),
-            }));
+        match self.db.forgs().user_by_username(spec).await {
+            Ok(Some(u)) => Ok(Some(crate::subject::user_key(u.id))),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.into()),
         }
-        Ok(None)
+    }
+
+    /// A human rendering of `key`: a user's username, else `None`.
+    pub(crate) async fn subject_display(&self, key: &SubjectKey) -> Option<String> {
+        let user = crate::subject::user_of(key)?;
+        self.db
+            .forgs()
+            .user_by_id(user)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.username)
+    }
+
+    /// A forgs grant row as the wire summary.
+    async fn grant_summary(&self, row: forgs_store::GrantRow) -> fleet_proto::GrantSummary {
+        let org = crate::subject::org_of(row.ns);
+        let subject = SubjectKey::parse(&row.subject).unwrap_or_else(|| {
+            // An unparseable stored subject is still listed (so it can be
+            // revoked), rendered verbatim as an opaque user id.
+            SubjectKey::new(None, fleet_proto::ids::SubjectKind::User, &row.subject)
+                .unwrap_or_else(|| crate::subject::user_key(forgs::UserId::from_parts(0, 0)))
+        });
+        fleet_proto::GrantSummary {
+            id: row.id.to_string(),
+            org_name: self.db.org_name(&org).await.ok().flatten(),
+            org,
+            subject_display: self.subject_display(&subject).await,
+            subject,
+            ops: crate::state::parsed_ops(&row.ops),
+            selector: row.selector,
+            expires: row.expires,
+            created_by: row.created_by.map(|u| u.to_string()),
+            created_at: row.created_at,
+        }
     }
 
     /// List this org's outbound grants.
@@ -1708,36 +1821,27 @@ impl Coordinator {
         &self,
         subject: &Subject,
     ) -> std::result::Result<Vec<fleet_proto::GrantSummary>, OpError> {
-        let org = subject.org.clone();
-        if authz::require_role(&self.db, subject, &org, Role::Member)
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Member)
             .await
             .is_err()
         {
             return Err(OpError::Denied);
         }
+        let ns = crate::subject::ns_of(&org).ok_or(OpError::Denied)?;
         let rows = self
             .db
-            .scoped(org.clone())
+            .forgs()
+            .scoped(ns)
             .list_grants()
             .await
-            .map_err(OpError::Internal)?;
-        let grants = rows
-            .into_iter()
-            .map(|row| fleet_proto::GrantSummary {
-                subject: row.parsed_subject().unwrap_or_else(|| SubjectKey {
-                    org: row.org.clone(),
-                    kind: fleet_proto::ids::SubjectKind::User,
-                    id: row.subject.clone(),
-                }),
-                ops: row.parsed_ops(),
-                id: row.id,
-                org: row.org,
-                selector: row.selector,
-                expires: row.expires.map(|e| u64::try_from(e).unwrap_or(0)),
-                created_by: row.created_by,
-                created_at: u64::try_from(row.created_at).unwrap_or(0),
-            })
-            .collect();
+            .map_err(|e| OpError::Internal(e.into()))?;
+        let mut grants = Vec::with_capacity(rows.len());
+        for row in rows {
+            grants.push(self.grant_summary(row).await);
+        }
         Ok(grants)
     }
 
@@ -1793,44 +1897,42 @@ impl Coordinator {
         subject: &Subject,
         id_prefix: &str,
     ) -> std::result::Result<Vec<String>, OpError> {
-        let org = subject.org.clone();
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
         // Membership first: a non-member must not be able to probe which
         // prefixes exist.
-        if authz::require_role(&self.db, subject, &org, Role::Member)
+        if authz::require_role(&self.db, subject, &org, FleetRole::Member)
             .await
             .is_err()
         {
             return Err(OpError::Denied);
         }
 
-        let prefix = id_prefix.trim().to_ascii_lowercase();
-        // Load-bearing, not hygiene: `delete_grants_by_prefix("")` is
-        // `LIKE '%'`, i.e. every grant in the org. So a prefix must be long
-        // enough to address a grant on purpose, and drawn from the alphabet
-        // grant ids actually use.
-        //
-        // Two alphabets, because there are two kinds of id. A human-created
-        // grant is 32 random hex characters. A grant synthesised by redeeming
-        // a CI auth key (§6.7) is `ci-<29 hex>` — a reserved namespace no
-        // random id can occupy, which is what keeps the two unambiguous. That
-        // second shape has to be accepted here: `grant list` prints these ids,
-        // and a listing whose ids its own revoke verb rejects is a dead end.
-        // (`auth-key revoke` tears the row down too, as a side effect of
-        // revoking the key; this is the direct route.)
-        let body = prefix.strip_prefix("ci-").unwrap_or(&prefix);
-        // Either way, at least 8 characters of *entropy*: the `ci-` marker
-        // itself distinguishes nothing, so it does not count toward the floor.
-        if body.len() < 8 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        // Load-bearing, not hygiene: a prefix must be long enough to address
+        // a grant on purpose, and drawn from the alphabet grant ids (ULIDs,
+        // Crockford base32) actually use. forgs enforces the same floor.
+        let prefix = id_prefix.trim().to_ascii_uppercase();
+        if prefix.len() < 8
+            || !prefix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b.is_ascii_uppercase() && !b"ILOU".contains(&b)))
+        {
             return Err(OpError::Invalid(
-                "grant id prefix must be at least 8 hex characters \
-                 (or `ci-` followed by 8, for a CI key's grant)"
-                    .to_owned(),
+                "grant id prefix must be at least 8 characters of the grant id".to_owned(),
             ));
         }
 
-        let scoped = self.db.scoped(org.clone());
-        let all = scoped.list_grants().await.map_err(OpError::Internal)?;
-        let matches: Vec<_> = all.iter().filter(|g| g.id.starts_with(&prefix)).collect();
+        let ns = crate::subject::ns_of(&org).ok_or(OpError::Denied)?;
+        let scoped = self.db.forgs().scoped(ns);
+        let all = scoped
+            .list_grants()
+            .await
+            .map_err(|e| OpError::Internal(e.into()))?;
+        let matches: Vec<_> = all
+            .iter()
+            .filter(|g| g.id.to_string().starts_with(&prefix))
+            .collect();
         let target = match matches.len() {
             0 => return Err(OpError::NotFound(format!("no grant matching {prefix}"))),
             1 => matches[0],
@@ -1841,7 +1943,7 @@ impl Coordinator {
             }
         };
 
-        let owned = target.created_by.as_deref() == Some(subject.id.as_str());
+        let owned = target.created_by.is_some() && target.created_by == subject.user_id();
         if !owned && !authz::is_org_admin(&self.db, subject).await {
             self.audit(
                 &org,
@@ -1857,12 +1959,12 @@ impl Coordinator {
             return Err(OpError::Denied);
         }
 
-        let grantee = target.parsed_subject();
+        let grantee = SubjectKey::parse(&target.subject);
         let deleted = scoped
-            .delete_grants_by_prefix(&prefix)
+            .delete_grant(target.id)
             .await
-            .map_err(OpError::Internal)?;
-        let ids: Vec<String> = deleted.iter().map(|g| g.id.clone()).collect();
+            .map_err(|e| OpError::Internal(e.into()))?;
+        let ids: Vec<String> = deleted.iter().map(|g| g.id.to_string()).collect();
         self.audit(
             &org,
             "grant.revoke",
@@ -1896,41 +1998,6 @@ impl Coordinator {
         }
     }
 
-    /// Revoke a **specific** grant by exact id, cascading as `grant revoke`
-    /// does, without any of its authorization checks.
-    ///
-    /// The auth-key revocation path's hook (architecture §6.7): revoking a CI
-    /// key must also tear down the grant its redemption synthesised, or the
-    /// runner keeps its board until the lease TTL runs out and the operator is
-    /// left believing the key is dead. Authorization already happened at
-    /// `POST /auth/keys` — same rule, creator-or-admin — which is why this
-    /// takes no `Subject`.
-    ///
-    /// Returns the ids actually deleted, so the caller can say whether
-    /// anything cascaded. A key that was never redeemed has no grant, and that
-    /// is an empty vector rather than an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns a database or scheduler error from the release path.
-    pub async fn revoke_grant_by_id(&self, org: &OrgId, id: &str) -> Result<Vec<String>> {
-        let scoped = self.db.scoped(org.clone());
-        let all = scoped.list_grants().await?;
-        let Some(target) = all.iter().find(|g| g.id == id) else {
-            return Ok(Vec::new());
-        };
-        let grantee = target.parsed_subject();
-        // By exact id, via the prefix delete: the id *is* the whole prefix, so
-        // this matches one row and reuses the one delete statement rather than
-        // adding a second way to remove a grant.
-        let deleted = scoped.delete_grants_by_prefix(id).await?;
-        let ids: Vec<String> = deleted.iter().map(|g| g.id.clone()).collect();
-        if let Some(grantee) = grantee {
-            self.cascade_revocation(&grantee, org).await?;
-        }
-        Ok(ids)
-    }
-
     /// After a grant is deleted, take back whatever it was still holding open.
     ///
     /// Recomputes `grantee`'s access from scratch and releases every lease it
@@ -1944,13 +2011,12 @@ impl Coordinator {
     /// own org that this revocation has nothing to do with, and would also be
     /// wrong for a subject still covered by a second, overlapping grant.
     /// Refreshing lets `promote_one` decide per board, exactly.
-    async fn cascade_revocation(&self, grantee: &SubjectKey, org: &OrgId) -> Result<()> {
+    pub(crate) async fn cascade_revocation(&self, grantee: &SubjectKey, org: &OrgId) -> Result<()> {
         let now = self.now();
-        // Rebuild the grantee's access. A `Subject` is needed for the lookup;
-        // `groups` is advisory and excluded from identity, so an empty one is
-        // faithful here.
-        let as_subject = Subject::new(grantee.org.clone(), grantee.kind, grantee.id.clone());
-        let access = authz::board_access(&self.db, &as_subject, now).await;
+        // Rebuild the grantee's access from scratch.
+        let access = authz::access_of(&self.db, grantee, now).await;
+        // The teardown is audited as acting in the hardware's org.
+        let as_subject = Subject::new(grantee.clone(), Some(org.clone()));
 
         let held = {
             let sched = self.scheduler.lock().await;
@@ -2023,7 +2089,7 @@ impl Coordinator {
         duration_secs: u64,
         ops: Vec<fleet_proto::token::AllowedOp>,
     ) -> Result<CoordToSidecar> {
-        if subject.kind == fleet_proto::ids::SubjectKind::Workload {
+        if subject.kind() == fleet_proto::ids::SubjectKind::Workload {
             debug!(%subject, "refusing delegation by a CI workload");
             return Ok(CoordToSidecar::Error {
                 message: "a CI workload may not delegate its lease".to_owned(),
@@ -2056,7 +2122,7 @@ impl Coordinator {
             // freed minutes later would be handed to a delegator that walked
             // away — held by nobody until TTL (#452). A separate entry point
             // rather than a flag, so the property is visible at the call site.
-            sched.try_lease(subject.clone(), &access, req, now)
+            sched.try_lease(subject.key().clone(), &access, req, now)
         };
         let granted = match decision {
             LeaseDecision::Granted(g) => g,
@@ -2096,7 +2162,7 @@ impl Coordinator {
             // tail out exists to prevent.
             self.tear_down_lease(
                 granted.lease,
-                &subject.key(),
+                subject.key(),
                 "delegation refused",
                 "lease.release",
                 subject,
@@ -2114,7 +2180,7 @@ impl Coordinator {
             .record_lease(
                 granted.lease,
                 &granted.board,
-                &granted.holder.key(),
+                &granted.holder,
                 self.now_i64(),
                 i64::try_from(granted.expires).unwrap_or(i64::MAX),
             )
@@ -2174,7 +2240,7 @@ impl Coordinator {
         // capped under the clamped priority at grant time. So a workload stays
         // clamped on every renewal and there is deliberately no second guard in
         // `extend_lease` — please do not add one.
-        if subject.kind == fleet_proto::ids::SubjectKind::Workload
+        if subject.kind() == fleet_proto::ids::SubjectKind::Workload
             && req.priority != fleet_proto::lease::Priority::Ci
         {
             debug!(
@@ -2186,7 +2252,7 @@ impl Coordinator {
         let select_display = req.select.to_string();
         let decision = {
             let mut sched = self.scheduler.lock().await;
-            sched.request_lease(subject.clone(), requester, &access, req, now)
+            sched.request_lease(subject.key().clone(), requester, &access, req, now)
         };
         match decision {
             LeaseDecision::Granted(granted) => {
@@ -2212,7 +2278,7 @@ impl Coordinator {
                     .record_lease(
                         granted.lease,
                         &granted.board,
-                        &granted.holder.key(),
+                        &granted.holder,
                         self.now_i64(),
                         i64::try_from(granted.expires).unwrap_or(i64::MAX),
                     )
@@ -2263,7 +2329,11 @@ impl Coordinator {
         };
         match outcome {
             Ok((holder, board_org, expires)) => {
-                let org = board_org.unwrap_or_else(|| subject.org.clone());
+                // A live lease always has a board; the acting org is only a
+                // fallback for the audit row.
+                let Some(org) = board_org.or_else(|| subject.org().cloned()) else {
+                    return Ok(CoordToSidecar::Extended { lease, expires });
+                };
                 self.db
                     .scoped(org.clone())
                     .update_lease_expiry(lease, i64::try_from(expires).unwrap_or(i64::MAX))
@@ -2375,7 +2445,9 @@ impl Coordinator {
                 Err(_) => return Ok(false),
             }
         };
-        let org = board_org.unwrap_or_else(|| acting.org.clone());
+        let Some(org) = board_org.or_else(|| acting.org().cloned()) else {
+            return Ok(true);
+        };
 
         self.db
             .scoped(org.clone())
@@ -2403,7 +2475,7 @@ impl Coordinator {
     /// Audit detail noting an admin override, if the acting subject is not the
     /// holder.
     fn override_detail(subject: &Subject, holder: &SubjectKey) -> Option<String> {
-        (subject.key() != *holder).then(|| format!("admin override; holder {holder}"))
+        (subject.key() != holder).then(|| format!("admin override; holder {holder}"))
     }
 
     /// Open a relay channel for a held lease.
@@ -2462,7 +2534,7 @@ impl Coordinator {
             }));
         };
         let now = self.now();
-        let holder_access = authz::board_access(&self.db, &holder_subject, now).await;
+        let holder_access = authz::access_of(&self.db, &holder_subject, now).await;
         let ops = {
             let sched = self.scheduler.lock().await;
             match sched.board(&board) {
@@ -2607,7 +2679,7 @@ impl Coordinator {
 
         // Attenuate to the intersection: never more than the token says, and
         // never more than the delegator currently holds.
-        let holder_access = authz::board_access(&self.db, &holder, now).await;
+        let holder_access = authz::access_of(&self.db, &holder, now).await;
         let ops: Vec<fleet_proto::token::AllowedOp> = {
             let sched = self.scheduler.lock().await;
             match sched.board(&board) {
@@ -2669,7 +2741,7 @@ impl Coordinator {
             Some(&board.node.0),
             Some(&board.name),
             Some(token.lease),
-            Some(&format!("{channel:?}; delegated by {}", holder.key())),
+            Some(&format!("{channel:?}; delegated by {holder}")),
         )
         .await?;
 
@@ -2828,7 +2900,7 @@ impl Coordinator {
             return false;
         };
         let now = self.now();
-        let access = authz::board_access(&self.db, &granted.holder, now).await;
+        let access = authz::access_of(&self.db, &granted.holder, now).await;
         let ops = {
             let sched = self.scheduler.lock().await;
             match sched.board(&granted.board) {
@@ -2908,7 +2980,7 @@ impl Coordinator {
                 .record_lease(
                     granted.lease,
                     &granted.board,
-                    &granted.holder.key(),
+                    &granted.holder,
                     self.now_i64(),
                     i64::try_from(granted.expires).unwrap_or(i64::MAX),
                 )
@@ -2923,7 +2995,7 @@ impl Coordinator {
             self.audit(
                 &org,
                 "lease.promote",
-                Some(&granted.holder.key().to_string()),
+                Some(&granted.holder.to_string()),
                 Some(&granted.board.node.0),
                 Some(&granted.board.name),
                 Some(granted.lease),
@@ -2938,7 +3010,7 @@ impl Coordinator {
             let now = self.now();
             let next = {
                 let mut sched = self.scheduler.lock().await;
-                match sched.release_lease(granted.lease, &granted.holder.key(), now) {
+                match sched.release_lease(granted.lease, &granted.holder, now) {
                     Ok(next) => next,
                     // The lease vanished under us (a sweep, a node deletion).
                     // Nothing left to undo, and nothing was promoted here.
@@ -2952,7 +3024,7 @@ impl Coordinator {
             self.audit(
                 &org,
                 "lease.release",
-                Some(&granted.holder.key().to_string()),
+                Some(&granted.holder.to_string()),
                 Some(&granted.board.node.0),
                 Some(&granted.board.name),
                 Some(granted.lease),
@@ -3011,7 +3083,7 @@ fn node_summary(status: NodeStatus) -> fleet_proto::admin::NodeSummary {
         name: status.row.name,
         tags: status.row.tags,
         adopt: status.row.adopt,
-        owner: status.row.owner_user_id,
+        owner: status.row.owner_user_id.map(|u| u.to_string()),
         last_seen: status.row.last_seen,
         created_at: status.row.created_at,
         online: status.online,
@@ -3054,7 +3126,10 @@ mod tests {
     use super::*;
     use crate::clock::Clock;
     use crate::config::SigningKeySource;
-    use crate::state::DEFAULT_ORG_ID;
+    use crate::subject::testkit;
+
+    /// The name of the fixtures' main org.
+    const DEFAULT_ORG_ID: &str = "default";
     use ed25519_dalek::{Verifier, VerifyingKey};
     use fleet_core::policy::Policy;
     use fleet_proto::board::PowerKind;
@@ -3081,17 +3156,17 @@ mod tests {
         CoordinatorConfig {
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(TEST_SEED),
-            default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
             ..CoordinatorConfig::default()
         }
     }
 
+    /// Fixture org `name`'s (deterministic) id; `coordinator_with` seeds it.
     fn org(name: &str) -> OrgId {
-        OrgId(name.to_owned())
+        testkit::org_id(name)
     }
 
     fn user(org_name: &str, id: &str) -> Subject {
-        Subject::new(org(org_name), SubjectKind::User, id)
+        Subject::user(testkit::user_id(id), org(org_name))
     }
 
     /// A board's fleet key, with a **production-shaped** node id.
@@ -3131,7 +3206,7 @@ mod tests {
     async fn coordinator_with(
         clock: Arc<TestClock>,
         boards: &[Board],
-        members: &[(&str, &str, Role)],
+        members: &[(&str, &str, FleetRole)],
     ) -> Coordinator {
         let mut sched = Scheduler::new(Policy::default());
         for b in boards {
@@ -3139,12 +3214,10 @@ mod tests {
         }
         let db = Db::connect_in_memory().await.unwrap();
         for (org_name, id, role) in members {
-            db.ensure_user_member(&org(org_name), id, *role)
-                .await
-                .unwrap();
+            testkit::seed_member(&db, org_name, id, *role).await;
             // Boards/leases reference their node row.
             for b in boards {
-                if b.id.org.0 == *org_name {
+                if b.id.org == org(org_name) {
                     db.scoped(org(org_name))
                         .ensure_node(&b.node, 1000)
                         .await
@@ -3161,9 +3234,9 @@ mod tests {
             clock,
             &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
-                (DEFAULT_ORG_ID, "alice", Role::Member),
-                (DEFAULT_ORG_ID, "bob", Role::Member),
-                (DEFAULT_ORG_ID, "op", Role::Admin),
+                (DEFAULT_ORG_ID, "alice", FleetRole::Member),
+                (DEFAULT_ORG_ID, "bob", FleetRole::Member),
+                (DEFAULT_ORG_ID, "op", FleetRole::Admin),
             ],
         )
         .await
@@ -3432,7 +3505,7 @@ mod tests {
                 board(DEFAULT_ORG_ID, "b2", "node-a"),
                 board(DEFAULT_ORG_ID, "b3", "node-a"),
             ],
-            &[(DEFAULT_ORG_ID, "alice", Role::Member)],
+            &[(DEFAULT_ORG_ID, "alice", FleetRole::Member)],
         )
         .await;
         let alice = user(DEFAULT_ORG_ID, "alice");
@@ -3567,9 +3640,9 @@ mod tests {
             clock,
             &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
-                (DEFAULT_ORG_ID, "alice", Role::Member),
-                (DEFAULT_ORG_ID, "bob", Role::Member),
-                (DEFAULT_ORG_ID, "carol", Role::Member),
+                (DEFAULT_ORG_ID, "alice", FleetRole::Member),
+                (DEFAULT_ORG_ID, "bob", FleetRole::Member),
+                (DEFAULT_ORG_ID, "carol", FleetRole::Member),
             ],
         )
         .await;
@@ -3623,7 +3696,7 @@ mod tests {
             .await
             .unwrap();
         match carol_rx.recv().await.unwrap() {
-            CoordToSidecar::Lease(g) => assert_eq!(g.holder, carol),
+            CoordToSidecar::Lease(g) => assert_eq!(&g.holder, carol.key()),
             other => panic!("expected carol's promotion, got {other:?}"),
         }
     }
@@ -3642,7 +3715,7 @@ mod tests {
 
         assert_eq!(
             coord.scheduler().lock().await.lease_holder(grant.lease),
-            Some(&alice),
+            Some(alice.key()),
             "a lease outlives the connection that requested it"
         );
         assert_eq!(
@@ -3700,9 +3773,9 @@ mod tests {
             clock,
             &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
-                (DEFAULT_ORG_ID, "alice", Role::Member),
-                (DEFAULT_ORG_ID, "bob", Role::Member),
-                (DEFAULT_ORG_ID, "carol", Role::Member),
+                (DEFAULT_ORG_ID, "alice", FleetRole::Member),
+                (DEFAULT_ORG_ID, "bob", FleetRole::Member),
+                (DEFAULT_ORG_ID, "carol", FleetRole::Member),
             ],
         )
         .await;
@@ -3748,7 +3821,7 @@ mod tests {
             .unwrap();
 
         match carol_rx.recv().await.unwrap() {
-            CoordToSidecar::Lease(g) => assert_eq!(g.holder, carol),
+            CoordToSidecar::Lease(g) => assert_eq!(&g.holder, carol.key()),
             other => panic!("expected carol's promotion, got {other:?}"),
         }
         assert_eq!(
@@ -3772,10 +3845,10 @@ mod tests {
             clock,
             &[board(DEFAULT_ORG_ID, "b1", "node-a")],
             &[
-                (DEFAULT_ORG_ID, "alice", Role::Member),
-                (DEFAULT_ORG_ID, "bob", Role::Member),
-                (DEFAULT_ORG_ID, "carol", Role::Member),
-                (DEFAULT_ORG_ID, "dave", Role::Member),
+                (DEFAULT_ORG_ID, "alice", FleetRole::Member),
+                (DEFAULT_ORG_ID, "bob", FleetRole::Member),
+                (DEFAULT_ORG_ID, "carol", FleetRole::Member),
+                (DEFAULT_ORG_ID, "dave", FleetRole::Member),
             ],
         )
         .await;
@@ -3820,7 +3893,7 @@ mod tests {
             .await
             .unwrap();
         match dave_rx.recv().await.unwrap() {
-            CoordToSidecar::Lease(g) => assert_eq!(g.holder, dave),
+            CoordToSidecar::Lease(g) => assert_eq!(&g.holder, dave.key()),
             other => panic!("expected dave's promotion, got {other:?}"),
         }
         assert_eq!(
@@ -3994,7 +4067,7 @@ mod tests {
             1
         );
         let sched = coord.scheduler().lock().await;
-        assert_eq!(sched.lease_holder(grant.lease), Some(&alice));
+        assert_eq!(sched.lease_holder(grant.lease), Some(alice.key()));
         let BoardState::Leased { expires, .. } = &sched
             .board(&board_ref(DEFAULT_ORG_ID, "node-a", "b1"))
             .unwrap()
@@ -4017,8 +4090,8 @@ mod tests {
             clock,
             &[board("org-a", "b1", "node-a")],
             &[
-                ("org-a", "alice", Role::Member),
-                ("org-b", "mallory", Role::Admin),
+                ("org-a", "alice", FleetRole::Member),
+                ("org-b", "mallory", FleetRole::Admin),
             ],
         )
         .await;
@@ -4085,8 +4158,9 @@ mod tests {
         assert_eq!(grant.board.org, org("org-a"));
     }
 
-    /// Cross-org: a subject in another org sees nothing and can do nothing,
-    /// even with the same user id.
+    /// Cross-org: a member of another org sees nothing and can do nothing.
+    /// (A user who is a member of *both* orgs reaches both: access is the
+    /// union of memberships, not the org a request names.)
     #[tokio::test]
     async fn cross_org_subject_is_isolated() {
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
@@ -4097,13 +4171,13 @@ mod tests {
                 board("org-b", "b1", "node-b"),
             ],
             &[
-                ("org-a", "alice", Role::Admin),
-                ("org-b", "alice", Role::Admin),
+                ("org-a", "alice", FleetRole::Admin),
+                ("org-b", "bob", FleetRole::Admin),
             ],
         )
         .await;
         let alice_a = user("org-a", "alice");
-        let alice_b = user("org-b", "alice");
+        let alice_b = user("org-b", "bob");
         let grant = grant_lease(&coord, &alice_a, "b1").await;
         assert_eq!(grant.board.org, org("org-a"));
 
@@ -4289,8 +4363,8 @@ mod tests {
 
         let strangers = [
             user(DEFAULT_ORG_ID, "mallory"),
-            Subject::new(org(DEFAULT_ORG_ID), SubjectKind::Workload, "ci"),
-            Subject::new(org(DEFAULT_ORG_ID), SubjectKind::Node, "rpi-1"),
+            Subject::new(SubjectKey::parse("gha/workload:o/ci").unwrap(), None),
+            Subject::node(org(DEFAULT_ORG_ID), &node_id(DEFAULT_ORG_ID, "rpi-1")).unwrap(),
         ];
         for s in strangers {
             for msg in [
@@ -4331,7 +4405,7 @@ mod tests {
             .unwrap()
             .expect("a repo spec must resolve");
         assert_eq!(key.to_string(), "gha/workload:ariel-os/ariel-os");
-        assert_eq!(key.kind, SubjectKind::Workload);
+        assert_eq!(key.kind(), SubjectKind::Workload);
 
         // Garbage after `repo:` resolves to nothing rather than to some
         // fallback subject: a grant to a subject nobody can authenticate as is
@@ -4350,9 +4424,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(key.kind, SubjectKind::Workload);
-        let key = coord.resolve_grantee("gh-7").await.unwrap().unwrap();
-        assert_eq!(key.kind, SubjectKind::User);
+        assert_eq!(key.kind(), SubjectKind::Workload);
+        // A username resolves to the user's immutable id; an unknown one to
+        // nothing rather than a guess.
+        let key = coord.resolve_grantee("alice").await.unwrap().unwrap();
+        assert_eq!(key, *user(DEFAULT_ORG_ID, "alice").key());
+        assert!(coord
+            .resolve_grantee("nobody-here")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// An ambiguous board name (two of the caller's *own* nodes carry it) is
@@ -4367,7 +4448,7 @@ mod tests {
                 board("org-a", "dk", "node-1"),
                 board("org-a", "dk", "node-2"),
             ],
-            &[("org-a", "alice", Role::Member)],
+            &[("org-a", "alice", FleetRole::Member)],
         )
         .await;
 
@@ -4406,8 +4487,8 @@ mod tests {
             clock,
             &[board("org-a", "b1", "node-a")],
             &[
-                ("org-a", "alice", Role::Member),
-                ("org-b", "bob", Role::Admin),
+                ("org-a", "alice", FleetRole::Member),
+                ("org-b", "bob", FleetRole::Admin),
             ],
         )
         .await;
@@ -4470,7 +4551,7 @@ mod tests {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         // Fresh coordinator with NO pre-seeded boards.
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let node_id = node_id(DEFAULT_ORG_ID, "node-a");
         // The node row is what resolves the report's org: there is no default-org
         // fallback any more (see `org_and_policy_of_node`).
@@ -4589,7 +4670,7 @@ mod tests {
     async fn a_report_from_a_node_with_no_row_is_dropped_not_defaulted() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         // Deliberately NOT calling `ensure_node`: this node is unknown. Its
         // id is still production-shaped — the report being dropped must be
         // because no row exists, not because the id could not name one.
@@ -4635,7 +4716,8 @@ mod tests {
             [(AdoptPolicy::Auto, true), (AdoptPolicy::Declared, false)]
         {
             let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-            let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+            let coord =
+                coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
             let node = node_id(DEFAULT_ORG_ID, "laptop");
             coord
                 .db()
@@ -4644,7 +4726,7 @@ mod tests {
                     "laptop",
                     "hash",
                     &[],
-                    Some("op"),
+                    Some(testkit::user_id("op")),
                     policy,
                     1000,
                 )
@@ -4702,7 +4784,7 @@ mod tests {
     async fn an_unplugged_adopted_board_leaves_the_scheduler() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         coord
             .db()
             .register_node_full(
@@ -4710,7 +4792,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Auto,
                 1000,
             )
@@ -4771,7 +4853,7 @@ mod tests {
     async fn a_renamed_board_leaves_no_stale_row() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let node = node_id(DEFAULT_ORG_ID, "node-a");
         coord
             .db()
@@ -4828,7 +4910,7 @@ mod tests {
     async fn an_offline_board_is_retained_in_the_db_but_not_in_the_scheduler() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let node = node_id(DEFAULT_ORG_ID, "node-a");
         let key = board_ref(DEFAULT_ORG_ID, "node-a", "b1");
         coord
@@ -4877,7 +4959,7 @@ mod tests {
     async fn an_unplugged_adopted_board_leaves_the_db_too() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         coord
             .db()
             .register_node_full(
@@ -4885,7 +4967,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Auto,
                 1000,
             )
@@ -4937,7 +5019,7 @@ mod tests {
     async fn a_policy_violating_adopted_board_gets_no_row() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let o = org(DEFAULT_ORG_ID);
         coord
             .db()
@@ -4946,7 +5028,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Auto,
                 1000,
             )
@@ -4974,7 +5056,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Declared,
                 1001,
             )
@@ -4999,7 +5081,8 @@ mod tests {
     async fn a_leased_board_that_vanishes_from_a_report_is_not_deleted() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "alice", Role::Member)]).await;
+        let coord =
+            coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "alice", FleetRole::Member)]).await;
         let node = node_id(DEFAULT_ORG_ID, "node-a");
         let key = board_ref(DEFAULT_ORG_ID, "node-a", "b1");
         coord
@@ -5062,8 +5145,8 @@ mod tests {
             clock,
             &[],
             &[
-                (DEFAULT_ORG_ID, "op", Role::Admin),
-                ("other", "op", Role::Admin),
+                (DEFAULT_ORG_ID, "op", FleetRole::Admin),
+                ("other", "op", FleetRole::Admin),
             ],
         )
         .await;
@@ -5073,7 +5156,6 @@ mod tests {
             (org("other"), node_id("other", "node-c")),
         ];
         for (o, node) in &nodes {
-            coord.db().ensure_org(o, "personal").await.unwrap();
             coord
                 .db()
                 .scoped(o.clone())
@@ -5160,7 +5242,7 @@ mod tests {
     async fn a_declared_node_still_honours_a_tombstone_for_a_previously_adopted_board() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let o = org(DEFAULT_ORG_ID);
         coord
             .db()
@@ -5169,7 +5251,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Auto,
                 1000,
             )
@@ -5198,7 +5280,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Declared,
                 1001,
             )
@@ -5234,7 +5316,8 @@ mod tests {
         use fleet_proto::node_api::ProbeInventory;
         for policy in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
             let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-            let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+            let coord =
+                coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
             coord
                 .db()
                 .register_node_full(&org(DEFAULT_ORG_ID), "pi", "hash", &[], None, policy, 1000)
@@ -5271,7 +5354,7 @@ mod tests {
     async fn an_inventory_report_does_not_reset_the_adopt_policy() {
         use fleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", Role::Admin)]).await;
+        let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         coord
             .db()
             .register_node_full(
@@ -5279,7 +5362,7 @@ mod tests {
                 "laptop",
                 "hash",
                 &[],
-                Some("op"),
+                Some(testkit::user_id("op")),
                 AdoptPolicy::Auto,
                 1000,
             )
@@ -5314,7 +5397,7 @@ mod tests {
     /// `granted_org`'s `tag=nrf52` boards.
     fn shared_access(own_org: &str, granted_org: &str) -> Access {
         Access {
-            own_org: Some(org(own_org)),
+            member_of: vec![org(own_org)],
             grants: vec![fleet_core::access::GrantScope {
                 id: "g1".to_owned(),
                 org: org(granted_org),
@@ -5338,8 +5421,8 @@ mod tests {
                 board("org-a", "dk", "node-a"),
             ],
             &[
-                ("org-a", "alice", Role::Member),
-                ("org-b", "bob", Role::Member),
+                ("org-a", "alice", FleetRole::Member),
+                ("org-b", "bob", FleetRole::Member),
             ],
         )
         .await;
@@ -5367,8 +5450,8 @@ mod tests {
                 board("org-a", "dk", "node-a"),
             ],
             &[
-                ("org-a", "alice", Role::Member),
-                ("org-b", "bob", Role::Member),
+                ("org-a", "alice", FleetRole::Member),
+                ("org-b", "bob", FleetRole::Member),
             ],
         )
         .await;
@@ -5377,7 +5460,9 @@ mod tests {
         // Every qualified spelling, against a production-shaped node id
         // (`org-a/node-a`) — including the BoardRef's own Display, which is
         // what a user copies out of `ctl list`.
-        for spelling in ["node-a/dk", "org-a/node-a/dk", "org-a/org-a/node-a/dk"] {
+        let full_node = format!("{}/dk", node_id("org-a", "node-a").0);
+        let display = board_ref("org-a", "node-a", "dk").to_string();
+        for spelling in ["node-a/dk", "org-a/node-a/dk", &full_node, &display] {
             assert_eq!(
                 coord
                     .resolve_board(&access, &BoardName(spelling.to_owned()), 1000)
@@ -5409,8 +5494,8 @@ mod tests {
                 board("org-a", "dk", "node-a"),
             ],
             &[
-                ("org-a", "alice", Role::Member),
-                ("org-b", "bob", Role::Member),
+                ("org-a", "alice", FleetRole::Member),
+                ("org-b", "bob", FleetRole::Member),
             ],
         )
         .await;
@@ -5438,7 +5523,7 @@ mod tests {
         let coord = coordinator_with(
             clock,
             &[board("org-a", "dk", "node-a")],
-            &[("org-b", "bob", Role::Member)],
+            &[("org-b", "bob", FleetRole::Member)],
         )
         .await;
         assert_eq!(
@@ -5472,8 +5557,8 @@ mod tests {
             clock,
             &[board("org-a", "dk", "node-a")],
             &[
-                ("org-a", "alice", Role::Admin),
-                ("org-b", "bob", Role::Member),
+                ("org-a", "alice", FleetRole::Admin),
+                ("org-b", "bob", FleetRole::Member),
             ],
         )
         .await;
@@ -5482,21 +5567,23 @@ mod tests {
 
         // Alice holds the board; bob queues behind her by grant.
         let _ = grant_lease(&coord, &alice, "dk").await;
-        let id = crate::state::new_grant_id();
-        coord
+        let id = coord
             .db()
-            .scoped(org("org-a"))
+            .forgs()
+            .scoped(crate::subject::ns_of(&org("org-a")).unwrap())
             .insert_grant(
-                &id,
-                &bob.key(),
-                "tag=nrf52",
-                &[fleet_proto::token::AllowedOp::Attach],
-                None,
-                Some("alice"),
+                &forgs_store::NewGrant {
+                    subject: bob.forgs_key().unwrap(),
+                    selector: "tag=nrf52".to_owned(),
+                    ops: crate::state::join_ops(&[fleet_proto::token::AllowedOp::Attach]),
+                    expires: None,
+                    created_by: Some(testkit::user_id("alice")),
+                },
                 1000,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .to_string();
 
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
@@ -5536,9 +5623,9 @@ mod tests {
 
         let promoted = {
             let mut sched = coord.scheduler().lock().await;
-            let held = sched.leases_held_by(&alice.key());
+            let held = sched.leases_held_by(alice.key());
             sched
-                .release_lease(held[0].0, &alice.key(), 2000)
+                .release_lease(held[0].0, alice.key(), 2000)
                 .expect("holder may release")
         };
         assert!(

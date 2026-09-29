@@ -355,7 +355,7 @@ mod tests {
     /// production is org-namespaced.
     fn test_node_id() -> NodeId {
         crate::state::node_id_for(
-            &fleet_proto::ids::OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+            &crate::subject::org_of(forgs::NsNodeId::from_parts(1, 1)),
             "node-a",
         )
     }

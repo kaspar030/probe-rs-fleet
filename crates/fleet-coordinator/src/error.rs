@@ -17,11 +17,15 @@ pub enum CoordinatorError {
     #[error("wire error: {0}")]
     Wire(fleet_wire::WireError),
 
-    /// A bearer-credential failure.
-    #[error("auth error: {0}")]
-    Auth(#[from] fleet_auth::AuthError),
-
     /// An HTTP-layer failure (listener, upgrade, or serving).
+    /// A forgs storage failure (users, orgs, credentials, grants).
+    #[error("identity store error: {0}")]
+    Store(#[from] forgs_store::StoreError),
+
+    /// The auth surface could not be configured.
+    #[error("auth configuration error: {0}")]
+    AuthConfig(#[from] forgs_http::ConfigError),
+
     #[error("http error: {0}")]
     Http(String),
 

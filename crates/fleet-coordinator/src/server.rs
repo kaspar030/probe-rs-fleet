@@ -23,7 +23,7 @@
 //! When a node's token is older than the policy allows, the coordinator mints a
 //! replacement, **holds it in memory**, and pushes it. The database keeps the
 //! *old* hash until the node acks with
-//! [`NodeReport::TokenRotated`]. See `fleet_auth::rotation` for why eagerly
+//! [`NodeReport::TokenRotated`]. See `forgs::rotation` for why eagerly
 //! retiring the old token is the wrong trade on hardware nobody can walk up to.
 
 use std::sync::Arc;
@@ -33,8 +33,9 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_proto::ids::{NodeId, Subject};
+use fleet_proto::ids::{NodeId, OrgId};
+
+use crate::subject::Subject;
 use fleet_proto::node_api::NodeReport;
 use fleet_proto::PROTOCOL_VERSION;
 use fleet_wire::{WireError, WireEvent, WireRx, WireTx};
@@ -61,6 +62,35 @@ struct PendingRotation {
     sent_at: Instant,
 }
 
+/// Who a node connection authenticated as: its org and node id (both from
+/// the node **row** its token matched) and the token's issue time.
+#[derive(Debug, Clone)]
+pub struct NodeAuth {
+    /// The node's org.
+    pub org: OrgId,
+    /// The node id.
+    pub node: NodeId,
+    /// When the presented token was issued, for the rotation policy.
+    pub token_issued_at: u64,
+    /// The rendered subject key, for audit rows.
+    pub subject: String,
+}
+
+impl NodeAuth {
+    /// A node identity.
+    #[must_use]
+    pub fn new(org: OrgId, node: NodeId, token_issued_at: u64) -> Self {
+        let subject =
+            crate::subject::node_key(&org, &node).map_or_else(|| node.0.clone(), |k| k.to_string());
+        Self {
+            org,
+            node,
+            token_issued_at,
+            subject,
+        }
+    }
+}
+
 /// Drive a node connection: register a writer task, then pump inbound
 /// envelopes into the coordinator, pinging and rotating along the way.
 ///
@@ -74,7 +104,7 @@ pub async fn handle_node(
     tx: BoxTx,
     rx: BoxRx,
     node_id: NodeId,
-    auth: fleet_auth::Authenticated,
+    auth: NodeAuth,
 ) -> Result<()> {
     let (out_tx, mut out_rx) = mpsc::channel::<NodeMessage>(64);
     // The handle is built first and *then* registered, so this task holds the
@@ -126,7 +156,7 @@ async fn node_read_loop(
     coord: &Coordinator,
     mut rx: BoxRx,
     node_id: &NodeId,
-    auth: &fleet_auth::Authenticated,
+    auth: &NodeAuth,
     out_tx: &mpsc::Sender<NodeMessage>,
     ping_tx: &mpsc::Sender<()>,
     shutdown: &tokio::sync::Notify,
@@ -148,11 +178,11 @@ async fn node_read_loop(
     // completed cycle — re-firing a rotation every ping tick for the life of the
     // connection, each one rewriting the Pi's SD card and appending an audit
     // row. `complete_rotation` advances this on a successful promotion.
-    let mut token_issued_at = auth.token_issued_at.unwrap_or(0);
+    let mut token_issued_at = auth.token_issued_at;
 
     // Rotate on connect if the token is already old enough: a node that
     // reconnects after a long outage should not have to wait a full interval.
-    let mut rotation_due = fleet_auth::should_rotate(token_issued_at, coord.now(), policy);
+    let mut rotation_due = forgs::should_rotate(token_issued_at, coord.now(), policy);
 
     // Created **once**, outside the loop, and pinned so `select!` can poll it
     // repeatedly. A `notified()` future built inside the loop would be polled
@@ -165,7 +195,7 @@ async fn node_read_loop(
     loop {
         if rotation_due && pending.is_none() {
             rotation_due = false;
-            match push_rotation(node_id, out_tx, next_rotation_id).await {
+            match push_rotation(coord, node_id, out_tx, next_rotation_id).await {
                 Some(p) => {
                     pending = Some(p);
                     next_rotation_id = next_rotation_id.wrapping_add(1);
@@ -259,7 +289,7 @@ async fn node_read_loop(
                     }
                 }
                 if pending.is_none()
-                    && fleet_auth::should_rotate(token_issued_at, coord.now(), policy)
+                    && forgs::should_rotate(token_issued_at, coord.now(), policy)
                 {
                     rotation_due = true;
                 }
@@ -275,28 +305,28 @@ async fn node_read_loop(
 async fn handle_node_report(
     coord: &Coordinator,
     node_id: &NodeId,
-    auth: &fleet_auth::Authenticated,
+    auth: &NodeAuth,
     pending: &mut Option<PendingRotation>,
     token_issued_at: &mut u64,
     report: NodeReport,
 ) -> Result<Option<CoordinatorError>> {
     match report {
-        NodeReport::Register { ref node, .. } if node.0 != auth.id => {
+        NodeReport::Register { ref node, .. } if *node != auth.node => {
             // Under bearer auth the self-declared id is attacker-controlled
             // text. Routing already uses the token-derived id, so ignoring the
             // field would be safe — but a node claiming another node's id is
             // not a benign typo, and letting it sit in the audit log as
             // ambiguous provenance is worse than refusing the connection.
             let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-            let detail = format!("claimed `{}`, token says `{}`", node.0, auth.id);
+            let detail = format!("claimed `{}`, token says `{}`", node.0, auth.node);
             let _ = coord
                 .db()
-                .scoped(fleet_proto::ids::OrgId(auth.org_id.clone()))
+                .scoped(auth.org.clone())
                 .append_audit(&AuditEntry {
                     ts: now,
-                    subject: Some(auth.id.as_str()),
+                    subject: Some(auth.subject.as_str()),
                     action: "node.register.id_mismatch",
-                    node: Some(auth.id.as_str()),
+                    node: Some(auth.node.0.as_str()),
                     board: None,
                     lease: None,
                     detail: Some(&detail),
@@ -305,7 +335,7 @@ async fn handle_node_report(
             warn!(%node_id, claimed = %node.0, "node declared an id its token does not grant");
             Ok(Some(CoordinatorError::Protocol(format!(
                 "node declared id `{}` but its token authenticates `{}`",
-                node.0, auth.id
+                node.0, auth.node
             ))))
         }
         NodeReport::TokenRotated { rotation_id } => {
@@ -321,11 +351,13 @@ async fn handle_node_report(
 
 /// Mint a replacement token and push it, without touching the database.
 async fn push_rotation(
+    coord: &Coordinator,
     node_id: &NodeId,
     out_tx: &mpsc::Sender<NodeMessage>,
     rotation_id: u64,
 ) -> Option<PendingRotation> {
-    let token = OpaqueToken::mint(TokenKind::Node);
+    let format = coord.auth().format();
+    let token = format.mint(crate::identity::node_token_kind(format));
     let hash = token.hash();
     let cmd = fleet_proto::node_api::CoordinatorCommand::RotateNodeToken {
         token: token.to_secret_string(),
@@ -350,13 +382,13 @@ async fn push_rotation(
 async fn complete_rotation(
     coord: &Coordinator,
     node_id: &NodeId,
-    auth: &fleet_auth::Authenticated,
+    auth: &NodeAuth,
     pending: &mut Option<PendingRotation>,
     token_issued_at: &mut u64,
     rotation_id: u64,
 ) {
     let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-    let org = fleet_proto::ids::OrgId(auth.org_id.clone());
+    let org = auth.org.clone();
     let matches = pending
         .as_ref()
         .is_some_and(|p| p.rotation_id == rotation_id);
@@ -368,9 +400,9 @@ async fn complete_rotation(
             .scoped(org)
             .append_audit(&AuditEntry {
                 ts: now,
-                subject: Some(auth.id.as_str()),
+                subject: Some(auth.subject.as_str()),
                 action: "node.token.rotate_stale",
-                node: Some(auth.id.as_str()),
+                node: Some(auth.node.0.as_str()),
                 board: None,
                 lease: None,
                 detail: None,
@@ -400,9 +432,9 @@ async fn complete_rotation(
         .scoped(org)
         .append_audit(&AuditEntry {
             ts: now,
-            subject: Some(auth.id.as_str()),
+            subject: Some(auth.subject.as_str()),
             action: "node.token.rotated",
-            node: Some(auth.id.as_str()),
+            node: Some(auth.node.0.as_str()),
             board: None,
             lease: None,
             detail: None,
@@ -680,16 +712,17 @@ pub async fn handle_agent_for_test(
     rx: BoxRx,
     node_id: NodeId,
 ) -> Result<()> {
-    let auth = fleet_auth::Authenticated {
-        kind: TokenKind::Node,
-        org_id: coord.config().default_org.0.clone(),
-        id: node_id.0.clone(),
-        expires: None,
-        hash: fleet_auth::TokenHash::from_hex(String::new()),
-        // Freshly issued: no rotation is due, so a test that is not about
-        // rotation does not accidentally exercise it.
-        token_issued_at: Some(coord.now()),
-    };
+    // The org is the node id's prefix (`node_id_for`).
+    let org = OrgId(
+        node_id
+            .0
+            .split_once('/')
+            .map_or(node_id.0.as_str(), |(o, _)| o)
+            .to_owned(),
+    );
+    // Freshly issued: no rotation is due, so a test that is not about
+    // rotation does not accidentally exercise it.
+    let auth = NodeAuth::new(org, node_id.clone(), coord.now());
     handle_node(coord, tx, rx, node_id, auth).await
 }
 
@@ -737,7 +770,7 @@ mod tests {
     /// with the production constructor rather than inventing a bare literal.
     fn test_node_id() -> NodeId {
         crate::state::node_id_for(
-            &fleet_proto::ids::OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
+            &crate::subject::org_of(forgs::NsNodeId::from_parts(1, 1)),
             "node-a",
         )
     }

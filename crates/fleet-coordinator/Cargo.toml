@@ -12,10 +12,13 @@ fleet-proto.workspace = true
 fleet-core.workspace = true
 fleet-tls.workspace = true
 fleet-wire.workspace = true
-# `oidc` is what makes this the only crate that verifies a JWT (architecture
-# §6.7). It is off by default in fleet-auth precisely so the Pi binary's graph
-# does not grow `rsa`/`p256`/`p384` — see docs/cross-compiling.md.
-fleet-auth = { workspace = true, features = ["client", "oidc"] }
+# Identity, sessions, API keys, the device flow and browser login are forgs'.
+# `oidc` + `client` on forgs-idp is what makes this the only crate that
+# verifies a JWT (architecture §6.7); the agent never links these.
+forgs.workspace = true
+forgs-store.workspace = true
+forgs-http.workspace = true
+forgs-idp = { workspace = true, features = ["client", "oidc"] }
 
 tokio.workspace = true
 tokio-rustls.workspace = true

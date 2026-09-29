@@ -27,16 +27,16 @@
 
 use fleet_core::access::Access;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{LeaseId, OrgId, Role, Subject, SubjectKey, SubjectKind};
+use fleet_proto::ids::{LeaseId, OrgId, SubjectKey, SubjectKind};
 use tracing::warn;
 
 use crate::state::Db;
+use crate::subject::{FleetRole, Subject};
 
 /// Why a request was refused.
 ///
-/// Both variants render to the caller as one flat message (see
-/// [`AuthzError::client_message`]): never leak whether an object exists in
-/// another org.
+/// Both variants render to the caller as one flat message: never leak whether
+/// an object exists in another org.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AuthzError {
     /// The subject may not act on this object.
@@ -60,60 +60,80 @@ impl AuthzError {
     }
 }
 
-/// Deny-by-default org check: the subject's org must equal the object's.
+/// Deny-by-default org check: the subject's acting org must equal the
+/// object's.
 ///
 /// # Errors
 ///
-/// [`AuthzError::Denied`] if the orgs differ.
+/// [`AuthzError::Denied`] if the orgs differ or the subject acts in none.
 pub fn same_org(subject: &Subject, org: &OrgId) -> Result<(), AuthzError> {
-    if &subject.org == org {
+    if subject.org() == Some(org) {
         Ok(())
     } else {
         Err(AuthzError::Denied)
     }
+}
+
+/// The subject's acting org, or `Denied`.
+///
+/// # Errors
+///
+/// [`AuthzError::Denied`] for a subject acting in no org (a workload).
+pub fn acting_org(subject: &Subject) -> Result<&OrgId, AuthzError> {
+    subject.org().ok_or(AuthzError::Denied)
 }
 
 /// Require that `subject` is a member of `org` with at least `min` role.
 ///
-/// **Membership is defined for [`SubjectKind::User`] only**: the `member`
-/// table is keyed by `user_id` and references `user(id)`, so a `Node` or
-/// `Workload` subject has no row and is denied *by construction*. That is the
-/// intended outcome, not a gap: a CI workload reaches boards through
-/// **per-repo grants** ([`board_access`]'s grant leg, architecture §6.7), never
-/// by being silently treated as a member of anything.
+/// **Membership is defined for users only** (forgs memberships are keyed by
+/// user): a node or workload subject is denied *by construction*. A CI
+/// workload reaches boards through **per-repo grants** ([`board_access`]'s
+/// grant leg), never by being silently treated as a member of anything.
+///
+/// Checked against the database on every call, not against the acting org
+/// the connection was opened with: a revoked member keeps a live session
+/// until it expires, and must stop being able to act.
 ///
 /// # Errors
 ///
-/// [`AuthzError::Denied`] if the subject is in another org, is not a user, is
-/// not a member, or holds a lesser role. A database failure is also reported as
-/// `Denied` (fail closed).
+/// [`AuthzError::Denied`] if the subject acts in another org, is not a user,
+/// is not a member, or holds a lesser role. A database failure is also
+/// reported as `Denied` (fail closed).
 pub async fn require_role(
     db: &Db,
     subject: &Subject,
     org: &OrgId,
-    min: Role,
+    min: FleetRole,
 ) -> Result<(), AuthzError> {
     same_org(subject, org)?;
-    if subject.kind != SubjectKind::User {
-        return Err(AuthzError::Denied);
-    }
-    // Fail closed: a DB error must never widen access.
+    let user = subject.user_id().ok_or(AuthzError::Denied)?;
     let role = db
-        .role_of(org, &subject.id)
+        .role_of(org, user)
         .await
         .map_err(|_| AuthzError::Denied)?
         .ok_or(AuthzError::Denied)?;
-    if role.satisfies(min) {
+    if role >= min {
         Ok(())
     } else {
         Err(AuthzError::Denied)
     }
 }
 
-/// Whether `subject` is an admin of its own org.
+/// Whether `subject` is an admin of `org` (a user, by membership; regardless
+/// of the acting org).
+pub async fn is_admin_of(db: &Db, subject: &Subject, org: &OrgId) -> bool {
+    let Some(user) = subject.user_id() else {
+        return false;
+    };
+    matches!(db.role_of(org, user).await, Ok(Some(FleetRole::Admin)))
+}
+
+/// Whether `subject` is an admin of its acting org.
 pub async fn is_org_admin(db: &Db, subject: &Subject) -> bool {
-    let org = subject.org.clone();
-    require_role(db, subject, &org, Role::Admin).await.is_ok()
+    match subject.org() {
+        Some(org) => is_admin_of(db, subject, org).await,
+        None => false,
+    }
 }
 
 /// Resolve everything `subject` may reach, at `now`.
@@ -121,53 +141,34 @@ pub async fn is_org_admin(db: &Db, subject: &Subject) -> bool {
 /// The single builder of an [`Access`], and therefore the single place a
 /// cross-org board can become reachable. Two independent legs:
 ///
-/// * **membership** — a `member` row in the subject's own org sets
-///   `own_org`. Membership, not merely "the subject's `Subject.org`": a
-///   revoked member keeps a valid session until it expires, and must stop
-///   being able to lease.
-/// * **grants** — live rows issued *to* this subject, from any org. Each is
-///   re-parsed from its stored form; a row that will not parse is dropped
+/// * **membership** — every org the user is a member of (forgs
+///   memberships). Membership, not merely the acting org: the ownership path
+///   is "the board's org is one of mine". A node or workload has none.
+/// * **grants** — live rows issued *to* this subject key, from any org. Each
+///   is re-parsed from its stored form; a row that will not parse is dropped
 ///   **closed** with a `warn!`, never widened into a match-anything.
 ///
-/// A database failure yields an *empty* access rather than an error, which is
-/// the fail-closed behaviour the rest of this module already uses: a DB blip
+/// A database failure yields an *empty* leg rather than an error: a DB blip
 /// must never widen access.
 pub async fn board_access(db: &Db, subject: &Subject, now: u64) -> Access {
+    access_of(db, subject.key(), now).await
+}
+
+/// [`board_access`] for a bare subject key (the revocation cascade).
+pub async fn access_of(db: &Db, key: &SubjectKey, now: u64) -> Access {
     let mut access = Access::none();
-
-    // Membership leg. Only users have membership rows (§6.1); a node or
-    // workload subject is denied here by construction and reaches boards only
-    // through the grant leg, which is the intended shape.
-    if subject.kind == SubjectKind::User {
-        match db.role_of(&subject.org, &subject.id).await {
-            Ok(Some(_role)) => access.own_org = Some(subject.org.clone()),
-            Ok(None) => {}
-            Err(e) => warn!(error = %e, subject = %subject, "membership lookup failed; denying"),
-        }
-    }
-
-    // Grant leg. Scoped by the authenticated subject key, which the caller
-    // cannot forge — see `Db::grants_for_subject` for why this one query is
-    // deliberately not org-scoped.
-    let now_i64 = i64::try_from(now).unwrap_or(i64::MAX);
-    match db.grants_for_subject(&subject.key(), now_i64).await {
-        Ok(rows) => {
-            for row in rows {
-                if let Some(scope) = row.to_scope() {
-                    access.grants.push(scope);
-                } else {
-                    warn!(
-                        grant = %row.id,
-                        selector = %row.selector,
-                        ops = %row.ops,
-                        "dropping an unparseable grant row (fails closed)"
-                    );
-                }
+    if key.kind() == SubjectKind::User {
+        if let Some(user) = crate::subject::user_of(key) {
+            match db.orgs_of_user(user).await {
+                Ok(orgs) => access.member_of = orgs.into_iter().map(|(o, _)| o).collect(),
+                Err(e) => warn!(error = %e, subject = %key, "membership lookup failed; denying"),
             }
         }
-        Err(e) => warn!(error = %e, subject = %subject, "grant lookup failed; denying"),
     }
-
+    match db.grant_scopes_for(key, now).await {
+        Ok(grants) => access.grants = grants,
+        Err(e) => warn!(error = %e, subject = %key, "grant lookup failed; denying"),
+    }
     access
 }
 
@@ -178,15 +179,12 @@ pub async fn board_access(db: &Db, subject: &Subject, now: u64) -> Access {
 /// holder, the recorded holder's when an admin overrides — which is exactly
 /// what [`Scheduler::extend_lease`] / [`Scheduler::release_lease`] require.
 ///
-/// # Three ways in, since cross-org leases now exist
-///
-/// Under grants a lease's holder and its *board* can be in different orgs, so
-/// "the lease's org" is ambiguous and the old `holder.org != subject.org`
-/// short-circuit is actively wrong: it would strip a board's owner of control
-/// over a lease running on their own hardware. The rule is therefore:
+/// # Three ways in
 ///
 /// 1. the holder; or
-/// 2. an admin of the **holder's** org (the original override); or
+/// 2. an admin of the **holder's** org (the holder's namespace for a node or
+///    named workload; for a user holder, the caller's acting org when the
+///    holder is a member of it); or
 /// 3. an admin of the **board's** org — you can always reclaim your own
 ///    hardware from someone you shared it with.
 ///
@@ -209,51 +207,59 @@ pub async fn require_lease_control(
         .lease_holder(lease)
         .ok_or(AuthzError::NotFound)?
         .clone();
-    if holder.key() == subject.key() {
-        return Ok(holder.key());
+    if &holder == subject.key() {
+        return Ok(holder);
     }
-
+    let Some(acting) = subject.org() else {
+        return Err(AuthzError::NotFound);
+    };
     let board_org = sched
         .lease_target(lease)
         .map(|(board, _)| board.org.clone());
-    let related = holder.org == subject.org || board_org.as_ref() == Some(&subject.org);
+    let holder_in_acting = holder_org_is(db, &holder, acting).await;
+    let related = holder_in_acting || board_org.as_ref() == Some(acting);
     if !related {
         // Neither the holder's org nor the hardware's: the lease is invisible,
         // not merely forbidden.
         return Err(AuthzError::NotFound);
     }
-    if is_org_admin(db, subject).await {
-        return Ok(holder.key());
+    if is_admin_of(db, subject, acting).await {
+        return Ok(holder);
     }
     Err(AuthzError::Denied)
+}
+
+/// Whether `holder` belongs to `org`: its namespace for a node / named
+/// workload, membership for a user.
+async fn holder_org_is(db: &Db, holder: &SubjectKey, org: &OrgId) -> bool {
+    if holder.ns() == Some(org.0.as_str()) {
+        return true;
+    }
+    match crate::subject::user_of(holder) {
+        Some(user) => matches!(db.role_of(org, user).await, Ok(Some(_))),
+        None => false,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subject::testkit::{self, member};
     use fleet_core::policy::Policy;
     use fleet_proto::board::{Board, BoardState, PowerKind};
     use fleet_proto::ids::{BoardName, BoardRef, NodeId};
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use fleet_proto::token::AllowedOp;
+    use FleetRole::{Admin, Member};
 
-    fn org(name: &str) -> OrgId {
-        OrgId(name.to_owned())
+    fn node(org: &OrgId) -> NodeId {
+        crate::state::node_id_for(org, "node-1")
     }
 
-    fn user(org_name: &str, id: &str) -> Subject {
-        Subject::new(org(org_name), SubjectKind::User, id)
-    }
-
-    /// The node id the coordinator would mint for this org's node, via the
-    /// production constructor rather than a hand-rolled literal.
-    fn node(org_name: &str) -> NodeId {
-        crate::state::node_id_for(&org(org_name), "node-1")
-    }
-
-    fn board(org_name: &str, name: &str) -> Board {
+    fn board(org: &OrgId, name: &str) -> Board {
         Board {
-            id: BoardRef::new(org(org_name), node(org_name), name),
-            node: node(org_name),
+            id: BoardRef::new(org.clone(), node(org), name),
+            node: node(org),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec![],
@@ -271,45 +277,31 @@ mod tests {
         }
     }
 
-    async fn db_with(members: &[(&str, &str, Role)]) -> Db {
-        let db = Db::connect_in_memory().await.unwrap();
-        for (org_name, id, role) in members {
-            db.ensure_user_member(&org(org_name), id, *role)
-                .await
-                .unwrap();
-        }
-        db
-    }
-
     fn sched_with_lease(holder: &Subject) -> (Scheduler, LeaseId) {
-        sched_with_lease_on(holder, &holder.org.0)
+        sched_with_lease_on(holder, holder.org().unwrap())
     }
 
     /// A scheduler where `holder` holds a lease on a board in `board_org` —
     /// which under grants need not be the holder's own org.
-    fn sched_with_lease_on(holder: &Subject, board_org: &str) -> (Scheduler, LeaseId) {
+    fn sched_with_lease_on(holder: &Subject, board_org: &OrgId) -> (Scheduler, LeaseId) {
         let mut s = Scheduler::new(Policy::default());
-        let b = board(board_org, "b1");
-        s.upsert_board(b.clone());
-        // The scheduler only ever asks the access it is given; building one
-        // that admits this board is exactly what `board_access` would do for a
-        // member (same org) or a grantee (cross org).
-        let access = if board_org == holder.org.0 {
-            Access::own_org(holder.org.clone())
+        s.upsert_board(board(board_org, "b1"));
+        let access = if Some(board_org) == holder.org() {
+            Access::own_org(board_org.clone())
         } else {
             Access {
-                own_org: Some(holder.org.clone()),
+                member_of: holder.org().into_iter().cloned().collect(),
                 grants: vec![fleet_core::access::GrantScope {
                     id: "g1".to_owned(),
-                    org: org(board_org),
+                    org: board_org.clone(),
                     selector: Constraint::Id(BoardName("b1".to_owned())),
-                    ops: vec![fleet_proto::token::AllowedOp::Attach],
+                    ops: vec![AllowedOp::Attach],
                     expires: None,
                 }],
             }
         };
         let fleet_core::scheduler::LeaseDecision::Granted(g) = s.request_lease(
-            holder.clone(),
+            holder.key().clone(),
             fleet_core::scheduler::RequesterId::DETACHED,
             &access,
             lease_req("b1"),
@@ -320,86 +312,106 @@ mod tests {
         (s, g.lease)
     }
 
-    #[test]
-    fn same_org_denies_cross_org() {
-        assert!(same_org(&user("a", "alice"), &org("a")).is_ok());
-        assert_eq!(
-            same_org(&user("a", "alice"), &org("b")),
-            Err(AuthzError::Denied)
-        );
+    #[tokio::test]
+    async fn same_org_denies_cross_org() {
+        let db = testkit::db().await;
+        let alice = member(&db, "a", "alice", Member).await;
+        let b = testkit::org(&db, "b").await;
+        assert!(same_org(&alice, alice.org().unwrap()).is_ok());
+        assert_eq!(same_org(&alice, &b), Err(AuthzError::Denied));
     }
 
     #[tokio::test]
     async fn require_role_denies_non_member_and_lesser_role() {
-        let db = db_with(&[("a", "alice", Role::Member), ("a", "root", Role::Admin)]).await;
-        assert!(
-            require_role(&db, &user("a", "alice"), &org("a"), Role::Member)
-                .await
-                .is_ok()
-        );
+        let db = testkit::db().await;
+        let alice = member(&db, "a", "alice", Member).await;
+        let root = member(&db, "a", "root", Admin).await;
+        let a = alice.org().unwrap().clone();
+        assert!(require_role(&db, &alice, &a, Member).await.is_ok());
         assert_eq!(
-            require_role(&db, &user("a", "alice"), &org("a"), Role::Admin).await,
+            require_role(&db, &alice, &a, Admin).await,
             Err(AuthzError::Denied),
             "a member is not an admin"
         );
+        assert!(require_role(&db, &root, &a, Admin).await.is_ok());
+        let mallory = Subject::user(testkit::user(&db, "mallory").await, a.clone());
+        assert_eq!(
+            require_role(&db, &mallory, &a, Member).await,
+            Err(AuthzError::Denied),
+            "a non-member claiming the org is denied"
+        );
+    }
+
+    /// Everyone is always in an org: a fresh user administers their personal
+    /// org.
+    #[tokio::test]
+    async fn a_user_administers_their_personal_org() {
+        let db = testkit::db().await;
+        let u = testkit::user(&db, "alice").await;
+        let personal = db.personal_org(u).await.unwrap().unwrap();
         assert!(
-            require_role(&db, &user("a", "root"), &org("a"), Role::Admin)
+            require_role(&db, &Subject::user(u, personal.clone()), &personal, Admin)
                 .await
                 .is_ok()
         );
         assert_eq!(
-            require_role(&db, &user("a", "mallory"), &org("a"), Role::Member).await,
-            Err(AuthzError::Denied),
-            "a non-member is denied"
+            db.org_name(&personal).await.unwrap().as_deref(),
+            Some("alice")
         );
     }
 
-    /// Membership is a user-only concept, by construction rather than by
-    /// accident: node and workload subjects must be denied here even when the
-    /// same *id* holds a membership row as a user.
+    /// Membership is a user-only concept: node and workload subjects are denied
+    /// even when claiming an org.
     #[tokio::test]
     async fn non_user_subjects_are_denied_membership() {
-        let db = db_with(&[("a", "ci", Role::Admin)]).await;
-        for kind in [SubjectKind::Node, SubjectKind::Workload] {
-            let s = Subject::new(org("a"), kind, "ci");
+        let db = testkit::db().await;
+        let a = testkit::org(&db, "a").await;
+        let n = Subject::node(a.clone(), &node(&a)).unwrap();
+        let w = Subject::new(
+            SubjectKey::new(Some(&a.0), SubjectKind::Workload, "agent:ci").unwrap(),
+            Some(a.clone()),
+        );
+        for s in [n, w] {
             assert_eq!(
-                require_role(&db, &s, &org("a"), Role::Member).await,
+                require_role(&db, &s, &a, Member).await,
                 Err(AuthzError::Denied),
-                "{kind} subjects have no membership"
+                "{s} has no membership"
             );
         }
     }
 
     #[tokio::test]
     async fn holder_controls_its_own_lease() {
-        let alice = user("a", "alice");
-        let db = db_with(&[("a", "alice", Role::Member)]).await;
+        let db = testkit::db().await;
+        let alice = member(&db, "a", "alice", Member).await;
         let (sched, lease) = sched_with_lease(&alice);
         assert_eq!(
             require_lease_control(&db, &sched, &alice, lease).await,
-            Ok(alice.key())
+            Ok(alice.key().clone())
         );
     }
 
     #[tokio::test]
     async fn other_member_cannot_control_someone_elses_lease() {
-        let alice = user("a", "alice");
-        let db = db_with(&[("a", "alice", Role::Member), ("a", "bob", Role::Member)]).await;
+        let db = testkit::db().await;
+        let alice = member(&db, "a", "alice", Member).await;
+        let bob = member(&db, "a", "bob", Member).await;
         let (sched, lease) = sched_with_lease(&alice);
         assert_eq!(
-            require_lease_control(&db, &sched, &user("a", "bob"), lease).await,
+            require_lease_control(&db, &sched, &bob, lease).await,
             Err(AuthzError::Denied)
         );
     }
 
     #[tokio::test]
     async fn org_admin_may_override_and_gets_the_holders_key() {
-        let alice = user("a", "alice");
-        let db = db_with(&[("a", "alice", Role::Member), ("a", "root", Role::Admin)]).await;
+        let db = testkit::db().await;
+        let alice = member(&db, "a", "alice", Member).await;
+        let root = member(&db, "a", "root", Admin).await;
         let (sched, lease) = sched_with_lease(&alice);
         assert_eq!(
-            require_lease_control(&db, &sched, &user("a", "root"), lease).await,
-            Ok(alice.key()),
+            require_lease_control(&db, &sched, &root, lease).await,
+            Ok(alice.key().clone()),
             "the admin acts as the holder, not as itself"
         );
     }
@@ -408,28 +420,16 @@ mod tests {
     /// "no such lease".
     #[tokio::test]
     async fn cross_org_lease_is_indistinguishable_from_unknown() {
-        let alice = user("a", "alice");
-        let db = db_with(&[("a", "alice", Role::Member), ("b", "root", Role::Admin)]).await;
+        let db = testkit::db().await;
+        let alice = member(&db, "a", "alice", Member).await;
+        let intruder = member(&db, "b", "root", Admin).await;
         let (sched, lease) = sched_with_lease(&alice);
-        let intruder = user("b", "root");
         assert_eq!(
             require_lease_control(&db, &sched, &intruder, lease).await,
             Err(AuthzError::NotFound)
         );
         assert_eq!(
             require_lease_control(&db, &sched, &intruder, LeaseId(9999)).await,
-            Err(AuthzError::NotFound)
-        );
-    }
-
-    /// Same id, different org: still someone else.
-    #[tokio::test]
-    async fn same_id_in_another_org_cannot_control_the_lease() {
-        let alice_a = user("a", "alice");
-        let db = db_with(&[("a", "alice", Role::Member), ("b", "alice", Role::Admin)]).await;
-        let (sched, lease) = sched_with_lease(&alice_a);
-        assert_eq!(
-            require_lease_control(&db, &sched, &user("b", "alice"), lease).await,
             Err(AuthzError::NotFound)
         );
     }
@@ -442,30 +442,37 @@ mod tests {
     async fn seed_grant(
         db: &Db,
         org_name: &str,
-        to: &Subject,
+        to: &SubjectKey,
         selector: &str,
-        ops: &[fleet_proto::token::AllowedOp],
-        expires: Option<i64>,
-    ) -> String {
-        let id = crate::state::new_grant_id();
-        db.ensure_org(&org(org_name), "team").await.unwrap();
-        db.scoped(org(org_name))
-            .insert_grant(&id, &to.key(), selector, ops, expires, Some("alice"), 100)
+        ops: &[AllowedOp],
+        expires: Option<u64>,
+    ) {
+        let o = testkit::org(db, org_name).await;
+        db.forgs()
+            .scoped(crate::subject::ns_of(&o).unwrap())
+            .insert_grant(
+                &forgs_store::NewGrant {
+                    subject: crate::subject::to_forgs(to).unwrap(),
+                    selector: selector.to_owned(),
+                    ops: crate::state::join_ops(ops),
+                    expires,
+                    created_by: None,
+                },
+                100,
+            )
             .await
             .unwrap();
-        id
     }
 
     #[tokio::test]
     async fn board_access_carries_membership_and_grants() {
-        use fleet_proto::token::AllowedOp;
-
-        let db = db_with(&[("a", "alice", Role::Admin), ("b", "bob", Role::Member)]).await;
-        let bob = user("b", "bob");
+        let db = testkit::db().await;
+        member(&db, "a", "alice", Admin).await;
+        let bob = member(&db, "b", "bob", Member).await;
         seed_grant(
             &db,
             "a",
-            &bob,
+            bob.key(),
             "tag=nrf52",
             &[AllowedOp::Attach],
             Some(5_000),
@@ -473,83 +480,66 @@ mod tests {
         .await;
 
         let access = board_access(&db, &bob, 1_000).await;
-        assert_eq!(access.own_org, Some(org("b")), "membership leg");
+        let personal = db
+            .personal_org(bob.user_id().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            access.member_of.contains(bob.org().unwrap()),
+            "membership leg"
+        );
+        assert!(
+            access.member_of.contains(&personal),
+            "every org, not just the acting one"
+        );
         assert_eq!(access.grants.len(), 1, "grant leg");
-        assert_eq!(access.grants[0].org, org("a"));
+        assert_eq!(access.grants[0].org, testkit::org(&db, "a").await);
     }
 
-    /// A grant to somebody else must never show up in this subject's access —
-    /// the query is scoped by the authenticated subject key.
+    /// A grant to somebody else must never show up in this subject's access.
     #[tokio::test]
     async fn a_grant_to_another_subject_is_not_visible() {
-        use fleet_proto::token::AllowedOp;
-
-        let db = db_with(&[("a", "alice", Role::Admin), ("b", "bob", Role::Member)]).await;
-        let bob = user("b", "bob");
-        let mallory = user("b", "mallory");
-        seed_grant(&db, "a", &bob, "tag=nrf52", &[AllowedOp::Attach], None).await;
-
-        let access = board_access(&db, &mallory, 1_000).await;
-        assert!(access.grants.is_empty());
-    }
-
-    /// Same id, different org, is a different subject here too.
-    #[tokio::test]
-    async fn a_grant_does_not_follow_an_id_across_orgs() {
-        use fleet_proto::token::AllowedOp;
-
-        let db = db_with(&[("b", "alice", Role::Member), ("c", "alice", Role::Member)]).await;
-        seed_grant(
-            &db,
-            "a",
-            &user("b", "alice"),
-            "tag=nrf52",
-            &[AllowedOp::Attach],
-            None,
-        )
-        .await;
-
-        assert_eq!(
-            board_access(&db, &user("b", "alice"), 1_000)
-                .await
-                .grants
-                .len(),
-            1
-        );
-        assert!(board_access(&db, &user("c", "alice"), 1_000)
-            .await
-            .grants
-            .is_empty());
+        let db = testkit::db().await;
+        let bob = member(&db, "b", "bob", Member).await;
+        let mallory = member(&db, "b", "mallory", Member).await;
+        seed_grant(&db, "a", bob.key(), "tag=nrf52", &[AllowedOp::Attach], None).await;
+        assert!(board_access(&db, &mallory, 1_000).await.grants.is_empty());
     }
 
     #[tokio::test]
     async fn an_expired_grant_is_filtered_out() {
-        use fleet_proto::token::AllowedOp;
-
-        let db = db_with(&[("b", "bob", Role::Member)]).await;
-        let bob = user("b", "bob");
-        seed_grant(&db, "a", &bob, "tag=nrf52", &[AllowedOp::Attach], Some(500)).await;
-
+        let db = testkit::db().await;
+        let bob = member(&db, "b", "bob", Member).await;
+        seed_grant(
+            &db,
+            "a",
+            bob.key(),
+            "tag=nrf52",
+            &[AllowedOp::Attach],
+            Some(500),
+        )
+        .await;
         assert_eq!(board_access(&db, &bob, 400).await.grants.len(), 1);
         assert!(board_access(&db, &bob, 600).await.grants.is_empty());
     }
 
-    /// A corrupt row must be dropped closed, not widened into a match-anything
-    /// — the difference between "this grant is broken" and "this grant covers
-    /// the whole fleet".
+    /// A corrupt row must be dropped closed, not widened into a match-anything.
     #[tokio::test]
     async fn an_unparseable_grant_row_is_dropped_closed() {
-        let db = db_with(&[("b", "bob", Role::Member)]).await;
-        let bob = user("b", "bob");
-        db.ensure_org(&org("a"), "team").await.unwrap();
-
-        for (selector, ops) in [("", "attach"), ("colour=red", "attach"), ("tag=nrf52", "")] {
-            let id = crate::state::new_grant_id();
+        let db = testkit::db().await;
+        let bob = member(&db, "b", "bob", Member).await;
+        let a = testkit::org(&db, "a").await;
+        for (i, (selector, ops)) in [("", "attach"), ("colour=red", "attach"), ("tag=nrf52", "")]
+            .into_iter()
+            .enumerate()
+        {
             sqlx::query(
-                "INSERT INTO \"grant\" (id, org_id, subject, selector, ops, expires, created_by, created_at)
-                 VALUES (?1, 'a', ?2, ?3, ?4, NULL, NULL, 0)",
+                "INSERT INTO forgs_grant (id, ns_node_id, subject, selector, ops, expires, created_by, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 0)",
             )
-            .bind(&id)
+            .bind(forgs::GrantId::generate(u64::try_from(i).unwrap()).to_string())
+            .bind(&a.0)
             .bind(bob.key().to_string())
             .bind(selector)
             .bind(ops)
@@ -557,101 +547,93 @@ mod tests {
             .await
             .unwrap();
         }
-
-        let access = board_access(&db, &bob, 1_000).await;
         assert!(
-            access.grants.is_empty(),
+            board_access(&db, &bob, 1_000).await.grants.is_empty(),
             "every unparseable row must be dropped, not widened"
         );
     }
 
-    /// A non-member with no grant gets an empty access, which every handler
-    /// treats as a flat refusal.
-    #[tokio::test]
-    async fn a_stranger_gets_an_empty_access() {
-        let db = db_with(&[("a", "alice", Role::Member)]).await;
-        assert!(board_access(&db, &user("a", "mallory"), 1_000)
-            .await
-            .is_empty());
-    }
-
-    /// A node or workload subject has no membership row by construction (§6.1),
-    /// so a grant is the *only* way it reaches a board — and it does work.
+    /// A node or workload subject has no membership, so a grant is the *only*
+    /// way it reaches a board — and it does work.
     #[tokio::test]
     async fn a_workload_subject_reaches_boards_only_through_a_grant() {
-        use fleet_proto::token::AllowedOp;
-
-        let db = db_with(&[("a", "alice", Role::Admin)]).await;
-        let ci = Subject::new(org("b"), SubjectKind::Workload, "ci");
+        let db = testkit::db().await;
+        let ci = Subject::new(
+            forgs::subject::workload_subject_key("acme/fw")
+                .to_string()
+                .parse::<String>()
+                .ok()
+                .and_then(|s| SubjectKey::parse(&s))
+                .unwrap(),
+            None,
+        );
         assert!(board_access(&db, &ci, 1_000).await.is_empty());
-
         seed_grant(
             &db,
             "a",
-            &ci,
+            ci.key(),
             "tag=nrf52",
             &[AllowedOp::Flash, AllowedOp::Attach],
             None,
         )
         .await;
         let access = board_access(&db, &ci, 1_000).await;
-        assert!(access.own_org.is_none(), "no membership, by construction");
+        assert!(
+            access.member_of.is_empty(),
+            "no membership, by construction"
+        );
         assert_eq!(access.grants.len(), 1);
     }
 
-    /// §1.7: the board's org admin may control a lease a grantee is holding on
-    /// their hardware. Without this, sharing a board would mean losing control
-    /// of it until the lease lapses.
+    /// The board's org admin may control a lease a grantee is holding on their
+    /// hardware.
     #[tokio::test]
     async fn the_boards_org_admin_may_control_a_grantees_lease() {
-        let bob = user("b", "bob");
-        let db = db_with(&[
-            ("a", "root", Role::Admin),
-            ("a", "plain", Role::Member),
-            ("b", "bob", Role::Member),
-        ])
-        .await;
-        // bob (org b) holds a lease on org a's board, by grant.
-        let (sched, lease) = sched_with_lease_on(&bob, "a");
-
+        let db = testkit::db().await;
+        let root = member(&db, "a", "root", Admin).await;
+        let plain = member(&db, "a", "plain", Member).await;
+        let bob = member(&db, "b", "bob", Member).await;
+        let (sched, lease) = sched_with_lease_on(&bob, root.org().unwrap());
         assert_eq!(
-            require_lease_control(&db, &sched, &user("a", "root"), lease).await,
-            Ok(bob.key()),
+            require_lease_control(&db, &sched, &root, lease).await,
+            Ok(bob.key().clone()),
             "the hardware's owner can always reclaim it"
         );
         assert_eq!(
-            require_lease_control(&db, &sched, &user("a", "plain"), lease).await,
+            require_lease_control(&db, &sched, &plain, lease).await,
             Err(AuthzError::Denied),
             "a plain member of the board's org still may not"
         );
         assert_eq!(
             require_lease_control(&db, &sched, &bob, lease).await,
-            Ok(bob.key()),
-            "the holder, obviously"
+            Ok(bob.key().clone())
         );
     }
 
-    /// The holder's own org admin keeps the override too, even when the
-    /// hardware belongs to somebody else.
+    /// The holder's own org admin keeps the override on a cross-org lease.
     #[tokio::test]
     async fn the_holders_org_admin_still_overrides_on_a_cross_org_lease() {
-        let bob = user("b", "bob");
-        let db = db_with(&[("b", "bob", Role::Member), ("b", "boss", Role::Admin)]).await;
-        let (sched, lease) = sched_with_lease_on(&bob, "a");
+        let db = testkit::db().await;
+        let bob = member(&db, "b", "bob", Member).await;
+        let boss = member(&db, "b", "boss", Admin).await;
+        let a = testkit::org(&db, "a").await;
+        let (sched, lease) = sched_with_lease_on(&bob, &a);
         assert_eq!(
-            require_lease_control(&db, &sched, &user("b", "boss"), lease).await,
-            Ok(bob.key())
+            require_lease_control(&db, &sched, &boss, lease).await,
+            Ok(bob.key().clone())
         );
     }
 
     /// An unrelated third org still sees nothing at all.
     #[tokio::test]
     async fn an_unrelated_org_cannot_see_a_cross_org_lease() {
-        let bob = user("b", "bob");
-        let db = db_with(&[("b", "bob", Role::Member), ("c", "root", Role::Admin)]).await;
-        let (sched, lease) = sched_with_lease_on(&bob, "a");
+        let db = testkit::db().await;
+        let bob = member(&db, "b", "bob", Member).await;
+        let root = member(&db, "c", "root", Admin).await;
+        let a = testkit::org(&db, "a").await;
+        let (sched, lease) = sched_with_lease_on(&bob, &a);
         assert_eq!(
-            require_lease_control(&db, &sched, &user("c", "root"), lease).await,
+            require_lease_control(&db, &sched, &root, lease).await,
             Err(AuthzError::NotFound),
             "not found, not forbidden: no enumeration oracle"
         );

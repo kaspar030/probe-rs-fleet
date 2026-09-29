@@ -180,7 +180,7 @@ mod tests {
 
     /// The org this fixture's node and boards live in.
     fn test_org() -> OrgId {
-        OrgId(crate::state::DEFAULT_ORG_ID.to_owned())
+        crate::subject::org_of(forgs::NsNodeId::from_parts(1, 1))
     }
 
     /// The node id the coordinator would mint for this fixture's node.

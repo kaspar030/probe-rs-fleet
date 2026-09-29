@@ -82,7 +82,7 @@ pub async fn sweep_once(coord: &Coordinator) {
         let _ = scoped
             .append_audit(&AuditEntry {
                 ts: now_i64,
-                subject: Some(&freed.holder.key().to_string()),
+                subject: Some(&freed.holder.to_string()),
                 action: "lease.expire",
                 node: Some(freed.board.node.0.as_str()),
                 board: Some(freed.board.name.as_str()),
@@ -104,55 +104,15 @@ pub async fn sweep_once(coord: &Coordinator) {
         }
     }
 
-    // Expired user sessions are dead credentials; deleting them keeps the table
-    // from growing without bound and makes "how many live sessions are there"
-    // an answerable question. Expiry is *enforced* at verification time
-    // regardless — this is hygiene, not the security boundary.
-    match coord.db().delete_expired_sessions(now_i64).await {
-        Ok(0) => {}
-        Ok(n) => debug!(count = n, "expired sessions swept"),
-        Err(e) => warn!(error = %e, "failed to sweep expired sessions"),
-    }
-
-    // Refresh tokens (migration 0011), same hygiene argument as sessions: a
-    // refresh token past its `expires` is a dead credential — expiry is
-    // *enforced* at verification time by `verify_refresh_token`, so this is
-    // table upkeep, not the security boundary. It matters a little more than
-    // for sessions only because these rows live 30 days rather than 12 hours,
-    // so without the sweep the table accumulates one row per login per month.
-    match coord.db().delete_expired_refresh_tokens(now_i64).await {
-        Ok(0) => {}
-        Ok(n) => debug!(count = n, "expired refresh tokens swept"),
-        Err(e) => warn!(error = %e, "failed to sweep expired refresh tokens"),
-    }
-
-    // Same reasoning for pending node registrations (architecture §4.2 rung 3):
-    // expiry and single-use are *enforced* by the conditional statements in
-    // `state.rs`, so this is hygiene. It matters more here than for sessions,
-    // though, because `/node/register/start` is unauthenticated — the sweep is
-    // what returns capacity to `max_pending_nodes` after an abandoned or
-    // hostile burst. Consumed rows go too: a redeemed or denied code can never
-    // be used again, so keeping it buys nothing.
-    //
-    // One visible consequence, accepted: a *denied* row is a consumed row, so a
-    // sweep between the denial and the machine's next poll turns its
-    // `access_denied` into `expired_token`. The remediation is the same either
-    // way; see `http::node_register_poll`, which says so at the other end.
-    match coord.db().delete_expired_pending_nodes(now_i64).await {
-        Ok(0) => {}
-        Ok(n) => debug!(count = n, "spent pending node registrations swept"),
-        Err(e) => warn!(error = %e, "failed to sweep pending node registrations"),
-    }
-
-    // CI workload tokens (architecture §6.7). The same hygiene argument, with
-    // the volume turned up: one row per CI job makes this the highest-churn
-    // credential table in the schema, so without the sweep the table grows
-    // monotonically with the fleet's CI usage. Expiry is still *enforced* at
-    // verification time — a swept-or-not distinction is invisible to a caller.
-    match coord.db().delete_expired_workload_tokens(now_i64).await {
-        Ok(0) => {}
-        Ok(n) => debug!(count = n, "expired workload tokens swept"),
-        Err(e) => warn!(error = %e, "failed to sweep expired workload tokens"),
+    // Expired / spent credentials and pending approvals (sessions, refresh
+    // tokens, workload tokens, API keys, signups, device and node
+    // approvals) are forgs' rows. Expiry and single use are *enforced* at
+    // verification time, so this is hygiene — but it is also what returns
+    // capacity to `max_pending_nodes` after an abandoned or hostile burst of
+    // unauthenticated `/node/register/start` calls.
+    match coord.db().forgs().sweep(now).await {
+        Ok(counts) => debug!(?counts, "expired credentials swept"),
+        Err(e) => warn!(error = %e, "failed to sweep expired credentials"),
     }
 }
 
@@ -164,11 +124,12 @@ mod tests {
     use crate::config::{CoordinatorConfig, SigningKeySource};
     use crate::proto::{CoordToSidecar, SidecarToCoord};
     use crate::registry::{NodeHandle, NodeMessage};
-    use crate::state::DEFAULT_ORG_ID;
+    use crate::subject::testkit;
+    use crate::subject::{FleetRole, Subject};
     use fleet_core::policy::Policy;
     use fleet_core::scheduler::{RequesterId, Scheduler};
     use fleet_proto::board::{Board, BoardState, PowerKind};
-    use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Role, Subject, SubjectKind};
+    use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId};
     use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
@@ -182,15 +143,10 @@ mod tests {
         }
     }
 
-    fn org() -> OrgId {
-        OrgId(DEFAULT_ORG_ID.to_owned())
-    }
-
     fn config() -> CoordinatorConfig {
         CoordinatorConfig {
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(SEED),
-            default_org: org(),
             ..CoordinatorConfig::default()
         }
     }
@@ -200,15 +156,20 @@ mod tests {
     /// Built by the production constructor: the node registry, the board key
     /// and the `node` row must all agree on one id, and the only way to be
     /// sure a fixture agrees with production is to call what production calls.
-    fn node() -> NodeId {
-        crate::state::node_id_for(&org(), "node-a")
+    fn node(org: &OrgId) -> NodeId {
+        crate::state::node_id_for(org, "node-a")
     }
 
-    async fn coord_with_board(time: Arc<AtomicU64>) -> Coordinator {
+    /// A coordinator with one board in org `acme`, and alice a member.
+    async fn coord_with_board(time: Arc<AtomicU64>) -> (Coordinator, OrgId, Subject) {
+        let db = testkit::db().await;
+        let alice = testkit::member(&db, "acme", "alice", FleetRole::Member).await;
+        let org = testkit::org(&db, "acme").await;
+        let node = node(&org);
         let mut sched = Scheduler::new(Policy::default());
         sched.upsert_board(Board {
-            id: BoardRef::new(org(), node(), "b1"),
-            node: node(),
+            id: BoardRef::new(org.clone(), node.clone(), "b1"),
+            node: node.clone(),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec![],
@@ -216,28 +177,28 @@ mod tests {
             power: PowerKind::None,
             state: BoardState::Idle,
         });
-        let db = crate::state::Db::connect_in_memory().await.unwrap();
-        db.ensure_user_member(&org(), "alice", Role::Member)
+        db.scoped(org.clone())
+            .ensure_node(&node, 1000)
             .await
             .unwrap();
-        db.scoped(org()).ensure_node(&node(), 1000).await.unwrap();
-        Coordinator::new(
+        let coord = Coordinator::new(
             config(),
             sched,
             db,
             Ed25519Signer::from_seed(&SEED),
             Arc::new(TestClock(time)),
-        )
+        );
+        (coord, org, alice)
     }
 
     #[tokio::test]
     async fn sweep_expires_lease_and_commands_agent_cleanup() {
         let time = Arc::new(AtomicU64::new(1000));
-        let coord = coord_with_board(time.clone()).await;
+        let (coord, org, alice) = coord_with_board(time.clone()).await;
 
         // Register a node so cleanup is delivered.
         let (atx, mut arx) = mpsc::channel::<NodeMessage>(16);
-        coord.nodes().insert(node(), NodeHandle::new(atx)).await;
+        coord.nodes().insert(node(&org), NodeHandle::new(atx)).await;
 
         // alice grabs a short lease.
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
@@ -246,7 +207,6 @@ mod tests {
             duration_secs: 10,
             priority: Priority::Interactive,
         };
-        let alice = Subject::new(org(), SubjectKind::User, "alice");
         coord
             .handle_sidecar_message(
                 &alice,
@@ -257,7 +217,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)));
-        let scoped = coord.db().scoped(org());
+        let scoped = coord.db().scoped(org.clone());
         assert_eq!(scoped.open_lease_count().await.unwrap(), 1);
 
         // No expiry yet.
@@ -285,20 +245,14 @@ mod tests {
     #[tokio::test]
     async fn sweep_pushes_a_promotion_to_the_waiting_sidecar() {
         let time = Arc::new(AtomicU64::new(1000));
-        let coord = coord_with_board(time.clone()).await;
-        coord
-            .db()
-            .ensure_user_member(&org(), "bob", Role::Member)
-            .await
-            .unwrap();
+        let (coord, org, alice) = coord_with_board(time.clone()).await;
+        let bob = testkit::member(coord.db(), "acme", "bob", FleetRole::Member).await;
 
         let req = || LeaseRequest {
             select: Constraint::Id(BoardName("b1".to_owned())),
             duration_secs: 10,
             priority: Priority::Interactive,
         };
-        let alice = Subject::new(org(), SubjectKind::User, "alice");
-        let bob = Subject::new(org(), SubjectKind::User, "bob");
 
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
@@ -328,11 +282,11 @@ mod tests {
         sweep_once(&coord).await;
 
         match bob_rx.recv().await.unwrap() {
-            CoordToSidecar::Lease(g) => assert_eq!(g.holder, bob),
+            CoordToSidecar::Lease(g) => assert_eq!(&g.holder, bob.key()),
             other => panic!("expected a promotion push, got {other:?}"),
         }
         assert_eq!(
-            coord.db().scoped(org()).open_lease_count().await.unwrap(),
+            coord.db().scoped(org).open_lease_count().await.unwrap(),
             1,
             "alice's expired lease is closed, bob's promotion is open"
         );

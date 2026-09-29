@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fleet_core::policy::Policy;
-use fleet_proto::ids::OrgId;
 
 use crate::error::{CoordinatorError, Result};
 
@@ -35,74 +34,100 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
-/// The GitHub OAuth app the coordinator brokers user login with.
+/// Which kind of login provider a `[[auth.providers]]` entry configures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderKind {
+    /// `GitHub` (`OAuth2`; identity from `/user` + `/user/emails`).
+    Github,
+    /// Any `OpenID` Connect issuer (discovery + verified `id_token`).
+    Oidc,
+    /// Codeberg / any Forgejo instance (OIDC; `issuer` defaults to Codeberg).
+    Codeberg,
+    /// GitLab (OIDC; `issuer` defaults to gitlab.com).
+    Gitlab,
+}
+
+impl ProviderKind {
+    /// Parse the config label (`github` | `oidc` | `codeberg` | `gitlab`).
+    #[must_use]
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "github" => Some(Self::Github),
+            "oidc" => Some(Self::Oidc),
+            "codeberg" => Some(Self::Codeberg),
+            "gitlab" => Some(Self::Gitlab),
+            _ => None,
+        }
+    }
+}
+
+/// One configured login provider (`[[auth.providers]]`).
 ///
-/// **`OAuth2`, not OIDC.** GitHub user login has no discovery document, no ID
-/// token and no JWKS; both flows yield an *access token* and identity comes
-/// from `GET /user`. (GitHub Actions workload identity *is* real OIDC — a
-/// different verifier, a different task.)
-///
-/// Two front doors, one app: the CLI's device flow (RFC 8628, no `redirect_uri`
-/// at all) and the browser's authorization-code flow (`docs/web-ui.md` D1). The
-/// device flow needs no per-deployment registration; the browser one needs
-/// exactly one, which is what [`callback_registered`](Self::callback_registered)
-/// asserts. A deployment that skips it still has a working login — the web UI
-/// falls back to showing a device code — so the browser path is a nicety rather
-/// than a new requirement.
-///
-/// The endpoint URLs are configurable so the integration tests can point the
-/// flows at a loopback stub — the only way to exercise them without GitHub.
-#[derive(Debug, Clone)]
-pub struct GithubConfig {
-    /// The OAuth app's client id. Not a secret (it appears in the device-flow
-    /// request and in the browser redirect), but without it there is no flow.
+/// A provider **proves who you are; it does not name you**: login yields
+/// `(provider, immutable subject id, verified email)` and the username is
+/// chosen in fleet on first login (forgs' signup). `name` is the configured
+/// instance name and appears in URLs (`/auth/{name}/start`), so two instances
+/// of the same software are two providers whose subjects never mix.
+#[derive(Clone)]
+pub struct ProviderConfig {
+    /// Which adapter.
+    pub kind: ProviderKind,
+    /// Instance name (`github`, `codeberg`, `gitlab-work`): `[a-z0-9_-]`.
+    pub name: String,
+    /// OAuth client id. Public.
     pub client_id: String,
-    /// The OAuth app's client secret, when the app requires one.
-    ///
-    /// OAuth Apps do not need it for the device flow; some GitHub App
-    /// configurations do. It becomes **required** once
-    /// [`callback_registered`](Self::callback_registered) is true: GitHub's
-    /// token endpoint refuses the authorization-code exchange without it, and
-    /// GitHub implements no PKCE, so the secret is also what makes an
-    /// intercepted code unspendable. It never leaves this process.
-    pub client_secret: Option<String>,
-    /// The OAuth scope requested. Empty is correct for identity-only login:
-    /// `GET /user` needs no scope, and asking for more than we use is a
-    /// permission the user cannot get back.
-    pub scope: String,
-    /// `POST` endpoint that starts a device flow.
-    pub device_code_url: String,
-    /// `POST` endpoint that redeems a device code — or a browser authorization
-    /// code — for an access token.
-    pub access_token_url: String,
-    /// Base URL of the GitHub REST API (`GET {api_base}/user`).
-    pub api_base: String,
-    /// Browser-facing endpoint the `/auth/github/start` redirect targets.
-    ///
-    /// Overridable exactly like the three URLs above, for GitHub Enterprise or
-    /// a loopback test stub; that overridability is what lets the integration
-    /// tests exercise the browser flow at all.
+    /// OAuth client secret (`fleet-bin` resolves `client_secret_path`).
+    /// Required by every adapter: GitHub ignores PKCE, so the secret is what
+    /// makes an intercepted code unspendable.
+    pub client_secret: String,
+    /// The OIDC issuer. Required for `oidc`; overrides the preset for
+    /// `codeberg` / `gitlab`; for `github`, a GitHub Enterprise Server origin.
+    pub issuer: Option<String>,
+    /// GitHub only: explicit endpoints, for a loopback test stub. All three
+    /// or none.
+    pub github_endpoints: Option<GithubEndpoints>,
+}
+
+/// GitHub's three URLs, overridable as a unit (tests, GHES).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubEndpoints {
+    /// Browser-facing authorize endpoint.
     pub authorize_url: String,
-    /// The operator asserting that `<public_url>/auth/github/callback` is
-    /// registered as a callback URL in the OAuth app.
+    /// Code → access token.
+    pub access_token_url: String,
+    /// REST API base (`/user`, `/user/emails`).
+    pub api_base: String,
+}
+
+impl std::fmt::Debug for ProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderConfig")
+            .field("kind", &self.kind)
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("issuer", &self.issuer)
+            .field("github_endpoints", &self.github_endpoints)
+            .finish()
+    }
+}
+
+/// The `[auth]` table.
+#[derive(Debug, Clone, Default)]
+pub struct AuthConfig {
+    /// Login providers, offered on `/auth/login` and `/auth/providers`.
     ///
-    /// Browser authorization-code login is offered **only** when this is true.
-    /// It is the one per-deployment setup step the device flow did not need,
-    /// and nothing the coordinator can discover for itself — GitHub does not
-    /// expose an app's registered callbacks to the app. Default `false`, so a
-    /// deployment that has not done the registration falls back to the in-page
-    /// device-code login rather than sending every user into a redirect that
-    /// dead-ends on GitHub's "`redirect_uri` is not associated with this
-    /// application" page.
-    pub callback_registered: bool,
+    /// Empty is a supported deployment (air-gapped / development): users are
+    /// then created with `coordinator user-token`, and CLI device login has
+    /// no way to complete.
+    pub providers: Vec<ProviderConfig>,
 }
 
 /// The GitHub Actions OIDC issuer the coordinator accepts workload tokens
 /// from (architecture §6.7).
 ///
-/// **This one really is OIDC**, unlike [`GithubConfig`] above: signed JWTs, a
-/// JWKS endpoint, and claims to verify. The two are independent — a fleet may
-/// have CI without user login, or the reverse.
+/// Signed JWTs, a JWKS endpoint, and claims to verify. Independent of the
+/// login providers — a fleet may have CI without user login, or the reverse.
 #[derive(Debug, Clone)]
 pub struct GithubActionsConfig {
     /// The expected `iss` claim.
@@ -165,6 +190,9 @@ pub const DEFAULT_GHA_JWKS_URL: &str =
 /// hours is already generous for "one job".
 const MAX_WORKLOAD_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
 
+/// The default `default_org` name.
+pub const DEFAULT_ORG_NAME: &str = "default";
+
 /// Full coordinator configuration.
 #[derive(Debug, Clone)]
 pub struct CoordinatorConfig {
@@ -206,7 +234,7 @@ pub struct CoordinatorConfig {
     /// How long (seconds) a freshly minted **refresh token** is valid.
     ///
     /// Default 30 days, deliberately the same figure as
-    /// [`crate::http::MAX_API_AUTH_KEY_TTL_SECS`], which is already this tree's
+    /// the API-key TTL cap, which is already this tree's
     /// stated ceiling for "a durable bearer credential a member may hold". A
     /// refresh token is strictly weaker than an auth key — it mints only
     /// sessions, for one user, in one org, and enrolls nothing — so it does not
@@ -236,20 +264,21 @@ pub struct CoordinatorConfig {
     /// recoverable, unbounded growth in a table an unauthenticated caller
     /// controls is not.
     pub max_pending_nodes: i64,
-    /// The org an interim admin-minted subject is assigned to when none is
-    /// specified.
+    /// The **name** of the deployment's shared org, created at startup if
+    /// absent. The org the interim admin verbs default to when the operator
+    /// names none. Not consulted for any authenticated request: a user acts
+    /// in an org they name (default: their personal org), a node in its own
+    /// node's org.
+    pub default_org: String,
+    /// Login providers (`[[auth.providers]]`).
+    pub auth: AuthConfig,
+    /// The dedicated cookie/CSRF secret (≥ 32 bytes), loaded by `fleet-bin`
+    /// from `csrf_secret_path`. **Not** derived from the signing key.
     ///
-    /// Note this is **not** consulted for node connections: a node's org comes
-    /// from its own row, so a node token cannot be replayed into another tenant
-    /// (see `http::authenticate_request`).
-    pub default_org: OrgId,
-    /// The GitHub OAuth app backing `probe-rs-fleet login`.
-    ///
-    /// `None` is a supported deployment, not a broken one: an air-gapped or
-    /// development fleet bootstraps with `coordinator user-token` instead. The
-    /// `/auth/device/*` routes then answer a named `503`
-    /// (`device_flow_unconfigured`) so the CLI can say *why*.
-    pub github: Option<GithubConfig>,
+    /// `None` is refused by [`crate::build`]; a coordinator constructed
+    /// directly (tests) then gets a random per-process secret, so browser
+    /// sessions do not survive a restart.
+    pub csrf_secret: Option<Vec<u8>>,
     /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`
     /// (architecture §6.7).
     ///
@@ -315,63 +344,54 @@ impl CoordinatorConfig {
                     .to_owned(),
             ));
         }
-        if self.default_org.0.is_empty() {
-            return Err(CoordinatorError::Config(
-                "default_org must be non-empty".to_owned(),
-            ));
-        }
-        // `gha` is the reserved namespace a CI workload's subject key lives in
-        // (architecture §6.7, `fleet_proto::ids::WORKLOAD_NS_GHA`). Letting an
-        // operator point `default_org` at it would put real tenant objects in
-        // a namespace whose whole meaning is "not a tenant". This is the
-        // second belt; the first is `Db::ensure_org`, which refuses the id at
-        // *every* org-creation path — a reserved name only one of the two
-        // respects is a trap for the next change.
-        if self.default_org.0 == fleet_proto::ids::WORKLOAD_NS_GHA {
+        // Through forgs' own naming rules and reserved list — the same check
+        // every org-creation path applies, so a name only one path accepts
+        // cannot exist.
+        if let Err(e) = crate::state::fleet_schema().canonical_name(
+            crate::subject::ORG_KIND,
+            &self.default_org,
+            forgs::schema::NameOrigin::App,
+        ) {
             return Err(CoordinatorError::Config(format!(
-                "default_org must not be `{}`: that namespace is reserved for CI \
-                 workload subjects (architecture §6.7)",
-                fleet_proto::ids::WORKLOAD_NS_GHA
+                "default_org `{}` is not a usable org name: {e}",
+                self.default_org
             )));
         }
-        if let Some(gh) = &self.github {
-            // A `[github]` table with no client id would make `login` fail at
-            // GitHub with an opaque error, far from the mistake.
-            if gh.client_id.trim().is_empty() {
+        if let Some(secret) = &self.csrf_secret {
+            if secret.len() < 32 {
                 return Err(CoordinatorError::Config(
-                    "github.client_id must be non-empty when a [github] table is present"
-                        .to_owned(),
+                    "the CSRF secret must be at least 32 bytes".to_owned(),
                 ));
             }
+        }
+        let mut names: Vec<&str> = Vec::new();
+        for p in &self.auth.providers {
+            if names.contains(&p.name.as_str()) {
+                return Err(CoordinatorError::Config(format!(
+                    "auth.providers: duplicate provider name `{}`",
+                    p.name
+                )));
+            }
+            names.push(&p.name);
             for (label, value) in [
-                ("github.device_code_url", &gh.device_code_url),
-                ("github.access_token_url", &gh.access_token_url),
-                ("github.api_base", &gh.api_base),
-                // Joined to the three above rather than checked separately:
-                // an empty authorize endpoint is the same class of mistake,
-                // and it would surface as a 302 to a bare query string.
-                ("github.authorize_url", &gh.authorize_url),
+                ("name", &p.name),
+                ("client_id", &p.client_id),
+                ("client_secret", &p.client_secret),
             ] {
                 if value.trim().is_empty() {
                     return Err(CoordinatorError::Config(format!(
-                        "{label} must be non-empty"
+                        "auth.providers `{}`: {label} must be non-empty",
+                        p.name
                     )));
                 }
             }
-            // Opting into browser login without a secret is a login that always
-            // fails at its last step: GitHub's token endpoint refuses the
-            // authorization-code exchange without `client_secret`, and GitHub
-            // implements no PKCE, so there is no verifier standing in for it.
-            // Refused here, where the operator can act on it, rather than at
-            // the callback, where every user sees an opaque error.
-            if gh.callback_registered && gh.client_secret.is_none() {
-                return Err(CoordinatorError::Config(
-                    "github.client_secret is required when github.callback_registered = true: \
-                     GitHub refuses the authorization-code exchange without it (and implements \
-                     no PKCE). Set the secret, or set callback_registered = false to fall back \
-                     to the device flow."
-                        .to_owned(),
-                ));
+            if p.kind == ProviderKind::Oidc
+                && p.issuer.as_deref().is_none_or(|i| i.trim().is_empty())
+            {
+                return Err(CoordinatorError::Config(format!(
+                    "auth.providers `{}`: an `oidc` provider needs an issuer",
+                    p.name
+                )));
             }
         }
         if let Some(gha) = &self.github_actions {
@@ -426,10 +446,10 @@ impl CoordinatorConfig {
 
     /// The node-token rotation policy this configuration implies.
     #[must_use]
-    pub fn rotation_policy(&self) -> fleet_auth::RotationPolicy {
-        fleet_auth::RotationPolicy {
+    pub fn rotation_policy(&self) -> forgs::RotationPolicy {
+        forgs::RotationPolicy {
             max_age_secs: self.node_token_rotate_secs,
-            ..fleet_auth::RotationPolicy::DEFAULT
+            ..forgs::RotationPolicy::DEFAULT
         }
     }
 }
@@ -448,11 +468,12 @@ impl Default for CoordinatorConfig {
             pong_timeout_secs: 60,
             session_ttl_secs: 12 * 60 * 60,
             refresh_token_ttl_secs: 30 * 24 * 3600,
-            node_token_rotate_secs: fleet_auth::RotationPolicy::DEFAULT.max_age_secs,
+            node_token_rotate_secs: forgs::RotationPolicy::DEFAULT.max_age_secs,
             pending_node_ttl_secs: 15 * 60,
             max_pending_nodes: 256,
-            default_org: OrgId(crate::state::DEFAULT_ORG_ID.to_owned()),
-            github: None,
+            default_org: DEFAULT_ORG_NAME.to_owned(),
+            auth: AuthConfig::default(),
+            csrf_secret: None,
             github_actions: None,
         }
     }
@@ -538,7 +559,7 @@ mod tests {
         assert!(c.validate().is_err());
 
         let c = CoordinatorConfig {
-            default_org: OrgId(String::new()),
+            default_org: String::new(),
             ..CoordinatorConfig::default()
         };
         assert!(c.validate().is_err());
@@ -553,112 +574,52 @@ mod tests {
         assert_eq!(c.rotation_policy().max_age_secs, 3600);
     }
 
-    /// A `[github]` table without a client id is a configuration that starts
-    /// cleanly and then fails at GitHub with an opaque error, so it is rejected
-    /// here instead.
-    #[test]
-    fn github_table_requires_a_client_id_and_endpoints() {
-        let good = GithubConfig {
-            client_id: "Iv1.abc".to_owned(),
-            client_secret: None,
-            scope: String::new(),
-            device_code_url: "https://github.com/login/device/code".to_owned(),
-            access_token_url: "https://github.com/login/oauth/access_token".to_owned(),
-            api_base: "https://api.github.com".to_owned(),
-            authorize_url: "https://github.com/login/oauth/authorize".to_owned(),
-            callback_registered: false,
-        };
-        let c = CoordinatorConfig {
-            github: Some(good.clone()),
-            ..CoordinatorConfig::default()
-        };
-        assert!(c.validate().is_ok());
-
-        let c = CoordinatorConfig {
-            github: Some(GithubConfig {
-                client_id: "  ".to_owned(),
-                ..good.clone()
-            }),
-            ..CoordinatorConfig::default()
-        };
-        assert!(c.validate().is_err());
-
-        let c = CoordinatorConfig {
-            github: Some(GithubConfig {
-                api_base: String::new(),
-                ..good.clone()
-            }),
-            ..CoordinatorConfig::default()
-        };
-        assert!(c.validate().is_err());
-
-        // The browser flow's endpoint is checked with the other three: an empty
-        // one would 302 the user at a bare query string.
-        let c = CoordinatorConfig {
-            github: Some(GithubConfig {
-                authorize_url: "  ".to_owned(),
-                ..good
-            }),
-            ..CoordinatorConfig::default()
-        };
-        assert!(c.validate().is_err());
+    fn provider(kind: ProviderKind, name: &str) -> ProviderConfig {
+        ProviderConfig {
+            kind,
+            name: name.to_owned(),
+            client_id: "id".to_owned(),
+            client_secret: "secret".to_owned(),
+            issuer: None,
+            github_endpoints: None,
+        }
     }
 
-    /// `callback_registered = true` promises a browser login; without a client
-    /// secret that login always fails at its last step, because GitHub refuses
-    /// the authorization-code grant without one and implements no PKCE to stand
-    /// in for it. The failure is invisible until a real user tries to log in,
-    /// which is why it is a startup error.
     #[test]
-    fn callback_registered_requires_a_client_secret() {
-        let base = GithubConfig {
-            client_id: "Iv1.abc".to_owned(),
-            client_secret: None,
-            scope: String::new(),
-            device_code_url: "https://github.com/login/device/code".to_owned(),
-            access_token_url: "https://github.com/login/oauth/access_token".to_owned(),
-            api_base: "https://api.github.com".to_owned(),
-            authorize_url: "https://github.com/login/oauth/authorize".to_owned(),
-            callback_registered: true,
-        };
-        let c = CoordinatorConfig {
-            github: Some(base.clone()),
-            ..CoordinatorConfig::default()
-        };
-        let err = c.validate().unwrap_err().to_string();
-        assert!(err.contains("client_secret"), "{err}");
-        // The message has to carry the remediation, or an operator's only move
-        // is to guess which of the two knobs to turn.
-        assert!(err.contains("callback_registered = false"), "{err}");
-
-        // With a secret, the same table is valid.
-        let c = CoordinatorConfig {
-            github: Some(GithubConfig {
-                client_secret: Some("s3cret".to_owned()),
-                ..base.clone()
-            }),
-            ..CoordinatorConfig::default()
-        };
+    fn providers_need_credentials_unique_names_and_an_oidc_issuer() {
+        let mut c = CoordinatorConfig::default();
+        c.auth.providers = vec![provider(ProviderKind::Github, "github")];
         assert!(c.validate().is_ok());
-
-        // And a deployment that has not registered the callback needs none:
-        // the device flow is the fallback, and it asks for no secret.
-        let c = CoordinatorConfig {
-            github: Some(GithubConfig {
-                callback_registered: false,
-                ..base
-            }),
-            ..CoordinatorConfig::default()
-        };
+        c.auth
+            .providers
+            .push(provider(ProviderKind::Github, "github"));
+        assert!(c.validate().is_err(), "duplicate name");
+        c.auth.providers = vec![ProviderConfig {
+            client_secret: " ".to_owned(),
+            ..provider(ProviderKind::Github, "github")
+        }];
+        assert!(c.validate().is_err(), "no secret");
+        c.auth.providers = vec![provider(ProviderKind::Oidc, "sso")];
+        assert!(c.validate().is_err(), "oidc without issuer");
+        c.auth.providers[0].issuer = Some("https://sso.example".to_owned());
         assert!(c.validate().is_ok());
     }
 
-    /// No `[github]` table is a supported deployment (air-gapped / dev), not an
-    /// invalid one.
     #[test]
-    fn github_is_optional() {
-        assert!(CoordinatorConfig::default().github.is_none());
-        assert!(CoordinatorConfig::default().validate().is_ok());
+    fn a_short_csrf_secret_is_refused() {
+        let mut c = CoordinatorConfig {
+            csrf_secret: Some(vec![1; 31]),
+            ..CoordinatorConfig::default()
+        };
+        assert!(c.validate().is_err());
+        c.csrf_secret = Some(vec![1; 32]);
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn provider_debug_redacts_the_secret() {
+        let p = provider(ProviderKind::Gitlab, "gitlab");
+        assert!(!format!("{p:?}").contains("secret\""));
     }
 
     /// A `[github_actions]` table must name an audience. Accepting GitHub's
@@ -706,13 +667,12 @@ mod tests {
     }
 
     /// `gha` is the reserved namespace CI workload subjects live in, so it must
-    /// not also be a tenant id. This is the config half of the fence;
-    /// `Db::ensure_org` is the other half, and both are needed — a reserved
-    /// name that only one creation path respects is worse than none.
+    /// not also be an org. The same forgs schema check guards every creation
+    /// path.
     #[test]
     fn default_org_may_not_be_the_reserved_workload_namespace() {
         let c = CoordinatorConfig {
-            default_org: OrgId(fleet_proto::ids::WORKLOAD_NS_GHA.to_owned()),
+            default_org: "gha".to_owned(),
             ..CoordinatorConfig::default()
         };
         assert!(c.validate().is_err());

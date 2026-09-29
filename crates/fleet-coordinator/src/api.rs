@@ -76,8 +76,8 @@
 //!   deliberate and lives in the cores. See [`create_grant`].
 //! * `POST /api/v1/auth-keys` / `DELETE /api/v1/auth-keys/{hash_prefix}` —
 //!   minting and revoking enrollment credentials, by **calling**
-//!   [`crate::http::create_auth_key`] / [`crate::http::revoke_auth_key`]
-//!   unchanged. See [`create_auth_key`].
+//!   [`forgs_http::keys::create`] / [`forgs_http::keys::revoke`] — the same
+//!   functions forgs' `/auth/keys` uses. See [`create_auth_key`].
 //! * `POST /api/v1/boards/power-cycle` — the one [`fleet_proto::token::AllowedOp`]
 //!   the *coordinator* enforces; see [`power_cycle`].
 //! * `DELETE /api/v1/leases/{lease_id}` — holder-or-admin lease release,
@@ -88,7 +88,7 @@
 //! equivalent (`docs/web-ui.md` D4): a lease taken in a browser has no sidecar
 //! to use it, and delegation hands out a capability token.
 //!
-//! Every one of them calls [`csrf_ok`] before touching anything, and the check
+//! Every one of them calls [`mutating_auth`] (forgs' `require_csrf`) before touching anything, and the check
 //! is a single shared helper rather than a per-handler line of code precisely
 //! so that "did this handler remember?" is answerable by grep.
 //!
@@ -114,26 +114,29 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use fleet_auth::api::NodeApprovalDecision;
-use fleet_auth::TokenKind;
+use forgs::TokenKind;
+use forgs_http::{Caller, Carrier};
+
 use fleet_proto::admin::{
     BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine,
 };
 use fleet_proto::adopt::AdoptPolicy;
+use fleet_proto::auth_api::NodeApprovalDecision;
 use fleet_proto::board::PowerKind;
-use fleet_proto::ids::{BoardName, BoardRef, LeaseId, Role, Subject, SubjectKey};
+use fleet_proto::ids::{BoardName, BoardRef, LeaseId, SubjectKey};
 use fleet_proto::token::AllowedOp;
 
-use crate::browser_auth::{cleared_session_cookies, csrf_ok};
 use crate::core::{Coordinator, NodeStatus, OpError};
-use crate::http::{authenticate_request_with, parse_adopt, reject, valid_tags, Arrival, Carrier};
+use crate::http::{parse_adopt, reject, valid_tags};
+use crate::identity::{CiKeyPayload, NodeKeyPayload, PURPOSE_CI, PURPOSE_NODE};
+use crate::subject::{FleetRole, Subject};
 
 /// Build the `/api/v1` router, merged into the coordinator's by
 /// [`crate::http::router`].
@@ -164,31 +167,44 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
         .route("/api/v1/auth-keys", get(auth_keys).post(create_auth_key))
         .route("/api/v1/auth-keys/{hash_prefix}", delete(revoke_auth_key))
         .route("/api/v1/audit", get(audit))
-        .merge(crate::browser_auth::api_routes())
 }
 
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------
 
-/// Authenticate an `/api/v1` request, accepting the session cookie.
+/// An authenticated `/api/v1` caller and the org it acts in.
+struct ApiCall {
+    caller: Caller,
+    subject: Subject,
+}
+
+/// Authenticate an `/api/v1` request, accepting the session cookie, and
+/// resolve the acting org (`?org=`, default the personal org; membership
+/// checked).
 ///
-/// The one place this surface builds a caller from wire input, and it does so
-/// by delegating to [`authenticate_request_with`] — still the only `Subject`
-/// construction site in the coordinator. `TokenKind::Session` only: a node or
-/// workload token has no business on the browser API, and saying so explicitly
-/// beats relying on the absence of a membership row.
+/// Authentication is forgs' [`forgs_http::authenticate_request`] — still the
+/// only place a caller is built from wire input. `TokenKind::Session` only: a
+/// node or workload token has no business on the browser API. The cookie is
+/// accepted only because `uri`'s path lies under the configured
+/// `cookie_api_prefix` (`/api/v1/`), which forgs checks.
 async fn api_auth(
     coord: &Coordinator,
+    uri: &Uri,
     headers: &HeaderMap,
-) -> Result<(fleet_auth::Authenticated, Subject, Arrival), Response> {
-    authenticate_request_with(
+    query: Option<&str>,
+) -> Result<ApiCall, Response> {
+    let caller = crate::http::authenticate(
         coord,
         headers,
+        uri.path(),
         &[TokenKind::Session],
-        Carrier::HeaderOrCookie,
+        Carrier::ApiCookie,
     )
-    .await
+    .await?;
+    let org = crate::http::org_param(query);
+    let subject = crate::http::acting_subject(coord, &caller, org.as_deref()).await?;
+    Ok(ApiCall { caller, subject })
 }
 
 /// Authenticate a **mutating** `/api/v1` call: [`api_auth`] plus the CSRF gate.
@@ -202,22 +218,45 @@ async fn api_auth(
 /// routes is the whole audit.
 ///
 /// The check is a no-op for a bearer-authenticated call, because that
-/// credential is not ambient; [`csrf_ok`] owns that distinction.
+/// credential is not ambient; [`forgs_http::auth::require_csrf`] owns that
+/// distinction. The CSRF check runs **before** the acting org is resolved, so
+/// a forged request learns nothing about memberships.
 async fn mutating_auth(
     coord: &Coordinator,
+    method: &Method,
+    uri: &Uri,
     headers: &HeaderMap,
-) -> Result<(fleet_auth::Authenticated, Subject), Response> {
-    let (auth, subject, arrival) = api_auth(coord, headers).await?;
-    if !csrf_ok(
+    query: Option<&str>,
+) -> Result<ApiCall, Response> {
+    let caller = crate::http::authenticate(
         coord,
         headers,
-        auth.hash.as_str(),
-        arrival == Arrival::Cookie,
-    ) {
-        warn!(subject = %auth.id, "a cookie-authenticated mutating call had no valid CSRF header");
-        return Err(reject(StatusCode::FORBIDDEN, "forbidden"));
+        uri.path(),
+        &[TokenKind::Session],
+        Carrier::ApiCookie,
+    )
+    .await?;
+    // A mutating route is never GET; treat any method as mutating here so a
+    // mis-routed GET cannot skip the gate.
+    let method = if matches!(*method, Method::GET | Method::HEAD) {
+        &Method::POST
+    } else {
+        method
+    };
+    if let Err(response) =
+        forgs_http::auth::require_csrf(coord.auth(), method, headers, &caller).await
+    {
+        warn!(subject = %caller.auth.subject, "a cookie-authenticated mutating call had no valid CSRF header");
+        return Err(response);
     }
-    Ok((auth, subject))
+    let org = crate::http::org_param(query);
+    let subject = crate::http::acting_subject(coord, &caller, org.as_deref()).await?;
+    Ok(ApiCall { caller, subject })
+}
+
+/// Map a forgs service error onto the one rejection shape.
+fn api_error(e: &forgs_http::ApiError) -> Response {
+    reject(e.status(), e.code())
 }
 
 /// Turn an [`OpError`] into the uniform JSON rejection.
@@ -349,14 +388,15 @@ impl From<&BoardRef> for BoardKeyView {
 #[derive(Debug, Serialize)]
 struct SubjectView {
     key: String,
-    org: String,
+    /// The namespace part of the key, if any (`null` for a user).
+    org: Option<String>,
     kind: String,
     id: String,
 }
 
 impl From<&Subject> for SubjectView {
     fn from(subject: &Subject) -> Self {
-        Self::from(&subject.key())
+        Self::from(subject.key())
     }
 }
 
@@ -364,9 +404,9 @@ impl From<&SubjectKey> for SubjectView {
     fn from(key: &SubjectKey) -> Self {
         Self {
             key: key.to_string(),
-            org: key.org.0.clone(),
-            kind: key.kind.to_string(),
-            id: key.id.clone(),
+            org: key.ns().map(str::to_owned),
+            kind: key.kind().to_string(),
+            id: key.id().to_owned(),
         }
     }
 }
@@ -493,7 +533,7 @@ impl From<NodeStatus> for NodeView {
             name: n.row.name,
             tags: n.row.tags,
             adopt: n.row.adopt.as_str(),
-            owner: n.row.owner_user_id,
+            owner: n.row.owner_user_id.map(|u| u.to_string()),
             last_seen: n.row.last_seen,
             created_at: n.row.created_at,
             online: n.online,
@@ -505,31 +545,34 @@ impl From<NodeStatus> for NodeView {
 /// `GET /api/v1/session`'s body.
 #[derive(Debug, Serialize)]
 struct SessionView {
-    user: String,
-    /// The cached GitHub login, for display. `None` for a user created by the
-    /// interim `coordinator user-token` verb.
-    login: Option<String>,
-    org: String,
-    org_slug: Option<String>,
-    role: &'static str,
-    /// The session row's expiry. The UI needs it to bounce to a fresh login
-    /// *before* the next call 401s; there is no silent refresh in v1
-    /// (`docs/web-ui.md` D1).
+    /// The immutable user id (`ULID`).
+    user_id: String,
+    /// The current username, for display.
+    username: Option<String>,
+    /// Every org the user is a member of, with its name and the user's role.
+    memberships: Vec<MembershipView>,
+    /// The org this request acted in (`?org=`, default the personal org), or
+    /// `null` when that org is not one the user belongs to.
+    org: Option<OrgView>,
+    /// The session's expiry. The UI needs it to bounce to a fresh login
+    /// *before* the next call 401s (`docs/web-ui.md` D1).
     expires: Option<u64>,
+}
+
+/// One membership of `GET /api/v1/session`.
+#[derive(Debug, Serialize)]
+struct MembershipView {
+    id: String,
+    name: Option<String>,
+    role: &'static str,
 }
 
 /// `GET /api/v1/org`'s body.
 #[derive(Debug, Serialize)]
 struct OrgView {
     id: String,
-    slug: Option<String>,
-    /// `personal` | `team` | `system`, read from the `org` row's own column.
-    ///
-    /// Read rather than assumed: every production creation path writes
-    /// `personal` today, so a constant would be *currently* correct — and
-    /// silently wrong the first time a team org exists, in a field whose name
-    /// promises it reports the column.
-    kind: Option<String>,
+    /// The org's current path (display name).
+    name: Option<String>,
     role: &'static str,
 }
 
@@ -537,7 +580,7 @@ struct OrgView {
 #[derive(Debug, Serialize)]
 struct MemberView {
     user_id: String,
-    login: Option<String>,
+    username: Option<String>,
     role: &'static str,
 }
 
@@ -664,90 +707,141 @@ impl From<GrantSummary> for GrantView {
 
 /// `GET /api/v1/session` — who the caller is.
 ///
-/// The first call any page makes. Membership is not required: a session whose
-/// membership was revoked must still be able to learn that it has none, or the
-/// UI has no way to render anything but a blank 403.
-async fn session(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (auth, subject, _) = match api_auth(&coord, &headers).await {
-        Ok(v) => v,
+/// The first call any page makes. Membership in the requested org is **not**
+/// required: a session whose membership was revoked must still be able to
+/// learn that it has none, or the UI has no way to render anything but a
+/// blank 403. `org` is then `null`.
+async fn session(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let caller = match crate::http::authenticate(
+        &coord,
+        &headers,
+        uri.path(),
+        &[TokenKind::Session],
+        Carrier::ApiCookie,
+    )
+    .await
+    {
+        Ok(c) => c,
         Err(response) => return response,
     };
-    let role = match coord.db().role_of(&subject.org, &auth.id).await {
-        Ok(role) => role,
+    let Some(user) = caller.user_id() else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    let username = match coord.db().forgs().user_by_id(user).await {
+        Ok(u) => u.map(|u| u.username),
         Err(e) => {
-            warn!(error = %e, "failed to resolve membership");
+            warn!(error = %e, "failed to resolve a username for display");
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
-    let login = match coord.db().user_login(&auth.id).await {
-        Ok(login) => login,
+    let orgs = match coord.db().orgs_of_user(user).await {
+        Ok(orgs) => orgs,
         Err(e) => {
-            warn!(error = %e, "failed to resolve a login for display");
+            warn!(error = %e, "failed to list memberships");
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
-    let org_slug = match coord.db().org_slug(&subject.org).await {
-        Ok(slug) => slug,
-        Err(e) => {
-            warn!(error = %e, "failed to resolve an org slug");
-            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    let mut memberships = Vec::with_capacity(orgs.len());
+    for (org, role) in orgs {
+        memberships.push(MembershipView {
+            name: coord.db().org_name(&org).await.ok().flatten(),
+            id: org.0,
+            role: role.as_str(),
+        });
+    }
+    // The acting org, if the caller may act in it; a refusal is not an error
+    // here (see above).
+    let requested = crate::http::org_param(query.as_deref());
+    let org = match crate::http::acting_subject(&coord, &caller, requested.as_deref()).await {
+        Ok(subject) => {
+            let org = subject.org().cloned();
+            match org {
+                Some(org) => memberships.iter().find(|m| m.id == org.0).map(|m| OrgView {
+                    id: m.id.clone(),
+                    name: m.name.clone(),
+                    role: m.role,
+                }),
+                None => None,
+            }
         }
+        Err(_) => None,
     };
     Json(SessionView {
-        user: auth.id.clone(),
-        login,
-        org: subject.org.0.clone(),
-        org_slug,
-        role: role.map_or("none", Role::as_str),
-        expires: auth.expires,
+        user_id: user.to_string(),
+        username,
+        memberships,
+        org,
+        expires: caller.auth.expires,
     })
     .into_response()
 }
 
 /// `POST /api/v1/session/logout` — destroy the caller's own session.
 ///
-/// Phase 1a's only mutating route, and the first consumer of the CSRF check;
-/// see the module documentation. It deletes exactly the row the caller
-/// authenticated with — never one named in the request — so the worst a
-/// successful forgery could achieve is logging somebody out.
+/// Deletes exactly the row the caller authenticated with — never one named in
+/// the request — so the worst a successful forgery could achieve is logging
+/// somebody out (and the CSRF gate stops that too).
 ///
 /// `204` with both cookies cleared, whether or not the row was there: a
 /// caller must not be able to distinguish "logged out" from "already gone".
-async fn logout(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (auth, _subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
+/// A storage failure, however, is a `500`: the session is still live.
+async fn logout(
+    State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let caller = match crate::http::authenticate(
+        &coord,
+        &headers,
+        uri.path(),
+        &[TokenKind::Session],
+        Carrier::ApiCookie,
+    )
+    .await
+    {
+        Ok(c) => c,
         Err(response) => return response,
     };
-    if let Err(e) = coord.db().delete_session(auth.hash.as_str()).await {
-        warn!(error = %e, "failed to delete a session on logout");
-        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    if let Err(response) =
+        forgs_http::auth::require_csrf(coord.auth(), &method, &headers, &caller).await
+    {
+        return response;
     }
-    let mut response = StatusCode::NO_CONTENT.into_response();
-    for cookie in cleared_session_cookies() {
-        if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
-            response
-                .headers_mut()
-                .append(axum::http::header::SET_COOKIE, value);
-        }
+    let request = forgs::api::LogoutRequest::default();
+    if let Err(e) = forgs_http::session::logout(coord.auth(), &caller, &request).await {
+        return api_error(&e);
     }
-    response
+    forgs_http::cookies::with_cookies(
+        StatusCode::NO_CONTENT.into_response(),
+        &forgs_http::cookies::cleared_session_cookies(coord.auth()),
+    )
 }
 
-/// `GET /api/v1/org` — the caller's org.
+/// `GET /api/v1/org` — the acting org.
 ///
-/// Member-gated: an authenticated non-member learns nothing about the org its
-/// session names, which is the same answer `require_role` gives everywhere
-/// else.
-async fn org(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+/// Member-gated by [`api_auth`]'s acting-org resolution: an authenticated
+/// non-member learns nothing about the org it names.
+async fn org(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { caller, subject } = match api_auth(&coord, &uri, &headers, query.as_deref()).await
+    {
         Ok(v) => v,
         Err(response) => return response,
     };
-    let org = subject.org.clone();
-    let Ok(()) = crate::authz::require_role(coord.db(), &subject, &org, Role::Member).await else {
+    let (Some(org), Some(user)) = (subject.org().cloned(), caller.user_id()) else {
         return reject(StatusCode::FORBIDDEN, "forbidden");
     };
-    let role = match coord.db().role_of(&org, &subject.id).await {
+    let role = match coord.db().role_of(&org, user).await {
         Ok(Some(role)) => role,
         Ok(None) => return reject(StatusCode::FORBIDDEN, "forbidden"),
         Err(e) => {
@@ -755,30 +849,30 @@ async fn org(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Respo
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
-    let (slug, kind) = match coord.db().org_slug_and_kind(&org).await {
-        // An org a live session names but no `org` row backs is not a
-        // condition to paper over with defaults; it cannot happen (`session`
-        // carries a foreign key onto `org`), and if it ever does the honest
-        // answer is nulls rather than an invented `personal`.
-        Ok(Some((slug, kind))) => (Some(slug), Some(kind)),
-        Ok(None) => (None, None),
+    let name = match coord.db().org_name(&org).await {
+        Ok(name) => name,
         Err(e) => {
-            warn!(error = %e, "failed to resolve an org slug");
+            warn!(error = %e, "failed to resolve an org name");
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
     Json(OrgView {
-        id: org.0.clone(),
-        slug,
-        kind,
+        id: org.0,
+        name,
         role: role.as_str(),
     })
     .into_response()
 }
 
-/// `GET /api/v1/org/members` — the org's membership, read-only in v1.
-async fn org_members(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+/// `GET /api/v1/org/members` — the org's membership, read-only in v1
+/// (management is forgs' `/auth/members`).
+async fn org_members(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -787,8 +881,8 @@ async fn org_members(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) 
             members
                 .into_iter()
                 .map(|m| MemberView {
-                    user_id: m.user_id,
-                    login: m.login,
+                    user_id: m.user_id.to_string(),
+                    username: m.username,
                     role: m.role.as_str(),
                 })
                 .collect::<Vec<_>>(),
@@ -811,8 +905,13 @@ async fn org_members(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) 
 /// `id` and `adopt` are already flattened to strings) and must be free to
 /// evolve on the browser's schedule rather than on `PROTOCOL_VERSION`'s. The
 /// two renderings happen to agree today; that is not a guarantee either way.
-async fn nodes(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+async fn nodes(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -873,13 +972,17 @@ struct NodePatch {
 async fn update_node(
     State(coord): State<Arc<Coordinator>>,
     Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let Ok(patch) = serde_json::from_slice::<NodePatch>(&body) else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
@@ -924,12 +1027,16 @@ async fn update_node(
 async fn delete_node(
     State(coord): State<Arc<Coordinator>>,
     Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     match coord.delete_node_core(&subject, &name).await {
         Ok(_id) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => op_error(&e),
@@ -988,36 +1095,29 @@ struct PendingDecision {
 async fn decide_pending(
     State(coord): State<Arc<Coordinator>>,
     Path(code): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let (auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let Ok(request) = serde_json::from_slice::<PendingDecision>(&body) else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
-
-    let org = subject.org.clone();
-    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-    // Membership, checked exactly as `node_register_approve` checks it, down to
-    // the audit action: two surfaces onto one ceremony must not disagree about
-    // who may perform it, nor leave two differently-named rows in the log.
-    if let Err(response) =
-        crate::http::require_membership_to_approve(&coord, &org, &auth.id, now).await
-    {
-        return response;
-    }
-
+    // Membership in the acting org was checked by `mutating_auth`, exactly
+    // as `POST /node/register/approve` checks it: two surfaces onto one
+    // ceremony must not disagree about who may perform it.
     let response = crate::http::decide_pending_node(
         &coord,
-        &org,
-        &auth.id,
+        &subject,
         &code,
         request.decision,
         request.replace,
-        now,
     )
     .await;
     decorate_pending(response, request.decision).await
@@ -1036,7 +1136,7 @@ pub(crate) const APPROVAL_WARNING: &str =
 /// Attach [`APPROVAL_WARNING`] to a successful `inspect` response.
 ///
 /// Done by re-shaping the JSON rather than by widening
-/// `fleet_auth::api::NodeApprovalResponse`: that type is the **wire** contract
+/// `fleet_proto::auth_api::NodeApprovalResponse`: that type is the **wire** contract
 /// the CLI parses, and growing it for the browser's benefit would put a
 /// browser-shaped field in the shared crate — the drift `docs/web-ui.md` D2
 /// exists to prevent. A non-200, or a body that is not the object we expect, is
@@ -1064,8 +1164,13 @@ async fn decorate_pending(response: Response, decision: NodeApprovalDecision) ->
 }
 
 /// `GET /api/v1/boards` — the same inventory `ctl list` renders.
-async fn boards(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+async fn boards(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -1076,8 +1181,13 @@ async fn boards(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Re
 }
 
 /// `GET /api/v1/leases` — the same table `ctl who` renders.
-async fn leases(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+async fn leases(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -1105,13 +1215,17 @@ async fn leases(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Re
 /// A board in another tenant is a `404`, identical to one that does not exist.
 async fn power_cycle(
     State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let Ok(request) = serde_json::from_slice::<PowerCycleRequest>(&body) else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
@@ -1160,12 +1274,16 @@ struct PowerCycledView {
 async fn release_lease(
     State(coord): State<Arc<Coordinator>>,
     Path(lease_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let Ok(lease) = lease_id.parse::<u64>() else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
@@ -1190,8 +1308,13 @@ struct ReleasedView {
 ///
 /// This is the outbound view. There is deliberately no "what am I granted?"
 /// endpoint; `GET /api/v1/boards` is the grantee-facing one.
-async fn grants(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+async fn grants(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };
@@ -1205,13 +1328,21 @@ async fn grants(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Re
 ///
 /// See [`GrantLimitsView`] for why this is a route rather than prose in
 /// `docs/web-ui.md`. Member-gated, like the listing it describes.
-async fn grant_limits(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+async fn grant_limits(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };
-    let org = subject.org.clone();
-    let Ok(()) = crate::authz::require_role(coord.db(), &subject, &org, Role::Member).await else {
+    let Some(org) = subject.org().cloned() else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    let Ok(()) = crate::authz::require_role(coord.db(), &subject, &org, FleetRole::Member).await
+    else {
         return reject(StatusCode::FORBIDDEN, "forbidden");
     };
     Json(GrantLimitsView {
@@ -1219,8 +1350,8 @@ async fn grant_limits(State(coord): State<Arc<Coordinator>>, headers: HeaderMap)
         expires_optional: false,
         now: coord.now(),
         ops: AllowedOp::all().into_iter().map(OpView::from).collect(),
-        min_revoke_prefix: crate::http::MIN_AUTH_KEY_PREFIX_LEN,
-        auth_key_max_ttl_secs: crate::http::MAX_API_AUTH_KEY_TTL_SECS,
+        min_revoke_prefix: forgs_http::keys::MIN_PREFIX_LEN,
+        auth_key_max_ttl_secs: coord.auth().ttl().api_key_max,
     })
     .into_response()
 }
@@ -1270,13 +1401,17 @@ struct GrantRequest {
 /// rather than a silently dropped op.
 async fn create_grant(
     State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let Ok(request) = serde_json::from_slice::<GrantRequest>(&body) else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
@@ -1319,12 +1454,16 @@ async fn create_grant(
 async fn revoke_grant(
     State(coord): State<Arc<Coordinator>>,
     Path(id_prefix): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    let (_auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     match coord.grant_revoke_core(&subject, &id_prefix).await {
         Ok(ids) => Json(RevokedGrantsView { revoked: ids }).into_response(),
         Err(e) => op_error(&e),
@@ -1341,24 +1480,29 @@ struct RevokedGrantsView {
 
 /// `GET /api/v1/auth-keys` — the org's enrollment keys, **hashes only**.
 ///
-/// Membership suffices, exactly as on `POST /auth/keys`: the check is
-/// [`crate::http::require_membership_for_auth_keys`], shared with that route so
+/// Membership suffices, exactly as on forgs' `/auth/keys`: the check is
+/// [`forgs_http::keys::list`]'s, shared with that route so
 /// the two surfaces cannot disagree about who may look, nor leave two
 /// differently-named refusals in the audit log. The listing carries no secret —
 /// only a key's SHA-256 is stored at all.
-async fn auth_keys(State(coord): State<Arc<Coordinator>>, headers: HeaderMap) -> Response {
-    let (auth, subject, _) = match api_auth(&coord, &headers).await {
+async fn auth_keys(
+    State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { caller, subject } = match api_auth(&coord, &uri, &headers, query.as_deref()).await
+    {
         Ok(v) => v,
         Err(response) => return response,
     };
-    let org = subject.org.clone();
-    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-    if let Err(response) =
-        crate::http::require_membership_for_auth_keys(&coord, &org, &auth.id, now).await
-    {
-        return response;
+    let (Some(org), Some(user)) = (subject.org(), caller.user_id()) else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    match forgs_http::keys::list(coord.auth(), user, &org.0).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => api_error(&e),
     }
-    crate::http::list_auth_keys(&coord, &org).await
 }
 
 /// The body of `POST /api/v1/auth-keys`, mirroring `AuthKeyRequest::Create`.
@@ -1373,7 +1517,7 @@ struct AuthKeyCreateRequest {
     #[serde(default)]
     tags: Vec<String>,
     /// Seconds. `0` is a `400` (no forever-keys over the API) and the value is
-    /// capped at [`crate::http::MAX_API_AUTH_KEY_TTL_SECS`].
+    /// capped at the configured API-key maximum (`Ttls::api_key_max`).
     ttl_secs: u64,
     #[serde(default)]
     multi_use: bool,
@@ -1387,7 +1531,7 @@ struct AuthKeyCreateRequest {
     /// For a `ci` key: a stable identity name (`--as` on the CLI).
     ///
     /// A name alongside `purpose: "node"`, or one outside `[a-z0-9._-]`, is a
-    /// `400` — the validation is [`crate::http::create_auth_key`]'s, as
+    /// `400` — the validation is [`forgs_http::keys::create`]'s, as
     /// everything else here is.
     #[serde(default)]
     subject_name: Option<String>,
@@ -1397,7 +1541,7 @@ struct AuthKeyCreateRequest {
 ///
 /// # This response contains a long-lived secret, exactly once
 ///
-/// [`fleet_auth::api::AuthKeyCreated`] carries the key itself; only its SHA-256
+/// [`forgs::api::ApiKeyCreated`] carries the key itself; only its SHA-256
 /// is stored, so it exists in this body and nowhere else, ever. That is the
 /// single place the browser surface creates a long-lived bearer secret, and it
 /// is a **deliberate, accepted cost** recorded in `docs/web-ui.md` D4: the
@@ -1414,44 +1558,67 @@ struct AuthKeyCreateRequest {
 /// the right to *enroll*: a `node` key adds a machine that offers probes, a `ci`
 /// key redeems into a workload token bounded by its own tag selector.
 ///
-/// # The validation is `POST /auth/keys`'s, because it is the same function
+/// # The validation is `/auth/keys`'s, because it is the same function
 ///
-/// [`crate::http::create_auth_key`] is called unchanged. Forking it would mean
+/// [`forgs_http::keys::create`] is called unchanged, and the payload is
+/// checked by `FleetPurposes::check_payload`. Forking it would mean
 /// two opinions about `ttl_secs = 0`, the TTL cap, the `purpose` allowlist and
 /// the tagless-`ci` refusal — and the tagless-`ci` rule is the one that stops a
 /// key from synthesising a grant over the whole fleet.
 async fn create_auth_key(
     State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let (auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
-    };
+    let ApiCall { caller, subject } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
     let Ok(request) = serde_json::from_slice::<AuthKeyCreateRequest>(&body) else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    let org = subject.org.clone();
-    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-    if let Err(response) =
-        crate::http::require_membership_for_auth_keys(&coord, &org, &auth.id, now).await
-    {
-        return response;
-    }
-    crate::http::create_auth_key(
-        &coord,
-        &org,
-        &auth.id,
-        request.tags,
+    let (Some(org), Some(user)) = (subject.org(), caller.user_id()) else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    // Build the purpose's payload from the flat request; the purpose policy
+    // (`FleetPurposes::check_payload`) validates and canonicalises it, so
+    // the rules — tagless `ci` refused, ops labels known — live in one place.
+    let purpose = request.purpose.as_deref().unwrap_or(PURPOSE_NODE);
+    let payload = match purpose {
+        PURPOSE_NODE => {
+            if !request.ops.is_empty() {
+                return reject(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            serde_json::to_value(NodeKeyPayload { tags: request.tags })
+        }
+        PURPOSE_CI => serde_json::to_value(CiKeyPayload {
+            tags: request.tags,
+            ops: request.ops,
+        }),
+        _ => return reject(StatusCode::BAD_REQUEST, "invalid_request"),
+    };
+    let Ok(payload) = payload else {
+        return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+    };
+    match forgs_http::keys::create(
+        coord.auth(),
+        user,
+        &org.0,
         request.ttl_secs,
         request.multi_use,
-        request.purpose.as_deref(),
-        request.ops,
+        purpose,
         request.subject_name.as_deref(),
-        now,
+        Some(&payload),
     )
     .await
+    {
+        Ok(created) => Json(created).into_response(),
+        Err(e) => api_error(&e),
+    }
 }
 
 /// `DELETE /api/v1/auth-keys/{hash_prefix}` — revoke enrollment keys.
@@ -1461,7 +1628,7 @@ async fn create_auth_key(
 /// the shell-minted rows whose `created_by` is `NULL`, which would otherwise be
 /// unrevokable from a browser at all.
 ///
-/// [`crate::http::revoke_auth_key`] is called unchanged, so the `≥ 8` hex-digit
+/// [`forgs_http::keys::revoke`] is called unchanged, so the `≥ 8` hex-digit
 /// prefix floor (an empty prefix is `LIKE '%'`, i.e. every key in the org) and
 /// the **CI-grant cascade** come along: revoking a `ci` key also revokes the
 /// grant its redemption synthesised, through the whole release path, rather
@@ -1471,20 +1638,23 @@ async fn create_auth_key(
 async fn revoke_auth_key(
     State(coord): State<Arc<Coordinator>>,
     Path(hash_prefix): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    let (auth, subject) = match mutating_auth(&coord, &headers).await {
-        Ok(v) => v,
-        Err(response) => return response,
+    let ApiCall { caller, subject } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let (Some(org), Some(user)) = (subject.org(), caller.user_id()) else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
     };
-    let org = subject.org.clone();
-    let now = i64::try_from(coord.now()).unwrap_or(i64::MAX);
-    if let Err(response) =
-        crate::http::require_membership_for_auth_keys(&coord, &org, &auth.id, now).await
-    {
-        return response;
+    match forgs_http::keys::revoke(coord.auth(), user, &org.0, &hash_prefix).await {
+        Ok(revoked) => Json(revoked).into_response(),
+        Err(e) => api_error(&e),
     }
-    crate::http::revoke_auth_key(&coord, &org, &auth.id, &subject, &hash_prefix, now).await
 }
 
 /// `GET /api/v1/audit?board=<name>` — the org's audit log, admin-only.
@@ -1495,10 +1665,11 @@ async fn revoke_auth_key(
 /// so the first reader does not see "audit log" and expect one.
 async fn audit(
     State(coord): State<Arc<Coordinator>>,
+    uri: Uri,
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    let (_auth, subject, _) = match api_auth(&coord, &headers).await {
+    let ApiCall { subject, .. } = match api_auth(&coord, &uri, &headers, query.as_deref()).await {
         Ok(v) => v,
         Err(response) => return response,
     };

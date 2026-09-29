@@ -162,6 +162,7 @@ dependencies = [
  "axum-core",
  "base64",
  "bytes",
+ "form_urlencoded",
  "futures-util",
  "http",
  "http-body",
@@ -177,6 +178,7 @@ dependencies = [
  "serde_core",
  "serde_json",
  "serde_path_to_error",
+ "serde_urlencoded",
  "sha1",
  "sync_wrapper",
  "tokio",
@@ -732,30 +734,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fleet-auth"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "fleet-proto",
- "fleet-tls",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "jsonwebtoken",
- "rand_core 0.6.4",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "fleet-bin"
 version = "0.1.0"
 dependencies = [
@@ -767,13 +745,13 @@ dependencies = [
  "clap_complete",
  "directories",
  "fleet-agent",
- "fleet-auth",
  "fleet-coordinator",
  "fleet-core",
  "fleet-proto",
  "fleet-sidecar",
  "fleet-tls",
  "fleet-wire",
+ "forgs-client",
  "jsonwebtoken",
  "rand_core 0.6.4",
  "serde",
@@ -796,12 +774,15 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "fleet-agent",
- "fleet-auth",
  "fleet-core",
  "fleet-proto",
  "fleet-sidecar",
  "fleet-tls",
  "fleet-wire",
+ "forgs",
+ "forgs-http",
+ "forgs-idp",
+ "forgs-store",
  "futures-util",
  "hmac",
  "http",
@@ -919,6 +900,94 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
+
+[[package]]
+name = "forgs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "ulid",
+]
+
+[[package]]
+name = "forgs-client"
+version = "0.1.0"
+dependencies = [
+ "forgs",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "forgs-http"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "forgs",
+ "forgs-idp",
+ "forgs-store",
+ "hmac",
+ "http",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "forgs-idp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "forgs",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "jsonwebtoken",
+ "rand_core 0.6.4",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "forgs-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forgs",
+ "sqlx",
+ "thiserror 2.0.18",
+]
 
 [[package]]
 name = "form_urlencoded"
@@ -1474,9 +1543,9 @@ dependencies = [
 
 [[package]]
 name = "jsonwebtoken"
-version = "10.3.0"
+version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0529410abe238729a60b108898784df8984c87f6054c9c4fcacc47e4803c1ce1"
+checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -1491,6 +1560,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "signature",
+ "zeroize",
 ]
 
 [[package]]
@@ -3134,6 +3204,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "web-time",
+]
+
+[[package]]
 name = "unicode-bidi"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3281,6 +3360,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75a326b8c223ee17883a4251907455a2431acc2791c98c26279376490c378c16"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3591,6 +3680,20 @@ name = "zeroize"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
+dependencies = [
+ "zeroize_derive",
+]
+
+[[package]]
+name = "zeroize_derive"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c50655cbb0fe3fc43170059e702f1ce5e19b84cec58dc87b037a09935c2f328"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "zerotrie"
