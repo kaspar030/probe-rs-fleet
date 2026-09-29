@@ -605,7 +605,7 @@ mod tests {
             name: "beast".to_owned(),
             tags: vec!["desk".to_owned(), "nrf52".to_owned()],
             adopt: fleet_proto::AdoptPolicy::Auto,
-            owner: Some("gh-1".to_owned()),
+            owner: Some("01J0000000000000000000USR1".to_owned()),
             last_seen: None,
             created_at: 1_700_000_000,
             online: true,

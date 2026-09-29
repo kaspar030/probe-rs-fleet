@@ -666,7 +666,7 @@ chip = "c1"
 
     fn agent_cfg() -> AgentConfig {
         AgentConfig {
-            node_id: "gh-4242/pi-lab-1".to_owned(),
+            node_id: "01J0000000000000000000ORG1/pi-lab-1".to_owned(),
             fleet_url: "https://fleet.example:7000".to_owned(),
             node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             previous_node_token: None,

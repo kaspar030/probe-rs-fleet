@@ -1385,9 +1385,9 @@ async fn grant_limits(
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GrantRequest {
-    /// The grantee, in one of `grant_create`'s four spellings
-    /// (`repo:<owner>/<name>`, a rendered `SubjectKey`, a bare `gh-<id>`, or a
-    /// GitHub login). Resolved server-side to an **immutable user id**.
+    /// The grantee, in one of `grant_create`'s three spellings
+    /// (`repo:<owner>/<name>`, a rendered `SubjectKey`, or a username).
+    /// Resolved server-side, once, to an **immutable** subject key.
     subject: String,
     /// The canonical selector string — the same one a CLI would send.
     selector: String,
@@ -1769,14 +1769,14 @@ mod tests {
     #[test]
     fn a_board_key_carries_both_shapes() {
         let board = BoardRef::new(
-            fleet_proto::ids::OrgId("gh-1".to_owned()),
-            fleet_proto::ids::NodeId("gh-1/rpi-1".to_owned()),
+            fleet_proto::ids::OrgId("01J0000000000000000000ORG1".to_owned()),
+            fleet_proto::ids::NodeId("01J0000000000000000000ORG1/rpi-1".to_owned()),
             "dk-3",
         );
         let view = BoardKeyView::from(&board);
-        assert_eq!(view.key, "gh-1/gh-1/rpi-1/dk-3");
-        assert_eq!(view.org, "gh-1");
-        assert_eq!(view.node, "gh-1/rpi-1");
+        assert_eq!(view.key, "01J0000000000000000000ORG1/01J0000000000000000000ORG1/rpi-1/dk-3");
+        assert_eq!(view.org, "01J0000000000000000000ORG1");
+        assert_eq!(view.node, "01J0000000000000000000ORG1/rpi-1");
         assert_eq!(view.name, "dk-3");
     }
 
