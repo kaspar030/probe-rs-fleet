@@ -16,12 +16,15 @@
 //     property rather than a promise — which is also why this comment spells
 //     none of them out.
 //
-// The two device-login routes (`POST /api/v1/session/device/{start,poll}`) are
-// unauthenticated brokering routes: they live in the coordinator's
-// `browser_auth::api_routes()` and call neither `mutating_auth` nor `csrf_ok`,
-// because no session credential is involved yet. Sending the header anyway is
-// harmless (there is no cookie to read), and this module does not special-case
-// them.
+// The acting org. A session is not bound to one org: the user acts in their
+// personal org by default, or in any org they are a member of via `?org=<id>`
+// on every `/api/v1` call (`src/http.rs` `acting_subject`). The choice lives in
+// this module (set by `app.mjs` from the page URL) and is appended here, in
+// the one place every call passes through, so no page can forget it. The
+// server re-checks membership on every request; this is plumbing, not policy.
+//
+// Sign-in itself is forgs' `/auth/*` (plain browser navigations, not fetches),
+// so nothing here special-cases it.
 
 /** Read one cookie value, or null. */
 export function cookie(name, jar) {
@@ -32,6 +35,25 @@ export function cookie(name, jar) {
     if (pair.slice(0, at).trim() === name) return pair.slice(at + 1).trim();
   }
   return null;
+}
+
+let actingOrg = null;
+
+/** Set the org every `/api/v1` call acts in (`null`: the server's default, the personal org). */
+export function setOrg(id) {
+  actingOrg = id ? String(id) : null;
+}
+
+/** The org `/api/v1` calls currently act in, or null. */
+export function currentOrg() {
+  return actingOrg;
+}
+
+/** `path` with `org=<id>` appended to its query, or unchanged when `org` is empty. */
+export function withOrg(path, org) {
+  if (!org) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}org=${encodeURIComponent(org)}`;
 }
 
 /** An API error carrying the HTTP status and the server's `error` code. */
@@ -59,7 +81,7 @@ export function describe(err) {
     case 'server_error':
       return 'The coordinator failed to handle that. Check its log.';
     case 'upstream_error':
-      return 'GitHub could not be reached.';
+      return 'The identity provider could not be reached.';
     default:
       return err.message;
   }
@@ -77,7 +99,9 @@ export function setUnauthorizedHandler(fn) {
  * Issue one API request.
  *
  * `fetchImpl` and `jar` exist so `web-tests/api.test.mjs` can drive this with
- * no browser; production callers pass neither.
+ * no browser; production callers pass neither. `options.org` overrides the
+ * acting org for this one call (`null` sends none); absent, the module's
+ * acting org is used. Only `/api/v1/` paths carry it.
  */
 export async function request(method, path, body, options = {}) {
   const fetchImpl = options.fetch || (typeof fetch === 'function' ? fetch : null);
@@ -88,7 +112,9 @@ export async function request(method, path, body, options = {}) {
     const csrf = cookie('prfs_csrf', options.jar);
     if (csrf) headers['X-Fleet-Csrf'] = csrf;
   }
-  const response = await fetchImpl(path, {
+  const org = 'org' in options ? options.org : actingOrg;
+  const url = String(path).startsWith('/api/v1/') ? withOrg(path, org) : path;
+  const response = await fetchImpl(url, {
     method,
     headers,
     credentials: 'same-origin',

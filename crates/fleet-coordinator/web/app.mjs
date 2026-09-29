@@ -8,6 +8,7 @@
 import * as api from './api.mjs';
 import { h, mount, errorBox } from './dom.mjs';
 import { route, NAV } from './router.mjs';
+import { memberships, orgLabel, userId, role } from './session.mjs';
 
 import * as login from './pages/login.mjs';
 import * as devices from './pages/devices.mjs';
@@ -22,6 +23,21 @@ const PAGE_MODULES = { devices, agents, approve, access, keys, audit };
 // In-memory only. Nothing here is ever persisted: no storage of any kind is
 // touched anywhere in this tree (see api.mjs).
 let session = null;
+
+// The acting org lives in the page URL (`/ui/devices?org=<id>`), not in any
+// storage: it survives a reload, is shareable, and every client-side
+// navigation carries it forward. Absent, the server's default applies (the
+// personal org). `api.mjs` appends it to every `/api/v1` call.
+function orgFromUrl() {
+  const org = new URLSearchParams(window.location.search).get('org');
+  return org && org.trim() ? org.trim() : null;
+}
+
+/** `path` (no query) with the acting org carried forward. */
+function withOrgQuery(path) {
+  const org = api.currentOrg();
+  return org ? `${path}?org=${encodeURIComponent(org)}` : path;
+}
 
 // The live page's own scratch object: which node is being edited, the pending
 // registration just inspected, the half-filled grant form, the auth key shown
@@ -93,7 +109,7 @@ function renderChrome(current) {
       h(
         'a',
         {
-          href: entry.path,
+          href: withOrgQuery(entry.path),
           class: entry.page === current ? 'active' : '',
           on: { click: (e) => { e.preventDefault(); navigate(entry.path); } },
         },
@@ -101,25 +117,58 @@ function renderChrome(current) {
       ),
     ),
   );
+  const orgs = memberships(session);
+  const acting = session.org;
+  // The switcher only exists when there is something to switch between. Its
+  // options are the server's membership list, rendered as text.
+  const orgPart =
+    orgs.length > 1
+      ? h(
+          'select',
+          {
+            name: 'org',
+            title: 'Acting org',
+            on: { change: (e) => switchOrg(e.target.value) },
+          },
+          orgs.map((m) =>
+            h('option', { value: m.id, selected: Boolean(acting && acting.id === m.id) }, `${orgLabel(m)} (${m.role})`),
+          ),
+        )
+      : h('span', {}, acting ? orgLabel(acting) : '—');
   mount(
     who,
     h(
       'span',
       {},
-      h('span', { class: 'mono' }, session.login || session.user),
+      h('span', { class: 'mono' }, session.username || userId(session)),
       ' · ',
-      h('span', {}, session.org_slug || session.org),
+      orgPart,
       ' · ',
-      h('span', { class: 'role' }, session.role),
+      h('span', { class: 'role' }, role(session) || 'no role'),
       ' ',
       h('button', { on: { click: signOut } }, 'Sign out'),
     ),
   );
 }
 
+/**
+ * Act in another org: re-resolve the session there (for the role), keep the
+ * choice in the URL, and re-render the current page from scratch — whatever
+ * the page held belonged to the previous org.
+ */
+async function switchOrg(id) {
+  api.setOrg(id || null);
+  const { pathname } = window.location;
+  window.history.pushState({}, '', withOrgQuery(pathname));
+  await loadSession();
+  mounted = null;
+  pageState = {};
+  await draw();
+}
+
 /** Client-side navigation. */
 export function navigate(path) {
-  window.history.pushState({}, '', path);
+  window.history.pushState({}, '', path.includes('?') ? path : withOrgQuery(path));
   void draw();
 }
 
@@ -132,6 +181,7 @@ async function signOut() {
     // and there is nothing useful to retry from here.
   }
   session = null;
+  api.setOrg(null);
   // Everything the last page held, including a minted auth key, goes with it.
   mounted = null;
   pageState = {};
@@ -145,6 +195,27 @@ async function loadSession() {
     session = await api.get('/api/v1/session', { quiet: true });
   } catch {
     session = null;
+    return;
+  }
+  // `org` is null when the requested org is not one of the user's (a stale
+  // link, a revoked membership). Fall back to the default rather than render
+  // a UI whose every call will 403.
+  if (session && !session.org && api.currentOrg()) {
+    api.setOrg(null);
+    window.history.replaceState({}, '', window.location.pathname);
+    try {
+      session = await api.get('/api/v1/session', { quiet: true });
+    } catch {
+      session = null;
+    }
+  }
+  // Pin the acting org explicitly once known, so every call names it, and
+  // make the URL say so too (history `back` then restores the right org).
+  if (session && session.org) {
+    api.setOrg(session.org.id);
+    if (orgFromUrl() !== session.org.id) {
+      window.history.replaceState({}, '', withOrgQuery(window.location.pathname));
+    }
   }
 }
 
@@ -155,9 +226,21 @@ api.setUnauthorizedHandler(() => {
   void draw();
 });
 
-window.addEventListener('popstate', () => { void draw(); });
+window.addEventListener('popstate', () => {
+  void (async () => {
+    const org = orgFromUrl();
+    if (session && org !== api.currentOrg()) {
+      api.setOrg(org);
+      await loadSession();
+      mounted = null;
+      pageState = {};
+    }
+    await draw();
+  })();
+});
 
 void (async () => {
+  api.setOrg(orgFromUrl());
   await loadSession();
   await draw();
 })();

@@ -1,30 +1,47 @@
-//! Shared scaffolding for the `WebSocket` integration tests.
+//! Shared scaffolding for the coordinator's integration tests.
 //!
-//! Every test in `ws_e2e` / `ws_auth` / `auth_token` / `rotation` / `keepalive`
-//! runs the **real** axum router on a real loopback socket and dials it with a
-//! real `tokio-tungstenite` client. Nothing here stubs the transport: that is
-//! the point, since the transport is what this task changed.
+//! Every test here runs the **real** axum router (fleet's routes merged with
+//! forgs' `/auth/*`) on a real loopback socket and dials it with a real
+//! `tokio-tungstenite` / hyper client.
+//!
+//! Fixtures are built through **production constructors** only: users with
+//! forgs' `create_local_user` (which also creates the personal org), team orgs
+//! with [`Db::ensure_org_named`] (forgs' `create_node`), memberships with
+//! [`Db::set_member`], sessions with `forgs_http::session::mint_session` on the
+//! coordinator's own `AuthContext`, API keys with `NsScope::insert_api_key`
+//! (payload canonicalised by fleet's own purpose hook), and node tokens through
+//! the coordinator's registration path. No test hand-rolls an id or a token
+//! shape production could not produce.
+//!
+//! # Acting org
+//!
+//! A user session is no longer bound to one org: it acts in its **personal**
+//! org unless the request names another (`?org=<name-or-id>`). So
+//! [`TestCoordinator::seed_session`] returns a token whose holder is a member
+//! of `org`, and a test that wants to act *there* on `/client` uses
+//! [`TestCoordinator::client_session_in`] (or appends `?org=` itself).
 
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use fleet_auth::{OpaqueToken, TokenKind};
 use fleet_coordinator::auth::Ed25519Signer;
 use fleet_coordinator::clock::SystemClock;
 use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
 use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
+use fleet_coordinator::FleetRole;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{BoardRef, NodeId, OrgId, Role};
+use fleet_proto::adopt::AdoptPolicy;
+use fleet_proto::ids::{BoardRef, NodeId, OrgId};
+use forgs::{TokenKind, UserId};
 
 /// The signing seed every test coordinator uses.
 pub const SEED: [u8; 32] = [7u8; 32];
 
-/// Counter behind [`TestCoordinator::seed_workload_grant`]'s ids.
-static NEXT_GRANT_ID: AtomicU64 = AtomicU64::new(1);
+/// The CSRF secret every test coordinator uses.
+pub const CSRF_SECRET: [u8; 32] = [9u8; 32];
 
 /// A coordinator serving its real router on a real loopback port.
 pub struct TestCoordinator {
@@ -52,24 +69,44 @@ impl TestCoordinator {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             sqlite_path: ":memory:".into(),
             signing_key: SigningKeySource::Seed(SEED),
+            csrf_secret: Some(CSRF_SECRET.to_vec()),
             ..CoordinatorConfig::default()
         };
         tweak(&mut config);
+        Self::start_config(config, Vec::new()).await
+    }
 
+    /// Start a coordinator from a finished config plus login providers.
+    pub async fn start_config(
+        config: CoordinatorConfig,
+        providers: Vec<Arc<dyn forgs_idp::IdentityProvider>>,
+    ) -> Self {
         let db = Db::connect_in_memory().await.unwrap();
-        let coord = Arc::new(Coordinator::new(
-            config,
-            Scheduler::new(Policy::default()),
-            db,
-            Ed25519Signer::from_seed(&SEED),
-            Arc::new(SystemClock),
-        ));
+        // What `fleet_coordinator::build` does at startup.
+        db.ensure_org_named(&config.default_org, fleet_coordinator::now_epoch_secs())
+            .await
+            .unwrap();
+        let coord = Arc::new(
+            Coordinator::with_providers(
+                config,
+                Scheduler::new(Policy::default()),
+                db,
+                Ed25519Signer::from_seed(&SEED),
+                Arc::new(SystemClock),
+                providers,
+            )
+            .unwrap(),
+        );
 
         let router = fleet_coordinator::http::router(Arc::clone(&coord));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, router).await;
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         Self {
@@ -84,51 +121,173 @@ impl TestCoordinator {
         self.coord.db()
     }
 
-    /// Seed a node row with a fresh token; returns the token's string form.
-    pub async fn seed_node(&self, org: &str, name: &str) -> (String, NodeId) {
-        self.seed_node_at(org, name, self.coord.now()).await
+    /// forgs' auth context of this coordinator.
+    pub fn auth(&self) -> &forgs_http::AuthContext {
+        self.coord.auth()
     }
 
-    /// Seed a node **owned** by `owner`, the way `share` from a logged-in shell
-    /// enrolls one.
+    /// The coordinator's clock, epoch seconds.
+    pub fn now(&self) -> u64 {
+        self.coord.now()
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity fixtures
+    // -----------------------------------------------------------------------
+
+    /// The team org named `name`, created if absent (forgs `create_node`).
+    pub async fn org(&self, name: &str) -> OrgId {
+        self.db().ensure_org_named(name, self.now()).await.unwrap()
+    }
+
+    /// The user named `name`, created (with its personal org, where they are
+    /// admin) if absent — forgs' `create_local_user`.
+    pub async fn user(&self, name: &str) -> UserId {
+        if let Some(u) = self.db().forgs().user_by_username(name).await.unwrap() {
+            return u.id;
+        }
+        self.db()
+            .forgs()
+            .create_local_user(name, None, self.now())
+            .await
+            .unwrap()
+            .0
+    }
+
+    /// `name`'s personal org.
+    pub async fn personal_org(&self, name: &str) -> OrgId {
+        let user = self.user(name).await;
+        self.db().personal_org(user).await.unwrap().unwrap()
+    }
+
+    /// Make `user` a member of team org `org` with `role`; returns both ids.
+    pub async fn member(&self, org: &str, user: &str, role: FleetRole) -> (OrgId, UserId) {
+        let o = self.org(org).await;
+        let u = self.user(user).await;
+        self.db().set_member(&o, u, role, self.now()).await.unwrap();
+        (o, u)
+    }
+
+    /// A fresh session token for `user` (created if absent), minted by forgs'
+    /// own `mint_session`.
+    pub async fn session_for(&self, user: &str) -> String {
+        let u = self.user(user).await;
+        forgs_http::session::mint_session(self.auth(), u, "test")
+            .await
+            .unwrap()
+            .token
+    }
+
+    /// `login` as a `role` member of team org `org`, plus a session token.
     ///
-    /// [`TestCoordinator::seed_node`] takes the auth-key path, which leaves
-    /// `owner_user_id = NULL` — and "NULL owner means admin-only" is a rule the
-    /// node-mutation tests have to be able to exercise from *both* sides, so
-    /// the owned shape needs a seed of its own.
+    /// The session acts in `login`'s **personal** org unless a request names
+    /// `org` (`?org=`); see the module docs.
+    pub async fn seed_session(&self, org: &str, login: &str, role: FleetRole) -> String {
+        self.member(org, login, role).await;
+        self.session_for(login).await
+    }
+
+    /// A user with only their personal org: `(session token, personal org,
+    /// user id)`. What a fresh signup looks like.
+    pub async fn seed_user(&self, login: &str) -> (String, OrgId, UserId) {
+        let user = self.user(login).await;
+        let org = self.db().personal_org(user).await.unwrap().unwrap();
+        (self.session_for(login).await, org, user)
+    }
+
+    /// A refresh token for `login` (forgs' `mint_refresh`).
+    pub async fn seed_refresh_token(&self, login: &str) -> String {
+        let u = self.user(login).await;
+        forgs_http::session::mint_refresh(self.auth(), u)
+            .await
+            .unwrap()
+    }
+
+    /// A session for `login` that has already expired.
+    pub async fn seed_expired_session(&self, login: &str) -> String {
+        let u = self.user(login).await;
+        let token = self.auth().format().mint(TokenKind::Session);
+        let now = self.now();
+        self.db()
+            .forgs()
+            .insert_session(&token.hash(), u, now - 100, now - 1)
+            .await
+            .unwrap();
+        token.to_secret_string()
+    }
+
+    /// The `Cookie` header and `X-Fleet-Csrf` value a browser holding session
+    /// `token` would send. The CSRF value is derived by forgs' own helper on
+    /// the coordinator's context, so a test cannot agree with itself about a
+    /// value the server would never produce.
+    pub fn browser_session(&self, token: &str) -> (String, String) {
+        let hash = self.auth().format().parse(token).unwrap().hash();
+        let csrf = forgs_http::cookies::csrf_token(self.auth(), hash.as_str());
+        (format!("prfs_session={token}"), csrf)
+    }
+
+    // -----------------------------------------------------------------------
+    // Node fixtures
+    // -----------------------------------------------------------------------
+
+    /// Enroll node `name` in team org `org` through the coordinator's
+    /// registration path (as an API-key enrollment: no owner, `declared`).
+    /// Returns the node token and id.
+    pub async fn seed_node(&self, org: &str, name: &str) -> (String, NodeId) {
+        let org = self.org(org).await;
+        self.seed_node_in(&org, name).await
+    }
+
+    /// As [`TestCoordinator::seed_node`] for an already-resolved org.
+    pub async fn seed_node_in(&self, org: &OrgId, name: &str) -> (String, NodeId) {
+        let resp = self
+            .coord
+            .register_node_and_mint(
+                org,
+                name,
+                &[],
+                None,
+                AdoptPolicy::Declared,
+                "node.enroll",
+                "test fixture",
+            )
+            .await
+            .unwrap();
+        (resp.token, NodeId(resp.node_id))
+    }
+
+    /// Seed a node **owned** by user `owner` (the `share` shape).
     pub async fn seed_owned_node(
         &self,
         org: &str,
         name: &str,
         owner: &str,
-        adopt: fleet_proto::adopt::AdoptPolicy,
+        adopt: AdoptPolicy,
     ) -> (String, NodeId) {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        let token = OpaqueToken::mint(TokenKind::Node);
-        let now = i64::try_from(self.coord.now()).unwrap();
-        let node = self
-            .db()
-            .register_node_full(
+        let org = self.org(org).await;
+        let owner = self.user(owner).await;
+        let resp = self
+            .coord
+            .register_node_and_mint(
                 &org,
                 name,
-                token.hash().as_str(),
                 &[],
                 Some(owner),
                 adopt,
-                now,
+                "node.self_register",
+                "test fixture",
             )
             .await
             .unwrap();
-        (token.to_secret_string(), node)
+        (resp.token, NodeId(resp.node_id))
     }
 
     /// As [`TestCoordinator::seed_node`], with an explicit `token_issued_at`,
     /// so a test can present a token that is already due for rotation.
     pub async fn seed_node_at(&self, org: &str, name: &str, issued_at: u64) -> (String, NodeId) {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        let token = OpaqueToken::mint(TokenKind::Node);
+        let org = self.org(org).await;
+        let format = self.auth().format();
+        let token = format.mint(fleet_coordinator::identity::node_token_kind(format));
         let node = self
             .db()
             .register_node(
@@ -143,203 +302,154 @@ impl TestCoordinator {
         (token.to_secret_string(), node)
     }
 
-    /// Seed a user + membership + session; returns the session token.
-    pub async fn seed_session(&self, org: &str, login: &str, role: Role) -> String {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        self.db()
-            .ensure_user_member(&org, login, role)
-            .await
+    // -----------------------------------------------------------------------
+    // API keys, grants, workloads
+    // -----------------------------------------------------------------------
+
+    /// Insert an API key in `org` whose payload fleet's own purpose hook
+    /// canonicalised; returns the secret.
+    async fn insert_key(
+        &self,
+        org: &OrgId,
+        purpose: &str,
+        payload: &serde_json::Value,
+        single_use: bool,
+        expires: Option<u64>,
+        subject_name: Option<&str>,
+    ) -> String {
+        let payload = self
+            .auth()
+            .purposes()
+            .check_payload(purpose, Some(payload))
             .unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session);
-        let now = i64::try_from(self.coord.now()).unwrap();
+        let token = self.auth().format().mint(TokenKind::ApiKey);
+        let ns = fleet_coordinator::subject::ns_of(org).unwrap();
         self.db()
-            .insert_session(token.hash().as_str(), &org, login, now, now + 3_600)
+            .forgs()
+            .scoped(ns)
+            .insert_api_key(
+                &forgs_store::NewApiKey {
+                    hash: token.hash(),
+                    purpose: purpose.to_owned(),
+                    subject_name: subject_name.map(str::to_owned),
+                    payload,
+                    single_use,
+                    expires,
+                    created_by: None,
+                },
+                self.now(),
+            )
             .await
             .unwrap();
         token.to_secret_string()
     }
 
-    /// Seed a refresh token for a user; returns the token's string form.
-    ///
-    /// Separate from [`TestCoordinator::seed_session`] because it is a
-    /// different credential with a different power: a session token *opens*
-    /// connections, a refresh token only *mints* sessions. Conflating the two
-    /// in a test would hide exactly the property the negative tests assert.
-    pub async fn seed_refresh_token(&self, org: &str, login: &str, expires: i64) -> String {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        self.db()
-            .ensure_user_member(&org, login, Role::Admin)
-            .await
-            .unwrap();
-        let token = OpaqueToken::mint(TokenKind::Refresh);
-        let now = i64::try_from(self.coord.now()).unwrap();
-        self.db()
-            .insert_refresh_token(token.hash().as_str(), &org, login, now, expires)
-            .await
-            .unwrap();
-        token.to_secret_string()
-    }
-
-    /// Seed a session that has already expired.
-    pub async fn seed_expired_session(&self, org: &str, login: &str) -> String {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        self.db()
-            .ensure_user_member(&org, login, Role::Admin)
-            .await
-            .unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session);
-        let now = i64::try_from(self.coord.now()).unwrap();
-        self.db()
-            .insert_session(token.hash().as_str(), &org, login, now - 100, now - 1)
-            .await
-            .unwrap();
-        token.to_secret_string()
-    }
-
-    /// Seed an auth key; returns its string form.
+    /// A `node`-purpose API key for team org `org` stamping `tags`.
     pub async fn seed_auth_key(
         &self,
         org: &str,
         tags: &[String],
         single_use: bool,
-        expires: Option<i64>,
+        expires: Option<u64>,
     ) -> String {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        let token = OpaqueToken::mint(TokenKind::AuthKey);
-        let now = i64::try_from(self.coord.now()).unwrap();
-        self.db()
-            .insert_auth_key(
-                &org,
-                token.hash().as_str(),
-                tags,
-                single_use,
-                expires,
-                None,
-                now,
-            )
-            .await
-            .unwrap();
-        token.to_secret_string()
+        let org = self.org(org).await;
+        self.insert_key(
+            &org,
+            fleet_coordinator::identity::PURPOSE_NODE,
+            &serde_json::json!({ "tags": tags }),
+            single_use,
+            expires,
+            None,
+        )
+        .await
     }
 
-    /// Seed a CI (`--purpose ci`) auth key; returns the key's string form.
-    ///
-    /// Separate from [`TestCoordinator::seed_auth_key`] because it is a
-    /// different credential: a `node` key enrolls a machine that *offers*
-    /// probes, a `ci` key redeems into a workload token that *leases* them
-    /// (architecture §6.7). Nothing should be able to conflate the two by
-    /// accident, in the tests least of all.
+    /// A multi-use `ci`-purpose key for team org `org` over boards tagged
+    /// `tags` (non-empty: an empty selector is refused by the hook).
     pub async fn seed_ci_auth_key(
         &self,
         org: &str,
         tags: &[String],
-        expires: Option<i64>,
+        expires: Option<u64>,
     ) -> String {
         self.seed_named_ci_auth_key(org, tags, expires, None).await
     }
 
-    /// Seed a CI auth key carrying an operator-chosen **identity name**
-    /// (`auth-key create --as <name>`), the shape whose redemption builds
-    /// `<org>/workload:agent:<name>` instead of `<org>/workload:key:<hash8>`.
-    ///
-    /// `None` is exactly [`TestCoordinator::seed_ci_auth_key`], so a test that
-    /// does not care about identities keeps the shorter spelling.
+    /// As [`TestCoordinator::seed_ci_auth_key`], with an identity name
+    /// (`<org>/workload:agent:<name>` instead of `…:key:<hash8>`).
     pub async fn seed_named_ci_auth_key(
         &self,
         org: &str,
         tags: &[String],
-        expires: Option<i64>,
+        expires: Option<u64>,
         subject_name: Option<&str>,
     ) -> String {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        let token = OpaqueToken::mint(TokenKind::AuthKey);
-        let now = i64::try_from(self.coord.now()).unwrap();
-        self.db()
-            .insert_auth_key_with_purpose(
-                &org,
-                token.hash().as_str(),
-                tags,
-                false,
-                expires,
-                None,
-                now,
-                "ci",
-                &[],
-                subject_name,
-            )
-            .await
-            .unwrap();
-        token.to_secret_string()
+        let org = self.org(org).await;
+        self.insert_key(
+            &org,
+            fleet_coordinator::identity::PURPOSE_CI,
+            &serde_json::json!({ "tags": tags }),
+            false,
+            expires,
+            subject_name,
+        )
+        .await
     }
 
-    /// Grant `repo` (as `owner/name`) access to `org`'s boards matching
-    /// `selector`, returning the grant id.
-    ///
-    /// The **per-repo** grant of architecture §6.7, built through the same
-    /// `workload_subject_key` the exchange path uses, so a test cannot pass by
-    /// agreeing with itself about a spelling the production code would not
-    /// produce.
+    /// Grant `repo` (`owner/name`) access to `org`'s boards matching
+    /// `selector`, returning the grant id. The subject is built by forgs'
+    /// `workload_subject_key`, as the exchange path builds it.
     pub async fn seed_workload_grant(
         &self,
         org: &str,
         repo: &str,
         selector: &str,
         ops: &[fleet_proto::token::AllowedOp],
-        expires: Option<i64>,
+        expires: Option<u64>,
     ) -> String {
-        let org = OrgId(org.to_owned());
-        self.db().ensure_org(&org, "personal").await.unwrap();
-        let normalised = fleet_proto::ids::normalise_repo(repo)
+        let org = self.org(org).await;
+        let normalised = forgs::subject::normalise_repo(repo)
             .unwrap_or_else(|| panic!("{repo} is not a valid owner/name"));
-        let key = fleet_proto::ids::workload_subject_key(&normalised);
+        let subject = forgs::subject::workload_subject_key(&normalised);
         let selector = fleet_proto::lease::parse_constraint(selector)
             .unwrap()
             .to_string();
-        // Unique per call: the id is the revocation handle and two grants in one
-        // test must not collide.
-        let id = format!("{:032x}", NEXT_GRANT_ID.fetch_add(1, Ordering::Relaxed));
-        let now = i64::try_from(self.coord.now()).unwrap();
+        let now = self.now();
+        let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
         self.db()
-            .scoped(org)
+            .forgs()
+            .scoped(ns)
             .insert_grant(
-                &id,
-                &key,
-                &selector,
-                ops,
-                expires.or(Some(now + 86_400)),
-                None,
+                &forgs_store::NewGrant {
+                    subject,
+                    selector,
+                    ops: fleet_coordinator::state::join_ops(ops),
+                    expires: expires.or(Some(now + 86_400)),
+                    created_by: None,
+                },
                 now,
             )
             .await
-            .unwrap();
-        id
+            .unwrap()
+            .to_string()
     }
 
-    /// Seed a workload token row directly; returns the token's string form.
+    /// A workload token for `repo`, inserted through forgs' store.
     ///
     /// For tests about what a workload token may *do* once it exists, which
     /// should not have to stand up a stub issuer to find out.
-    pub async fn seed_workload_token(&self, repo: &str, expires: i64) -> String {
-        let token = OpaqueToken::mint(TokenKind::Workload);
-        let normalised = fleet_proto::ids::normalise_repo(repo).unwrap();
-        let key = fleet_proto::ids::workload_subject_key(&normalised);
-        let now = i64::try_from(self.coord.now()).unwrap();
+    pub async fn seed_workload_token(&self, repo: &str, expires: u64) -> String {
+        let normalised = forgs::subject::normalise_repo(repo).unwrap();
+        let subject = forgs::subject::workload_subject_key(&normalised);
+        let token = self.auth().format().mint(TokenKind::Workload);
         self.db()
+            .forgs()
             .insert_workload_token(
-                token.hash().as_str(),
-                &key,
-                "github_oidc",
-                &fleet_coordinator::state::WorkloadClaimColumns {
-                    repository: Some(normalised),
-                    repository_owner: Some("seeded".to_owned()),
-                    ..fleet_coordinator::state::WorkloadClaimColumns::default()
-                },
-                now,
+                &token.hash(),
+                &subject,
+                "github-actions",
+                None,
+                self.now(),
                 expires,
             )
             .await
@@ -347,199 +457,17 @@ impl TestCoordinator {
         token.to_secret_string()
     }
 
-    /// Dial a route with a bearer token, returning the connected wire halves.
-    pub async fn dial(
-        &self,
-        path: &'static str,
-        bearer: &str,
-    ) -> Result<(fleet_wire::client::DialedTx, fleet_wire::client::DialedRx), fleet_wire::WireError>
-    {
-        fleet_wire::client::dial(fleet_wire::client::DialOpts {
-            url: self.base_url.clone(),
-            path,
-            bearer: bearer.to_owned(),
-            pin: None,
-        })
-        .await
-    }
-
-    /// The HTTP status a `WebSocket` upgrade attempt was rejected with.
-    ///
-    /// The dial helper collapses tungstenite's error into a `Protocol` string,
-    /// which is right for production (the client should not branch on the
-    /// status) but not enough for a test asserting 401 vs. 403 — hence the raw
-    /// dial here.
-    pub async fn upgrade_status(&self, path: &str, bearer: Option<&str>) -> u16 {
-        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-
-        let url = format!("{}{path}", self.base_url.replace("http://", "ws://"));
-        let mut request = url.as_str().into_client_request().unwrap();
-        if let Some(bearer) = bearer {
-            request.headers_mut().insert(
-                http::header::AUTHORIZATION,
-                format!("Bearer {bearer}").parse().unwrap(),
-            );
-        }
-        match tokio_tungstenite::connect_async(request).await {
-            Ok(_) => 101,
-            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
-            Err(e) => panic!("unexpected dial failure: {e}"),
-        }
-    }
-
-    /// Issue a plain HTTP request against the coordinator, returning
-    /// `(status, body)`.
-    pub async fn http(&self, method: &str, path: &str, body: Option<String>) -> (u16, String) {
-        self.http_auth(method, path, None, body).await
-    }
-
-    /// As [`TestCoordinator::http`], with an optional `Authorization: Bearer`.
-    ///
-    /// `/auth/keys` authenticates with a header rather than a body field, and
-    /// the only other bearer-capable helper here ([`TestCoordinator::upgrade_status`])
-    /// is `WebSocket`-only.
-    pub async fn http_auth(
-        &self,
-        method: &str,
-        path: &str,
-        bearer: Option<&str>,
-        body: Option<String>,
-    ) -> (u16, String) {
-        use http_body_util::BodyExt as _;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
-        let client: Client<_, http_body_util::Full<hyper::body::Bytes>> =
-            Client::builder(TokioExecutor::new()).build_http();
-        let mut builder = http::Request::builder()
-            .method(method)
-            .uri(format!("{}{path}", self.base_url))
-            .header(http::header::CONTENT_TYPE, "application/json");
-        if let Some(bearer) = bearer {
-            builder = builder.header(http::header::AUTHORIZATION, format!("Bearer {bearer}"));
-        }
-        let req = builder
-            .body(http_body_util::Full::new(hyper::body::Bytes::from(
-                body.unwrap_or_default(),
-            )))
-            .unwrap();
-        let resp = client.request(req).await.unwrap();
-        let status = resp.status().as_u16();
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    /// As [`TestCoordinator::http_auth`], but with arbitrary request headers
-    /// and the **response** headers returned.
-    ///
-    /// The browser surface is defined by its headers as much as by its bodies:
-    /// a test that cannot see `Set-Cookie` cannot check that a session cookie
-    /// is `HttpOnly`, `Secure`, `SameSite=Lax` and no longer-lived than the
-    /// `session` row — which is most of what `docs/web-ui.md` D1 promises.
-    /// Returns `(status, response headers, body)`.
-    pub async fn http_full(
-        &self,
-        method: &str,
-        path: &str,
-        headers: &[(&str, &str)],
-        body: Option<String>,
-    ) -> (u16, Vec<(String, String)>, String) {
-        use http_body_util::BodyExt as _;
-        use hyper_util::client::legacy::Client;
-        use hyper_util::rt::TokioExecutor;
-
-        let client: Client<_, http_body_util::Full<hyper::body::Bytes>> =
-            Client::builder(TokioExecutor::new()).build_http();
-        let mut builder = http::Request::builder()
-            .method(method)
-            .uri(format!("{}{path}", self.base_url))
-            .header(http::header::CONTENT_TYPE, "application/json");
-        for (name, value) in headers {
-            builder = builder.header(*name, *value);
-        }
-        let req = builder
-            .body(http_body_util::Full::new(hyper::body::Bytes::from(
-                body.unwrap_or_default(),
-            )))
-            .unwrap();
-        // The browser flows answer with 302s that a following client would
-        // chase; this one deliberately does not, because the redirect target
-        // and the cookies riding with it are the thing under test.
-        let resp = client.request(req).await.unwrap();
-        let status = resp.status().as_u16();
-        let response_headers = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_owned(),
-                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                )
-            })
-            .collect();
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        (
-            status,
-            response_headers,
-            String::from_utf8_lossy(&bytes).into_owned(),
-        )
-    }
-
-    /// The `Cookie` header and `X-Fleet-Csrf` value a browser holding `token`
-    /// would send.
-    ///
-    /// The CSRF value is derived **the way the server derives it** — from
-    /// [`SEED`], through the production code's own helper — so a test cannot
-    /// pass by agreeing with itself about a value the coordinator would never
-    /// produce.
-    pub fn browser_session(&self, token: &str) -> (String, String) {
-        let hash = OpaqueToken::parse(token).unwrap().hash();
-        let csrf = fleet_coordinator::browser_auth::csrf_token_for_test(&self.coord, hash.as_str());
-        (format!("prfs_session={token}"), csrf)
-    }
-
-    /// Seed a GitHub-shaped user (so `grant <login>` can resolve it) plus a
-    /// session, and return the session token.
-    ///
-    /// The grant path resolves a login to the immutable `user.id`, so a test
-    /// that grants by name needs a real `user` row rather than the bare
-    /// membership `seed_session` creates.
-    pub async fn seed_github_user(
-        &self,
-        gh_id: i64,
-        login: &str,
-        role: Role,
-    ) -> (String, OrgId, String) {
-        let now = i64::try_from(self.coord.now()).unwrap();
-        let (user_id, org, _created) = self
-            .db()
-            .upsert_github_user(gh_id, login, None, now)
-            .await
-            .unwrap();
-        self.db()
-            .ensure_user_member(&org, &user_id, role)
-            .await
-            .unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session);
-        self.db()
-            .insert_session(token.hash().as_str(), &org, &user_id, now, now + 3_600)
-            .await
-            .unwrap();
-        (token.to_secret_string(), org, user_id)
-    }
+    // -----------------------------------------------------------------------
+    // Boards
+    // -----------------------------------------------------------------------
 
     /// Put a board into the scheduler directly, bypassing a node connection.
-    ///
-    /// Authorization tests care about who may reach a board, not about how it
-    /// got there; standing up a real node for each one would drown the
-    /// property being tested.
     pub async fn seed_board(&self, org: &OrgId, node: &str, name: &str, tags: &[&str]) -> BoardRef {
         self.seed_board_with_model(org, node, name, tags, None)
             .await
     }
 
-    /// As [`seed_board`](Self::seed_board), but declaring a board **model** —
-    /// what a `board=<model>` selector matches.
+    /// As [`seed_board`](Self::seed_board), but declaring a board **model**.
     pub async fn seed_board_with_model(
         &self,
         org: &OrgId,
@@ -550,12 +478,8 @@ impl TestCoordinator {
     ) -> BoardRef {
         use fleet_proto::board::{Board, BoardState, PowerKind};
 
-        self.db().ensure_org(org, "personal").await.unwrap();
-        // The node id production would mint for this `(org, node)`, built by
-        // calling the production constructor rather than re-spelling its
-        // format string — the one definition of the shape lives in `state.rs`.
         let node = fleet_coordinator::node_id_for(org, node);
-        let now = i64::try_from(self.coord.now()).unwrap();
+        let now = i64::try_from(self.now()).unwrap();
         self.db()
             .scoped(org.clone())
             .ensure_node(&node, now)
@@ -581,10 +505,177 @@ impl TestCoordinator {
         id
     }
 
-    /// Open a `/client` session as the holder of `bearer`.
+    // -----------------------------------------------------------------------
+    // Transport
+    // -----------------------------------------------------------------------
+
+    /// Dial a route with a bearer token, returning the connected wire halves.
+    /// `path` may carry a query (`/client?org=acme`).
+    pub async fn dial(
+        &self,
+        path: &str,
+        bearer: &str,
+    ) -> Result<(fleet_wire::client::DialedTx, fleet_wire::client::DialedRx), fleet_wire::WireError>
+    {
+        // `DialOpts::path` is `'static` for production's fixed routes; a test
+        // leaks its few dynamic ones.
+        let path: &'static str = Box::leak(path.to_owned().into_boxed_str());
+        fleet_wire::client::dial(fleet_wire::client::DialOpts {
+            url: self.base_url.clone(),
+            path,
+            bearer: bearer.to_owned(),
+            pin: None,
+        })
+        .await
+    }
+
+    /// The HTTP status a `WebSocket` upgrade attempt was rejected with (101 on
+    /// success).
+    pub async fn upgrade_status(&self, path: &str, bearer: Option<&str>) -> u16 {
+        self.upgrade_status_with(path, bearer, &[]).await
+    }
+
+    /// As [`TestCoordinator::upgrade_status`], with extra request headers (a
+    /// `Cookie`, say).
+    pub async fn upgrade_status_with(
+        &self,
+        path: &str,
+        bearer: Option<&str>,
+        headers: &[(&'static str, &str)],
+    ) -> u16 {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let url = format!("{}{path}", self.base_url.replace("http://", "ws://"));
+        let mut request = url.as_str().into_client_request().unwrap();
+        if let Some(bearer) = bearer {
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                format!("Bearer {bearer}").parse().unwrap(),
+            );
+        }
+        for (name, value) in headers {
+            request.headers_mut().insert(*name, value.parse().unwrap());
+        }
+        match tokio_tungstenite::connect_async(request).await {
+            Ok(_) => 101,
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+            Err(e) => panic!("unexpected dial failure: {e}"),
+        }
+    }
+
+    /// A plain HTTP request, returning `(status, body)`.
+    pub async fn http(&self, method: &str, path: &str, body: Option<String>) -> (u16, String) {
+        self.http_auth(method, path, None, body).await
+    }
+
+    /// As [`TestCoordinator::http`], with an optional `Authorization: Bearer`.
+    pub async fn http_auth(
+        &self,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<String>,
+    ) -> (u16, String) {
+        let auth = bearer.map(|b| format!("Bearer {b}"));
+        let headers: Vec<(&str, &str)> = auth
+            .as_deref()
+            .map(|a| vec![("authorization", a)])
+            .unwrap_or_default();
+        let (status, _, body) = self.http_full(method, path, &headers, body).await;
+        (status, body)
+    }
+
+    /// An HTTP request with arbitrary headers, returning `(status, response
+    /// headers, body)`. Redirects are **not** followed.
+    pub async fn http_full(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<String>,
+    ) -> (u16, Vec<(String, String)>, String) {
+        use http_body_util::BodyExt as _;
+        use hyper_util::client::legacy::Client;
+        use hyper_util::rt::TokioExecutor;
+
+        let client: Client<_, http_body_util::Full<hyper::body::Bytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let mut builder = http::Request::builder()
+            .method(method)
+            .uri(format!("{}{path}", self.base_url));
+        if !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        {
+            builder = builder.header(http::header::CONTENT_TYPE, "application/json");
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
+            .body(http_body_util::Full::new(hyper::body::Bytes::from(
+                body.unwrap_or_default(),
+            )))
+            .unwrap();
+        let resp = client.request(req).await.unwrap();
+        let status = resp.status().as_u16();
+        let response_headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_owned(),
+                    String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                )
+            })
+            .collect();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            response_headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// Open a `/client` session as the holder of `bearer`, acting in its
+    /// default org (a user's personal org; a workload's none).
     pub async fn client_session(&self, bearer: &str) -> fleet_sidecar::transport::CoordSession {
-        let (tx, rx) = self.dial("/client", bearer).await.unwrap();
+        self.client_session_at("/client", bearer).await
+    }
+
+    /// Open a `/client` session acting in `org` (a name or id).
+    pub async fn client_session_in(
+        &self,
+        bearer: &str,
+        org: &str,
+    ) -> fleet_sidecar::transport::CoordSession {
+        self.client_session_at(&format!("/client?org={org}"), bearer)
+            .await
+    }
+
+    async fn client_session_at(
+        &self,
+        path: &str,
+        bearer: &str,
+    ) -> fleet_sidecar::transport::CoordSession {
+        let (tx, rx) = self.dial(path, bearer).await.unwrap();
         fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
+            .await
+            .unwrap()
+    }
+
+    /// Every fleet audit action recorded, as `(org id, subject, action)`.
+    pub async fn audit_rows(&self) -> Vec<(String, Option<String>, String)> {
+        sqlx::query_as("SELECT ns_node_id, subject, action FROM audit_log ORDER BY id")
+            .fetch_all(self.db().pool_for_test())
+            .await
+            .unwrap()
+    }
+
+    /// Every forgs (identity) audit action recorded, oldest first.
+    pub async fn forgs_audit_actions(&self) -> Vec<String> {
+        sqlx::query_scalar("SELECT action FROM forgs_audit ORDER BY id")
+            .fetch_all(self.db().pool_for_test())
             .await
             .unwrap()
     }
@@ -592,20 +683,11 @@ impl TestCoordinator {
 
 /// A stand-in for a connected node, registered directly in the coordinator's
 /// registry.
-///
-/// The delegation tests care about which capability token the coordinator hands
-/// the node, not about running a real `probe-rs serve`; standing up a full
-/// node for that would bury the property under scaffolding. `ws_e2e.rs`
-/// already covers the real node end to end.
 pub struct NodeStub {
     rx: tokio::sync::mpsc::Receiver<fleet_coordinator::registry::NodeMessage>,
 }
 
 /// What a node was told to open, as observed by a [`NodeStub`].
-///
-/// The tokens are what make this worth returning: `token` is the byte string
-/// the node checks, `serve_token` the string it writes into `.probe-rs.toml`,
-/// and a test's job is to prove the client is handed exactly those.
 pub struct OpenedSession {
     pub channel: fleet_proto::ChannelId,
     pub token: Vec<u8>,
@@ -646,12 +728,7 @@ impl NodeStub {
         }
     }
 
-    /// Await the next `PowerCycle` command, returning the board name it names.
-    ///
-    /// The point of asserting on the *command* rather than on the handler's
-    /// `200` is that power-cycle is the one op the coordinator enforces: an
-    /// implementation that authorized correctly and then sent nothing, or sent
-    /// the wrong board, would pass a status-code-only test.
+    /// Await the next `PowerCycle` command, returning the board name.
     pub async fn expect_power_cycle(&mut self) -> fleet_proto::ids::BoardName {
         match self.rx.recv().await.expect("node connection closed") {
             fleet_coordinator::registry::NodeMessage::Command(
@@ -661,11 +738,7 @@ impl NodeStub {
         }
     }
 
-    /// Await the next `KillSession` command, returning the channel it names.
-    ///
-    /// The observable half of channel teardown: the coordinator removing its
-    /// route is not enough — the node must be told, or its `probe-rs serve`
-    /// keeps holding the probe.
+    /// Await the next `KillSession` command, returning the channel.
     pub async fn expect_kill_session(&mut self) -> fleet_proto::ChannelId {
         match self.rx.recv().await.expect("node connection closed") {
             fleet_coordinator::registry::NodeMessage::Command(
@@ -676,10 +749,6 @@ impl NodeStub {
     }
 
     /// Whether any command is queued for this stub, without waiting.
-    ///
-    /// For the negative half of a power-cycle test: a *refused* request must
-    /// have left the node with nothing to do, which "the response was a 403"
-    /// alone does not show.
     pub fn is_idle(&mut self) -> bool {
         self.rx.try_recv().is_err()
     }

@@ -21,9 +21,11 @@ use fleet_coordinator::clock::SystemClock;
 use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
 use fleet_coordinator::core::Coordinator;
 use fleet_coordinator::state::Db;
+use fleet_coordinator::subject::Subject;
+use fleet_coordinator::FleetRole;
 use fleet_core::policy::Policy;
 use fleet_core::scheduler::{RequesterId, Scheduler};
-use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, Role, Subject, SubjectKind};
+use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
@@ -105,14 +107,14 @@ fn coordinator_config() -> CoordinatorConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         sqlite_path: ":memory:".into(),
         signing_key: SigningKeySource::Seed(SEED),
-        default_org: OrgId("default".to_owned()),
+        csrf_secret: Some([9u8; 32].to_vec()),
         ..CoordinatorConfig::default()
     }
 }
 
-fn agent_config(token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
+fn agent_config(node: &NodeId, token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
     fleet_agent::config::AgentConfig {
-        node_id: node_id().0,
+        node_id: node.0.clone(),
         fleet_url: "https://coordinator.example:7000".to_owned(),
         node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
         previous_node_token: None,
@@ -147,8 +149,8 @@ kind = "none"
 /// The node's configured id, the `node` row and the board key must all be the
 /// same string, and in production that string comes from `node_id_for`. Built
 /// by calling it, so the fixture cannot drift from the shape production mints.
-fn node_id() -> NodeId {
-    fleet_coordinator::node_id_for(&OrgId("default".to_owned()), "node-a")
+fn node_id(org: &OrgId) -> NodeId {
+    fleet_coordinator::node_id_for(org, "node-a")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -159,19 +161,28 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     let token_pubkey = signer.public_key_bytes();
     let sched = Scheduler::new(Policy::default());
     let db = Db::connect_in_memory().await.unwrap();
-    // The membership `coordinator user-token` provisions when it mints a
-    // session: without it, `authz::require_role` denies a perfectly valid token.
-    db.ensure_user_member(&OrgId("default".to_owned()), "dev", Role::Admin)
+    // The org, user and membership `coordinator user-token` provisions when
+    // it mints a session: without the membership, the acting-org check denies
+    // a perfectly valid token.
+    let now = fleet_coordinator::now_epoch_secs();
+    let org = db.ensure_org_named("default", now).await.unwrap();
+    let (user, _) = db
+        .forgs()
+        .create_local_user("dev", None, now)
         .await
         .unwrap();
+    db.set_member(&org, user, FleetRole::Admin, now)
+        .await
+        .unwrap();
+    let node_id = node_id(&org);
     // The node row resolves this node's reports to an org: since task 3448
     // there is no `default_org` fallback, so a report from a node with no row
     // is dropped rather than filed into the configured tenant.
-    db.scoped(OrgId("default".to_owned()))
-        .ensure_node(&node_id(), 1_000)
+    db.scoped(org.clone())
+        .ensure_node(&node_id, 1_000)
         .await
         .unwrap();
-    let dev = Subject::new(OrgId("default".to_owned()), SubjectKind::User, "dev");
+    let dev = Subject::user(user, org.clone());
     let coord = Arc::new(Coordinator::new(
         coordinator_config(),
         sched,
@@ -181,26 +192,33 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     ));
 
     // --- Node dial-out over duplex A ---
-    let node =
-        Arc::new(Agent::new(agent_config(&token_pubkey), boards(), Arc::new(EchoBackend)).unwrap());
+    let node = Arc::new(
+        Agent::new(
+            agent_config(&node_id, &token_pubkey),
+            boards(),
+            Arc::new(EchoBackend),
+        )
+        .unwrap(),
+    );
     node.seed_inventory_from_boards().await;
 
     let (coord_tx, coord_rx, agent_tx, agent_rx) = fleet_wire::mock::pair();
     {
         let coord = Arc::clone(&coord);
+        let node_id = node_id.clone();
         tokio::spawn(async move {
             let _ = fleet_coordinator::server::handle_agent_for_test(
                 coord,
                 Box::new(coord_tx),
                 Box::new(coord_rx),
-                node_id(),
+                node_id,
             )
             .await;
         });
     }
     {
         let node = Arc::clone(&node);
-        let mut config = agent_config(&token_pubkey);
+        let mut config = agent_config(&node_id, &token_pubkey);
         tokio::spawn(async move {
             // A node that never persists its rotated token: these tests are
             // about the wire, and the storage half is covered in fleet-bin.
@@ -221,7 +239,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // The coordinator keys the board by (org, node, name); the sidecar asks for
     // it by node-local name.
     let board_name = BoardName("nrf52840-dk-1".to_owned());
-    let board_id = BoardRef::new(OrgId("default".to_owned()), node_id(), "nrf52840-dk-1");
+    let board_id = BoardRef::new(org.clone(), node_id.clone(), "nrf52840-dk-1");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         {
@@ -269,7 +287,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         .await
         .unwrap();
     assert_eq!(grant.board, board_id);
-    assert_eq!(grant.node, node_id());
+    assert_eq!(grant.node, node_id);
 
     // Open a data relay channel.
     let channel = session

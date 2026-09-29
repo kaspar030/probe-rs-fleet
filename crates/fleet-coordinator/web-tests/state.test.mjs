@@ -6,8 +6,8 @@
 //
 //   * `load()` runs again on every `reload()`, so anything a handler stores in
 //     a local is rebuilt empty on the very next render. The Edit form would set
-//     `editing` and then re-render without it; the device-login page would
-//     fetch a code and immediately forget it. State that must survive a
+//     `editing` and then re-render without it; the approve page would
+//     look up a code and immediately forget it. State that must survive a
 //     re-render lives on the context object `app.mjs` owns.
 //   * that object is per *mounted page*, not per render, and is dropped whole
 //     on navigation — which is what makes the keys page's shown-once panel
@@ -25,7 +25,13 @@ import * as agents from '../web/pages/agents.mjs';
 import * as approve from '../web/pages/approve.mjs';
 import * as keys from '../web/pages/keys.mjs';
 
-const SESSION = { user: 'gh-1', login: 'alice', org: 'gh-1', role: 'admin' };
+const ORG = '01J0000000000000000000ORG1';
+const TEAM = '01J0000000000000000000ORG2';
+const SESSION = {
+  user_id: '01J0000000000000000000USR1', username: 'alice',
+  memberships: [{ id: ORG, name: 'alice', role: 'admin' }, { id: TEAM, name: 'ariel-os', role: 'member' }],
+  org: { id: ORG, name: 'alice', role: 'admin' }, expires: 1800000000,
+};
 
 /**
  * A context that behaves like `app.mjs`'s: stable identity, `reload()`
@@ -39,10 +45,13 @@ function makeCtx(page, responses) {
         if (!(path in responses)) throw new Error(`unstubbed GET ${path}`);
         return responses[path];
       },
-      post: async (path, body) => {
+      posts: [],
+      post: async (path, body, options) => {
+        ctx.api.posts.push({ path, body, options });
         if (!(path in responses)) throw new Error(`unstubbed POST ${path}`);
-        return typeof responses[path] === 'function' ? responses[path](body) : responses[path];
+        return typeof responses[path] === 'function' ? responses[path](body, options) : responses[path];
       },
+      currentOrg: () => ORG,
       patch: async () => ({}),
       del: async () => null,
       describe: (e) => String(e && e.message ? e.message : e),
@@ -57,8 +66,8 @@ function makeCtx(page, responses) {
 }
 
 const NODE = {
-  id: 'gh-1/rpi-1', name: 'rpi-1', tags: ['lab'], adopt: 'declared',
-  owner: 'gh-1', last_seen: 1700000000, created_at: 1600000000, online: true, boards: [],
+  id: `${ORG}/rpi-1`, name: 'rpi-1', tags: ['lab'], adopt: 'declared',
+  owner: SESSION.user_id, last_seen: 1700000000, created_at: 1600000000, online: true, boards: [],
 };
 
 test('the agents edit form survives the re-render that opens it', async () => {
@@ -80,7 +89,7 @@ test('an inspected registration survives the re-render that displays it', async 
   const warning = 'SERVER WARNING';
   const pending = {
     user_code: 'ABCD-1234', node_name: 'rpi-9', tags: [], adopt: 'declared',
-    created_at: 1, expires: 2, state: 'pending', org: 'gh-1', warning,
+    created_at: 1, expires: 2, state: 'pending', org: ORG, warning,
   };
   const ctx = makeCtx(approve, { '/api/v1/nodes/pending/ABCD-1234': pending });
   let tree = await ctx.reload();
@@ -93,6 +102,50 @@ test('an inspected registration survives the re-render that displays it', async 
   assert.match(textOf(tree), /rpi-9/);
 });
 
+test('approval acts in the chosen target org and names it in the confirmation', async () => {
+  const pendingIn = (org) => ({
+    user_code: 'ABCD-1234', node_name: 'rpi-9', tags: [], adopt: 'declared',
+    created_at: 1, expires: 2, state: 'pending', org, warning: 'w',
+  });
+  const ctx = makeCtx(approve, {
+    '/api/v1/nodes/pending/ABCD-1234': (body, options) =>
+      ({ ...pendingIn(options.org), state: body.decision === 'approve' ? 'approved' : 'pending' }),
+  });
+  let tree = await ctx.reload();
+  // Defaults to the org the UI acts in.
+  const picker = find(tree, (n) => n.tag === 'select' && n.attrs.name === 'org');
+  assert.equal(find(picker, (n) => n.tag === 'option' && n.attrs.selected).attrs.value, ORG);
+
+  // Pick the team org, then look up and approve.
+  await picker.on.change({ target: { value: TEAM } });
+  tree = ctx.tree;
+  await find(tree, (n) => n.tag === 'form').on.submit({ preventDefault() {}, target: { elements: { code: { value: 'ABCD-1234' } } } });
+  tree = ctx.tree;
+  assert.match(textOf(tree), /ariel-os/);
+  const approveButton = find(tree, (n) => n.tag === 'button' && n.children.join('') === 'Approve into ariel-os');
+  assert.ok(approveButton, 'the confirm names the target org');
+  await approveButton.on.click();
+  tree = ctx.tree;
+
+  assert.deepEqual(ctx.api.posts.map((p) => [p.body.decision, p.options.org]), [['inspect', TEAM], ['approve', TEAM]]);
+  assert.match(textOf(tree), /Approved into ariel-os/);
+});
+
+test('changing the target org drops a looked-up registration', async () => {
+  const ctx = makeCtx(approve, {
+    '/api/v1/nodes/pending/ABCD-1234': (_b, o) => ({
+      user_code: 'ABCD-1234', node_name: 'rpi-9', tags: [], adopt: 'declared',
+      created_at: 1, expires: 2, state: 'pending', org: o.org, warning: 'SERVER WARNING',
+    }),
+  });
+  let tree = await ctx.reload();
+  await find(tree, (n) => n.tag === 'form').on.submit({ preventDefault() {}, target: { elements: { code: { value: 'ABCD-1234' } } } });
+  tree = ctx.tree;
+  assert.match(textOf(tree), /SERVER WARNING/);
+  await find(tree, (n) => n.tag === 'select' && n.attrs.name === 'org').on.change({ target: { value: TEAM } });
+  assert.ok(!textOf(ctx.tree).includes('SERVER WARNING'));
+});
+
 test('an empty code is refused before any request, with a reason', async () => {
   const ctx = makeCtx(approve, {});
   let tree = await ctx.reload();
@@ -103,9 +156,9 @@ test('an empty code is refused before any request, with a reason', async () => {
 });
 
 test('a minted key survives its own re-render and is dropped on dismiss', async () => {
-  const minted = { key: 'prffk1_SECRET', key_hash: 'b'.repeat(64), purpose: 'node', single_use: true, expires: 1800000000 };
+  const minted = { key: 'prfk1_SECRET', key_hash: 'b'.repeat(64), purpose: 'node', single_use: true, expires: 1800000000 };
   const ctx = makeCtx(keys, {
-    '/api/v1/auth-keys': { org: 'gh-1', keys: [] },
+    '/api/v1/auth-keys': { org: ORG, keys: [] },
     '/api/v1/grants/limits': { now: 1700000000, max_ttl_secs: 100, ops: [], min_revoke_prefix: 8, auth_key_max_ttl_secs: 2592000, expires_optional: false },
   });
   // The mint call answers with the secret.
@@ -133,7 +186,7 @@ test('a minted key survives its own re-render and is dropped on dismiss', async 
 
 test('a CI key with no tags is refused client-side, with the reason', async () => {
   const ctx = makeCtx(keys, {
-    '/api/v1/auth-keys': { org: 'gh-1', keys: [] },
+    '/api/v1/auth-keys': { org: ORG, keys: [] },
     '/api/v1/grants/limits': { now: 1, max_ttl_secs: 100, ops: [], min_revoke_prefix: 8, auth_key_max_ttl_secs: 2592000, expires_optional: false },
   });
   let called = false;

@@ -17,7 +17,7 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::ids::{BoardName, Role};
+use fleet_proto::ids::BoardName;
 use fleet_proto::token::{AllowedOp, SignedToken};
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
@@ -76,7 +76,7 @@ async fn a_delegated_token_opens_a_channel_and_nothing_else_is_needed() {
     use crate::common::NodeStub;
 
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let mut node = NodeStub::attach(&fleet, &board.node).await;
 
@@ -141,7 +141,7 @@ async fn a_delegated_token_opens_a_channel_and_nothing_else_is_needed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_non_relay_verb_is_refused_on_the_delegated_route() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
 
     let grant = delegate(
@@ -231,7 +231,7 @@ async fn every_non_relay_verb_is_refused_on_the_delegated_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_token_cannot_open_a_channel_on_another_lease() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     fleet.seed_board(&org, "rpi-1", "dk-a", &["nrf52"]).await;
     fleet.seed_board(&org, "rpi-1", "dk-b", &["nrf52"]).await;
 
@@ -272,7 +272,7 @@ async fn a_token_cannot_open_a_channel_on_another_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_token_stops_working_the_moment_its_lease_is_released() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
 
     let grant = delegate(
@@ -315,18 +315,17 @@ async fn a_token_stops_working_the_moment_its_lease_is_released() {
 /// signature the caller can learn from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_credentials_are_refused_uniformly() {
-    use fleet_proto::ids::{BoardRef, OrgId};
+    use fleet_proto::ids::BoardRef;
     use fleet_proto::token::{CapabilityToken, TokenSigner as _};
 
     let fleet = TestCoordinator::start().await;
-    let (session_token, _org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (session_token, org, _) = fleet.seed_user("alice").await;
 
     // A board key of the shape the coordinator mints. Nothing here resolves it
     // — both tokens below are refused before the board is ever looked up — but
     // a fixture that spells an unreachable shape teaches the next reader the
     // wrong one.
     let board = {
-        let org = OrgId("default".to_owned());
         let node = fleet_coordinator::node_id_for(&org, "rpi-1");
         BoardRef::new(org, node, "dk-3")
     };
@@ -381,7 +380,7 @@ async fn bad_credentials_are_refused_uniformly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_capability_token_is_not_accepted_on_the_client_route() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
 
     let grant = delegate(
@@ -405,8 +404,8 @@ async fn a_capability_token_is_not_accepted_on_the_client_route() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delegation_cannot_exceed_the_delegators_own_access() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, _, _) = fleet.seed_user("bob").await;
     fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -495,7 +494,7 @@ async fn dropping_a_sidecar_connection_closes_its_channels() {
     use crate::common::NodeStub;
 
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let mut node = NodeStub::attach(&fleet, &board.node).await;
 
@@ -546,7 +545,7 @@ async fn dropping_a_delegated_connection_closes_its_channels() {
     use crate::common::NodeStub;
 
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let mut node = NodeStub::attach(&fleet, &board.node).await;
 
@@ -585,7 +584,7 @@ async fn one_connection_dropping_leaves_another_connections_channel_alone() {
     use crate::common::NodeStub;
 
     let fleet = TestCoordinator::start().await;
-    let (alice_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice_token, org, _) = fleet.seed_user("alice").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let mut node = NodeStub::attach(&fleet, &board.node).await;
 

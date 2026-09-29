@@ -7,7 +7,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { request, cookie, ApiError, describe, setUnauthorizedHandler } from '../web/api.mjs';
+import { request, cookie, ApiError, describe, setUnauthorizedHandler, setOrg, withOrg } from '../web/api.mjs';
 
 /** A `fetch` that records its calls and answers with a canned response. */
 function fakeFetch(response) {
@@ -53,7 +53,7 @@ test('every mutating method carries the CSRF cookie as a header', async () => {
 
 test('with no CSRF cookie the header is simply absent, not empty', async () => {
   const f = fakeFetch({ status: 200, body: '{}' });
-  await request('POST', '/api/v1/session/device/start', {}, { fetch: f, jar: '' });
+  await request('POST', '/api/v1/session/logout', {}, { fetch: f, jar: '' });
   assert.equal(f.calls[0].init.headers['X-Fleet-Csrf'], undefined);
 });
 
@@ -94,4 +94,27 @@ test('the coarse error codes all have human copy', () => {
     assert.ok(text.length > 10, code);
     assert.notEqual(text, code, `${code} must not be shown raw`);
   }
+});
+
+test('every /api/v1 call carries the acting org, and only /api/v1 calls do', async () => {
+  setOrg('01J0000000000000000000ORG2');
+  try {
+    const f = fakeFetch({ status: 200, body: '{}' });
+    await request('GET', '/api/v1/boards', null, { fetch: f, jar: JAR });
+    await request('GET', '/api/v1/audit?board=dk-3', null, { fetch: f, jar: JAR });
+    await request('POST', '/api/v1/nodes/pending/ABCD', {}, { fetch: f, jar: JAR, org: 'other org' });
+    await request('GET', '/auth/providers', null, { fetch: f, jar: JAR });
+    assert.deepEqual(f.calls.map((c) => c.path), [
+      '/api/v1/boards?org=01J0000000000000000000ORG2',
+      '/api/v1/audit?board=dk-3&org=01J0000000000000000000ORG2',
+      '/api/v1/nodes/pending/ABCD?org=other%20org',
+      '/auth/providers',
+    ]);
+  } finally {
+    setOrg(null);
+  }
+  const f = fakeFetch({ status: 200, body: '{}' });
+  await request('GET', '/api/v1/session', null, { fetch: f, jar: JAR });
+  assert.equal(f.calls[0].path, '/api/v1/session', 'no org: the server default (personal org)');
+  assert.equal(withOrg('/api/v1/x', null), '/api/v1/x');
 });

@@ -106,7 +106,10 @@ async fn a_lost_push_leaves_the_old_token_working() {
     let (_, _, issued_at) = fleet
         .db()
         .node_by_token_hash(
-            fleet_auth::OpaqueToken::parse(&old_token)
+            fleet
+                .auth()
+                .format()
+                .parse(&old_token)
                 .unwrap()
                 .hash()
                 .as_str(),

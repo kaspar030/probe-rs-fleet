@@ -15,7 +15,8 @@ use common::TestCoordinator;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use fleet_agent::{Agent, ProbeRsBackend, Session, SpliceIo};
-use fleet_proto::ids::{BoardName, BoardRef, OrgId, Role};
+use fleet_coordinator::FleetRole;
+use fleet_proto::ids::{BoardName, BoardRef};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 /// A backend whose `probe-rs serve` session echoes every byte back — a fresh
@@ -163,11 +164,7 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
 
     // The node registers and reports inventory; the board becomes leasable.
     let board_name = BoardName("nrf52840-dk-1".to_owned());
-    let board_id = BoardRef::new(
-        OrgId("default".to_owned()),
-        node_id.clone(),
-        "nrf52840-dk-1",
-    );
+    let board_id = BoardRef::new(fleet.org("default").await, node_id.clone(), "nrf52840-dk-1");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         {
@@ -184,8 +181,12 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
     }
 
     // --- The user: a real WS client presenting a session token on /client ---
-    let session_token = fleet.seed_session("default", "dev", Role::Admin).await;
-    let (sc_tx, sc_rx) = fleet.dial("/client", &session_token).await.unwrap();
+    let session_token = fleet.seed_session("default", "dev", FleetRole::Admin).await;
+    // A session acts in its personal org unless it names another.
+    let (sc_tx, sc_rx) = fleet
+        .dial("/client?org=default", &session_token)
+        .await
+        .unwrap();
     let session = fleet_sidecar::transport::CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
         .await
         .unwrap();
@@ -256,7 +257,7 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
     // The coordinator's default org is `default`; the node belongs to `acme`.
     let fleet = TestCoordinator::start().await;
     let token_pubkey = fleet.coord.signer().public_key_bytes();
-    assert_eq!(fleet.coord.config().default_org.0, "default");
+    assert_eq!(fleet.coord.config().default_org, "default");
 
     let (node_token, node_id) = fleet.seed_node("acme", "rpi-1").await;
     let mut config = agent_config(&node_id.0, &fleet.base_url, &node_token, &token_pubkey);
@@ -277,12 +278,8 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
         .await;
     });
 
-    let acme_board = BoardRef::new(OrgId("acme".to_owned()), node_id.clone(), "nrf52840-dk-1");
-    let default_board = BoardRef::new(
-        OrgId("default".to_owned()),
-        node_id.clone(),
-        "nrf52840-dk-1",
-    );
+    let acme_board = BoardRef::new(fleet.org("acme").await, node_id.clone(), "nrf52840-dk-1");
+    let default_board = BoardRef::new(fleet.org("default").await, node_id.clone(), "nrf52840-dk-1");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -316,14 +313,18 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deadline_that_fires_leaves_no_waiter_behind() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("default".to_owned());
+    let org = fleet.org("default").await;
     let board = fleet.seed_board(&org, "rpi-lab-1", "b1", &["nrf52"]).await;
 
-    let alice = fleet.seed_session("default", "alice", Role::Member).await;
-    let bob = fleet.seed_session("default", "bob", Role::Member).await;
+    let alice = fleet
+        .seed_session("default", "alice", FleetRole::Member)
+        .await;
+    let bob = fleet
+        .seed_session("default", "bob", FleetRole::Member)
+        .await;
 
     // alice takes the board.
-    let alice_session = fleet.client_session(&alice).await;
+    let alice_session = fleet.client_session_in(&alice, "default").await;
     let request = LeaseRequest {
         select: Constraint::Id(BoardName("b1".to_owned())),
         duration_secs: 600,
@@ -337,7 +338,7 @@ async fn a_deadline_that_fires_leaves_no_waiter_behind() {
 
     // bob waits, briefly, and gives up.
     {
-        let bob_session = fleet.client_session(&bob).await;
+        let bob_session = fleet.client_session_in(&bob, "default").await;
         let err = bob_session
             .lease(&request, std::time::Duration::from_millis(200))
             .await

@@ -21,13 +21,14 @@
 // `GET /api/v1/nodes` with per-board presence.
 
 import { h, tags, ago, when, errorBox } from '../dom.mjs';
+import { isAdmin, userId } from '../session.mjs';
 
 const ADOPT = ['auto', 'declared'];
 
 function mayEdit(node, session) {
   if (!session) return false;
-  if (session.role === 'admin') return true;
-  return Boolean(node.owner) && node.owner === session.user;
+  if (isAdmin(session)) return true;
+  return Boolean(node.owner) && node.owner === userId(session);
 }
 
 export function render(state) {

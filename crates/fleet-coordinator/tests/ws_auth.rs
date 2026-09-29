@@ -5,6 +5,12 @@
 //! is the credential present, well-formed, known, unexpired — and is it the
 //! *right kind* for the route it was presented on.
 //!
+//! Credentials are verified by forgs (`forgs_http::authenticate_request`);
+//! what fleet owns, and what this file pins, is each route's allowlist of
+//! token kinds: `/agent` takes node tokens (`prfn1_`) only, `/client` takes
+//! user sessions and workload tokens, `/delegate` takes neither (only a
+//! capability token), and the browser's session cookie opens none of them.
+//!
 //! Two properties are asserted throughout:
 //!
 //! * **401 vs. 403 is about the route, not the credential.** An absent, garbled,
@@ -12,16 +18,20 @@
 //!   wrong kind for the route is a 403: the caller's problem is the door, not
 //!   the key.
 //! * **No oracle.** The rejection bodies are identical whatever the reason;
-//!   `ws_auth` asserts that too, because the moment they diverge the endpoint
-//!   becomes a credential-enumeration tool.
+//!   the moment they diverge an endpoint becomes a credential-enumeration tool.
 
 mod common;
 
 use common::TestCoordinator;
 
-use fleet_auth::{OpaqueToken, TokenKind};
-use fleet_proto::ids::Role;
+use fleet_coordinator::FleetRole;
+use forgs::TokenKind;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+/// A `POST /node/enroll` body.
+fn enroll_body(key: &str, name: &str) -> String {
+    serde_json::json!({ "auth_key": key, "node_name": name }).to_string()
+}
 
 #[tokio::test]
 async fn no_credential_is_rejected_on_both_planes() {
@@ -44,13 +54,15 @@ async fn garbage_credentials_are_rejected() {
 }
 
 /// A well-formed token that matches no row: the shape is right, the credential
-/// is not. This is also the **revoked node** case — revocation is deleting the
-/// `node` row — so it must fail on the very next connection.
+/// is not.
 #[tokio::test]
 async fn a_well_formed_but_unknown_token_is_rejected() {
     let fleet = TestCoordinator::start().await;
-    let orphan_node = OpaqueToken::mint(TokenKind::Node).to_secret_string();
-    let orphan_session = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+    let format = fleet.auth().format();
+    let orphan_node = format
+        .mint(fleet_coordinator::identity::node_token_kind(format))
+        .to_secret_string();
+    let orphan_session = format.mint(TokenKind::Session).to_secret_string();
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&orphan_node)).await,
         401
@@ -61,10 +73,12 @@ async fn a_well_formed_but_unknown_token_is_rejected() {
     );
 }
 
+/// Revocation is deleting the `node` row, so it must fail on the very next
+/// connection.
 #[tokio::test]
 async fn a_revoked_node_cannot_reconnect() {
     let fleet = TestCoordinator::start().await;
-    let (token, node) = fleet.seed_node("default", "rpi-1").await;
+    let (token, node) = fleet.seed_node("acme", "rpi-1").await;
 
     // It works before revocation ...
     assert_eq!(fleet.upgrade_status("/agent", Some(&token)).await, 101);
@@ -77,12 +91,12 @@ async fn a_revoked_node_cannot_reconnect() {
 #[tokio::test]
 async fn an_expired_session_is_rejected() {
     let fleet = TestCoordinator::start().await;
-    let expired = fleet.seed_expired_session("default", "alice").await;
+    let expired = fleet.seed_expired_session("alice").await;
     assert_eq!(fleet.upgrade_status("/client", Some(&expired)).await, 401);
 
     // A live session for the same user still works, so the rejection is about
     // the expiry and not about the user.
-    let live = fleet.seed_session("default", "alice", Role::Admin).await;
+    let live = fleet.session_for("alice").await;
     assert_eq!(fleet.upgrade_status("/client", Some(&live)).await, 101);
 }
 
@@ -92,7 +106,7 @@ async fn an_expired_session_is_rejected() {
 #[tokio::test]
 async fn a_node_token_is_forbidden_on_the_client_plane() {
     let fleet = TestCoordinator::start().await;
-    let (node_token, _) = fleet.seed_node("default", "rpi-1").await;
+    let (node_token, _) = fleet.seed_node("acme", "rpi-1").await;
     assert_eq!(
         fleet.upgrade_status("/client", Some(&node_token)).await,
         403,
@@ -105,72 +119,91 @@ async fn a_node_token_is_forbidden_on_the_client_plane() {
 #[tokio::test]
 async fn a_session_token_is_forbidden_on_the_agent_plane() {
     let fleet = TestCoordinator::start().await;
-    let session = fleet.seed_session("default", "alice", Role::Admin).await;
+    let session = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
     assert_eq!(
         fleet.upgrade_status("/agent", Some(&session)).await,
         403,
         "a user session token must not impersonate a node"
     );
     assert_eq!(fleet.upgrade_status("/client", Some(&session)).await, 101);
+    assert_eq!(
+        fleet
+            .upgrade_status("/client?org=acme", Some(&session))
+            .await,
+        101
+    );
 }
 
-/// An auth key is redeemed at `POST /auth/token`; it is not a connection
+/// A workload token opens `/client` (acting in no org) and nothing else.
+#[tokio::test]
+async fn a_workload_token_is_forbidden_on_the_agent_plane() {
+    let fleet = TestCoordinator::start().await;
+    let workload = fleet
+        .seed_workload_token("octo/firmware", fleet.now() + 600)
+        .await;
+    assert_eq!(fleet.upgrade_status("/agent", Some(&workload)).await, 403);
+    assert_eq!(fleet.upgrade_status("/client", Some(&workload)).await, 101);
+    // A workload acts in no org; naming one is refused.
+    assert_eq!(
+        fleet
+            .upgrade_status("/client?org=acme", Some(&workload))
+            .await,
+        403
+    );
+}
+
+/// An API key is redeemed at `POST /node/enroll`; it is not a connection
 /// credential. Presenting one on a `WebSocket` upgrade is a 403 even though the
 /// key itself is perfectly valid.
 #[tokio::test]
-async fn an_auth_key_cannot_open_a_connection() {
+async fn an_api_key_cannot_open_a_connection() {
     let fleet = TestCoordinator::start().await;
-    let key = fleet.seed_auth_key("default", &[], true, None).await;
+    let key = fleet.seed_auth_key("acme", &[], true, None).await;
     assert_eq!(fleet.upgrade_status("/agent", Some(&key)).await, 403);
     assert_eq!(fleet.upgrade_status("/client", Some(&key)).await, 403);
 
     // ... and it is still redeemable afterwards: a rejected upgrade must not
-    // consume it.
-    let body = serde_json::json!({
-        "grant_type": "auth_key",
-        "auth_key": key,
-        "node_name": "rpi-1",
-    })
-    .to_string();
-    let (status, _) = fleet.http("POST", "/auth/token", Some(body)).await;
-    assert_eq!(status, 200);
+    // consume a single-use key.
+    let (status, body) = fleet
+        .http("POST", "/node/enroll", Some(enroll_body(&key, "rpi-1")))
+        .await;
+    assert_eq!(status, 200, "body: {body}");
 }
 
-/// A refresh token is redeemed at `/auth/token` and is a connection credential
-/// **nowhere**. This is the claim the whole feature rests on: no route's
-/// `allowed` list contains `TokenKind::Refresh`, and `authenticate` refuses it
-/// from the prefix alone before any database access.
+/// A refresh token is a connection credential **nowhere**, and neither it nor
+/// a workload token may mint API keys at forgs' `POST /auth/keys` — minting a
+/// key with a mint-only or CI credential would be a privilege escalation.
 ///
-/// The token seeded here is entirely valid — it mints a session on the route
-/// that is allowed to — which is what makes the 403s meaningful.
+/// The refresh token seeded here is entirely valid — it mints a session on the
+/// route that is allowed to — which is what makes the 403s meaningful.
 #[tokio::test]
-async fn a_refresh_token_cannot_open_a_connection_or_reach_auth_keys() {
+async fn refresh_and_workload_tokens_cannot_open_connections_or_mint_keys() {
     let fleet = TestCoordinator::start().await;
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    let refresh = fleet
-        .seed_refresh_token("acme", "alice", now + 86_400)
+    let (_, personal, _) = fleet.seed_user("alice").await;
+    let refresh = fleet.seed_refresh_token("alice").await;
+    let workload = fleet
+        .seed_workload_token("octo/firmware", fleet.now() + 600)
         .await;
 
-    for route in ["/agent", "/client"] {
-        assert_eq!(
-            fleet.upgrade_status(route, Some(&refresh)).await,
-            403,
-            "a refresh token must not open {route}"
+    for route in ["/agent", "/client", "/delegate"] {
+        let status = fleet.upgrade_status(route, Some(&refresh)).await;
+        assert!(
+            status == 403 || (route == "/delegate" && status == 401),
+            "a refresh token must not open {route} (got {status})"
         );
     }
 
-    // `/auth/keys` is a plain authenticated POST rather than an upgrade, and it
-    // allows only `Session` — minting an auth key with a mint-only credential
-    // would be a privilege escalation, not a convenience.
-    let (status, _) = fleet
-        .http_auth(
-            "POST",
-            "/auth/keys",
-            Some(&refresh),
-            Some(serde_json::json!({ "action": "list" }).to_string()),
-        )
-        .await;
-    assert_eq!(status, 403);
+    for token in [&refresh, &workload] {
+        let (status, body) = fleet
+            .http_auth(
+                "POST",
+                "/auth/keys",
+                Some(token),
+                Some(serde_json::json!({ "action": "list", "namespace": personal.0 }).to_string()),
+            )
+            .await;
+        assert_eq!(status, 403, "body: {body}");
+    }
 
     // `/node/register/approve` too: approving an enrollment is a member act.
     let (status, _) = fleet
@@ -185,8 +218,7 @@ async fn a_refresh_token_cannot_open_a_connection_or_reach_auth_keys() {
         .await;
     assert_eq!(status, 403);
 
-    // ...and it is still redeemable afterwards: a rejected upgrade must not
-    // consume it.
+    // ... and the refresh token is still redeemable afterwards.
     let (status, body) = fleet
         .http(
             "POST",
@@ -200,12 +232,36 @@ async fn a_refresh_token_cannot_open_a_connection_or_reach_auth_keys() {
     assert_eq!(status, 200, "body: {body}");
 }
 
+/// The browser's session cookie is accepted on `/api/v1/*` only. A page (or a
+/// cross-site `WebSocket`, which carries cookies) must never drive the node,
+/// operator or delegate planes with it: without a bearer the upgrade is
+/// unauthenticated, 401.
+#[tokio::test]
+async fn a_session_cookie_opens_no_connection() {
+    let fleet = TestCoordinator::start().await;
+    let session = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let (cookie, csrf) = fleet.browser_session(&session);
+
+    for route in ["/agent", "/client", "/client?org=acme", "/delegate"] {
+        assert_eq!(
+            fleet
+                .upgrade_status_with(route, None, &[("cookie", &cookie), ("x-fleet-csrf", &csrf)])
+                .await,
+            401,
+            "a session cookie must not open {route}"
+        );
+    }
+    // The same session as a bearer does open `/client`: the refusal is about
+    // the carrier.
+    assert_eq!(fleet.upgrade_status("/client", Some(&session)).await, 101);
+}
+
 /// Only the `Bearer` scheme counts. A `Basic` credential — or a bare token with
 /// no scheme — is *absent*, not malformed, and gets the same uniform 401.
 #[tokio::test]
 async fn other_authorization_schemes_do_not_authenticate() {
     let fleet = TestCoordinator::start().await;
-    let (node_token, _) = fleet.seed_node("default", "rpi-1").await;
+    let (node_token, _) = fleet.seed_node("acme", "rpi-1").await;
 
     let url = format!("{}/agent", fleet.base_url.replace("http://", "ws://"));
 
@@ -231,34 +287,77 @@ async fn other_authorization_schemes_do_not_authenticate() {
 /// **No oracle.** Every 401 body is byte-identical, whatever the underlying
 /// reason. If this test ever fails because someone made the errors "more
 /// helpful", the endpoint has become a credential-enumeration tool: an attacker
-/// can distinguish "this token never existed" from "this token expired", which
-/// tells them whether they have found a real account. The helpful detail belongs
-/// in the coordinator's audit log and in the client's own local error text.
+/// can distinguish "this key never existed" from "this key expired", which
+/// tells them whether they have found a real one. The helpful detail belongs
+/// in the coordinator's log and in the client's own local error text.
 #[tokio::test]
 async fn rejection_bodies_are_uniform() {
     let fleet = TestCoordinator::start().await;
-    let unknown = OpaqueToken::mint(TokenKind::Session).to_secret_string();
-    let expired = fleet.seed_expired_session("default", "alice").await;
+    let unknown = fleet
+        .auth()
+        .format()
+        .mint(TokenKind::ApiKey)
+        .to_secret_string();
+    let expired = fleet
+        .seed_auth_key("acme", &[], false, Some(fleet.now() - 1))
+        .await;
+    let spent = fleet.seed_auth_key("acme", &[], true, None).await;
+    let (status, _) = fleet
+        .http("POST", "/node/enroll", Some(enroll_body(&spent, "rpi-0")))
+        .await;
+    assert_eq!(status, 200);
 
-    let bodies = futures_util::future::join_all([
-        fleet.http("POST", "/auth/token", Some(refresh_body(&unknown))),
-        fleet.http("POST", "/auth/token", Some(refresh_body(&expired))),
-        fleet.http("POST", "/auth/token", Some(refresh_body("garbage"))),
-    ])
+    let enroll = futures_util::future::join_all(
+        [
+            unknown.as_str(),
+            expired.as_str(),
+            spent.as_str(),
+            "garbage",
+        ]
+        .map(|key| fleet.http("POST", "/node/enroll", Some(enroll_body(key, "rpi-1")))),
+    )
     .await;
-
-    for (status, _) in &bodies {
+    for (status, _) in &enroll {
         assert_eq!(*status, 401);
     }
-    let first = &bodies[0].1;
-    for (_, body) in &bodies[1..] {
+    for (_, body) in &enroll[1..] {
         assert_eq!(
-            body, first,
-            "rejection bodies must not distinguish unknown / expired / malformed"
+            body, &enroll[0].1,
+            "enrollment rejections must not distinguish unknown / expired / spent / malformed"
         );
     }
-}
 
-fn refresh_body(token: &str) -> String {
-    serde_json::json!({ "grant_type": "refresh", "session_token": token }).to_string()
+    // The same on a session-authenticated fleet route.
+    let unknown_session = fleet
+        .auth()
+        .format()
+        .mint(TokenKind::Session)
+        .to_secret_string();
+    let expired_session = fleet.seed_expired_session("alice").await;
+    let body = serde_json::json!({ "node_name": "rpi-2" }).to_string();
+    let register = futures_util::future::join_all(
+        [
+            unknown_session.as_str(),
+            expired_session.as_str(),
+            "garbage",
+        ]
+        .map(|token| {
+            fleet.http_auth(
+                "POST",
+                "/node/self-register",
+                Some(token),
+                Some(body.clone()),
+            )
+        }),
+    )
+    .await;
+    for (status, _) in &register {
+        assert_eq!(*status, 401);
+    }
+    for (_, b) in &register[1..] {
+        assert_eq!(
+            b, &register[0].1,
+            "session rejections must not distinguish unknown / expired / malformed"
+        );
+    }
 }

@@ -577,7 +577,7 @@ async fn node_register_approve(
 }
 
 /// Log a refused org claim (there is no org to scope an audit row to).
-async fn audit_denied(coord: &Coordinator, caller: &Caller, action: &str) {
+pub(crate) async fn audit_denied(coord: &Coordinator, caller: &Caller, action: &str) {
     coord
         .auth()
         .audit()

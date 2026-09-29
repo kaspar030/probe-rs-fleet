@@ -10,14 +10,25 @@
 // string: this page must render the field.
 //
 // There is no listing of pending registrations, and there is not going to be
-// one: `pending_node.org_id` is NULL until an approval binds it, so a listing
+// one: a pending registration has no org until an approval binds it, so a listing
 // could only show every live code in the deployment — exactly the cross-tenant
 // index docs/web-ui.md §4 forbids. Approval is code-driven.
+//
+// The **target org** is chosen here, before anything is looked up: a session
+// is not bound to one org, and approving grants the machine hardware access
+// in whichever org the request acts in (`?org=<id>`). The picker lists the
+// session's memberships and defaults to the org the UI is acting in; the
+// inspect call already carries the choice, so the server's `org` field — shown
+// in the table and in the confirmation — is the org the approval would bind.
+// Changing the org drops a looked-up registration: its collision check and
+// `org` answer belonged to the previous choice.
 
 import { h, tags, when, ago, errorBox } from '../dom.mjs';
+import { memberships, orgLabel, orgName } from '../session.mjs';
 
 export function render(state) {
-  const { pending, error, code, replace } = state;
+  const { pending, error, code, replace, session, targetOrg } = state;
+  const orgs = memberships(session);
   const children = [
     h('h1', {}, 'Approve a machine'),
     h(
@@ -29,12 +40,21 @@ export function render(state) {
     h(
       'form',
       { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onInspect(e.target.elements.code.value); } } },
+      orgs.length > 0
+        ? h('label', {}, h('span', { class: 'label' }, 'Approve into org'),
+          h(
+            'select',
+            { name: 'org', on: { change: (e) => state.onOrg(e.target.value) } },
+            orgs.map((m) => h('option', { value: m.id, selected: m.id === targetOrg }, `${orgLabel(m)} (${m.role})`)),
+          ))
+        : null,
       h('label', {}, h('span', { class: 'label' }, 'Code'),
         h('input', { name: 'code', value: code || '', placeholder: 'ABCD-1234', autocomplete: 'off' })),
       h('button', { class: 'primary', type: 'submit' }, 'Look up'),
     ),
   ];
   if (error) children.push(errorBox(error));
+  if (state.notice) children.push(h('p', { class: 'warning' }, state.notice));
 
   if (pending) {
     children.push(
@@ -53,7 +73,7 @@ export function render(state) {
             h('tr', {}, h('th', {}, 'Source address'), h('td', { class: 'mono' }, pending.source_ip || 'unknown')),
             h('tr', {}, h('th', {}, 'Started'), h('td', {}, `${when(pending.created_at)} (${ago(pending.created_at)})`)),
             h('tr', {}, h('th', {}, 'Expires'), h('td', {}, when(pending.expires))),
-            h('tr', {}, h('th', {}, 'Joins org'), h('td', { class: 'mono' }, pending.org || '—')),
+            h('tr', {}, h('th', {}, 'Joins org'), h('td', { class: 'mono' }, pending.org ? orgName(session, pending.org) : '—')),
             h('tr', {}, h('th', {}, 'State'), h('td', {}, pending.state)),
           ),
         ),
@@ -61,7 +81,7 @@ export function render(state) {
           ? h(
               'p',
               { class: 'warning' },
-              `Your org already has a node called ${pending.node_name} (${pending.collides_with}). ` +
+              `${pending.org ? orgName(session, pending.org) : 'This org'} already has a node called ${pending.node_name} (${pending.collides_with}). ` +
                 'Approving with "replace" re-credentials that node — the machine currently using it stops working.',
             )
           : null,
@@ -81,7 +101,11 @@ export function render(state) {
         h(
           'div',
           { class: 'row' },
-          h('button', { class: 'primary', on: { click: () => state.onDecide('approve') } }, 'Approve'),
+          h(
+            'button',
+            { class: 'primary', on: { click: () => state.onDecide('approve') } },
+            pending.org ? `Approve into ${orgName(session, pending.org)}` : 'Approve',
+          ),
           h('button', { class: 'danger', on: { click: () => state.onDecide('deny') } }, 'Deny'),
         ),
       ),
@@ -91,17 +115,34 @@ export function render(state) {
 }
 
 export async function load(ctx) {
-  const { api } = ctx;
+  const { api, session } = ctx;
+  const orgs = memberships(session);
+  // Default: the org the UI is acting in; else the session's; else the first.
+  if (!ctx.targetOrg || !orgs.some((m) => m.id === ctx.targetOrg)) {
+    const acting = (api.currentOrg && api.currentOrg()) || (session && session.org && session.org.id) || null;
+    ctx.targetOrg = orgs.some((m) => m.id === acting) ? acting : orgs.length > 0 ? orgs[0].id : acting;
+  }
   const state = {
+    session,
+    targetOrg: ctx.targetOrg,
     pending: ctx.pending || null,
     code: ctx.code || '',
     replace: Boolean(ctx.replace),
     error: ctx.approveError || null,
+    notice: ctx.approveNotice || null,
   };
   ctx.approveError = null;
+  ctx.approveNotice = null;
 
   state.onReplace = (on) => {
     ctx.replace = on;
+    return ctx.reload();
+  };
+
+  state.onOrg = (id) => {
+    ctx.targetOrg = id || null;
+    ctx.pending = null;
+    ctx.replace = false;
     return ctx.reload();
   };
 
@@ -117,7 +158,11 @@ export async function load(ctx) {
     try {
       // Any spelling `user_code::normalise` accepts is fine; the server
       // normalises, so this page does not reimplement the grammar.
-      ctx.pending = await api.post(`/api/v1/nodes/pending/${encodeURIComponent(code)}`, { decision: 'inspect' });
+      ctx.pending = await api.post(
+        `/api/v1/nodes/pending/${encodeURIComponent(code)}`,
+        { decision: 'inspect' },
+        { org: ctx.targetOrg },
+      );
     } catch (err) {
       ctx.pending = null;
       ctx.approveError = api.describe(err);
@@ -126,16 +171,22 @@ export async function load(ctx) {
   };
 
   state.onDecide = async (decision) => {
+    const target = ctx.targetOrg;
     try {
-      await api.post(`/api/v1/nodes/pending/${encodeURIComponent(ctx.code)}`, {
-        decision,
-        replace: Boolean(ctx.replace),
-      });
+      const decided = await api.post(
+        `/api/v1/nodes/pending/${encodeURIComponent(ctx.code)}`,
+        { decision, replace: Boolean(ctx.replace) },
+        { org: target },
+      );
+      const into = orgName(session, (decided && decided.org) || target);
       ctx.pending = null;
       ctx.code = '';
       ctx.replace = false;
       ctx.approveError = null;
-      window.alert(decision === 'approve' ? 'Approved. The machine will finish enrolling on its next poll.' : 'Denied.');
+      ctx.approveNotice =
+        decision === 'approve'
+          ? `Approved into ${into}. The machine will finish enrolling on its next poll.`
+          : 'Denied.';
     } catch (err) {
       ctx.approveError = api.describe(err);
     }

@@ -1,132 +1,73 @@
 // Sign in.
 //
-// Which flow is offered comes from `GET /api/v1/auth/methods`, never from a
+// Sign-in is forgs' `/auth/*`, not this UI's. Which providers exist comes from
+// `GET /auth/providers` (`{"providers": ["github", …]}`), never from a
 // build-time branch — there is no build (docs/web-ui.md D3), and the answer is
-// a property of the deployment's config.
+// a property of the deployment's config. Each provider is a plain link to
+// `/auth/{name}/start?return_to=/ui/`: a link and not a fetch, because the flow
+// is a browser navigation that ends in a redirect back to `/ui/` with cookies
+// attached, and XHR would swallow it. Account creation (signup) is rendered by
+// forgs on that same path; this page offers none of its own.
 //
-//   * `authorization_code` — a plain link to `/auth/github/start`. A link and
-//     not a fetch: the flow is a browser navigation that ends in a `302 /ui`
-//     with cookies attached, and XHR would swallow it.
-//   * `device` — the brokered fallback. `POST /api/v1/session/device/start`
-//     returns the user code and where to type it (the `device_code` itself
-//     stays in an `HttpOnly` cookie), then `.../poll` until `{"status":"ok"}`.
-//     Neither route authenticates anything, so neither needs the CSRF header.
-//   * `none` — no GitHub config at all; the operator mints a session with
-//     `coordinator user-token`.
+// Provider names are server strings, so they go through `dom.mjs` as text and
+// are URL-encoded into the href; a name that could not form a same-origin path
+// would be dropped by `safeHref` anyway.
+//
+// With no provider configured there is no browser sign-in; the operator mints
+// a session with `coordinator user-token` for CLI use.
 
 import { h, errorBox } from '../dom.mjs';
 
+/** Where the UI wants to land after a provider's callback. */
+export const RETURN_TO = '/ui/';
+
+/** The start URL for provider `name`. */
+export function startHref(name) {
+  return `/auth/${encodeURIComponent(name)}/start?return_to=${encodeURIComponent(RETURN_TO)}`;
+}
+
+/** A provider name, for display. */
+function label(name) {
+  const s = String(name);
+  return s.length === 0 ? s : s[0].toUpperCase() + s.slice(1);
+}
+
 export function render(state) {
-  const { method, device, error, polling } = state;
+  const { providers, error } = state;
   const children = [h('h1', {}, 'Sign in')];
   if (error) children.push(errorBox(error));
 
-  if (method === 'authorization_code') {
+  if (providers === null || providers === undefined) {
+    if (!error) children.push(h('p', { class: 'loading' }, 'Checking which sign-in this deployment offers…'));
+  } else if (providers.length === 0) {
     children.push(
-      h('p', {}, 'This coordinator signs in with GitHub.'),
-      h('p', {}, h('a', { class: 'button', href: '/auth/github/start' }, 'Continue with GitHub')),
-    );
-  } else if (method === 'device') {
-    if (!device) {
-      children.push(
-        h('p', {}, 'This coordinator has no OAuth callback registered, so sign-in uses the GitHub device flow.'),
-        h('p', {}, h('button', { class: 'primary', on: { click: state.onStart } }, 'Start device sign-in')),
-      );
-    } else {
-      children.push(
-        h('p', {}, 'Open GitHub and enter this code:'),
-        h('p', { class: 'secret' }, device.user_code),
-        h(
-          'p',
-          {},
-          h('a', { href: device.verification_uri, rel: 'noreferrer' }, device.verification_uri),
-          ' ',
-          h('span', { class: 'hint' }, '(opens github.com)'),
-        ),
-        h('p', { class: 'hint' }, polling ? 'Waiting for you to approve it on GitHub…' : 'Stopped polling.'),
-      );
-    }
-  } else if (method === 'none') {
-    children.push(
-      h('p', {}, 'This coordinator has no GitHub configuration, so there is no browser sign-in.'),
+      h('p', {}, 'This coordinator has no login provider configured, so there is no browser sign-in.'),
       h('p', {}, 'An operator can mint a session on the coordinator host:'),
       h('p', { class: 'mono secret' }, 'probe-rs-fleet coordinator user-token'),
-      h('p', { class: 'hint' }, 'That prints a session token for CLI use; the web UI needs a GitHub login.'),
+      h('p', { class: 'hint' }, 'That prints a session token for CLI use; the web UI needs a login provider.'),
     );
   } else {
-    children.push(h('p', { class: 'loading' }, 'Checking which sign-in this deployment offers…'));
+    children.push(
+      h('p', {}, providers.length === 1 ? 'Continue with:' : 'Choose how to sign in:'),
+      h(
+        'div',
+        { class: 'row' },
+        providers.map((name) => h('a', { class: 'button', href: startHref(name) }, `Continue with ${label(name)}`)),
+      ),
+    );
   }
   return h('section', {}, children);
 }
 
-// The device link is the one absolute URL in this tree. `safeHref` in dom.mjs
-// refuses it (only `/…` and `#…` are set as `href`), so it renders as text
-// rather than as a link — which is correct: the value comes from GitHub via the
-// coordinator, and a UI that turned an upstream string into a live link would
-// be one upstream change away from an open redirect.
-//
-// The in-flight device flow lives on `ctx`, not in a local: `load()` runs again
-// on every `reload()`, so a local would be rebuilt empty and the code the user
-// is meant to type would vanish the instant it was fetched.
 export async function load(ctx) {
   const { api } = ctx;
-  const state = {
-    method: null,
-    device: ctx.device || null,
-    error: ctx.loginError || null,
-    polling: Boolean(ctx.polling),
-    onStart: null,
-  };
-  ctx.loginError = null;
+  const state = { providers: null, error: null };
   try {
-    const methods = await api.get('/api/v1/auth/methods', { quiet: true });
-    state.method = methods && methods.login;
+    const body = await api.get('/auth/providers', { quiet: true });
+    const list = body && Array.isArray(body.providers) ? body.providers : [];
+    state.providers = list.filter((p) => typeof p === 'string' && p.length > 0);
   } catch (err) {
     state.error = api.describe(err);
-    return render(state);
   }
-
-  state.onStart = async () => {
-    // One flow at a time: a second `start` overwrites the `HttpOnly` cookie
-    // holding the first device code, stranding a login the user may already
-    // have half-completed on github.com.
-    if (ctx.device) return;
-    try {
-      const started = await api.post('/api/v1/session/device/start', {}, { quiet: true });
-      ctx.device = started;
-      ctx.polling = true;
-      await ctx.reload();
-      pollUntilSignedIn(ctx, started.interval);
-    } catch (err) {
-      ctx.loginError = api.describe(err);
-      await ctx.reload();
-    }
-  };
   return render(state);
-}
-
-/** Poll the brokered device flow at the interval GitHub asked for. */
-function pollUntilSignedIn(ctx, intervalSecs) {
-  const wait = Math.max(1, Number(intervalSecs) || 5) * 1000;
-  const tick = async () => {
-    try {
-      const result = await ctx.api.post('/api/v1/session/device/poll', {}, { quiet: true });
-      if (result && result.status === 'ok') {
-        // The session arrived as cookies; a reload is the simplest way to pick
-        // it up through the same path a fresh visit takes.
-        window.location.assign('/ui/');
-        return;
-      }
-    } catch {
-      // Expired or denied. Say so and offer a fresh start, rather than looping
-      // forever on a flow the coordinator has already forgotten.
-      ctx.device = null;
-      ctx.polling = false;
-      ctx.loginError = 'That sign-in expired or was refused. Start a new one.';
-      await ctx.reload();
-      return;
-    }
-    window.setTimeout(() => { void tick(); }, wait);
-  };
-  window.setTimeout(() => { void tick(); }, wait);
 }

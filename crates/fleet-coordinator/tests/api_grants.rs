@@ -22,13 +22,14 @@
 //! * **the selector and expiry bounds**, which the frontend has to constrain
 //!   inputs against and which therefore have to be enforced identically here;
 //! * **CSRF**, **cross-tenancy**, and **the no-capability-token rule**, whose
-//!   one deliberate exception (`AuthKeyCreated.key`) the test knows by name.
+//!   one deliberate exception (`ApiKeyCreated.key`) the test knows by name.
 
 mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::ids::{OrgId, Role};
+use fleet_coordinator::FleetRole;
+use fleet_proto::ids::OrgId;
 use fleet_proto::token::AllowedOp;
 
 /// Every mutating route this file covers, as `(method, path)`.
@@ -38,6 +39,9 @@ const MUTATING: [(&str, &str); 4] = [
     ("POST", "/api/v1/auth-keys"),
     ("DELETE", "/api/v1/auth-keys/abcdef0123456789"),
 ];
+
+/// The grant listing, acting in the team org `acme`.
+const GRANTS_IN_ACME: &str = "/api/v1/grants?org=acme";
 
 /// Every read route, for the unauthenticated sweep.
 const READ_ROUTES: [&str; 3] = [
@@ -71,10 +75,13 @@ async fn as_browser(
     (status, body)
 }
 
-/// Every audit action recorded, as `(org, subject, action)`.
-async fn audit_rows(fleet: &TestCoordinator) -> Vec<(String, Option<String>, String)> {
-    sqlx::query_as("SELECT org_id, subject, action FROM audit_log ORDER BY id")
-        .fetch_all(fleet.db().pool_for_test())
+/// The grants `org` has issued, straight from forgs' store.
+async fn list_grants(fleet: &TestCoordinator, org: &OrgId) -> Vec<forgs_store::GrantRow> {
+    fleet
+        .db()
+        .forgs()
+        .scoped(fleet_coordinator::subject::ns_of(org).unwrap())
+        .list_grants()
         .await
         .unwrap()
 }
@@ -144,7 +151,7 @@ async fn every_route_refuses_an_unauthenticated_caller() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_mutating_route_needs_the_csrf_header_when_cookie_authenticated() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
     let (cookie, csrf) = fleet.browser_session(&alice);
 
     for (method, path) in MUTATING {
@@ -194,27 +201,16 @@ async fn every_mutating_route_needs_the_csrf_header_when_cookie_authenticated() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grant_create_is_admin_only_while_grant_list_is_member() {
     let fleet = TestCoordinator::start().await;
-    let (admin, org, _admin_id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _bob_org, _bob) = fleet.seed_github_user(2, "bob", Role::Member).await;
-    // A plain member of alice's org.
-    fleet
-        .db()
-        .ensure_user_member(&org, "member-user", Role::Member)
-        .await
-        .unwrap();
-    let member = {
-        let token = fleet_auth::OpaqueToken::mint(fleet_auth::TokenKind::Session);
-        let now = i64::try_from(fleet.coord.now()).unwrap();
-        fleet
-            .db()
-            .insert_session(token.hash().as_str(), &org, "member-user", now, now + 3_600)
-            .await
-            .unwrap();
-        token.to_secret_string()
-    };
+    let admin = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let alice_id = fleet.user("alice").await;
+    let (bob_token, _bob_org, bob_id) = fleet.seed_user("bob").await;
+    // A plain member of acme.
+    let member = fleet
+        .seed_session("acme", "member-user", FleetRole::Member)
+        .await;
 
     // The member may list...
-    let (status, body) = as_browser(&fleet, "GET", "/api/v1/grants", &member, None).await;
+    let (status, body) = as_browser(&fleet, "GET", GRANTS_IN_ACME, &member, None).await;
     assert_eq!(status, 200, "a member must be able to list grants: {body}");
     assert_eq!(parse(&body).as_array().unwrap().len(), 0);
 
@@ -222,7 +218,7 @@ async fn grant_create_is_admin_only_while_grant_list_is_member() {
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/grants",
+        GRANTS_IN_ACME,
         &member,
         Some(&grant_body(&fleet, "bob", "tag=nrf52", &["attach"])),
     )
@@ -234,19 +230,20 @@ async fn grant_create_is_admin_only_while_grant_list_is_member() {
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/grants",
+        GRANTS_IN_ACME,
         &admin,
         Some(&grant_body(&fleet, "bob", "tag=nrf52", &["attach"])),
     )
     .await;
     assert_eq!(status, 200, "{body}");
     let created = parse(&body);
-    // Resolved to the immutable id, never the login — §6.4's rename/reuse
+    // Resolved to the immutable id, never the username — §6.4's rename/reuse
     // takeover is otherwise a hole.
-    assert_eq!(created["subject"]["id"], "gh-2");
-    assert_eq!(created["created_by"], "gh-1");
+    assert_eq!(created["subject"]["key"], format!("user:{bob_id}"));
+    assert_eq!(created["created_by"], alice_id.to_string());
 
-    // And a non-member of the org sees nothing of it.
+    // And a non-member of the org sees nothing of it: bob, in his own
+    // personal org, sees that org's (empty) list ...
     let (status, body) = as_browser(&fleet, "GET", "/api/v1/grants", &bob_token, None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
@@ -254,40 +251,55 @@ async fn grant_create_is_admin_only_while_grant_list_is_member() {
         0,
         "bob's own org has issued no grants: {body}"
     );
+    // ... and asking for acme's by name is refused outright.
+    let (status, body) = as_browser(&fleet, "GET", GRANTS_IN_ACME, &bob_token, None).await;
+    assert_eq!(status, 403, "{body}");
 }
 
 /// A session whose membership was revoked is refused everywhere, exactly as an
-/// absent one is.
+/// absent one is: acting in the org is checked per request, so removing the
+/// membership bites the very next call on a still-valid session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoked_membership_is_refused_like_an_absent_one() {
     let fleet = TestCoordinator::start().await;
-    let carol = fleet.seed_session("acme", "carol", Role::Admin).await;
-    sqlx::query("DELETE FROM member WHERE user_id = 'carol'")
-        .execute(fleet.db().pool_for_test())
+    let carol = fleet.seed_session("acme", "carol", FleetRole::Admin).await;
+    let (acme, carol_id) = fleet.member("acme", "carol", FleetRole::Admin).await;
+    // Still a member: the org is reachable.
+    let (status, body) = as_browser(&fleet, "GET", GRANTS_IN_ACME, &carol, None).await;
+    assert_eq!(status, 200, "{body}");
+    fleet
+        .db()
+        .forgs()
+        .scoped(fleet_coordinator::subject::ns_of(&acme).unwrap())
+        .remove_member(&forgs::SubjectKey::user(carol_id))
         .await
         .unwrap();
 
     for path in READ_ROUTES {
-        let (status, body) = as_browser(&fleet, "GET", path, &carol, None).await;
+        let path = format!("{path}?org=acme");
+        let (status, body) = as_browser(&fleet, "GET", &path, &carol, None).await;
         assert_eq!(status, 403, "{path}: {body}");
         assert!(body.contains("forbidden"), "{path}: {body}");
     }
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/auth-keys",
+        "/api/v1/auth-keys?org=acme",
         &carol,
         Some(&auth_key_body(&[], 3_600)),
     )
     .await;
     assert_eq!(status, 403, "{body}");
-    // The refusal is the *shared* `auth_key.denied` row the CLI route writes,
-    // not a second, differently-spelled opinion.
-    let rows = audit_rows(&fleet).await;
-    assert!(
-        rows.iter().any(|(_, _, a)| a == "auth_key.denied"),
-        "{rows:?}"
-    );
+    // Indistinguishable from an org that does not exist at all.
+    let (status, body) = as_browser(
+        &fleet,
+        "GET",
+        "/api/v1/grants?org=no-such-org",
+        &carol,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -302,8 +314,8 @@ async fn a_revoked_membership_is_refused_like_an_absent_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grants_expiry_is_required_and_bounded_on_both_ends() {
     let fleet = TestCoordinator::start().await;
-    let (alice, _org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice, _org, _id) = fleet.seed_user("alice").await;
+    fleet.seed_user("bob").await;
     let now = fleet.coord.now();
 
     let with_expiry = |expires: Option<u64>| {
@@ -386,8 +398,8 @@ async fn a_grants_expiry_is_required_and_bounded_on_both_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_selector_is_canonicalised_and_an_empty_one_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let (alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice, org, _id) = fleet.seed_user("alice").await;
+    fleet.seed_user("bob").await;
 
     // A bare term is a tag, and whitespace is normalised
     // away: the stored form is the parser's, not the caller's.
@@ -403,7 +415,7 @@ async fn a_selector_is_canonicalised_and_an_empty_one_is_refused() {
     assert_eq!(parse(&body)["selector"], "tag=nrf52");
 
     // And the *stored* row agrees, not merely the response.
-    let stored = fleet.db().scoped(org).list_grants().await.unwrap();
+    let stored = list_grants(&fleet, &org).await;
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].selector, "tag=nrf52");
 
@@ -448,8 +460,8 @@ async fn a_selector_is_canonicalised_and_an_empty_one_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ops_are_normalised_and_an_empty_set_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let (alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice, org, _id) = fleet.seed_user("alice").await;
+    fleet.seed_user("bob").await;
 
     let (status, body) = as_browser(
         &fleet,
@@ -486,9 +498,9 @@ async fn ops_are_normalised_and_an_empty_set_is_refused() {
     assert!(ops.contains(&serde_json::json!("attach")), "{body}");
     assert!(ops.contains(&serde_json::json!("flash")), "{body}");
 
-    let stored = fleet.db().scoped(org).list_grants().await.unwrap();
+    let stored = list_grants(&fleet, &org).await;
     assert_eq!(stored.len(), 1);
-    let stored_ops = stored[0].parsed_ops();
+    let stored_ops = fleet_coordinator::state::parsed_ops(&stored[0].ops);
     assert!(
         stored_ops.contains(&AllowedOp::Attach),
         "the stored row must carry the implied attach: {stored_ops:?}"
@@ -500,7 +512,7 @@ async fn ops_are_normalised_and_an_empty_set_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_grantee_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let (alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
+    let (alice, org, _id) = fleet.seed_user("alice").await;
 
     let (status, body) = as_browser(
         &fleet,
@@ -511,13 +523,7 @@ async fn an_unknown_grantee_is_refused() {
     )
     .await;
     assert_eq!(status, 400, "{body}");
-    assert!(fleet
-        .db()
-        .scoped(org)
-        .list_grants()
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(list_grants(&fleet, &org).await.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -530,42 +536,29 @@ async fn an_unknown_grantee_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
     let fleet = TestCoordinator::start().await;
-    let (alice, org, alice_id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    fleet.seed_github_user(2, "bob", Role::Member).await;
-    // A second *member* of alice's org, who created nothing.
-    fleet
-        .db()
-        .ensure_user_member(&org, "dave", Role::Member)
-        .await
-        .unwrap();
-    let dave = {
-        let token = fleet_auth::OpaqueToken::mint(fleet_auth::TokenKind::Session);
-        let now = i64::try_from(fleet.coord.now()).unwrap();
-        fleet
-            .db()
-            .insert_session(token.hash().as_str(), &org, "dave", now, now + 3_600)
-            .await
-            .unwrap();
-        token.to_secret_string()
-    };
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let alice_id = fleet.user("alice").await;
+    fleet.seed_user("bob").await;
+    // A second *member* of acme, who created nothing.
+    let dave = fleet.seed_session("acme", "dave", FleetRole::Member).await;
 
     // Alice's own grant.
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/grants",
+        GRANTS_IN_ACME,
         &alice,
         Some(&grant_body(&fleet, "bob", "tag=nrf52", &["attach"])),
     )
     .await;
     assert_eq!(status, 200, "{body}");
     let mine = parse(&body)["id"].as_str().unwrap().to_owned();
-    assert_eq!(parse(&body)["created_by"], alice_id);
+    assert_eq!(parse(&body)["created_by"], alice_id.to_string());
 
     // A row with no recorded creator, as a shell would leave.
     let orphan = fleet
         .seed_workload_grant(
-            &org.0,
+            "acme",
             "acme/runner",
             "tag=stm32",
             &[AllowedOp::Attach],
@@ -578,7 +571,7 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
         let (status, body) = as_browser(
             &fleet,
             "DELETE",
-            &format!("/api/v1/grants/{}", &id[..12]),
+            &format!("/api/v1/grants/{}?org=acme", &id[..12]),
             &dave,
             None,
         )
@@ -587,7 +580,7 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
         assert!(body.contains("forbidden"), "{body}");
     }
     // Refused revocations are on the record.
-    let rows = audit_rows(&fleet).await;
+    let rows = fleet.audit_rows().await;
     assert_eq!(
         rows.iter()
             .filter(|(_, _, a)| a == "grant.revoke.denied")
@@ -601,7 +594,7 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
         let (status, body) = as_browser(
             &fleet,
             "DELETE",
-            &format!("/api/v1/grants/{}", &id[..12]),
+            &format!("/api/v1/grants/{}?org=acme", &id[..12]),
             &alice,
             None,
         )
@@ -609,12 +602,8 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
         assert_eq!(status, 200, "{id}: {body}");
         assert_eq!(parse(&body)["revoked"], serde_json::json!([id]));
     }
-    assert!(fleet
-        .db()
-        .scoped(org)
-        .list_grants()
+    assert!(list_grants(&fleet, &fleet.org("acme").await)
         .await
-        .unwrap()
         .is_empty());
 }
 
@@ -623,7 +612,7 @@ async fn a_grant_is_revocable_by_its_creator_or_an_admin_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_short_or_non_hex_grant_prefix_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
 
     for bad in ["abc", "nothexbutlong", "ci-", "ci-abc"] {
         let (status, body) = as_browser(
@@ -655,8 +644,8 @@ async fn a_short_or_non_hex_grant_prefix_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_a_grant_tears_down_the_grantees_live_lease() {
     let fleet = TestCoordinator::start().await;
-    let (alice, alice_org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _bob_org, _bob) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice, alice_org, _id) = fleet.seed_user("alice").await;
+    let (bob_token, _bob_org, _bob) = fleet.seed_user("bob").await;
     fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -714,7 +703,7 @@ async fn revoking_a_grant_tears_down_the_grantees_live_lease() {
     assert_eq!(closed.len(), 1);
     assert!(closed[0].0.is_some(), "the lease row is still open");
 
-    let rows = audit_rows(&fleet).await;
+    let rows = fleet.audit_rows().await;
     for action in ["grant.create", "grant.revoke"] {
         assert!(rows.iter().any(|(_, _, a)| a == action), "{rows:?}");
     }
@@ -729,12 +718,12 @@ async fn revoking_a_grant_tears_down_the_grantees_live_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_mints_a_key_and_the_listing_is_hash_only() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
 
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/auth-keys",
+        "/api/v1/auth-keys?org=acme",
         &alice,
         Some(&auth_key_body(&["lab"], 3_600)),
     )
@@ -742,13 +731,14 @@ async fn a_member_mints_a_key_and_the_listing_is_hash_only() {
     assert_eq!(status, 200, "a member must be able to mint: {body}");
     let created = parse(&body);
     let secret = created["key"].as_str().unwrap().to_owned();
-    assert!(secret.starts_with("prffk1_"), "{body}");
+    assert!(secret.starts_with("prfk1_"), "{body}");
     let hash = created["key_hash"].as_str().unwrap().to_owned();
     assert_eq!(created["purpose"], "node");
-    assert_eq!(created["tags"], serde_json::json!(["lab"]));
+    assert_eq!(created["payload"], serde_json::json!({ "tags": ["lab"] }));
 
     // The listing names the hash and never the secret — it is stored nowhere.
-    let (status, body) = as_browser(&fleet, "GET", "/api/v1/auth-keys", &alice, None).await;
+    let (status, body) =
+        as_browser(&fleet, "GET", "/api/v1/auth-keys?org=acme", &alice, None).await;
     assert_eq!(status, 200, "{body}");
     assert!(
         !body.contains(&secret),
@@ -757,16 +747,18 @@ async fn a_member_mints_a_key_and_the_listing_is_hash_only() {
     assert!(body.contains(&hash), "{body}");
     let listed = parse(&body);
     assert_eq!(listed["keys"].as_array().unwrap().len(), 1);
-    assert_eq!(listed["keys"][0]["created_by"], "alice");
+    assert_eq!(
+        listed["keys"][0]["created_by"],
+        fleet.user("alice").await.to_string()
+    );
 
     // And it works: the key enrolls a node, which is the whole point.
     let (status, body) = fleet
         .http(
             "POST",
-            "/auth/token",
+            "/node/enroll",
             Some(
                 serde_json::json!({
-                    "grant_type": "auth_key",
                     "auth_key": secret,
                     "node_name": "rpi-lab-1",
                 })
@@ -795,7 +787,7 @@ async fn a_member_mints_a_key_and_the_listing_is_hash_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_key_validation_is_the_shared_validation() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
 
     let cases = [
         (
@@ -833,7 +825,7 @@ async fn auth_key_validation_is_the_shared_validation() {
         let (status, response) = as_browser(
             &fleet,
             "POST",
-            "/api/v1/auth-keys",
+            "/api/v1/auth-keys?org=acme",
             &alice,
             Some(&body.to_string()),
         )
@@ -846,7 +838,7 @@ async fn auth_key_validation_is_the_shared_validation() {
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/auth-keys",
+        "/api/v1/auth-keys?org=acme",
         &alice,
         Some(&auth_key_body(&[], 30 * 24 * 3600)),
     )
@@ -860,16 +852,16 @@ async fn auth_key_validation_is_the_shared_validation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let admin = fleet.seed_session("acme", "root", Role::Admin).await;
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
-    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+    let org = fleet.org("acme").await;
+    let admin = fleet.seed_session("acme", "root", FleetRole::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
+    let bob = fleet.seed_session("acme", "bob", FleetRole::Member).await;
 
     // Alice's own key.
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/auth-keys",
+        "/api/v1/auth-keys?org=acme",
         &alice,
         Some(&auth_key_body(&[], 3_600)),
     )
@@ -878,29 +870,35 @@ async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
     let alices = parse(&body)["key_hash"].as_str().unwrap().to_owned();
 
     // A shell-minted key: `created_by` is NULL.
-    let orphan_secret = fleet.seed_auth_key(&org.0, &[], true, None).await;
-    let orphan = fleet_auth::OpaqueToken::parse(&orphan_secret)
+    let orphan_secret = fleet.seed_auth_key("acme", &[], true, None).await;
+    let orphan = fleet
+        .auth()
+        .format()
+        .parse(&orphan_secret)
         .unwrap()
         .hash()
         .as_str()
         .to_owned();
+    // The org is resolved per request; it is the same one either way.
+    assert_eq!(org, fleet.org("acme").await);
 
     // Bob, a member who created neither, may revoke neither.
     for hash in [&alices, &orphan] {
         let (status, body) = as_browser(
             &fleet,
             "DELETE",
-            &format!("/api/v1/auth-keys/{}", &hash[..16]),
+            &format!("/api/v1/auth-keys/{}?org=acme", &hash[..16]),
             &bob,
             None,
         )
         .await;
         assert_eq!(status, 403, "{hash}: {body}");
     }
-    let rows = audit_rows(&fleet).await;
+    // Refused revocations are on forgs' (identity) record.
+    let rows = fleet.forgs_audit_actions().await;
     assert_eq!(
         rows.iter()
-            .filter(|(_, _, a)| a == "auth_key.revoke.denied")
+            .filter(|a| *a == "api_key.revoke.denied")
             .count(),
         2,
         "{rows:?}"
@@ -910,7 +908,7 @@ async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
     let (status, body) = as_browser(
         &fleet,
         "DELETE",
-        &format!("/api/v1/auth-keys/{}", &alices[..16]),
+        &format!("/api/v1/auth-keys/{}?org=acme", &alices[..16]),
         &alice,
         None,
     )
@@ -922,7 +920,7 @@ async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
     let (status, body) = as_browser(
         &fleet,
         "DELETE",
-        &format!("/api/v1/auth-keys/{}", &orphan[..16]),
+        &format!("/api/v1/auth-keys/{}?org=acme", &orphan[..16]),
         &alice,
         None,
     )
@@ -931,7 +929,7 @@ async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
     let (status, body) = as_browser(
         &fleet,
         "DELETE",
-        &format!("/api/v1/auth-keys/{}", &orphan[..16]),
+        &format!("/api/v1/auth-keys/{}?org=acme", &orphan[..16]),
         &admin,
         None,
     )
@@ -943,7 +941,7 @@ async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
         let (status, body) = as_browser(
             &fleet,
             "DELETE",
-            &format!("/api/v1/auth-keys/{bad}"),
+            &format!("/api/v1/auth-keys/{bad}?org=acme"),
             &admin,
             None,
         )
@@ -961,8 +959,8 @@ async fn an_auth_key_is_revocable_by_its_creator_or_an_admin_only() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let org = fleet.org("acme").await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
 
     // Mint through the browser API, so the key under test is one this surface
@@ -970,7 +968,7 @@ async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
     let (status, body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/auth-keys",
+        "/api/v1/auth-keys?org=acme",
         &alice,
         Some(
             &serde_json::json!({
@@ -990,16 +988,20 @@ async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
         .http(
             "POST",
             "/auth/token",
-            Some(
-                serde_json::json!({ "grant_type": "workload_key", "auth_key": secret }).to_string(),
-            ),
+            Some(serde_json::json!({ "grant_type": "api_key", "api_key": secret }).to_string()),
         )
         .await;
     assert_eq!(status, 200, "{body}");
     let workload = parse(&body)["token"].as_str().unwrap().to_owned();
-    let grants = fleet.db().scoped(org.clone()).list_grants().await.unwrap();
+    let grants = list_grants(&fleet, &org).await;
     assert_eq!(grants.len(), 1, "one key, one grant");
-    assert!(grants[0].id.starts_with("ci-"), "{}", grants[0].id);
+    // Deterministic, keyed on the key's workload identity, and attributed to
+    // the key's creator, who may therefore revoke it.
+    assert_eq!(
+        grants[0].subject,
+        format!("{}/workload:key:{}", org.0, &hash[..8]),
+    );
+    assert_eq!(grants[0].created_by, Some(fleet.user("alice").await));
 
     // The runner takes a lease.
     let ci = fleet.client_session(&workload).await;
@@ -1009,7 +1011,7 @@ async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
     let (status, body) = as_browser(
         &fleet,
         "DELETE",
-        &format!("/api/v1/auth-keys/{}", &hash[..16]),
+        &format!("/api/v1/auth-keys/{}?org=acme", &hash[..16]),
         &alice,
         None,
     )
@@ -1027,13 +1029,7 @@ async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
         "revoking a CI key must release what it was holding, not wait out the TTL"
     );
     assert!(
-        fleet
-            .db()
-            .scoped(org)
-            .list_grants()
-            .await
-            .unwrap()
-            .is_empty(),
+        list_grants(&fleet, &org).await.is_empty(),
         "the synthesised grant survived the key"
     );
 }
@@ -1044,16 +1040,16 @@ async fn revoking_a_ci_key_cascades_into_its_grant_and_lease() {
 
 /// **Org A can list, create against, revoke and see nothing of org B.**
 ///
-/// The listings are org-scoped by `OrgDb`, and the revocations must answer
+/// The listings are scoped to the acting org (forgs `NsScope`), and the revocations must answer
 /// exactly as they would for an object that does not exist — a `403` for "not
 /// yours" and a `404` for "no such thing" would make the API an org-enumeration
 /// oracle (`docs/web-ui.md` §4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_orgs_session_touches_nothing_of_another() {
     let fleet = TestCoordinator::start().await;
-    let (alice, alice_org, _a) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (mallory, mallory_org, _m) = fleet.seed_github_user(2, "mallory", Role::Admin).await;
-    fleet.seed_github_user(3, "bob", Role::Member).await;
+    let (alice, alice_org, _a) = fleet.seed_user("alice").await;
+    let (mallory, mallory_org, _m) = fleet.seed_user("mallory").await;
+    fleet.seed_user("bob").await;
 
     // Alice's org has a grant and a key; mallory's has neither.
     let (status, body) = as_browser(
@@ -1084,7 +1080,7 @@ async fn one_orgs_session_touches_nothing_of_another() {
     let (status, body) = as_browser(&fleet, "GET", "/api/v1/auth-keys", &mallory, None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(parse(&body)["keys"].as_array().unwrap().len(), 0, "{body}");
-    assert_eq!(parse(&body)["org"], mallory_org.0);
+    assert_eq!(parse(&body)["namespace"], mallory_org.0);
 
     // And cannot revoke either, indistinguishably from an absent object.
     let (real_status, real_body) = as_browser(
@@ -1131,16 +1127,7 @@ async fn one_orgs_session_touches_nothing_of_another() {
     );
 
     // Nothing of alice's moved.
-    assert_eq!(
-        fleet
-            .db()
-            .scoped(alice_org)
-            .list_grants()
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
+    assert_eq!(list_grants(&fleet, &alice_org).await.len(), 1);
 
     // A grant *created* by mallory lands in mallory's org, never alice's: the
     // org comes from the session, never from the request.
@@ -1169,8 +1156,8 @@ async fn one_orgs_session_touches_nothing_of_another() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_response_body_carries_a_capability_token() {
     let fleet = TestCoordinator::start().await;
-    let (alice, org, _id) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice, org, _id) = fleet.seed_user("alice").await;
+    fleet.seed_user("bob").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     // A live lease, so the one artefact that *has* a capability token exists
     // while the sweep runs.
@@ -1232,7 +1219,7 @@ async fn no_response_body_carries_a_capability_token() {
     }
 
     for (route, body) in &bodies {
-        for prefix in ["prfs1_", "prfn1_", "prffk1_", "prfnd1_", "prfw1_"] {
+        for prefix in ["prfs1_", "prfr1_", "prfn1_", "prfk1_", "prfd1_", "prfw1_"] {
             assert!(
                 !body.contains(prefix),
                 "{route} returned a `{prefix}` credential: {body}"
@@ -1264,10 +1251,10 @@ async fn no_response_body_carries_a_capability_token() {
         );
     }
 
-    // The one deliberate exception, and only there: `AuthKeyCreated.key`.
+    // The one deliberate exception, and only there: `ApiKeyCreated.key`.
     let key_fields = parse(&created_key);
     assert!(
-        key_fields["key"].as_str().unwrap().starts_with("prffk1_"),
+        key_fields["key"].as_str().unwrap().starts_with("prfk1_"),
         "the auth-key panel's shown-once secret must still be present"
     );
     // ... and it is the *only* field of that body carrying it.
@@ -1276,7 +1263,7 @@ async fn no_response_body_carries_a_capability_token() {
             continue;
         }
         assert!(
-            !value.to_string().contains("prffk1_"),
+            !value.to_string().contains("prfk1_"),
             "{name} carried the secret too: {created_key}"
         );
     }
@@ -1284,7 +1271,7 @@ async fn no_response_body_carries_a_capability_token() {
 
 /// A hex run long enough to be a signed capability token rather than an id.
 ///
-/// Grant ids are 32 hex characters and key hashes are 64, so the bar is set
+/// Grant ids are 26-character ULIDs and key hashes are 64 hex, so the bar is set
 /// above both: a `SignedToken`'s wire form is a signature plus a payload, so it
 /// is far longer than either. This is deliberately a *shape* check — the point
 /// is to fail for a token a future endpoint adds, whatever it is called.
@@ -1319,7 +1306,7 @@ fn contains_long_hex_run(body: &str) -> bool {
 async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
     use fleet_wire::{CoordToSidecar, SidecarToCoord};
 
-    /// `(action, detail)` for every audit row, in order.
+    /// `(action, detail)` for every fleet audit row, in order.
     async fn detailed_rows(fleet: &TestCoordinator) -> Vec<(String, Option<String>)> {
         sqlx::query_as("SELECT action, detail FROM audit_log ORDER BY id")
             .fetch_all(fleet.db().pool_for_test())
@@ -1327,10 +1314,33 @@ async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
             .unwrap()
     }
 
+    /// Replace everything that is random per coordinator — the grant id and
+    /// the user ids rendered into subject keys — with placeholders.
+    async fn normalise(
+        fleet: &TestCoordinator,
+        rows: Vec<(String, Option<String>)>,
+        grant_id: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let alice = fleet.user("alice").await.to_string();
+        let bob = fleet.user("bob").await.to_string();
+        rows.into_iter()
+            .map(|(a, d)| {
+                (
+                    a,
+                    d.map(|d| {
+                        d.replace(grant_id, "<id>")
+                            .replace(&alice, "<alice>")
+                            .replace(&bob, "<bob>")
+                    }),
+                )
+            })
+            .collect()
+    }
+
     // --- the wire path, as the CLI drives it ------------------------------
     let wire = TestCoordinator::start().await;
-    let (alice_w, org_w, _id) = wire.seed_github_user(1, "alice", Role::Admin).await;
-    wire.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_w, _org_w, _id) = wire.seed_user("alice").await;
+    wire.seed_user("bob").await;
     let expires = wire.coord.now() + 3_600;
     let session = wire.client_session(&alice_w).await;
     let wire_id = match session
@@ -1360,9 +1370,8 @@ async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
 
     // --- the browser path, doing exactly the same thing -------------------
     let browser = TestCoordinator::start().await;
-    let (alice_b, org_b, _id) = browser.seed_github_user(1, "alice", Role::Admin).await;
-    browser.seed_github_user(2, "bob", Role::Member).await;
-    assert_eq!(org_w, org_b, "the two fixtures must produce the same org");
+    let (alice_b, _org_b, _id) = browser.seed_user("alice").await;
+    browser.seed_user("bob").await;
     let (status, body) = as_browser(
         &browser,
         "POST",
@@ -1392,16 +1401,10 @@ async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
     assert_eq!(status, 200, "{body}");
     let browser_rows = detailed_rows(&browser).await;
 
-    // The grant id is random per run, so it is normalised out; everything else
-    // — the action names, the subject rendering, the op list, the selector —
-    // must match byte for byte.
-    let normalise =
-        |rows: Vec<(String, Option<String>)>, id: &str| -> Vec<(String, Option<String>)> {
-            rows.into_iter()
-                .map(|(a, d)| (a, d.map(|d| d.replace(id, "<id>"))))
-                .collect()
-        };
-    let wire_rows = normalise(wire_rows, &wire_id);
+    // The grant id and user ids are random per run, so they are normalised
+    // out; everything else — the action names, the subject rendering, the op
+    // list, the selector — must match byte for byte.
+    let wire_rows = normalise(&wire, wire_rows, &wire_id).await;
     // Guard against the comparison passing because both sides logged nothing:
     // the two verbs write one row each, and `grant.revoke` is the one a
     // reimplementation would most plausibly drop.
@@ -1411,35 +1414,49 @@ async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
         "the wire baseline is empty, so the comparison proves nothing: {wire_rows:?}"
     );
     assert_eq!(
-        normalise(browser_rows, &browser_id),
+        normalise(&browser, browser_rows, &browser_id).await,
         wire_rows,
         "the browser path must leave the same audit trail as the CLI's"
     );
 }
 
 /// Auth-key mint and revoke leave the rows `POST /auth/keys` leaves, for the
-/// same reason: one credential, one ceremony, one spelling in the log.
+/// same reason: one credential, one ceremony, one spelling in the log. These
+/// are identity events, so they land in forgs' audit table.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
-    /// `(action, detail)` for every audit row, in order.
-    async fn detailed_rows(fleet: &TestCoordinator) -> Vec<(String, Option<String>)> {
-        sqlx::query_as("SELECT action, detail FROM audit_log ORDER BY id")
-            .fetch_all(fleet.db().pool_for_test())
-            .await
-            .unwrap()
+    type Row = (String, Option<String>, Option<String>);
+
+    /// `(action, target, detail)` for every `api_key.*` forgs audit row.
+    async fn detailed_rows(
+        fleet: &TestCoordinator,
+    ) -> Vec<(String, Option<String>, Option<String>)> {
+        sqlx::query_as(
+            "SELECT action, target, detail FROM forgs_audit \
+             WHERE action LIKE 'api_key%' ORDER BY id",
+        )
+        .fetch_all(fleet.db().pool_for_test())
+        .await
+        .unwrap()
     }
 
     // --- `POST /auth/keys`, as the CLI drives it --------------------------
     let cli = TestCoordinator::start().await;
-    let alice_c = cli.seed_session("acme", "alice", Role::Member).await;
+    let alice_c = cli.seed_session("acme", "alice", FleetRole::Member).await;
     let (status, body) = cli
         .http_auth(
             "POST",
             "/auth/keys",
             Some(&alice_c),
             Some(
-                serde_json::json!({ "action": "create", "tags": ["lab"], "ttl_secs": 3600 })
-                    .to_string(),
+                serde_json::json!({
+                    "action": "create",
+                    "namespace": "acme",
+                    "ttl_secs": 3600,
+                    "purpose": "node",
+                    "payload": { "tags": ["lab"] },
+                })
+                .to_string(),
             ),
         )
         .await;
@@ -1450,7 +1467,14 @@ async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
             "POST",
             "/auth/keys",
             Some(&alice_c),
-            Some(serde_json::json!({ "action": "revoke", "prefix": &cli_hash[..16] }).to_string()),
+            Some(
+                serde_json::json!({
+                    "action": "revoke",
+                    "namespace": "acme",
+                    "prefix": &cli_hash[..16],
+                })
+                .to_string(),
+            ),
         )
         .await;
     assert_eq!(status, 200, "{body}");
@@ -1458,11 +1482,11 @@ async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
 
     // --- `/api/v1/auth-keys`, doing the same thing ------------------------
     let web = TestCoordinator::start().await;
-    let alice_w = web.seed_session("acme", "alice", Role::Member).await;
+    let alice_w = web.seed_session("acme", "alice", FleetRole::Member).await;
     let (status, body) = as_browser(
         &web,
         "POST",
-        "/api/v1/auth-keys",
+        "/api/v1/auth-keys?org=acme",
         &alice_w,
         Some(&auth_key_body(&["lab"], 3_600)),
     )
@@ -1472,7 +1496,7 @@ async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
     let (status, body) = as_browser(
         &web,
         "DELETE",
-        &format!("/api/v1/auth-keys/{}", &web_hash[..16]),
+        &format!("/api/v1/auth-keys/{}?org=acme", &web_hash[..16]),
         &alice_w,
         None,
     )
@@ -1480,16 +1504,16 @@ async fn auth_key_verbs_audit_exactly_as_the_json_route_does() {
     assert_eq!(status, 200, "{body}");
     let web_rows = detailed_rows(&web).await;
 
-    let normalise =
-        |rows: Vec<(String, Option<String>)>, hash: &str| -> Vec<(String, Option<String>)> {
-            rows.into_iter()
-                .map(|(a, d)| (a, d.map(|d| d.replace(hash, "<hash>"))))
-                .collect()
-        };
+    let normalise = |rows: Vec<Row>, hash: &str| -> Vec<Row> {
+        let scrub = |s: String| s.replace(hash, "<hash>").replace(&hash[..8], "<short>");
+        rows.into_iter()
+            .map(|(a, t, d)| (a, t.map(scrub), d.map(scrub)))
+            .collect()
+    };
     let cli_rows = normalise(cli_rows, &cli_hash);
     assert!(
-        cli_rows.iter().any(|(a, _)| a == "auth_key.mint")
-            && cli_rows.iter().any(|(a, _)| a == "auth_key.revoke"),
+        cli_rows.iter().any(|(a, _, _)| a == "api_key.mint")
+            && cli_rows.iter().any(|(a, _, _)| a == "api_key.revoke"),
         "the CLI baseline is empty, so the comparison proves nothing: {cli_rows:?}"
     );
     assert_eq!(

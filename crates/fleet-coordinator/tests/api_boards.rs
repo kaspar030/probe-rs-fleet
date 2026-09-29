@@ -17,12 +17,18 @@
 //!   or lease ids become enumerable across tenants;
 //! * **CSRF** on both, for a cookie-authenticated caller, and **cross-tenancy**,
 //!   where "not yours" and "does not exist" must be one answer.
+//!
+//! A session is not bound to an org: it acts in the user's personal org unless
+//! the request names one (`?org=`). Board *reach* is every org the user is a
+//! member of (plus grants); the acting org matters for the admin leg of lease
+//! release and for naming an org one is not a member of (`403`).
 
 mod common;
 
 use common::{NodeStub, TestCoordinator};
 
-use fleet_proto::ids::{LeaseId, OrgId, Role};
+use fleet_coordinator::FleetRole;
+use fleet_proto::ids::LeaseId;
 use fleet_proto::token::AllowedOp;
 
 /// Every mutating route this file covers, as `(method, path)`.
@@ -54,14 +60,6 @@ async fn as_browser(
         )
         .await;
     (status, body)
-}
-
-/// Every audit action recorded, as `(org, subject, action)`.
-async fn audit_rows(fleet: &TestCoordinator) -> Vec<(String, Option<String>, String)> {
-    sqlx::query_as("SELECT org_id, subject, action FROM audit_log ORDER BY id")
-        .fetch_all(fleet.db().pool_for_test())
-        .await
-        .unwrap()
 }
 
 fn power_cycle_body(board: &str) -> String {
@@ -112,7 +110,7 @@ async fn every_route_refuses_an_unauthenticated_caller() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cookie_authenticated_mutation_needs_the_csrf_header() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
     let (cookie, csrf) = fleet.browser_session(&alice);
 
     for (method, path) in MUTATING {
@@ -169,8 +167,8 @@ async fn a_cookie_authenticated_mutation_needs_the_csrf_header() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_owner_power_cycles_a_board_and_the_agent_is_commanded() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
+    let org = fleet.org("acme").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let mut node = NodeStub::attach(&fleet, &board.node).await;
 
@@ -189,10 +187,10 @@ async fn an_owner_power_cycles_a_board_and_the_agent_is_commanded() {
     assert_eq!(node.expect_power_cycle().await.0, "dk-3");
 
     // Audited exactly as the CLI path audits it: same action, same board.
-    let rows = audit_rows(&fleet).await;
+    let rows = fleet.audit_rows().await;
     assert!(
         rows.iter()
-            .any(|(o, _, a)| o == "acme" && a == "board.power-cycle"),
+            .any(|(o, _, a)| o == &org.0 && a == "board.power-cycle"),
         "{rows:?}"
     );
 }
@@ -211,8 +209,8 @@ async fn an_owner_power_cycles_a_board_and_the_agent_is_commanded() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_qualified_board_spelling_the_ui_sends_resolves_unambiguously() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
+    let org = fleet.org("acme").await;
     let first = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let second = fleet.seed_board(&org, "rpi-2", "dk-3", &["nrf52"]).await;
     let mut agent_one = NodeStub::attach(&fleet, &first.node).await;
@@ -250,8 +248,10 @@ async fn the_qualified_board_spelling_the_ui_sends_resolves_unambiguously() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grantee_without_the_power_cycle_op_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _alice) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _bob_org, _bob) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    // Two fresh signups: each is admin of their own personal org and nothing
+    // else. Bob is named by **username** in the grant below.
+    let (alice_token, alice_org, _alice) = fleet.seed_user("alice").await;
+    let (bob_token, _bob_org, _bob) = fleet.seed_user("bob").await;
     let board = fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -268,7 +268,7 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
                 "subject": "bob",
                 "selector": "tag=nrf52",
                 "ops": ["attach"],
-                "expires": fleet.coord.now() + 3_600,
+                "expires": fleet.now() + 3_600,
             })
             .to_string(),
         ),
@@ -306,7 +306,7 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
                 "subject": "bob",
                 "selector": "tag=nrf52",
                 "ops": ["power-cycle"],
-                "expires": fleet.coord.now() + 3_600,
+                "expires": fleet.now() + 3_600,
             })
             .to_string(),
         ),
@@ -331,9 +331,9 @@ async fn a_grantee_without_the_power_cycle_op_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_org_board_is_no_such_board() {
     let fleet = TestCoordinator::start().await;
-    let acme = OrgId("acme".to_owned());
-    let other = OrgId("other".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let acme = fleet.org("acme").await;
+    let other = fleet.org("other").await;
     fleet.seed_board(&acme, "rpi-1", "mine", &["nrf52"]).await;
     let theirs = fleet
         .seed_board(&other, "rpi-9", "theirs", &["nrf52"])
@@ -368,21 +368,43 @@ async fn a_cross_org_board_is_no_such_board() {
     );
 }
 
-/// A caller with no access at all is refused, and a malformed body is a `400`
-/// rather than a `500` or a silent no-op.
+/// A caller whose membership was revoked is refused, and a malformed body is a
+/// `400` rather than a `500` or a silent no-op.
+///
+/// Carol still has her personal org, so her `Access` is not empty any more:
+/// naming the org she was removed from is a `403` (not a member), and acting
+/// in her own org the board is simply not there — the same `404` as a board
+/// that does not exist. Either way the node hears nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn power_cycle_rejects_a_non_member_and_a_malformed_body() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
-    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let org = fleet.org("acme").await;
+    let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+    let mut node = NodeStub::attach(&fleet, &board.node).await;
 
-    // A session whose membership was revoked has an empty `Access`.
-    let carol = fleet.seed_session("acme", "carol", Role::Member).await;
-    sqlx::query("DELETE FROM member WHERE user_id = 'carol'")
-        .execute(fleet.db().pool_for_test())
+    let carol = fleet.seed_session("acme", "carol", FleetRole::Member).await;
+    let carol_id = fleet.user("carol").await;
+    let removed = fleet
+        .db()
+        .forgs()
+        .scoped(fleet_coordinator::subject::ns_of(&org).unwrap())
+        .remove_member(&forgs::SubjectKey::user(carol_id))
         .await
         .unwrap();
+    assert!(removed, "carol was a member before");
+
+    let (status, body) = as_browser(
+        &fleet,
+        "POST",
+        "/api/v1/boards/power-cycle?org=acme",
+        &carol,
+        Some(&power_cycle_body("dk-3")),
+    )
+    .await;
+    assert_eq!(status, 403, "a former member named the org: {body}");
+    assert!(body.contains("forbidden"), "{body}");
+
     let (status, body) = as_browser(
         &fleet,
         "POST",
@@ -391,7 +413,11 @@ async fn power_cycle_rejects_a_non_member_and_a_malformed_body() {
         Some(&power_cycle_body("dk-3")),
     )
     .await;
-    assert_eq!(status, 403, "{body}");
+    assert_eq!(status, 404, "a former member reached the board: {body}");
+    assert!(
+        node.is_idle(),
+        "a former member's power-cycle must not reach the node"
+    );
 
     for bad in [
         String::new(),
@@ -424,8 +450,8 @@ async fn power_cycle_rejects_a_non_member_and_a_malformed_body() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_holder_releases_their_own_lease() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
+    let org = fleet.org("acme").await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let session = fleet.client_session(&alice).await;
     let lease = take_lease(&session, "dk-3").await;
@@ -464,10 +490,10 @@ async fn the_holder_releases_their_own_lease() {
     assert_eq!(closed[0].1.as_deref(), Some("released"));
 
     // The same `lease.release` row the wire path writes.
-    let rows = audit_rows(&fleet).await;
+    let rows = fleet.audit_rows().await;
     assert!(
         rows.iter()
-            .any(|(o, _, a)| o == "acme" && a == "lease.release"),
+            .any(|(o, _, a)| o == &org.0 && a == "lease.release"),
         "{rows:?}"
     );
 
@@ -489,37 +515,43 @@ async fn the_holder_releases_their_own_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stranger_gets_the_answer_for_a_lease_that_does_not_exist() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
+    let org = fleet.org("acme").await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let session = fleet.client_session(&alice).await;
     let lease = take_lease(&session, "dk-3").await;
 
     // A member of a *different* org — not a member of alice's, so not an admin
     // of the board's org either.
-    let mallory = fleet.seed_session("evil", "mallory", Role::Admin).await;
-    let (real_status, real_body) = as_browser(
-        &fleet,
-        "DELETE",
-        &format!("/api/v1/leases/{}", lease.0),
-        &mallory,
-        None,
-    )
-    .await;
-    let (fake_status, fake_body) = as_browser(
-        &fleet,
-        "DELETE",
-        &format!("/api/v1/leases/{}", lease.0 + 9_999),
-        &mallory,
-        None,
-    )
-    .await;
-    assert_eq!(real_status, 404, "{real_body}");
-    assert_eq!(
-        (real_status, real_body.as_str()),
-        (fake_status, fake_body.as_str()),
-        "someone else's lease must be indistinguishable from an absent one"
-    );
+    let mallory = fleet
+        .seed_session("evil", "mallory", FleetRole::Admin)
+        .await;
+    // Both in her personal org and acting as admin of her own team org: an
+    // admin role *somewhere* is no stake in this lease.
+    for acting in ["", "?org=evil"] {
+        let (real_status, real_body) = as_browser(
+            &fleet,
+            "DELETE",
+            &format!("/api/v1/leases/{}{acting}", lease.0),
+            &mallory,
+            None,
+        )
+        .await;
+        let (fake_status, fake_body) = as_browser(
+            &fleet,
+            "DELETE",
+            &format!("/api/v1/leases/{}{acting}", lease.0 + 9_999),
+            &mallory,
+            None,
+        )
+        .await;
+        assert_eq!(real_status, 404, "{acting}: {real_body}");
+        assert_eq!(
+            (real_status, real_body.as_str()),
+            (fake_status, fake_body.as_str()),
+            "{acting}: someone else's lease must be indistinguishable from an absent one"
+        );
+    }
 
     // And it really is still held.
     assert!(
@@ -540,8 +572,10 @@ async fn a_stranger_gets_the_answer_for_a_lease_that_does_not_exist() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_board_orgs_admin_reclaims_a_cross_org_lease() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _alice) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _bob_org, _bob) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    // Two fresh signups: each is admin of their own personal org and nothing
+    // else. Bob is named by **username** in the grant below.
+    let (alice_token, alice_org, _alice) = fleet.seed_user("alice").await;
+    let (bob_token, _bob_org, _bob) = fleet.seed_user("bob").await;
     fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -555,7 +589,7 @@ async fn the_board_orgs_admin_reclaims_a_cross_org_lease() {
                 "subject": "bob",
                 "selector": "tag=nrf52",
                 "ops": ["attach"],
-                "expires": fleet.coord.now() + 3_600,
+                "expires": fleet.now() + 3_600,
             })
             .to_string(),
         ),
@@ -595,7 +629,7 @@ async fn the_board_orgs_admin_reclaims_a_cross_org_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_malformed_lease_id_is_a_bad_request() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
 
     for bad in ["abc", "-1", "1.5", "18446744073709551616"] {
         let (status, body) = as_browser(
@@ -618,8 +652,8 @@ async fn a_malformed_lease_id_is_a_bad_request() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_board_action_response_carries_a_capability_token() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
+    let org = fleet.org("acme").await;
     let board = fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
     let _agent = NodeStub::attach(&fleet, &board.node).await;
     let session = fleet.client_session(&alice).await;
@@ -643,7 +677,7 @@ async fn no_board_action_response_carries_a_capability_token() {
     .await;
 
     for body in [&cycled, &released] {
-        for prefix in ["prfs1_", "prfn1_", "prffk1_", "prfnd1_", "prfw1_"] {
+        for prefix in ["prfs1_", "prfr1_", "prfk1_", "prfw1_", "prfd1_", "prfn1_"] {
             assert!(!body.contains(prefix), "{body} carried a `{prefix}`");
         }
         // A capability token is a hex blob; the response shapes here are two
@@ -661,7 +695,7 @@ async fn no_board_action_response_carries_a_capability_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_limits_endpoint_reports_where_each_op_is_enforced() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Member).await;
     let (status, body) = as_browser(&fleet, "GET", "/api/v1/grants/limits", &alice, None).await;
     assert_eq!(status, 200, "{body}");
     let limits = parse(&body);

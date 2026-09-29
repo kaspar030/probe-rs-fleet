@@ -12,15 +12,16 @@
 // about what the server will do (tests/ui_authz.rs).
 
 import { h, tags, when, errorBox } from '../dom.mjs';
+import { isAdmin, userId } from '../session.mjs';
 
 /** Whether `holder` is the signed-in caller. */
 function isSelf(holder, session) {
-  return Boolean(holder && session && holder.id === session.user);
+  return Boolean(holder && holder.kind === 'user' && userId(session) && holder.id === userId(session));
 }
 
 export function render(state) {
   const { boards, session, error, notice } = state;
-  const admin = session && session.role === 'admin';
+  const admin = isAdmin(session);
   const children = [
     h('h1', {}, 'Devices'),
     h('p', { class: 'hint' }, 'Boards this org owns, plus any shared with it by a grant.'),

@@ -20,6 +20,7 @@
 // from now" into a 400.
 
 import { h, when, errorBox, findAll } from '../dom.mjs';
+import { isAdmin, userId } from '../session.mjs';
 
 // `board` is first: it is the model selector (`board=nrf52840dk` — any board of
 // that type), which is what people actually want to grant. `id` is the single
@@ -48,7 +49,7 @@ export function enforcementNote(op) {
 
 export function render(state) {
   const { grants, limits, session, error, notice, form } = state;
-  const admin = session && session.role === 'admin';
+  const admin = isAdmin(session);
   const children = [
     h('h1', {}, 'Access'),
     h('p', { class: 'hint' }, 'Grants this org has issued: hardware here, shared with a subject who is not in it.'),
@@ -75,7 +76,7 @@ export function render(state) {
           'tbody',
           {},
           grants.map((g) => {
-            const mine = session && g.created_by && g.created_by === session.user;
+            const mine = Boolean(g.created_by) && g.created_by === userId(session);
             return h(
               'tr',
               {},
@@ -128,9 +129,8 @@ export function render(state) {
             'select',
             { name: 'grantee_kind', on: { change: (e) => state.onField('granteeKind', e.target.value) } },
             [
-              ['login', 'GitHub login'],
-              ['id', 'GitHub id (gh-<id>)'],
-              ['subject', 'Subject key'],
+              ['login', 'Username'],
+              ['subject', 'Subject key (user:<id>, <org>/node:<name>, …)'],
               ['repo', 'CI repository (owner/name)'],
             ].map(([v, label]) => h('option', { value: v, selected: form.granteeKind === v }, label)),
           ),

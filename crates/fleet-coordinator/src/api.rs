@@ -228,6 +228,21 @@ async fn mutating_auth(
     headers: &HeaderMap,
     query: Option<&str>,
 ) -> Result<ApiCall, Response> {
+    let caller = mutating_caller(coord, method, uri, headers).await?;
+    let org = crate::http::org_param(query);
+    let subject = crate::http::acting_subject(coord, &caller, org.as_deref()).await?;
+    Ok(ApiCall { caller, subject })
+}
+
+/// The authentication + CSRF half of [`mutating_auth`], without resolving the
+/// acting org — for a handler that must audit a refused org claim itself
+/// ([`decide_pending`]).
+async fn mutating_caller(
+    coord: &Coordinator,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<Caller, Response> {
     let caller = crate::http::authenticate(
         coord,
         headers,
@@ -249,9 +264,7 @@ async fn mutating_auth(
         warn!(subject = %caller.auth.subject, "a cookie-authenticated mutating call had no valid CSRF header");
         return Err(response);
     }
-    let org = crate::http::org_param(query);
-    let subject = crate::http::acting_subject(coord, &caller, org.as_deref()).await?;
-    Ok(ApiCall { caller, subject })
+    Ok(caller)
 }
 
 /// Map a forgs service error onto the one rejection shape.
@@ -1101,17 +1114,25 @@ async fn decide_pending(
     RawQuery(query): RawQuery,
     body: axum::body::Bytes,
 ) -> Response {
-    let ApiCall { subject, .. } =
-        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
-            Ok(v) => v,
-            Err(response) => return response,
-        };
+    let caller = match mutating_caller(&coord, &method, &uri, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    // Membership in the acting org is checked — and a refusal audited as
+    // `node.approve.denied` — exactly as `POST /node/register/approve` does
+    // it: two surfaces onto one ceremony must not disagree about who may
+    // perform it, nor about what the record of a refusal looks like.
+    let org = crate::http::org_param(query.as_deref());
+    let subject = match crate::http::acting_subject(&coord, &caller, org.as_deref()).await {
+        Ok(s) => s,
+        Err(response) => {
+            crate::http::audit_denied(&coord, &caller, "node.approve.denied").await;
+            return response;
+        }
+    };
     let Ok(request) = serde_json::from_slice::<PendingDecision>(&body) else {
         return reject(StatusCode::BAD_REQUEST, "invalid_request");
     };
-    // Membership in the acting org was checked by `mutating_auth`, exactly
-    // as `POST /node/register/approve` checks it: two surfaces onto one
-    // ceremony must not disagree about who may perform it.
     let response = crate::http::decide_pending_node(
         &coord,
         &subject,

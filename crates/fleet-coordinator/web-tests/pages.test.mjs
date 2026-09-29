@@ -25,19 +25,30 @@ import * as access from '../web/pages/access.mjs';
 import * as keys from '../web/pages/keys.mjs';
 import * as audit from '../web/pages/audit.mjs';
 
-const ADMIN = { user: 'gh-1', login: 'alice', org: 'gh-1', org_slug: 'alice', role: 'admin' };
-const MEMBER = { user: 'gh-2', login: 'bob', org: 'gh-1', org_slug: 'alice', role: 'member' };
+// `GET /api/v1/session`'s shape (src/api.rs `SessionView`).
+const ORG = '01J0000000000000000000ORG1';
+const TEAM = '01J0000000000000000000ORG2';
+const ADMIN = {
+  user_id: '01J0000000000000000000USR1', username: 'alice',
+  memberships: [{ id: ORG, name: 'alice', role: 'admin' }, { id: TEAM, name: 'ariel-os', role: 'member' }],
+  org: { id: ORG, name: 'alice', role: 'admin' }, expires: 1800000000,
+};
+const MEMBER = {
+  user_id: '01J0000000000000000000USR2', username: 'bob',
+  memberships: [{ id: ORG, name: 'alice', role: 'member' }],
+  org: { id: ORG, name: 'alice', role: 'member' }, expires: 1800000000,
+};
 
 const BOARD = {
-  board: { key: 'gh-1/gh-1/rpi-1/dk-3', org: 'gh-1', node: 'gh-1/rpi-1', name: 'dk-3' },
-  node: 'gh-1/rpi-1',
+  board: { key: `${ORG}/${ORG}/rpi-1/dk-3`, org: ORG, node: `${ORG}/rpi-1`, name: 'dk-3' },
+  node: `${ORG}/rpi-1`,
   chip: 'nRF52840_xxAA',
   model: 'nrf52840dk',
   tags: ['lab', 'nrf'],
   exclusive: true,
   power: 'uhubctl',
   availability: 'leased',
-  holder: { key: 'gh-1:user:gh-2', org: 'gh-1', kind: 'user', id: 'gh-2' },
+  holder: { key: 'user:01J0000000000000000000USR2', org: null, kind: 'user', id: '01J0000000000000000000USR2' },
   lease: 42,
   expires: 1800000000,
 };
@@ -63,16 +74,38 @@ const labels = (tree) => findAll(tree, (n) => n.tag === 'button').map((n) => n.c
 
 // ---------------------------------------------------------------------------
 
-test('login offers whichever flow the deployment reports', () => {
-  const code = login.render({ method: 'authorization_code' });
-  const link = find(code, (n) => n.tag === 'a');
-  assert.equal(link.attrs.href, '/auth/github/start');
+test('login links every provider the deployment reports, returning to /ui/', () => {
+  const tree = login.render({ providers: ['github', 'oidc'] });
+  const hrefs = findAll(tree, (n) => n.tag === 'a').map((n) => n.attrs.href);
+  assert.deepEqual(hrefs, ['/auth/github/start?return_to=%2Fui%2F', '/auth/oidc/start?return_to=%2Fui%2F']);
 
-  const device = login.render({ method: 'device', device: { user_code: 'ABCD-1234', verification_uri: 'https://github.com/login/device', interval: 5 }, polling: true });
-  assert.match(textOf(device), /ABCD-1234/);
+  // No in-page device flow and no signup form: forgs owns both.
+  assert.equal(find(tree, (n) => n.tag === 'button' || n.tag === 'form' || n.tag === 'input'), null);
+  assert.ok(!/device/i.test(textOf(tree)));
 
-  const none = login.render({ method: 'none' });
+  const none = login.render({ providers: [] });
   assert.match(textOf(none), /coordinator user-token/);
+});
+
+test('a hostile provider name is encoded into one path segment and rendered as text', () => {
+  const name = '../../x?y=<img src=x>';
+  const tree = login.render({ providers: [name] });
+  const link = find(tree, (n) => n.tag === 'a');
+  assert.ok(link.attrs.href.startsWith('/auth/'));
+  assert.equal(link.attrs.href.split('/').length, 4, link.attrs.href);
+  assert.ok(!link.attrs.href.includes('<'));
+  assert.ok(link.children.every((c) => typeof c === 'string'));
+});
+
+test('login loads providers from /auth/providers', async () => {
+  const seen = [];
+  const api = {
+    get: async (path) => { seen.push(path); return { providers: ['github'] }; },
+    describe: String,
+  };
+  const tree = await login.load({ api });
+  assert.deepEqual(seen, ['/auth/providers']);
+  assert.equal(find(tree, (n) => n.tag === 'a').attrs.href, '/auth/github/start?return_to=%2Fui%2F');
 });
 
 test('devices renders the inventory and gates its actions by role', () => {
@@ -81,12 +114,12 @@ test('devices renders the inventory and gates its actions by role', () => {
   assert.match(text, /dk-3/);
   assert.match(text, /nRF52840_xxAA/);
   assert.match(text, /nrf52840dk/);
-  assert.match(text, /gh-1:user:gh-2/);
+  assert.match(text, /user:01J0000000000000000000USR2/);
   assert.ok(labels(asHolder).includes('Release'), 'the holder sees Release');
 
   // A member who is not the holder does not; an admin does. Hiding is UX —
   // `tests/ui_authz.rs` is the half that matters.
-  const asStranger = devices.render({ boards: [BOARD], session: { ...MEMBER, user: 'gh-9' } });
+  const asStranger = devices.render({ boards: [BOARD], session: { ...MEMBER, user_id: '01J0000000000000000000USR9' } });
   assert.ok(!labels(asStranger).includes('Release'));
   const asAdmin = devices.render({ boards: [BOARD], session: ADMIN });
   assert.ok(labels(asAdmin).includes('Release'));
@@ -108,8 +141,8 @@ test('devices renders a missing board model as a dash', () => {
 
 test('agents offers tags and adopt, never a rename', () => {
   const node = {
-    id: 'gh-1/rpi-1', name: 'rpi-1', tags: ['lab'], adopt: 'declared',
-    owner: 'gh-1', last_seen: 1700000000, created_at: 1600000000, online: true, boards: ['dk-3'],
+    id: `${ORG}/rpi-1`, name: 'rpi-1', tags: ['lab'], adopt: 'declared',
+    owner: ADMIN.user_id, last_seen: 1700000000, created_at: 1600000000, online: true, boards: ['dk-3'],
   };
   const tree = agents.render({ nodes: [node], session: ADMIN, editing: 'rpi-1' });
   const inputs = findAll(tree, (n) => n.tag === 'input' || n.tag === 'select').map((n) => n.attrs.name);
@@ -124,8 +157,8 @@ test('agents offers tags and adopt, never a rename', () => {
 // as the bug it used to be.
 test('agents says its board count is the declared set, not the leasable one', () => {
   const node = {
-    id: 'gh-1/rpi-1', name: 'rpi-1', tags: [], adopt: 'declared',
-    owner: 'gh-1', last_seen: 1700000000, created_at: 1600000000, online: true, boards: ['dk-3'],
+    id: `${ORG}/rpi-1`, name: 'rpi-1', tags: [], adopt: 'declared',
+    owner: ADMIN.user_id, last_seen: 1700000000, created_at: 1600000000, online: true, boards: ['dk-3'],
   };
   const text = textOf(agents.render({ nodes: [node], session: MEMBER }));
   assert.match(text, /declares/);
@@ -139,14 +172,18 @@ test('approve renders the server warning verbatim, not a copy of the sentence', 
   const pending = {
     user_code: 'ABCD-1234', node_name: 'rpi-9', tags: ['lab'], adopt: 'declared',
     source_ip: '10.0.0.9', created_at: 1700000000, expires: 1700000900,
-    org: 'gh-1', state: 'pending', warning,
+    org: TEAM, state: 'pending', warning,
   };
-  const tree = approve.render({ pending, code: 'ABCD-1234', replace: false });
+  const tree = approve.render({ pending, code: 'ABCD-1234', replace: false, session: ADMIN, targetOrg: TEAM });
   const text = textOf(tree);
   assert.ok(text.includes(warning), 'the warning field must be rendered');
   assert.match(text, /rpi-9/);
   assert.match(text, /10\.0\.0\.9/);
-  assert.ok(labels(tree).includes('Approve') && labels(tree).includes('Deny'));
+  // The target org is chosen before the confirm, and named in it.
+  assert.ok(labels(tree).includes('Approve into ariel-os') && labels(tree).includes('Deny'));
+  const picker = find(tree, (n) => n.tag === 'select' && n.attrs.name === 'org');
+  assert.deepEqual(findAll(picker, (n) => n.tag === 'option').map((o) => o.attrs.value), [ORG, TEAM]);
+  assert.equal(find(picker, (n) => n.tag === 'option' && n.attrs.selected).attrs.value, TEAM);
 
   // A server that sent no warning must produce a visibly empty box, never a
   // frontend copy of the sentence.
@@ -158,10 +195,11 @@ test('approve names the collision before the confirm, not after', () => {
   const tree = approve.render({
     pending: {
       user_code: 'ABCD-1234', node_name: 'rpi-1', tags: [], adopt: 'declared',
-      created_at: 1, expires: 2, state: 'pending', warning: 'w', collides_with: 'gh-1/rpi-1',
+      created_at: 1, expires: 2, state: 'pending', warning: 'w', org: ORG, collides_with: `${ORG}/rpi-1`,
     },
+    session: ADMIN,
   });
-  assert.match(textOf(tree), /already has a node called rpi-1/);
+  assert.match(textOf(tree), /alice already has a node called rpi-1/);
 });
 
 test('access builds its op list from the server, enforcement and all', () => {
@@ -214,7 +252,7 @@ test('the selector is the canonical string a CLI would send', () => {
 
 test('keys shows a minted key once, and says it will not be shown again', () => {
   const minted = {
-    key: 'prffk1_SECRETVALUE', key_hash: 'a'.repeat(64), org: 'gh-1',
+    key: 'prfk1_SECRETVALUE', key_hash: 'a'.repeat(64), org: ORG,
     tags: ['lab'], single_use: true, purpose: 'node', expires: 1800000000,
   };
   const tree = keys.render({
@@ -243,7 +281,7 @@ test('audit says a 403 in words and admits it does not page', () => {
 
   const lines = audit.render({
     session: ADMIN,
-    lines: [{ ts: 1700000000, action: 'lease.grant', board: 'dk-3', detail: 'gh-1:user:gh-2' }],
+    lines: [{ ts: 1700000000, action: 'lease.grant', board: 'dk-3', detail: 'user:01J0000000000000000000USR2' }],
   });
   const text = textOf(lines);
   assert.match(text, /lease\.grant/);
@@ -257,5 +295,5 @@ test('every page renders an empty state without throwing', () => {
   assert.ok(textOf(access.render({ grants: [], limits: null, session: ADMIN, form: {} })).length > 0);
   assert.ok(textOf(keys.render({ keys: [], limits: null, session: MEMBER, form: { purpose: 'node', tags: '', ttl_secs: 1, multi_use: false } })).length > 0);
   assert.ok(textOf(audit.render({ lines: [], session: ADMIN })).length > 0);
-  assert.ok(textOf(login.render({ method: null })).length > 0);
+  assert.ok(textOf(login.render({ providers: null })).length > 0);
 });

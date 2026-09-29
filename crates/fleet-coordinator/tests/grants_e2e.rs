@@ -2,7 +2,7 @@
 //! it back (architecture §6.5).
 //!
 //! Everything runs through the real router on a real socket with real bearer
-//! tokens — two users in two orgs, exactly the "a second GitHub user can be
+//! tokens — two users in two orgs, exactly the "a second user can be
 //! granted access to a subset of boards, use them, and be revoked" story the
 //! feature exists for.
 //!
@@ -16,7 +16,8 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::ids::{BoardName, Role};
+use fleet_coordinator::FleetRole;
+use fleet_proto::ids::{BoardName, OrgId};
 use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use fleet_proto::token::{AllowedOp, SignedToken};
 use fleet_wire::{CoordToSidecar, SidecarToCoord};
@@ -50,8 +51,8 @@ fn token_ops(wire: &[u8]) -> Vec<AllowedOp> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _alice) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _bob_org, _bob) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _alice) = fleet.seed_user("alice").await;
+    let (bob_token, _bob_org, bob_id) = fleet.seed_user("bob").await;
     let board = fleet
         .seed_board(&alice_org, "rpi-1", "nrf52840-dk-3", &["nrf52"])
         .await;
@@ -87,8 +88,8 @@ async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
         CoordToSidecar::GrantCreated(g) => {
             assert_eq!(g.selector, "tag=nrf52", "stored in canonical form");
             assert_eq!(g.org, alice_org);
-            // Resolved to the immutable id, never the login.
-            assert_eq!(g.subject.id, "gh-2");
+            // Resolved to the immutable id, never the username.
+            assert_eq!(g.subject.to_string(), format!("user:{bob_id}"));
             g.id
         }
         other => panic!("expected GrantCreated, got {other:?}"),
@@ -176,8 +177,8 @@ async fn a_second_user_can_be_granted_a_board_use_it_and_be_revoked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grantee_without_the_op_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, _, _) = fleet.seed_user("bob").await;
     fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -217,8 +218,8 @@ async fn a_grantee_without_the_op_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_grant_is_denied() {
     let fleet = TestCoordinator::start().await;
-    let (_alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _, bob_id) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (_alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, _, bob_id) = fleet.seed_user("bob").await;
     fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -226,22 +227,19 @@ async fn an_expired_grant_is_denied() {
     // Seeded directly, because the API refuses to *create* an expired grant —
     // which is itself the point: this row could only come from a grant that has
     // since lapsed.
-    let key = fleet_proto::ids::SubjectKey {
-        org: fleet_proto::ids::OrgId("gh-2".to_owned()),
-        kind: fleet_proto::ids::SubjectKind::User,
-        id: bob_id,
-    };
-    let now = i64::try_from(fleet.coord.now()).unwrap();
+    let now = fleet.coord.now();
     fleet
         .db()
-        .scoped(alice_org)
+        .forgs()
+        .scoped(fleet_coordinator::subject::ns_of(&alice_org).unwrap())
         .insert_grant(
-            &fleet_coordinator::state::new_grant_id(),
-            &key,
-            "tag=nrf52",
-            &[AllowedOp::Attach],
-            Some(now - 1),
-            None,
+            &forgs_store::NewGrant {
+                subject: forgs::SubjectKey::user(bob_id),
+                selector: "tag=nrf52".to_owned(),
+                ops: fleet_coordinator::state::join_ops(&[AllowedOp::Attach]),
+                expires: Some(now - 1),
+                created_by: None,
+            },
             now - 100,
         )
         .await
@@ -267,9 +265,9 @@ async fn an_expired_grant_is_denied() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_grant_does_not_reach_a_third_orgs_same_tagged_board() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
-    let (_carol_token, carol_org, _) = fleet.seed_github_user(3, "carol", Role::Admin).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, _, _) = fleet.seed_user("bob").await;
+    let (_carol_token, carol_org, _) = fleet.seed_user("carol").await;
 
     let alice_board = fleet
         .seed_board(&alice_org, "rpi-1", "dk-a", &["nrf52"])
@@ -306,9 +304,9 @@ async fn a_grant_does_not_reach_a_third_orgs_same_tagged_board() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_model_grant_covers_every_board_of_that_model_in_the_org() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
-    let (_carol_token, carol_org, _) = fleet.seed_github_user(3, "carol", Role::Admin).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, _, _) = fleet.seed_user("bob").await;
+    let (_carol_token, carol_org, _) = fleet.seed_user("carol").await;
 
     let dk1 = fleet
         .seed_board_with_model(&alice_org, "rpi-1", "dk-1", &[], Some("nrf52840dk"))
@@ -360,30 +358,11 @@ async fn a_model_grant_covers_every_board_of_that_model_in_the_org() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_plain_member_cannot_share_the_orgs_hardware() {
     let fleet = TestCoordinator::start().await;
-    let (_admin_token, org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (_bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
-
-    // A second member of alice's org, without admin.
-    let now = i64::try_from(fleet.coord.now()).unwrap();
-    let (member_id, _) = fleet
-        .db()
-        .upsert_github_user(4, "dave", None, now)
-        .await
-        .map(|(id, o, _)| (id, o))
-        .unwrap();
-    fleet
-        .db()
-        .ensure_user_member(&org, &member_id, Role::Member)
-        .await
-        .unwrap();
-    let token = fleet_auth::OpaqueToken::mint(fleet_auth::TokenKind::Session);
-    fleet
-        .db()
-        .insert_session(token.hash().as_str(), &org, &member_id, now, now + 3_600)
-        .await
-        .unwrap();
-
-    let dave = fleet.client_session(&token.to_secret_string()).await;
+    fleet.member("acme", "alice", FleetRole::Admin).await;
+    fleet.seed_user("bob").await;
+    // A second member of acme, without admin, acting in acme.
+    let dave = fleet.seed_session("acme", "dave", FleetRole::Member).await;
+    let dave = fleet.client_session_in(&dave, "acme").await;
     match dave
         .request(SidecarToCoord::GrantCreate {
             subject: "bob".to_owned(),
@@ -410,8 +389,8 @@ async fn a_plain_member_cannot_share_the_orgs_hardware() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_dangerous_grant_shapes_are_refused_server_side() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (_bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (_bob_token, _, _) = fleet.seed_user("bob").await;
     let alice = fleet.client_session(&alice_token).await;
 
     let cases: &[(&str, SidecarToCoord)] = &[
@@ -470,13 +449,7 @@ async fn the_dangerous_grant_shapes_are_refused_server_side() {
     }
 
     // Nothing was written by any of them.
-    assert!(fleet
-        .db()
-        .scoped(alice_org)
-        .list_grants()
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(list_grants(&fleet, &alice_org).await.is_empty());
 }
 
 /// Revoking by a short or non-hex prefix would match every grant in the org
@@ -484,8 +457,8 @@ async fn the_dangerous_grant_shapes_are_refused_server_side() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoking_by_a_dangerous_prefix_is_refused() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (_bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (_bob_token, _, _) = fleet.seed_user("bob").await;
     let alice = fleet.client_session(&alice_token).await;
     let _ = alice
         .request(SidecarToCoord::GrantCreate {
@@ -510,13 +483,7 @@ async fn revoking_by_a_dangerous_prefix_is_refused() {
         }
     }
     assert_eq!(
-        fleet
-            .db()
-            .scoped(alice_org)
-            .list_grants()
-            .await
-            .unwrap()
-            .len(),
+        list_grants(&fleet, &alice_org).await.len(),
         1,
         "nothing was deleted"
     );
@@ -528,8 +495,8 @@ async fn revoking_by_a_dangerous_prefix_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_boards_owner_can_release_a_grantees_lease() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, _, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, _, _) = fleet.seed_user("bob").await;
     fleet
         .seed_board(&alice_org, "rpi-1", "dk-3", &["nrf52"])
         .await;
@@ -564,7 +531,7 @@ async fn the_boards_owner_can_release_a_grantees_lease() {
 /// The qualified-name escape hatch, against **production-shaped** node ids.
 ///
 /// `state.rs::node_id_for` namespaces node ids by org, so a real `BoardRef` is
-/// `org=gh-1, node="gh-1/rpi-1", name="dk-3"` — four slash-separated segments,
+/// `org=<ULID>, node="<ULID>/rpi-1", name="dk-3"` — four slash-separated segments,
 /// not three. `seed_board` builds exactly that shape. Without a spelling that
 /// works against it, a shared board is unreachable for `ctl release` /
 /// `ctl power-cycle` the moment you own a same-named one, which is the failure
@@ -572,8 +539,8 @@ async fn the_boards_owner_can_release_a_grantees_lease() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
     let fleet = TestCoordinator::start().await;
-    let (alice_token, alice_org, _) = fleet.seed_github_user(1, "alice", Role::Admin).await;
-    let (bob_token, bob_org, _) = fleet.seed_github_user(2, "bob", Role::Member).await;
+    let (alice_token, alice_org, _) = fleet.seed_user("alice").await;
+    let (bob_token, bob_org, _) = fleet.seed_user("bob").await;
 
     // Both orgs have a board called `dk-3`. Bob owns one; alice shares hers.
     let alices = fleet
@@ -640,7 +607,7 @@ async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
     }
 
     // A qualified name for a board bob may not reach is still just "not found".
-    let (_carol, carol_org, _) = fleet.seed_github_user(3, "carol", Role::Admin).await;
+    let (_carol, carol_org, _) = fleet.seed_user("carol").await;
     let carols = fleet.seed_board(&carol_org, "rpi-9", "dk-3", &[]).await;
     match bob
         .request(SidecarToCoord::PowerCycle {
@@ -655,4 +622,15 @@ async fn a_qualified_name_reaches_a_shared_board_past_a_same_named_local_one() {
         ),
         other => panic!("expected no-such-board, got {other:?}"),
     }
+}
+
+/// The grants `org` has issued, straight from forgs' store.
+async fn list_grants(fleet: &TestCoordinator, org: &OrgId) -> Vec<forgs_store::GrantRow> {
+    fleet
+        .db()
+        .forgs()
+        .scoped(fleet_coordinator::subject::ns_of(org).unwrap())
+        .list_grants()
+        .await
+        .unwrap()
 }

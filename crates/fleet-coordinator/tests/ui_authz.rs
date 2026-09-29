@@ -21,8 +21,8 @@ mod common;
 
 use common::TestCoordinator;
 
+use fleet_coordinator::FleetRole;
 use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::ids::{OrgId, Role};
 
 /// Call a route the way the UI does: session cookie + CSRF header.
 async fn as_browser(
@@ -54,8 +54,8 @@ async fn a_member_is_refused_every_admin_action_the_ui_hides() {
     // Both in **one** org: the question is what a member of an org may do in
     // it, not what a stranger may do to it. A pair of personal orgs would make
     // every refusal below true for the wrong reason.
-    fleet.seed_session("acme", "alice", Role::Admin).await;
-    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+    fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", FleetRole::Member).await;
 
     // Grant creation: admin-only, because a grant points *outward*.
     let body = serde_json::json!({
@@ -65,13 +65,14 @@ async fn a_member_is_refused_every_admin_action_the_ui_hides() {
         "expires": fleet.coord.now() + 3_600,
     })
     .to_string();
-    let (status, response) = as_browser(&fleet, "POST", "/api/v1/grants", &bob, Some(&body)).await;
+    let (status, response) =
+        as_browser(&fleet, "POST", "/api/v1/grants?org=acme", &bob, Some(&body)).await;
     assert_eq!(status, 403, "a member created a grant: {response}");
     assert!(response.contains("forbidden"), "{response}");
 
     // The audit log: admin-only. The UI renders "your role cannot read the
     // audit log"; the server is what makes that true.
-    let (status, response) = as_browser(&fleet, "GET", "/api/v1/audit", &bob, None).await;
+    let (status, response) = as_browser(&fleet, "GET", "/api/v1/audit?org=acme", &bob, None).await;
     assert_eq!(status, 403, "a member read the audit log: {response}");
 }
 
@@ -83,8 +84,8 @@ async fn a_member_is_refused_every_admin_action_the_ui_hides() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_cannot_mutate_a_node_it_does_not_own() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
-    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", FleetRole::Member).await;
     // Owned by alice, in the org bob is a member of — so the refusal below is
     // about ownership, not about tenancy (which `api_nodes.rs` covers).
     fleet
@@ -94,14 +95,15 @@ async fn a_member_cannot_mutate_a_node_it_does_not_own() {
     let (status, response) = as_browser(
         &fleet,
         "PATCH",
-        "/api/v1/nodes/rpi-1",
+        "/api/v1/nodes/rpi-1?org=acme",
         &bob,
         Some(r#"{"tags":["mine-now"]}"#),
     )
     .await;
     assert_eq!(status, 403, "a non-owner retagged a node: {response}");
 
-    let (status, response) = as_browser(&fleet, "DELETE", "/api/v1/nodes/rpi-1", &bob, None).await;
+    let (status, response) =
+        as_browser(&fleet, "DELETE", "/api/v1/nodes/rpi-1?org=acme", &bob, None).await;
     assert_eq!(status, 403, "a non-owner revoked a node: {response}");
 
     // And a rename is refused for the *owner* too — the nodes page offers
@@ -109,7 +111,7 @@ async fn a_member_cannot_mutate_a_node_it_does_not_own() {
     let (status, response) = as_browser(
         &fleet,
         "PATCH",
-        "/api/v1/nodes/rpi-1",
+        "/api/v1/nodes/rpi-1?org=acme",
         &alice,
         Some(r#"{"name":"rpi-2"}"#),
     )
@@ -127,13 +129,13 @@ async fn a_member_cannot_mutate_a_node_it_does_not_own() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
     let fleet = TestCoordinator::start().await;
-    let org = OrgId("acme".to_owned());
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
-    let bob = fleet.seed_session("acme", "bob", Role::Member).await;
+    let org = fleet.org("acme").await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", FleetRole::Member).await;
     fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
 
     // Alice takes a lease through the real sidecar path.
-    let session = fleet.client_session(&alice).await;
+    let session = fleet.client_session_in(&alice, "acme").await;
     let lease = {
         use fleet_proto::ids::BoardName;
         use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
@@ -155,7 +157,7 @@ async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
     let (status, held) = as_browser(
         &fleet,
         "DELETE",
-        &format!("/api/v1/leases/{}", lease.0),
+        &format!("/api/v1/leases/{}?org=acme", lease.0),
         &bob,
         None,
     )
@@ -164,8 +166,14 @@ async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
 
     // Byte-identical to the answer for a lease that never existed: that is
     // what stops the endpoint enumerating live leases across tenants.
-    let (absent_status, absent) =
-        as_browser(&fleet, "DELETE", "/api/v1/leases/999999", &bob, None).await;
+    let (absent_status, absent) = as_browser(
+        &fleet,
+        "DELETE",
+        "/api/v1/leases/999999?org=acme",
+        &bob,
+        None,
+    )
+    .await;
     assert_eq!(absent_status, status);
     assert_eq!(absent, held);
 }
@@ -175,24 +183,24 @@ async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_board_in_another_org_is_indistinguishable_from_one_that_does_not_exist() {
     let fleet = TestCoordinator::start().await;
-    let other = OrgId("other".to_owned());
-    fleet
+    let other = fleet.org("other").await;
+    let secret = fleet
         .seed_board(&other, "rpi-9", "secret-dk", &["nrf52"])
         .await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
 
     let (cross, cross_body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/boards/power-cycle",
+        "/api/v1/boards/power-cycle?org=acme",
         &alice,
-        Some(r#"{"board":"other/other/rpi-9/secret-dk"}"#),
+        Some(&serde_json::json!({ "board": secret.to_string() }).to_string()),
     )
     .await;
     let (absent, absent_body) = as_browser(
         &fleet,
         "POST",
-        "/api/v1/boards/power-cycle",
+        "/api/v1/boards/power-cycle?org=acme",
         &alice,
         Some(r#"{"board":"no-such-board"}"#),
     )
@@ -211,7 +219,7 @@ async fn a_board_in_another_org_is_indistinguishable_from_one_that_does_not_exis
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_action_the_ui_performs_needs_the_csrf_header() {
     let fleet = TestCoordinator::start().await;
-    let alice = fleet.seed_session("acme", "alice", Role::Admin).await;
+    let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
     fleet
         .seed_owned_node("acme", "rpi-1", "alice", AdoptPolicy::Declared)
         .await;
@@ -253,12 +261,9 @@ async fn every_action_the_ui_performs_needs_the_csrf_header() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refresh_token_reaches_no_api_route_over_either_carrier() {
     let fleet = TestCoordinator::start().await;
-    let now = i64::try_from(fleet.coord.now()).unwrap();
     // A genuinely valid refresh token: it mints sessions on `/auth/token`, so
     // the refusals below are about the route rather than a dead credential.
-    let refresh = fleet
-        .seed_refresh_token("acme", "alice", now + 86_400)
-        .await;
+    let refresh = fleet.seed_refresh_token("alice").await;
 
     for path in ["/api/v1/session", "/api/v1/org", "/api/v1/nodes"] {
         // As a bearer.
