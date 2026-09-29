@@ -22,7 +22,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use fleet_coordinator::config::{
-    CoordinatorConfig, GithubActionsConfig, GithubConfig, SigningKeySource, TlsConfig,
+    AuthConfig, CoordinatorConfig, GithubActionsConfig, GithubEndpoints, ProviderConfig,
+    ProviderKind, SigningKeySource, TlsConfig,
 };
 use fleet_core::policy::Policy;
 
@@ -35,68 +36,108 @@ struct TlsToml {
     key: PathBuf,
 }
 
-/// The `[github]` table: the OAuth app backing `probe-rs-fleet login` and the
-/// web UI's browser login.
+/// One `[[auth.providers]]` entry: a login provider for `probe-rs-fleet
+/// login` and the web UI.
 ///
-/// Omit it entirely for an air-gapped or development fleet; the device-flow
-/// routes then answer a named `503` and `coordinator user-token` remains the
-/// bootstrap path.
+/// A provider **proves who you are; it does not name you**: the username is
+/// chosen on first login. Omit every provider for an air-gapped or
+/// development fleet; `coordinator user-token` is then the bootstrap path.
 #[derive(Debug, Clone, Deserialize)]
-struct GithubToml {
-    /// The OAuth app's client id.
+#[serde(deny_unknown_fields)]
+struct ProviderToml {
+    /// `github` | `oidc` | `codeberg` | `gitlab`.
+    kind: String,
+    /// Instance name, used in URLs (`/auth/{name}/start`). Defaults to `kind`.
+    #[serde(default)]
+    name: Option<String>,
+    /// OAuth client id.
     client_id: String,
-    /// The OAuth app's client secret, when the app requires one.
+    /// OAuth client secret, inline.
     #[serde(default)]
     client_secret: Option<String>,
-    /// The OAuth scope to request. Empty (the default) is correct for
-    /// identity-only login: `GET /user` needs no scope, and asking for more
-    /// than we use is a permission the user cannot easily take back.
+    /// A file holding the client secret (preferred: keeps it out of the
+    /// config).
     #[serde(default)]
-    scope: String,
-    /// Overridable so tests (and a GitHub Enterprise deployment) can point the
-    /// flow somewhere other than github.com.
-    #[serde(default = "default_device_code_url")]
-    device_code_url: String,
-    /// See [`GithubToml::device_code_url`].
-    #[serde(default = "default_access_token_url")]
-    access_token_url: String,
-    /// See [`GithubToml::device_code_url`].
-    #[serde(default = "default_api_base")]
-    api_base: String,
-    /// The browser endpoint `/auth/github/start` redirects to. Overridable for
-    /// the same reasons as [`GithubToml::device_code_url`].
-    #[serde(default = "default_authorize_url")]
-    authorize_url: String,
-    /// The operator asserting that `<public_url>/auth/github/callback` is
-    /// registered in the OAuth app — the one setup step the device flow did not
-    /// need. Browser login is offered only when this is true; `false` (the
-    /// default) falls back to the in-page device-code login. Requires
-    /// `client_secret`.
+    client_secret_path: Option<PathBuf>,
+    /// OIDC issuer (required for `oidc`; overrides the `codeberg`/`gitlab`
+    /// preset; a GitHub Enterprise origin for `github`).
     #[serde(default)]
-    callback_registered: bool,
+    issuer: Option<String>,
+    /// GitHub only: explicit endpoints, all three or none (tests, GHES).
+    #[serde(default)]
+    authorize_url: Option<String>,
+    /// See [`ProviderToml::authorize_url`].
+    #[serde(default)]
+    access_token_url: Option<String>,
+    /// See [`ProviderToml::authorize_url`].
+    #[serde(default)]
+    api_base: Option<String>,
 }
 
-fn default_device_code_url() -> String {
-    "https://github.com/login/device/code".to_owned()
+/// The `[auth]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthToml {
+    /// Login providers.
+    #[serde(default)]
+    providers: Vec<ProviderToml>,
 }
 
-fn default_access_token_url() -> String {
-    "https://github.com/login/oauth/access_token".to_owned()
-}
-
-fn default_api_base() -> String {
-    "https://api.github.com".to_owned()
-}
-
-fn default_authorize_url() -> String {
-    "https://github.com/login/oauth/authorize".to_owned()
+impl ProviderToml {
+    fn into_config(self) -> Result<ProviderConfig> {
+        let kind = ProviderKind::from_label(&self.kind).with_context(|| {
+            format!(
+                "auth.providers: unknown kind `{}` (expected github, oidc, codeberg or gitlab)",
+                self.kind
+            )
+        })?;
+        let name = self.name.unwrap_or_else(|| self.kind.clone());
+        let client_secret = match (self.client_secret, self.client_secret_path) {
+            (Some(_), Some(_)) => anyhow::bail!(
+                "auth.providers `{name}`: set only one of `client_secret` or `client_secret_path`"
+            ),
+            (Some(s), None) => s,
+            (None, Some(p)) => std::fs::read_to_string(&p)
+                .with_context(|| {
+                    format!(
+                        "auth.providers `{name}`: reading client_secret_path {}",
+                        p.display()
+                    )
+                })?
+                .trim()
+                .to_owned(),
+            (None, None) => String::new(),
+        };
+        let github_endpoints = match (self.authorize_url, self.access_token_url, self.api_base) {
+            (Some(authorize_url), Some(access_token_url), Some(api_base)) => {
+                Some(GithubEndpoints {
+                    authorize_url,
+                    access_token_url,
+                    api_base,
+                })
+            }
+            (None, None, None) => None,
+            _ => anyhow::bail!(
+                "auth.providers `{name}`: set all of authorize_url, access_token_url and \
+                 api_base, or none"
+            ),
+        };
+        Ok(ProviderConfig {
+            kind,
+            name,
+            client_id: self.client_id,
+            client_secret,
+            issuer: self.issuer,
+            github_endpoints,
+        })
+    }
 }
 
 /// The `[github_actions]` table: the OIDC issuer backing `probe-rs-fleet ci
 /// login` (architecture §6.7).
 ///
-/// Independent of `[github]`: a fleet may have CI without user login, or the
-/// reverse. `audience` has **no default** — see [`GithubActionsToml::audience`].
+/// Independent of the login providers: a fleet may have CI without user
+/// login, or the reverse. `audience` has **no default** — see [`GithubActionsToml::audience`].
 #[derive(Debug, Clone, Deserialize)]
 struct GithubActionsToml {
     /// The `aud` claim a workload token must carry.
@@ -194,12 +235,17 @@ struct CoordinatorConfigToml {
     /// Ceiling on live pending node registrations.
     #[serde(default = "default_max_pending_nodes")]
     max_pending_nodes: i64,
-    /// The org the interim admin verbs default to.
+    /// The **name** of the deployment's shared org (created at startup); the
+    /// org the shell admin verbs default to.
     #[serde(default = "default_org")]
     default_org: String,
-    /// The GitHub OAuth app backing `probe-rs-fleet login`.
+    /// The cookie/CSRF secret file (≥ 32 bytes, hex or raw). Required to run
+    /// the daemon; `coordinator init` writes one.
     #[serde(default)]
-    github: Option<GithubToml>,
+    csrf_secret_path: Option<PathBuf>,
+    /// Login providers (`[[auth.providers]]`).
+    #[serde(default)]
+    auth: AuthToml,
     /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`.
     #[serde(default)]
     github_actions: Option<GithubActionsToml>,
@@ -229,11 +275,11 @@ fn default_refresh_token_ttl_secs() -> u64 {
 }
 
 fn default_node_token_rotate_secs() -> u64 {
-    fleet_auth::RotationPolicy::DEFAULT.max_age_secs
+    forgs::RotationPolicy::DEFAULT.max_age_secs
 }
 
 fn default_org() -> String {
-    "default".to_owned()
+    fleet_coordinator::config::DEFAULT_ORG_NAME.to_owned()
 }
 
 fn default_pending_node_ttl_secs() -> u64 {
@@ -273,6 +319,18 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         raw.signing_key_path.as_deref(),
     )?;
 
+    let csrf_secret = raw
+        .csrf_secret_path
+        .as_deref()
+        .map(load_csrf_secret)
+        .transpose()?;
+    let providers = raw
+        .auth
+        .providers
+        .into_iter()
+        .map(ProviderToml::into_config)
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(CoordinatorConfig {
         listen_addr: raw.listen_addr,
         public_url: raw.public_url,
@@ -291,17 +349,9 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
         node_token_rotate_secs: raw.node_token_rotate_secs,
         pending_node_ttl_secs: raw.pending_node_ttl_secs,
         max_pending_nodes: raw.max_pending_nodes,
-        default_org: fleet_proto::ids::OrgId(raw.default_org),
-        github: raw.github.map(|g| GithubConfig {
-            client_id: g.client_id,
-            client_secret: g.client_secret,
-            scope: g.scope,
-            device_code_url: g.device_code_url,
-            access_token_url: g.access_token_url,
-            api_base: g.api_base,
-            authorize_url: g.authorize_url,
-            callback_registered: g.callback_registered,
-        }),
+        default_org: raw.default_org,
+        auth: AuthConfig { providers },
+        csrf_secret,
         github_actions: raw.github_actions.map(|g| GithubActionsConfig {
             issuer: g.issuer,
             jwks_url: g.jwks_url,
@@ -311,6 +361,33 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
             workload_token_ttl_secs: g.workload_token_ttl_secs,
         }),
     })
+}
+
+/// Read the CSRF secret file: 64+ hex characters (decoded), or raw bytes.
+/// At least 32 bytes either way.
+fn load_csrf_secret(path: &Path) -> Result<Vec<u8>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read csrf secret {}", path.display()))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let trimmed = text.trim();
+    let secret = if trimmed.len() >= 64
+        && trimmed.len() % 2 == 0
+        && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        (0..trimmed.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&trimmed[i..i + 2], 16))
+            .collect::<std::result::Result<Vec<u8>, _>>()
+            .context("csrf secret contains non-hex characters")?
+    } else {
+        bytes
+    };
+    anyhow::ensure!(
+        secret.len() >= 32,
+        "the csrf secret in {} must be at least 32 bytes",
+        path.display()
+    );
+    Ok(secret)
 }
 
 /// Resolve the 32-byte ed25519 signing seed from the configured source.
@@ -446,6 +523,49 @@ signing_key_hex = "{seed}"
         assert_eq!(cfg.node_token_rotate_secs, default_node_token_rotate_secs());
         assert_eq!(cfg.policy, Policy::default());
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn providers_and_csrf_secret_are_loaded() {
+        let seed = "01".repeat(32);
+        let dir = tempfile::tempdir().unwrap();
+        let csrf = dir.path().join("csrf.secret");
+        std::fs::write(&csrf, "cd".repeat(32)).unwrap();
+        let secret = dir.path().join("gh.secret");
+        std::fs::write(&secret, "s3cret\n").unwrap();
+        let toml = format!(
+            r#"
+listen_addr = "127.0.0.1:7000"
+public_url = "https://fleet.example"
+sqlite_path = "db.sqlite"
+signing_key_hex = "{seed}"
+csrf_secret_path = "{}"
+
+[[auth.providers]]
+kind = "github"
+client_id = "Iv1.x"
+client_secret_path = "{}"
+
+[[auth.providers]]
+kind = "oidc"
+name = "sso"
+client_id = "c"
+client_secret = "s"
+issuer = "https://sso.example"
+"#,
+            csrf.display(),
+            secret.display()
+        );
+        let cfg = load_coordinator_config_from_str(&toml).unwrap();
+        assert_eq!(cfg.csrf_secret.as_deref(), Some(&[0xcd_u8; 32][..]));
+        assert_eq!(cfg.auth.providers.len(), 2);
+        assert_eq!(cfg.auth.providers[0].name, "github");
+        assert_eq!(cfg.auth.providers[0].client_secret, "s3cret");
+        assert_eq!(cfg.auth.providers[1].kind, ProviderKind::Oidc);
+        cfg.validate().unwrap();
+
+        std::fs::write(&csrf, "short").unwrap();
+        assert!(load_coordinator_config_from_str(&toml).is_err());
     }
 
     #[test]

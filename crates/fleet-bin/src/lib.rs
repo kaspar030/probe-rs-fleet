@@ -10,6 +10,7 @@ pub mod completion;
 pub mod config;
 pub mod fleet_config;
 pub mod logging;
+pub mod node_client;
 pub mod paths;
 /// Shared table-cell renderers. Crate-private: these are output formatting,
 /// not a library surface.
@@ -18,6 +19,7 @@ pub mod roles;
 pub mod secrets;
 pub mod signal;
 pub mod timearg;
+pub mod tokens;
 
 /// Test-only support shared across modules.
 #[cfg(test)]

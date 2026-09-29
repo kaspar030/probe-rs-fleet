@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! probe-rs-fleet ci login --fleet-url https://fleet.example
-//! probe-rs-fleet ci login --fleet-url https://fleet.example --auth-key prffk1_…
+//! probe-rs-fleet ci login --fleet-url https://fleet.example --auth-key prfk1_…
 //! ```
 //!
 //! # The GitHub Actions path holds no secret
@@ -47,8 +47,8 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use fleet_auth::api::TokenResponse;
-use fleet_auth::http_client::ClientError;
+use forgs_client::api::TokenResponse;
+use forgs_client::{ClientError, ForgsClient};
 
 use crate::cli::CiLoginArgs;
 
@@ -85,8 +85,11 @@ pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
         .as_deref()
         .and_then(fleet_tls::parse_fingerprint);
 
+    let client =
+        ForgsClient::new(&url, pin).map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
     let response = if let Some(key) = &args.auth_key {
-        fleet_auth::http_client::exchange_workload_key(&url, pin, key.trim())
+        client
+            .exchange_api_key(key.trim())
             .await
             .map_err(|e| describe(&e, "redeeming a workload auth key"))
     } else {
@@ -95,8 +98,9 @@ pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
         // deployment sets `audience` to; the coordinator itself has no
         // default, for the replay reason `CiLoginArgs` records.
         let audience = args.audience.clone().unwrap_or_else(|| url.clone());
-        let jwt = request_github_oidc_token(&audience).await?;
-        fleet_auth::http_client::exchange_github_oidc(&url, pin, &jwt)
+        let jwt = request_github_oidc_token(&client, &audience).await?;
+        client
+            .exchange_github_oidc(&jwt)
             .await
             .map_err(|e| describe(&e, "exchanging this job's GitHub workload identity"))
     }?;
@@ -108,17 +112,16 @@ pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
 
 /// Ask the runner's own token service for an OIDC JWT with `audience`.
 ///
-/// Delegates the HTTPS call to [`fleet_auth::github::fetch_workload_id_token`],
-/// which is where every other egress in this tree lives — keeping `fleet-bin`
-/// out of the `hyper`/`rustls` stack and, more importantly, keeping this
-/// request and the token exchange on one trust path.
+/// Delegates the HTTPS call to [`forgs_client::gha::fetch_id_token`] through
+/// the same client as the exchange, keeping this request and the token
+/// exchange on one trust path.
 ///
 /// # Errors
 ///
 /// Returns an error naming the missing permission when the runner injected no
 /// token endpoint — by far the most common failure, and one whose fix
 /// (`permissions: id-token: write`) is not guessable from a generic message.
-async fn request_github_oidc_token(audience: &str) -> Result<String> {
+async fn request_github_oidc_token(client: &ForgsClient, audience: &str) -> Result<String> {
     let (url, token) = match (
         std::env::var(ENV_REQUEST_URL).ok(),
         std::env::var(ENV_REQUEST_TOKEN).ok(),
@@ -135,8 +138,9 @@ async fn request_github_oidc_token(audience: &str) -> Result<String> {
         ),
     };
 
-    fleet_auth::github::fetch_workload_id_token(&url, &token, audience)
+    forgs_client::gha::fetch_id_token(client, &url, &forgs_client::Secret::from(token), audience)
         .await
+        .map(forgs_client::Secret::into_inner)
         .context("requesting an OIDC token from GitHub's own token service")
 }
 
@@ -212,24 +216,14 @@ fn emit(
 
 /// Print what was obtained — never the token itself.
 ///
-/// The granting orgs are the useful part: a job that can suddenly not reach a
-/// board wants to know which org's grant it is running under, and `orgs` is the
-/// honest answer where `org` is only the first of them (a workload belongs to
-/// no org).
+/// A workload belongs to no org: it reaches boards only through grants, so
+/// there is nothing to name here but the expiry.
 fn print_summary(response: &TokenResponse) {
-    let orgs = if response.orgs.is_empty() {
-        response.org.clone()
-    } else {
-        response.orgs.join(", ")
-    };
-    println!("granted by: {orgs}");
-    if let Some(expires) = response.expires {
-        println!("expires:    {expires} (epoch seconds)");
-        println!(
-            "note:       there is no refresh for a CI token. A job that runs past \
-             the expiry must re-run `ci login`."
-        );
-    }
+    println!("expires:    {} (epoch seconds)", response.expires);
+    println!(
+        "note:       there is no refresh for a CI token. A job that runs past \
+         the expiry must re-run `ci login`."
+    );
 }
 
 /// Turn a coordinator rejection into remediation-shaped text.
@@ -255,7 +249,7 @@ pub(crate) fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
              `probe-rs-fleet grant --repo <owner>/<name> --select '<selector>' \
              --ops flash`"
         }
-        "workload_oidc_unconfigured" => {
+        "workload_oidc_unconfigured" | "workload_unconfigured" => {
             "that coordinator has no [github_actions] block, so it cannot \
              verify a GitHub workload identity at all. Ask the operator to \
              configure one (see examples/coordinator.toml), or use \
@@ -295,15 +289,16 @@ mod tests {
         }
     }
 
+    fn test_client() -> ForgsClient {
+        ForgsClient::new("https://fleet.example", None).unwrap()
+    }
+
     fn response() -> TokenResponse {
         TokenResponse {
             token: "prfw1_secret".to_owned(),
-            node_id: None,
-            org: "acme".to_owned(),
-            orgs: vec!["acme".to_owned(), "beta".to_owned()],
-            expires: Some(4_600),
-            coordinator_token_pubkey: None,
-            login: None,
+            expires: 4_600,
+            username: None,
+            user_id: None,
             refresh_token: None,
         }
     }
@@ -341,15 +336,18 @@ mod tests {
 
     /// A malformed audience is refused before any request leaves the process.
     ///
-    /// The validation itself lives in `fleet_auth::github`; what this pins is
+    /// The validation itself lives in `forgs_client::gha`; what this pins is
     /// that `ci login` reaches it rather than building a query string GitHub
     /// would read differently than we meant.
     #[tokio::test]
     async fn a_malformed_audience_never_reaches_the_network() {
         for bad in ["", "https://fleet.example&x=1", "https://fleet.example#f"] {
-            let err = temp_env_unset_async(ENV_REQUEST_URL, request_github_oidc_token(bad))
-                .await
-                .unwrap_err();
+            let err = temp_env_unset_async(
+                ENV_REQUEST_URL,
+                request_github_oidc_token(&test_client(), bad),
+            )
+            .await
+            .unwrap_err();
             let text = format!("{err:#}");
             // With no runner identity set in the test process, the
             // no-identity error fires first; either way nothing was sent.
@@ -364,9 +362,12 @@ mod tests {
     /// fix and it is not guessable.
     #[tokio::test]
     async fn a_runner_without_workload_identity_is_told_exactly_what_to_add() {
-        let err = temp_env_unset_async(ENV_REQUEST_URL, request_github_oidc_token("aud"))
-            .await
-            .unwrap_err();
+        let err = temp_env_unset_async(
+            ENV_REQUEST_URL,
+            request_github_oidc_token(&test_client(), "aud"),
+        )
+        .await
+        .unwrap_err();
         let text = err.to_string();
         assert!(text.contains("id-token: write"), "{text}");
         assert!(text.contains("--auth-key"), "{text}");

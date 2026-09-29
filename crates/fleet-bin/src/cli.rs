@@ -50,7 +50,8 @@ pub enum Command {
     Sidecar(SidecarArgs),
     /// Admin / UX CLI: talk to the coordinator over its `/client` WebSocket.
     Ctl(CtlArgs),
-    /// Log in to a fleet with GitHub, caching a session token for `ctl` and the
+    /// Log in to a fleet (browser login with any provider the coordinator
+    /// offers), caching a session token for `ctl` and the
     /// `probe-rs` sidecar shim.
     Login(LoginArgs),
     /// Revoke this machine's fleet session (and, with --all, every session and
@@ -97,11 +98,10 @@ pub struct CompletionsArgs {
 
 /// Arguments for `probe-rs-fleet login`.
 ///
-/// GitHub **device flow**: the CLI asks the coordinator to start one, prints the
-/// short code and the URL, opens a browser where it can, and polls until the
-/// human has authorised it. The CLI never talks to GitHub directly — the OAuth
-/// app's credentials stay on the coordinator, which is also what lets a
-/// self-hosted deployment use its own app without a rebuild.
+/// The coordinator's own **device flow** (forgs): the CLI asks it to start
+/// one, prints the short code and the URL, opens a browser where it can, and
+/// polls until the human has logged in (with any configured provider) and
+/// confirmed the code. The CLI never talks to an identity provider directly.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
     /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
@@ -117,8 +117,8 @@ pub struct LoginArgs {
     /// flow.
     ///
     /// The escape hatch for an air-gapped fleet or one whose coordinator has no
-    /// GitHub app: pair it with `coordinator user-token`. Also what the
-    /// integration tests use, so they need no GitHub at all.
+    /// login provider: pair it with `coordinator user-token`. Also what the
+    /// integration tests use, so they need no identity provider at all.
     #[arg(long)]
     pub token: Option<String>,
     /// Record an externally minted refresh token beside `--token`.
@@ -132,6 +132,11 @@ pub struct LoginArgs {
     /// Do not try to open a browser; just print the URL and code.
     #[arg(long)]
     pub no_browser: bool,
+    /// The org to act in by default (a path like `acme`, or its id), recorded
+    /// in the fleet file. Omitted: your personal org (named after your
+    /// username). A re-login keeps a previously recorded one.
+    #[arg(long)]
+    pub org: Option<String>,
     /// The fleet to log in to.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
@@ -196,8 +201,44 @@ pub enum CoordinatorCommand {
     AuthKeys(AuthKeysArgs),
     /// Revoke an auth key by hash prefix.
     AuthKeyRevoke(AuthKeyRevokeArgs),
-    /// Mint a user session token directly (INTERIM).
+    /// Create (or reuse) a local user and mint a session + refresh token for
+    /// it directly: the air-gapped / bootstrap escape hatch.
     UserToken(UserTokenArgs),
+    /// Manage orgs from a shell on the coordinator host.
+    Org(OrgArgs),
+}
+
+/// Arguments for `coordinator org`.
+#[derive(Debug, Args)]
+pub struct OrgArgs {
+    /// The org verb.
+    #[command(subcommand)]
+    pub command: OrgCommand,
+}
+
+/// `coordinator org` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum OrgCommand {
+    /// Create a team org and make an existing user its admin.
+    Create(OrgCreateArgs),
+}
+
+/// Arguments for `coordinator org create`.
+///
+/// A team org has no other creation path: personal orgs are made at signup,
+/// and the default org at startup.
+#[derive(Debug, Args)]
+pub struct OrgCreateArgs {
+    /// The org name (one path segment: lowercase letters, digits, `-`).
+    pub name: String,
+    /// The username of its first admin. Must already exist (log in once, or
+    /// `coordinator user-token --username <name>`).
+    #[arg(long)]
+    pub admin: String,
+    /// Override the config directory (default: XDG config dir). Used to locate
+    /// `coordinator.toml`.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// Arguments for `coordinator init`.
@@ -313,14 +354,19 @@ pub struct AuthKeyArgs {
 
 /// Arguments for `coordinator user-token`.
 ///
-/// **Interim.** This mints a session token from a shell on the coordinator host,
-/// bypassing any login flow. It exists so the fleet is usable before the GitHub
-/// device flow lands, and it should not become the way people log in.
+/// The **escape hatch**: from a shell on the coordinator host, create the
+/// local user `--username` if it does not exist (reusing it if it does), add
+/// it to `--org`, and mint a session plus a refresh token. For an air-gapped
+/// fleet with no login provider, and for bootstrapping. The user it creates
+/// is an ordinary forgs user (personal org included); it simply has no
+/// provider identity linked.
 #[derive(Debug, Args)]
 pub struct UserTokenArgs {
-    /// The user's login (the subject id the token authenticates as).
-    pub login: String,
-    /// Org to place the user in. Defaults to the coordinator's `default_org`.
+    /// The username to mint for (created if absent).
+    #[arg(long)]
+    pub username: String,
+    /// Org to also place the user in. Defaults to the coordinator's
+    /// `default_org`.
     #[arg(long)]
     pub org: Option<String>,
     /// Role to grant in that org.
@@ -349,11 +395,22 @@ pub enum RoleArg {
     Admin,
 }
 
-impl From<RoleArg> for fleet_proto::ids::Role {
+impl RoleArg {
+    /// The role label on the coordinator's ladder.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            RoleArg::Member => "member",
+            RoleArg::Admin => "admin",
+        }
+    }
+}
+
+impl From<RoleArg> for fleet_coordinator::FleetRole {
     fn from(r: RoleArg) -> Self {
         match r {
-            RoleArg::Member => fleet_proto::ids::Role::Member,
-            RoleArg::Admin => fleet_proto::ids::Role::Admin,
+            RoleArg::Member => fleet_coordinator::FleetRole::Member,
+            RoleArg::Admin => fleet_coordinator::FleetRole::Admin,
         }
     }
 }
@@ -416,6 +473,10 @@ pub struct ShareArgs {
     /// Probe adoption policy for this node. Defaults to `auto` for `share`.
     #[arg(long, value_enum)]
     pub adopt: Option<AdoptArg>,
+    /// The org to register the node into (path or id). Defaults to the fleet
+    /// file's `[user].org`, else your personal org. You must be a member.
+    #[arg(long)]
+    pub org: Option<String>,
     /// Overwrite an existing `[node]` credential instead of refusing.
     #[arg(long)]
     pub force: bool,
@@ -433,8 +494,9 @@ pub struct ShareArgs {
 /// (architecture §6.4). `coordinator auth-key` remains the self-hosted
 /// operator's shell-on-the-host escape hatch.
 ///
-/// The key inherits the caller's org from their session and can never exceed
-/// it: there is no `--org` flag here, and there deliberately is not one.
+/// The key is scoped to one org — `--org`, else the fleet file's `[user].org`,
+/// else your personal org — and the coordinator refuses it unless you are a
+/// member there, so a key can never exceed its minter's access.
 #[derive(Debug, Args)]
 pub struct AuthKeyCliArgs {
     /// The auth-key verb.
@@ -527,6 +589,10 @@ pub struct AuthKeyCreateArgs {
     /// cutting power to a lab board should be an explicit choice.
     #[arg(long, add = crate::completion::ops_candidates())]
     pub ops: Option<String>,
+    /// The org to act in (path or id). Defaults to the fleet file's
+    /// `[user].org`, else your personal org.
+    #[arg(long)]
+    pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the mint.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
@@ -540,6 +606,10 @@ pub struct AuthKeyCreateArgs {
 /// Arguments for `probe-rs-fleet auth-key list`.
 #[derive(Debug, Args)]
 pub struct AuthKeyListArgs {
+    /// The org to act in (path or id). Defaults to the fleet file's
+    /// `[user].org`, else your personal org.
+    #[arg(long)]
+    pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the listing.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
@@ -559,6 +629,10 @@ pub struct AuthKeyRevokeCliArgs {
     /// Hash prefix of the key to revoke, from `probe-rs-fleet auth-key list`
     /// (at least 8 hex characters).
     pub prefix: String,
+    /// The org to act in (path or id). Defaults to the fleet file's
+    /// `[user].org`, else your personal org.
+    #[arg(long)]
+    pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the revocation.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
@@ -863,6 +937,10 @@ pub struct NodeApproveArgs {
     /// chose the name, and it may not be the one you think.
     #[arg(long)]
     pub replace: bool,
+    /// The org to act in (path or id). Defaults to the fleet file's
+    /// `[user].org`, else your personal org.
+    #[arg(long)]
+    pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the approval.
     #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
@@ -1233,16 +1311,16 @@ pub enum CtlCommand {
 /// `grant revoke <id>` manage them.
 ///
 /// The cost of that ergonomics, stated: a user literally named `list` or
-/// `revoke` is shadowed by the subcommand. Name them by their id form
-/// (`gh-1234`) or rendered subject key instead.
+/// `revoke` is shadowed by the subcommand. Name them by their subject key
+/// (`user:<id>`) instead.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct GrantArgs {
     #[command(flatten)]
     pub client: CtlClientArgs,
-    /// Who to share with: a GitHub login, a `gh-<id>`, or a rendered subject
-    /// key (`<org>/user:<id>`). Resolved to an immutable user id at creation —
-    /// a login can be renamed and reused, an id cannot.
+    /// Who to share with: a username, or a rendered subject key
+    /// (`user:<id>`, `<org-id>/node:<node>`). Resolved to an immutable user id
+    /// at creation — a username can be renamed, an id cannot.
     pub subject: Option<String>,
     /// Share with a **CI repository** instead of a person: `owner/name`
     /// (architecture §6.7).
@@ -1436,6 +1514,12 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                         roles::admin::user_token(args).await?;
                         Ok(ExitCode::SUCCESS)
                     }
+                    Some(CoordinatorCommand::Org(args)) => match args.command {
+                        OrgCommand::Create(args) => {
+                            roles::admin::org_create(args).await?;
+                            Ok(ExitCode::SUCCESS)
+                        }
+                    },
                     None => {
                         roles::coordinator::run(args).await?;
                         Ok(ExitCode::SUCCESS)
@@ -1682,8 +1766,8 @@ mod tests {
         }
     }
 
-    /// Defaults match `coordinator auth-key`'s: single use, 24h. There is no
-    /// `--org` — the org comes from the session, and a key can never exceed it.
+    /// Defaults match `coordinator auth-key`'s: single use, 24h, and no
+    /// explicit org (the fleet file's, else the personal org).
     #[test]
     fn auth_key_create_defaults_are_single_use_and_expiring() {
         let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
@@ -1872,12 +1956,13 @@ mod tests {
             "probe-rs-fleet",
             "coordinator",
             "user-token",
+            "--username",
             "alice",
         ]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
                 Some(CoordinatorCommand::UserToken(t)) => {
-                    assert_eq!(t.login, "alice");
+                    assert_eq!(t.username, "alice");
                     assert_eq!(t.role, RoleArg::Admin);
                     assert!(t.ttl.is_none());
                 }
@@ -1890,6 +1975,7 @@ mod tests {
             "probe-rs-fleet",
             "coordinator",
             "user-token",
+            "--username",
             "bob",
             "--role",
             "member",
@@ -1919,7 +2005,7 @@ mod tests {
             "--fleet-url",
             "https://fleet.example",
             "--auth-key",
-            "prffk1_abc",
+            "prfk1_abc",
         ]));
         match cli.command {
             Command::Agent(a) => {
@@ -1927,7 +2013,7 @@ mod tests {
                 match a.command {
                     Some(AgentCommand::Up(up)) => {
                         assert_eq!(up.fleet_url.as_deref(), Some("https://fleet.example"));
-                        assert_eq!(up.auth_key.as_deref(), Some("prffk1_abc"));
+                        assert_eq!(up.auth_key.as_deref(), Some("prfk1_abc"));
                         assert!(up.node_name.is_none());
                         assert!(up.adopt.is_none());
                     }
@@ -1980,7 +2066,7 @@ mod tests {
             "--fleet-url",
             "https://fleet.example",
             "--auth-key",
-            "prffk1_abc",
+            "prfk1_abc",
             "--node-name",
             "rpi-7",
             "--no-interactive",
@@ -2091,7 +2177,7 @@ mod tests {
             "--fleet-url",
             "https://fleet.example",
             "--auth-key",
-            "prffk1_abc",
+            "prfk1_abc",
             "--as",
             "desk-bot",
             "--server-cert-sha256",
@@ -2103,7 +2189,7 @@ mod tests {
                 match a.command {
                     Some(AgentCommand::Login(l)) => {
                         assert_eq!(l.fleet_url.as_deref(), Some("https://fleet.example"));
-                        assert_eq!(l.auth_key, "prffk1_abc");
+                        assert_eq!(l.auth_key, "prfk1_abc");
                         assert_eq!(l.subject_name.as_deref(), Some("desk-bot"));
                         assert_eq!(l.server_cert_sha256.as_deref(), Some(&*"ab".repeat(32)));
                     }
@@ -2123,7 +2209,7 @@ mod tests {
             "agent",
             "login",
             "--auth-key",
-            "prffk1_abc",
+            "prfk1_abc",
         ]));
         match cli.command {
             Command::Agent(a) => match a.command {
@@ -2161,7 +2247,7 @@ mod tests {
             "/tmp/cfg",
             "login",
             "--auth-key",
-            "prffk1_abc",
+            "prfk1_abc",
         ]));
         match cli.command {
             Command::Agent(a) => {
@@ -2583,12 +2669,15 @@ mod tests {
         let cli = Cli::parse_from(os(&[
             "probe-rs-fleet",
             "grant",
-            "gh-1234",
+            "user:01J9Z3Q4ABCDEFGHJKMNPQRSTV",
             "--select",
             "tag=nrf52",
         ]));
         match cli.command {
-            Command::Grant(a) => assert_eq!(a.subject.as_deref(), Some("gh-1234")),
+            Command::Grant(a) => assert_eq!(
+                a.subject.as_deref(),
+                Some("user:01J9Z3Q4ABCDEFGHJKMNPQRSTV")
+            ),
             other => panic!("expected grant, got {other:?}"),
         }
     }
@@ -2760,11 +2849,11 @@ mod tests {
             "--fleet-url",
             "https://f",
             "--auth-key",
-            "prffk1_x",
+            "prfk1_x",
         ]));
         match cli.command {
             Command::Ci(a) => match a.command {
-                CiCommand::Login(l) => assert_eq!(l.auth_key.as_deref(), Some("prffk1_x")),
+                CiCommand::Login(l) => assert_eq!(l.auth_key.as_deref(), Some("prfk1_x")),
             },
             other => panic!("expected ci, got {other:?}"),
         }

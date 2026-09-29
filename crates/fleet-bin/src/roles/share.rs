@@ -43,6 +43,7 @@ pub async fn run(args: ShareArgs) -> Result<()> {
         node_name,
         tag,
         adopt,
+        org,
         force,
         config_dir,
     } = args;
@@ -75,16 +76,26 @@ pub async fn run(args: ShareArgs) -> Result<()> {
     let node_name = node_name.unwrap_or_else(node_setup::default_node_name);
     let adopt: AdoptPolicy = adopt.map_or(AdoptPolicy::Auto, Into::into);
 
-    let response = fleet_auth::http_client::self_register(
-        &file.url,
-        file.pin(),
+    let org = org.or_else(|| file.user.as_ref().and_then(|u| u.org.clone()));
+    let client = crate::node_client::client(&file.url, file.pin())
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    let response = crate::node_client::self_register(
+        &client,
         &session,
-        &node_name,
-        tag,
-        Some(adopt.as_str()),
+        &fleet_proto::auth_api::SelfRegisterRequest {
+            node_name: node_name.clone(),
+            tags: tag,
+            adopt: Some(adopt.as_str().to_owned()),
+            org,
+        },
     )
     .await
-    .context("registering this machine as a node at <fleet-url>/auth/token")?;
+    .map_err(|e| {
+        anyhow::anyhow!(forgs_client::cli::describe(
+            &e,
+            "registering this machine as a node at <fleet-url>/node/self-register"
+        ))
+    })?;
 
     // `None` for the URL: the session that authorised this came out of *this*
     // file, so the coordinator it names is already the right one. Same for the
@@ -96,7 +107,7 @@ pub async fn run(args: ShareArgs) -> Result<()> {
 
     node_setup::print_summary(&node_setup::Enrollment {
         node_id: &node_id,
-        org: &response.org,
+        org: response.org_name.as_deref().unwrap_or(&response.org),
         fleet: &fleet,
         adopt,
         fleet_path: &fleet_path,

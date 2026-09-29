@@ -42,8 +42,8 @@ use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::{Context, Result};
 
-use fleet_auth::api::{NodeApprovalDecision, NodeApprovalResponse};
-use fleet_auth::http_client::ClientError;
+use fleet_proto::auth_api::{NodeApprovalDecision, NodeApprovalResponse};
+use forgs_client::ClientError;
 
 use crate::cli::NodeApproveArgs;
 use crate::fleet_config::{self, FleetFile};
@@ -59,7 +59,7 @@ use crate::roles::node_setup;
 pub async fn run(args: &NodeApproveArgs) -> Result<()> {
     // Locally first: a mistyped code fails here, with the shape it should have
     // had, rather than as a 404 from a request that need not have been made.
-    let code = fleet_auth::user_code::normalise(&args.code).with_context(|| {
+    let code = forgs::user_code::normalise(&args.code).with_context(|| {
         format!(
             "`{}` is not an approval code: expected 8 characters like `ABCD-1234`, \
              as printed by the machine that is waiting",
@@ -68,15 +68,21 @@ pub async fn run(args: &NodeApproveArgs) -> Result<()> {
     })?;
 
     let (file, session) = session_for(&args.fleet, args.config_dir.as_deref()).await?;
+    let org = args
+        .org
+        .clone()
+        .or_else(|| file.user.as_ref().and_then(|u| u.org.clone()));
+    let client = crate::node_client::client(&file.url, file.pin())
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
 
     // Always inspect before acting. This is the mitigation, not a convenience.
-    let pending = fleet_auth::http_client::node_approval(
-        &file.url,
-        file.pin(),
+    let pending = crate::node_client::approve(
+        &client,
         &session,
         &code,
         NodeApprovalDecision::Inspect,
         false,
+        org.as_deref(),
     )
     .await
     .map_err(|e| describe(&e, "looking up the approval code"))?;
@@ -91,13 +97,13 @@ pub async fn run(args: &NodeApproveArgs) -> Result<()> {
     };
     confirm(args, &pending)?;
 
-    let outcome = fleet_auth::http_client::node_approval(
-        &file.url,
-        file.pin(),
+    let outcome = crate::node_client::approve(
+        &client,
         &session,
         &code,
         decision,
         args.replace,
+        org.as_deref(),
     )
     .await
     .map_err(|e| {
@@ -343,7 +349,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
              waiting machine"
         }
         "forbidden" => {
-            "you are not a member of the org your session belongs to, so you \
+            "you are not a member of the org you named (or your personal org), so you \
              cannot approve a node into it"
         }
         "unauthorized" => "your session was refused. Log in again with `probe-rs-fleet login`",
@@ -362,6 +368,7 @@ mod tests {
             deny: false,
             yes: false,
             replace: false,
+            org: None,
             fleet: "default".to_owned(),
             config_dir: None,
         }

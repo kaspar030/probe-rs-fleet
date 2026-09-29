@@ -16,8 +16,10 @@
 //! Three properties come from the coordinator rather than from here, and are
 //! worth knowing while reading this file:
 //!
-//! * **the org comes from the session**, never from a flag, so a key can never
-//!   exceed the caller's own org (there is deliberately no `--org`);
+//! * **the key is scoped to one org** — `--org`, else the fleet file's
+//!   `[user].org`, else the caller's personal org (named after the username)
+//!   — and the coordinator refuses the mint unless the caller is a member
+//!   there, so a key can never exceed its minter's access;
 //! * **membership is sufficient** to mint, consistent with §6.4/§6.5's
 //!   "membership is enough to add a node";
 //! * **an API-minted key must expire**, within a documented cap. A forever-key
@@ -26,15 +28,15 @@
 //!
 //! # Work and printing are separate
 //!
-//! [`create`] / [`list`] / [`revoke`] do the work and return the `fleet_auth`
+//! [`create`] / [`list`] / [`revoke`] do the work and return the forgs
 //! wire types; [`run`] dispatches and prints. The split is not decoration: the
 //! minted secret is printed exactly once and stored nowhere, so a test (or any
 //! future caller) that needs its value cannot scrape stdout for it.
 
 use anyhow::{Context, Result};
 
-use fleet_auth::api::{AuthKeyCreated, AuthKeyList, AuthKeyRevoked};
-use fleet_auth::http_client::ClientError;
+use forgs_client::api::{ApiKeyCreated, ApiKeyList, ApiKeyRevoked};
+use forgs_client::{ApiKeySpec, ClientError, ForgsClient};
 
 use crate::cli::{
     AuthKeyCliArgs, AuthKeyCommand, AuthKeyCreateArgs, AuthKeyListArgs, AuthKeyRevokeCliArgs,
@@ -68,13 +70,13 @@ pub(crate) const PURPOSE_AGENT_ALIAS: &str = "agent";
 ///
 /// Returns an error naming the charset, the length cap and why they exist.
 pub(crate) fn normalise_identity_name(raw: &str) -> Result<String> {
-    fleet_proto::ids::normalise_agent_name(raw).with_context(|| {
+    forgs::subject::normalise_service_name(raw).with_context(|| {
         format!(
             "`--as {raw}` is not a usable identity name: use 1-{} characters from \
              [a-z0-9._-], starting with a letter or digit. No `:` and no `/`, so a \
              name can never be mistaken for the unnamed `key:<hash>` form or for a \
              `gha/workload:owner/repo` repo subject",
-            fleet_proto::ids::MAX_AGENT_NAME_LEN
+            forgs::subject::MAX_SERVICE_NAME_LEN
         )
     })
 }
@@ -144,7 +146,7 @@ pub async fn run(args: AuthKeyCliArgs) -> Result<()> {
 /// See [`run`]. A TTL of zero (or `never`) is refused locally, with the reason,
 /// rather than bouncing the user off a `400`. So are a `--purpose node` key
 /// carrying `--as`, and an `--as` name that breaks the charset rule.
-pub async fn create(args: &AuthKeyCreateArgs) -> Result<AuthKeyCreated> {
+pub async fn create(args: &AuthKeyCreateArgs) -> Result<ApiKeyCreated> {
     let ttl = parse_ttl(&args.ttl)?;
     // `--purpose agent` is a spelling of `ci`, normalised at this boundary so
     // only the epilogue below ever branches on what the operator typed.
@@ -176,7 +178,7 @@ pub async fn create(args: &AuthKeyCreateArgs) -> Result<AuthKeyCreated> {
             Some(normalise_identity_name(raw)?)
         }
     };
-    let ops = match &args.ops {
+    let ops: Vec<String> = match &args.ops {
         // Validated locally so a typo names the unknown op rather than
         // bouncing off a coarse `400`.
         Some(spec) => crate::roles::grant::parse_ops_arg(spec)?
@@ -185,22 +187,38 @@ pub async fn create(args: &AuthKeyCreateArgs) -> Result<AuthKeyCreated> {
             .collect(),
         None => Vec::new(),
     };
-    let (file, session) = session_for(&args.fleet, args.config_dir.as_deref()).await?;
+    anyhow::ensure!(
+        ops.is_empty() || purpose == "ci",
+        "`--ops` only applies to a `--purpose ci` (or `agent`) key; a node key confers \
+         no operations"
+    );
+    // The payload the coordinator's purpose policy validates: a node key's
+    // tags are stamped onto every node it enrolls; a ci key's tags become the
+    // selector of the grant its redemption synthesises, and its ops that
+    // grant's operations.
+    let payload = if purpose == "ci" {
+        serde_json::json!({ "tags": args.tag, "ops": ops })
+    } else {
+        serde_json::json!({ "tags": args.tag })
+    };
+    let ctx = session_for(&args.fleet, args.config_dir.as_deref(), args.org.as_deref()).await?;
     // `--single-use` is the default, so it is accepted and ignored; clap already
     // refuses it together with `--multi-use`.
-    let created = fleet_auth::http_client::create_auth_key_with_purpose(
-        &file.url,
-        file.pin(),
-        &session,
-        args.tag.clone(),
-        ttl,
-        args.multi_use,
-        Some(purpose),
-        ops,
-        subject_name.as_deref(),
-    )
-    .await
-    .map_err(|e| describe(&e, "minting an auth key"))?;
+    let created = ctx
+        .client
+        .create_api_key(
+            &ctx.session,
+            &ApiKeySpec {
+                namespace: ctx.namespace.clone(),
+                ttl_secs: ttl,
+                multi_use: args.multi_use,
+                purpose: purpose.to_owned(),
+                subject_name: subject_name.clone(),
+                payload: Some(payload),
+            },
+        )
+        .await
+        .map_err(|e| describe(&e, "minting an auth key"))?;
     // Version skew, which is silent otherwise: `/auth/keys` does not
     // `deny_unknown_fields`, so an **older** coordinator ignores `subject_name`
     // and mints an unnamed key while returning `200`. The operator would then
@@ -225,9 +243,10 @@ pub async fn create(args: &AuthKeyCreateArgs) -> Result<AuthKeyCreated> {
 /// # Errors
 ///
 /// See [`run`].
-pub async fn list(args: &AuthKeyListArgs) -> Result<AuthKeyList> {
-    let (file, session) = session_for(&args.fleet, args.config_dir.as_deref()).await?;
-    fleet_auth::http_client::list_auth_keys(&file.url, file.pin(), &session)
+pub async fn list(args: &AuthKeyListArgs) -> Result<ApiKeyList> {
+    let ctx = session_for(&args.fleet, args.config_dir.as_deref(), args.org.as_deref()).await?;
+    ctx.client
+        .list_api_keys(&ctx.session, &ctx.namespace)
         .await
         .map_err(|e| describe(&e, "listing this org's auth keys"))
 }
@@ -237,11 +256,19 @@ pub async fn list(args: &AuthKeyListArgs) -> Result<AuthKeyList> {
 /// # Errors
 ///
 /// See [`run`].
-pub async fn revoke(args: &AuthKeyRevokeCliArgs) -> Result<AuthKeyRevoked> {
-    let (file, session) = session_for(&args.fleet, args.config_dir.as_deref()).await?;
-    fleet_auth::http_client::revoke_auth_key(&file.url, file.pin(), &session, &args.prefix)
+pub async fn revoke(args: &AuthKeyRevokeCliArgs) -> Result<ApiKeyRevoked> {
+    let ctx = session_for(&args.fleet, args.config_dir.as_deref(), args.org.as_deref()).await?;
+    ctx.client
+        .revoke_api_key(&ctx.session, &ctx.namespace, &args.prefix)
         .await
         .map_err(|e| describe(&e, "revoking an auth key"))
+}
+
+/// What every verb here needs: a client, a live session, and the org.
+struct KeyContext {
+    client: ForgsClient,
+    session: String,
+    namespace: String,
 }
 
 /// Load the fleet file and produce a usable session token.
@@ -253,7 +280,8 @@ pub async fn revoke(args: &AuthKeyRevokeCliArgs) -> Result<AuthKeyRevoked> {
 async fn session_for(
     fleet: &str,
     config_dir: Option<&std::path::Path>,
-) -> Result<(FleetFile, String)> {
+    org: Option<&str>,
+) -> Result<KeyContext> {
     let (fleet_path, _node_dir) = node_setup::resolve_paths(fleet, config_dir)?;
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
@@ -269,10 +297,33 @@ async fn session_for(
          (With a shell on the coordinator host, `probe-rs-fleet coordinator \
          auth-key` is the self-hosted escape hatch.)"
     );
+    let namespace = acting_org(&file, org).with_context(|| {
+        format!(
+            "no org to act in for fleet `{fleet}`: pass `--org <name>` (your personal \
+             org is named after your username, which this fleet file does not record)"
+        )
+    })?;
     let session = fleet_config::ensure_fresh_session(fleet, &file)
         .await
         .context("refreshing the session token")?;
-    Ok((file, session))
+    let client = ForgsClient::new(&file.url, file.pin())
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    Ok(KeyContext {
+        client,
+        session,
+        namespace,
+    })
+}
+
+/// The org a user-session verb acts in: an explicit `--org`, else the fleet
+/// file's `[user].org`, else the personal org — whose name is the username.
+pub(crate) fn acting_org(file: &FleetFile, explicit: Option<&str>) -> Option<String> {
+    let explicit = explicit.map(str::trim).filter(|o| !o.is_empty());
+    let user = file.user.as_ref();
+    explicit
+        .map(ToOwned::to_owned)
+        .or_else(|| user.and_then(|u| u.org.clone()))
+        .or_else(|| user.and_then(|u| u.username.clone()))
 }
 
 /// Turn a coordinator rejection into remediation-shaped text.
@@ -285,7 +336,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
     };
     let hint = match code.as_str() {
         "forbidden" => {
-            "you are not a member of the org your session belongs to, or the key \
+            "you are not a member of that org (or it does not exist), or the key \
              is not yours to revoke (its creator, or an org admin, may revoke it)"
         }
         "ambiguous_prefix" => {
@@ -349,23 +400,35 @@ fn short(hash: &str) -> String {
     hash.chars().take(16).collect()
 }
 
+/// The tags a key's payload carries (empty if none, or unreadable).
+fn payload_tags(payload: Option<&serde_json::Value>) -> Vec<String> {
+    payload
+        .and_then(|p| p.get("tags"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Print a freshly minted key. **The only place the secret is printed.**
-fn print_created(created: &AuthKeyCreated) {
-    println!("Auth key for org '{}':", created.org);
+fn print_created(created: &ApiKeyCreated) {
+    println!("Auth key for org '{}':", created.namespace);
     println!();
     println!("  {}", created.key);
     println!();
     println!("  single use : {}", created.single_use);
     if let Some(name) = &created.subject_name {
         println!("  identity   : agent:{name}");
-        println!("  subject    : {}/workload:agent:{name}", created.org);
+        println!("  subject    : {}/workload:agent:{name}", created.namespace);
     }
-    match created.expires {
-        Some(e) => println!("  expires    : {e} (epoch seconds)"),
-        None => println!("  expires    : never"),
-    }
-    if !created.tags.is_empty() {
-        println!("  tags       : {}", created.tags.join(", "));
+    println!("  expires    : {} (epoch seconds)", created.expires);
+    let tags = payload_tags(created.payload.as_ref());
+    if !tags.is_empty() {
+        println!("  tags       : {}", tags.join(", "));
     }
     println!("  hash       : {}", short(&created.key_hash));
     println!();
@@ -380,7 +443,7 @@ fn print_created(created: &AuthKeyCreated) {
         println!("anywhere at all. See docs/ci-github-actions.md.");
         if let Some(name) = &created.subject_name {
             println!();
-            println!("{}", identity_epilogue(&created.org, name));
+            println!("{}", identity_epilogue(&created.namespace, name));
         }
     } else {
         println!("Enroll a node with it:");
@@ -392,20 +455,17 @@ fn print_created(created: &AuthKeyCreated) {
 }
 
 /// Print a listing, in the same column layout as `coordinator auth-keys`.
-fn print_list(list: &AuthKeyList) {
+fn print_list(list: &ApiKeyList) {
     if list.keys.is_empty() {
-        println!("No auth keys for org '{}'.", list.org);
+        println!("No auth keys for org '{}'.", list.namespace);
         return;
     }
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
-    )
-    .unwrap_or(i64::MAX);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     println!(
         "Auth keys for org '{}' ({} total):",
-        list.org,
+        list.namespace,
         list.keys.len()
     );
     println!();
@@ -433,7 +493,7 @@ fn print_list(list: &AuthKeyList) {
             short(&key.key_hash),
             key.purpose,
             key.single_use,
-            key.tags.join(",")
+            payload_tags(key.payload.as_ref()).join(",")
         );
     }
     println!();
@@ -456,9 +516,9 @@ fn print_list(list: &AuthKeyList) {
 }
 
 /// Print what a revocation deleted.
-fn print_revoked(revoked: &AuthKeyRevoked) {
+fn print_revoked(revoked: &ApiKeyRevoked) {
     for hash in &revoked.revoked {
-        println!("Revoked auth key {hash} (org '{}').", revoked.org);
+        println!("Revoked auth key {hash} (org '{}').", revoked.namespace);
     }
     println!();
     println!("Nodes already enrolled with it keep working: their node tokens are");

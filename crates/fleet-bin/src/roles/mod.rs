@@ -8,7 +8,7 @@
 //! - [`sidecar`] → [`fleet_sidecar::run`]
 //! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
 //!   coordinator client the tree has
-//! - [`login`] → the GitHub device flow, brokered by the coordinator
+//! - [`login`] → the coordinator's (forgs) device flow, any login provider
 //! - [`logout`] → revoke this machine's session and refresh token (`--all`:
 //!   every one the caller holds, the lost-machine answer)
 //! - [`share`] → self-register this machine as a node with the login it has

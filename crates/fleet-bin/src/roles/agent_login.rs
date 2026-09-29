@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! probe-rs-fleet agent login --fleet-url https://fleet.example \
-//!     --auth-key prffk1_… --as desk-bot
+//!     --auth-key prfk1_… --as desk-bot
 //! ```
 //!
 //! # Who this is for, and what it grants
@@ -66,8 +66,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use fleet_auth::api::TokenResponse;
-use fleet_auth::http_client::ClientError;
+use forgs_client::api::TokenResponse;
+use forgs_client::{ClientError, ForgsClient};
 
 use crate::cli::AgentLoginArgs;
 use crate::fleet_config::{self, AgentSection};
@@ -135,9 +135,8 @@ pub async fn run(args: AgentLoginArgs, fleet: &str, config_dir: Option<PathBuf>)
     // arriving as a 401 from a machine the user cannot see.
     let auth_key = args.auth_key.trim().to_owned();
     anyhow::ensure!(
-        fleet_auth::OpaqueToken::parse(&auth_key)
-            .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::AuthKey),
-        "--auth-key must be an auth key (`prffk1_…`); mint one with \
+        crate::tokens::is_api_key(&auth_key),
+        "--auth-key must be an auth key (`prfk1_…`); mint one with \
          `probe-rs-fleet auth-key create --purpose agent --as <name> --multi-use --tag <tag>`"
     );
     // Never repaired, only refused: a repaired name is a *different* identity,
@@ -148,10 +147,7 @@ pub async fn run(args: AgentLoginArgs, fleet: &str, config_dir: Option<PathBuf>)
     };
 
     let (response, confirmation) = redeem_twice(&url, pin, &auth_key).await?;
-    let expires = response.expires.context(
-        "the coordinator returned a workload token with no expiry, so a \
-         self-renewing agent session cannot know when to renew",
-    )?;
+    let expires = response.expires;
 
     let written = fleet_config::update(&path, |f| {
         f.url.clone_from(&url);
@@ -181,11 +177,14 @@ async fn redeem_twice(
     pin: Option<[u8; 32]>,
     auth_key: &str,
 ) -> Result<(TokenResponse, Confirmation)> {
-    let first = fleet_auth::http_client::exchange_workload_key(url, pin, auth_key)
+    let client =
+        ForgsClient::new(url, pin).map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    let first = client
+        .exchange_api_key(auth_key)
         .await
         .map_err(|e| crate::roles::ci::describe(&e, "redeeming an agent auth key"))?;
 
-    match fleet_auth::http_client::exchange_workload_key(url, pin, auth_key).await {
+    match client.exchange_api_key(auth_key).await {
         Ok(second) => Ok((second, Confirmation::MultiUse)),
         Err(ClientError::Rejected { .. }) => Err(anyhow::anyhow!("{SINGLE_USE}")),
         Err(e) => {
@@ -228,11 +227,7 @@ fn summary_lines(
     expires: u64,
     confirmation: Confirmation,
 ) -> Vec<String> {
-    let orgs = if response.orgs.is_empty() {
-        response.org.clone()
-    } else {
-        response.orgs.join(", ")
-    };
+    let _ = response;
     let name = written
         .agent
         .as_ref()
@@ -242,7 +237,7 @@ fn summary_lines(
     let mut lines = vec![
         String::new(),
         format!("Agent session established as `{name}` — fleet `{fleet}`"),
-        format!("  granted by: {orgs}"),
+        "  reaches boards through the grants its key's org gave it".to_owned(),
         format!("  expires:    {expires} (epoch seconds)"),
         format!("  {} (0600)", path.display()),
     ];
@@ -295,7 +290,8 @@ fn summary_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_auth::{OpaqueToken, TokenKind};
+    use crate::tokens::mint_string;
+    use forgs::TokenKind;
 
     fn args(auth_key: &str) -> AgentLoginArgs {
         AgentLoginArgs {
@@ -309,12 +305,9 @@ mod tests {
     fn response() -> TokenResponse {
         TokenResponse {
             token: "prfw1_verysecret".to_owned(),
-            node_id: None,
-            org: "acme".to_owned(),
-            orgs: vec!["acme".to_owned(), "beta".to_owned()],
-            expires: Some(4_600),
-            coordinator_token_pubkey: None,
-            login: None,
+            expires: 4_600,
+            username: None,
+            user_id: None,
             refresh_token: None,
         }
     }
@@ -323,7 +316,7 @@ mod tests {
     /// without printing either credential.
     #[test]
     fn the_summary_never_prints_a_credential() {
-        let key = OpaqueToken::mint(TokenKind::AuthKey).to_secret_string();
+        let key = mint_string(TokenKind::ApiKey);
         let file = fleet_config::FleetFile {
             url: "https://fleet.example".to_owned(),
             agent: Some(AgentSection {
@@ -350,7 +343,6 @@ mod tests {
             "the workload token must never be printed"
         );
         assert!(text.contains("desk-bot"), "got: {text}");
-        assert!(text.contains("acme, beta"), "got: {text}");
         assert!(text.contains("refresh"), "got: {text}");
     }
 
@@ -360,14 +352,15 @@ mod tests {
         let file = fleet_config::FleetFile {
             url: "https://fleet.example".to_owned(),
             user: Some(crate::fleet_config::UserSection {
-                session_token: OpaqueToken::mint(TokenKind::Session).to_secret_string(),
-                org: "acme".to_owned(),
-                login: None,
+                session_token: mint_string(TokenKind::Session),
+                username: None,
+                user_id: None,
+                org: None,
                 expires: None,
                 refresh_token: None,
             }),
             agent: Some(AgentSection {
-                auth_key: OpaqueToken::mint(TokenKind::AuthKey).to_secret_string(),
+                auth_key: mint_string(TokenKind::ApiKey),
                 name: None,
                 workload_token: response().token,
                 expires: 4_600,
@@ -393,7 +386,7 @@ mod tests {
         let file = fleet_config::FleetFile {
             url: "https://fleet.example".to_owned(),
             agent: Some(AgentSection {
-                auth_key: OpaqueToken::mint(TokenKind::AuthKey).to_secret_string(),
+                auth_key: mint_string(TokenKind::ApiKey),
                 name: None,
                 workload_token: response().token,
                 expires: 4_600,
@@ -430,17 +423,14 @@ mod tests {
     #[tokio::test]
     async fn malformed_input_is_refused_before_any_request_and_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let key = OpaqueToken::mint(TokenKind::AuthKey).to_secret_string();
+        let key = mint_string(TokenKind::ApiKey);
 
         // Not an auth key: a session token, and outright garbage.
-        for bad in [
-            OpaqueToken::mint(TokenKind::Session).to_secret_string(),
-            "garbage".to_owned(),
-        ] {
+        for bad in [mint_string(TokenKind::Session), "garbage".to_owned()] {
             let err = run(args(&bad), "default", Some(tmp.path().to_path_buf()))
                 .await
                 .expect_err("wrong token kind");
-            assert!(format!("{err:#}").contains("prffk1_"), "got: {err:#}");
+            assert!(format!("{err:#}").contains("prfk1_"), "got: {err:#}");
         }
 
         // A malformed pin.
@@ -469,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn a_first_agent_login_needs_a_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let key = OpaqueToken::mint(TokenKind::AuthKey).to_secret_string();
+        let key = mint_string(TokenKind::ApiKey);
         let mut a = args(&key);
         a.fleet_url = None;
         let err = run(a, "default", Some(tmp.path().to_path_buf()))

@@ -1,28 +1,18 @@
-//! `probe-rs-fleet login`: authenticate against GitHub and cache a session
-//! token in the fleet file.
+//! `probe-rs-fleet login`: authenticate through the coordinator's forgs
+//! device flow and cache a session token in the fleet file.
 //!
 //! # The flow, and why it looks like this
 //!
-//! Enrollment used to be **coordinator-operator-rooted**: someone with a shell
-//! on the coordinator minted a single-use secret and sent it out of band. Every
-//! path — user, agent, CI — funnelled through that. This inverts it: a human
-//! authenticates once against GitHub, and every other credential derives from
-//! that authority.
+//! The coordinator is its own device authorization server (forgs'
+//! `/auth/device/*`, RFC 8628): the CLI asks it for a short `user_code`, the
+//! human opens the printed URL, logs in with **any** provider the coordinator
+//! offers (GitHub, Codeberg, GitLab, an OIDC issuer — choosing a username on
+//! first login), confirms the code, and the CLI's poll returns a session plus
+//! a refresh token.
 //!
-//! The mechanism is GitHub's **device flow** (RFC 8628): the coordinator asks
-//! GitHub for a short `user_code`, the human types it at
-//! `https://github.com/login/device`, and the coordinator polls until GitHub
-//! says yes.
-//!
-//! Two properties worth stating because they are easy to get wrong:
-//!
-//! * **This CLI never talks to GitHub.** It talks to the coordinator, which
-//!   brokers. The OAuth app's client id/secret stay server-side, the user's
-//!   *GitHub* access token never leaves the coordinator, and a self-hosted fleet
-//!   can point at its own OAuth app without anybody rebuilding this binary.
-//! * **There is no callback URL.** The device flow has no `redirect_uri` at all,
-//!   so the unresolved "where does the hosted control plane run" question does
-//!   not block login and nothing here hardcodes a hostname.
+//! * **This CLI never talks to an identity provider.** Provider credentials
+//!   stay on the coordinator, and nothing here hardcodes one.
+//! * **There is no callback URL on this side.** The CLI only polls.
 //!
 //! # What it writes
 //!
@@ -31,31 +21,12 @@
 //! node, and dropping a node credential means a re-enrollment.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 use crate::cli::LoginArgs;
 use crate::fleet_config::{self, FleetFile, UserSection};
 use crate::paths;
-
-/// Cap on how long a login attempt runs, if GitHub reports no expiry.
-const DEFAULT_EXPIRES_IN: u64 = 900;
-
-/// Floor on the poll interval, whatever GitHub asks for.
-///
-/// GitHub's `slow_down` response is advisory and its `interval` can be absent;
-/// polling faster than this earns a rate limit that looks, from here, like a
-/// broken login.
-const MIN_POLL_INTERVAL: u64 = 5;
-
-/// How many consecutive transport failures to tolerate while polling.
-///
-/// The device code lives for minutes and the user is mid-ceremony in a browser,
-/// so one dropped packet must not force them to start again. A sustained run of
-/// failures is different — that is the coordinator being unreachable, and
-/// saying so beats polling a dead endpoint until the code expires.
-const MAX_TRANSPORT_RETRIES: u32 = 5;
 
 /// Run `probe-rs-fleet login`.
 ///
@@ -70,6 +41,7 @@ pub async fn run(args: LoginArgs) -> Result<()> {
         token,
         refresh_token,
         no_browser,
+        org,
         fleet,
         config_dir,
     } = args;
@@ -104,10 +76,21 @@ pub async fn run(args: LoginArgs) -> Result<()> {
     }
     let pin = pin_hex.as_deref().and_then(fleet_tls::parse_fingerprint);
 
-    let session = match token {
+    if let Some(org) = &org {
+        anyhow::ensure!(!org.trim().is_empty(), "--org must not be empty");
+    }
+    let mut session = match token {
         Some(token) => record_external_token(&token, refresh_token.as_deref())?,
         None => device_flow(&url, pin, no_browser).await?,
     };
+    // An explicit `--org` wins; otherwise a re-login keeps the org this
+    // machine was already acting in.
+    session.org = org.or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|f| f.user.as_ref())
+            .and_then(|u| u.org.clone())
+    });
 
     let written = fleet_config::update(&path, |f| {
         f.url.clone_from(&url);
@@ -129,26 +112,24 @@ pub async fn run(args: LoginArgs) -> Result<()> {
 /// session token.
 fn record_external_token(token: &str, refresh_token: Option<&str>) -> Result<UserSection> {
     anyhow::ensure!(
-        fleet_auth::OpaqueToken::parse(token)
-            .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Session),
+        crate::tokens::is_session(token),
         "--token must be a session token (`prfs1_…`); mint one with \
-         `probe-rs-fleet coordinator user-token <login>`"
+         `probe-rs-fleet coordinator user-token --username <name>`"
     );
     if let Some(refresh) = refresh_token {
         anyhow::ensure!(
-            fleet_auth::OpaqueToken::parse(refresh)
-                .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Refresh),
+            crate::tokens::is_refresh(refresh),
             "--refresh-token must be a refresh token (`prfr1_…`); \
-             `probe-rs-fleet coordinator user-token <login>` prints one"
+             `probe-rs-fleet coordinator user-token --username <name>` prints one"
         );
     }
     Ok(UserSection {
         session_token: token.to_owned(),
-        // An externally minted token carries no org in-band. The coordinator
-        // resolves the org from the session row on every request, so this is
-        // only a display value; `ctl` never sends it.
-        org: "(unknown)".to_owned(),
-        login: None,
+        // An externally minted token carries no identity in-band; the
+        // coordinator resolves it from the session row on every request.
+        username: None,
+        user_id: None,
+        org: None,
         // No expiry either. With a refresh token present that means
         // `ensure_fresh_session` redeems once on first use and then records the
         // expiry it gets back; with none it means "use it and let the
@@ -158,9 +139,11 @@ fn record_external_token(token: &str, refresh_token: Option<&str>) -> Result<Use
     })
 }
 
-/// Drive the device flow to completion against `url`.
+/// Drive forgs' device flow to completion against `url`.
 async fn device_flow(url: &str, pin: Option<[u8; 32]>, no_browser: bool) -> Result<UserSection> {
-    let grant = fleet_auth::http_client::device_start(url, pin)
+    let client = forgs_client::ForgsClient::new(url, pin)
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    let login = forgs_client::DeviceLogin::start(&client)
         .await
         .map_err(|e| describe_start_error(&e))?;
 
@@ -168,155 +151,52 @@ async fn device_flow(url: &str, pin: Option<[u8; 32]>, no_browser: bool) -> Resu
     // code is the whole interface, and a browser that fails to open silently
     // must not leave the user with nothing.
     println!();
-    println!("  Open       {}", grant.verification_uri);
-    println!("  Enter code {}", grant.user_code);
+    println!("  Open       {}", login.verification_uri());
+    println!("  Enter code {}", login.user_code());
     println!();
 
-    if !no_browser && should_try_browser() {
-        try_open_browser(&grant.verification_uri);
+    if !no_browser && forgs_client::cli::should_try_browser() {
+        let _ = forgs_client::cli::try_open_browser(login.browser_uri());
     }
-
-    let expires_in = if grant.expires_in == 0 {
-        DEFAULT_EXPIRES_IN
-    } else {
-        grant.expires_in
-    };
-    let deadline = Instant::now() + Duration::from_secs(expires_in);
-    let mut interval = grant.interval.max(MIN_POLL_INTERVAL);
-    // A dropped packet must not kill a ceremony the user is in the middle of.
-    // The device code stays valid for its whole lifetime regardless of what our
-    // socket did, so a transport failure is worth retrying; only a *run* of them
-    // means the coordinator is genuinely unreachable.
-    let mut consecutive_transport_failures = 0_u32;
 
     println!("Waiting for you to authorise this device…");
-
-    loop {
-        if Instant::now() >= deadline {
-            anyhow::bail!(
-                "the device code expired before it was authorised; run `probe-rs-fleet login` again"
-            );
-        }
-        tokio::time::sleep(Duration::from_secs(interval)).await;
-
-        match fleet_auth::http_client::device_poll(url, pin, &grant.device_code).await {
-            Ok(response) => {
-                return Ok(UserSection {
-                    session_token: response.token,
-                    org: response.org,
-                    login: response.login,
-                    expires: response.expires,
-                    // `None` from a coordinator too old to mint one. That must
-                    // work: the session still functions, and
-                    // `ensure_fresh_session` falls back to today's behaviour.
-                    refresh_token: response.refresh_token,
-                });
-            }
-            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => {
-                consecutive_transport_failures = 0;
-                match code.as_str() {
-                    "authorization_pending" => {}
-                    // Back off additively, as RFC 8628 §3.5 requires: GitHub
-                    // counts a too-fast poll against us, and answering
-                    // `slow_down` by polling at the same rate is how a login
-                    // stops working.
-                    "slow_down" => interval = interval.saturating_add(5),
-                    "access_denied" => {
-                        anyhow::bail!("you cancelled the authorisation on GitHub");
-                    }
-                    "expired_token" => {
-                        anyhow::bail!(
-                            "the device code expired before it was authorised; run \
-                             `probe-rs-fleet login` again"
-                        );
-                    }
-                    "device_flow_unconfigured" => anyhow::bail!(UNCONFIGURED),
-                    other => anyhow::bail!("the coordinator rejected the login ({other})"),
-                }
-            }
-            Err(e) => {
-                // Transport, not rejection: the coordinator did not answer at
-                // all. Tolerate a short blip rather than making the user redo
-                // the browser step.
-                consecutive_transport_failures += 1;
-                if consecutive_transport_failures > MAX_TRANSPORT_RETRIES {
-                    return Err(anyhow::anyhow!(
-                        "polling the coordinator failed {consecutive_transport_failures} times in \
-                         a row: {e}"
-                    ));
-                }
-                tracing::debug!(error = %e, "transient failure polling the coordinator; retrying");
-            }
-        }
-    }
+    let session = login
+        .wait(&client)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(UserSection {
+        session_token: session.session_token.into_inner(),
+        username: session.username,
+        user_id: session.user_id,
+        org: None,
+        expires: Some(session.expires),
+        refresh_token: session.refresh_token.map(forgs_client::Secret::into_inner),
+    })
 }
-
-/// The message for a coordinator with no GitHub app configured.
-///
-/// A named error code rather than a 404 exists precisely so this sentence can be
-/// printed: "not found" would send the user looking for a version mismatch.
-const UNCONFIGURED: &str = "this coordinator has no GitHub app configured, so `login` cannot \
-     work against it.\nAsk its operator to add a [github] block to coordinator.toml, or \
-     bootstrap with:\n  probe-rs-fleet coordinator user-token <login>\n  probe-rs-fleet login \
-     --fleet-url <url> --token <token>";
 
 /// Turn a `/auth/device/start` failure into remediation-shaped text.
-fn describe_start_error(e: &fleet_auth::http_client::ClientError) -> anyhow::Error {
-    match e {
-        fleet_auth::http_client::ClientError::Rejected { code, .. }
-            if code == "device_flow_unconfigured" =>
-        {
-            anyhow::anyhow!(UNCONFIGURED)
-        }
-        _ => anyhow::anyhow!("could not start the GitHub device flow: {e}"),
+fn describe_start_error(e: &forgs_client::ClientError) -> anyhow::Error {
+    if e.status() == Some(404) {
+        return anyhow::anyhow!(
+            "this coordinator does not offer device login.\nBootstrap with:\n  \
+             probe-rs-fleet coordinator user-token --username <name>\n  \
+             probe-rs-fleet login --fleet-url <url> --token <token>"
+        );
     }
-}
-
-/// Whether opening a browser is even plausible here.
-///
-/// Over SSH or with no display, spawning `xdg-open` opens a browser on the wrong
-/// machine (or nothing at all) — the printed code is the real interface there.
-fn should_try_browser() -> bool {
-    if std::env::var_os("SSH_CONNECTION").is_some() {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        true
-    }
-}
-
-/// Best-effort browser launch. Failure is ignored: the URL is already printed.
-fn try_open_browser(url: &str) {
-    let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
-        ("open", &[])
-    } else if cfg!(target_os = "windows") {
-        ("cmd", &["/C", "start", ""])
-    } else {
-        ("xdg-open", &[])
-    };
-    // Detached and silenced: a browser's chatter on our stderr would bury the
-    // code the user needs to read.
-    let _ = std::process::Command::new(program)
-        .args(args)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    anyhow::anyhow!(forgs_client::cli::describe(e, "starting the device login"))
 }
 
 /// Print the post-login summary.
 fn print_summary(fleet: &str, path: &Path, file: &FleetFile) {
     let user = file.user.as_ref();
-    let login = user.and_then(|u| u.login.as_deref()).unwrap_or("(unknown)");
-    let org = user.map_or("(unknown)", |u| u.org.as_str());
+    let name = user
+        .and_then(|u| u.username.as_deref())
+        .unwrap_or("(unknown)");
+    let org = user
+        .and_then(|u| u.org.as_deref())
+        .unwrap_or("your personal org");
     println!();
-    println!("Logged in as {login} (org {org}) — fleet `{fleet}`");
+    println!("Logged in as {name} (acting in {org}) — fleet `{fleet}`");
     println!("  {} (0600)", path.display());
     if file.node.is_some() {
         // Worth saying: the whole point of one file per fleet is that this
@@ -338,7 +218,8 @@ fn print_summary(fleet: &str, path: &Path, file: &FleetFile) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_auth::{OpaqueToken, TokenKind};
+    use crate::tokens::{mint_string, node_kind};
+    use forgs::TokenKind;
 
     fn args(dir: &std::path::Path, token: Option<&str>) -> LoginArgs {
         LoginArgs {
@@ -347,6 +228,7 @@ mod tests {
             token: token.map(ToOwned::to_owned),
             refresh_token: None,
             no_browser: true,
+            org: None,
             fleet: "default".to_owned(),
             config_dir: Some(dir.to_path_buf()),
         }
@@ -355,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn token_login_writes_a_usable_0600_fleet_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let token = mint_string(TokenKind::Session);
         run(args(tmp.path(), Some(&token))).await.unwrap();
 
         let path = tmp.path().join("default.toml");
@@ -377,19 +259,19 @@ mod tests {
     async fn login_preserves_an_existing_node_table() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("default.toml");
-        let node_token = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+        let node_token = mint_string(node_kind());
         fleet_config::update(&path, |f| {
             f.url = "https://fleet.example".to_owned();
             f.node = Some(crate::fleet_config::NodeSection {
                 node_token: node_token.clone(),
-                node_id: "gh-1/laptop".to_owned(),
+                node_id: "01J9Z3Q4ABCDEFGHJKMNPQRSTV/laptop".to_owned(),
                 coordinator_token_pubkey: "ab".repeat(32),
                 previous_node_token: None,
             });
         })
         .unwrap();
 
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let token = mint_string(TokenKind::Session);
         run(args(tmp.path(), Some(&token))).await.unwrap();
 
         let file = fleet_config::load(&path).unwrap();
@@ -400,7 +282,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_of_the_wrong_kind_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let node = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+        let node = mint_string(node_kind());
         assert!(run(args(tmp.path(), Some(&node))).await.is_err());
         assert!(run(args(tmp.path(), Some("garbage"))).await.is_err());
         assert!(!tmp.path().join("default.toml").exists());
@@ -411,7 +293,7 @@ mod tests {
     #[tokio::test]
     async fn a_first_login_needs_a_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let token = mint_string(TokenKind::Session);
         let mut a = args(tmp.path(), Some(&token));
         a.fleet_url = None;
         assert!(run(a).await.is_err());
@@ -421,10 +303,10 @@ mod tests {
     #[tokio::test]
     async fn a_later_login_remembers_the_url() {
         let tmp = tempfile::tempdir().unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let token = mint_string(TokenKind::Session);
         run(args(tmp.path(), Some(&token))).await.unwrap();
 
-        let fresh = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let fresh = mint_string(TokenKind::Session);
         let mut a = args(tmp.path(), Some(&fresh));
         a.fleet_url = None;
         run(a).await.unwrap();
@@ -437,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_pin_is_rejected_before_anything_is_written() {
         let tmp = tempfile::tempdir().unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let token = mint_string(TokenKind::Session);
         let mut a = args(tmp.path(), Some(&token));
         a.server_cert_sha256 = Some("nope".to_owned());
         assert!(run(a).await.is_err());
@@ -449,8 +331,8 @@ mod tests {
     #[tokio::test]
     async fn an_external_refresh_token_is_stored_beside_the_session() {
         let tmp = tempfile::tempdir().unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
-        let refresh = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
+        let token = mint_string(TokenKind::Session);
+        let refresh = mint_string(TokenKind::Refresh);
         let mut a = args(tmp.path(), Some(&token));
         a.refresh_token = Some(refresh.clone());
         run(a).await.unwrap();
@@ -466,9 +348,9 @@ mod tests {
     #[tokio::test]
     async fn a_refresh_token_of_the_wrong_kind_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
-        let token = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let token = mint_string(TokenKind::Session);
         let mut a = args(tmp.path(), Some(&token));
-        a.refresh_token = Some(OpaqueToken::mint(TokenKind::Session).to_secret_string());
+        a.refresh_token = Some(mint_string(TokenKind::Session));
         assert!(run(a).await.is_err());
         assert!(!tmp.path().join("default.toml").exists());
     }
@@ -478,20 +360,14 @@ mod tests {
     #[tokio::test]
     async fn a_relogin_replaces_the_refresh_token() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = OpaqueToken::mint(TokenKind::Refresh).to_secret_string();
-        let mut a = args(
-            tmp.path(),
-            Some(&OpaqueToken::mint(TokenKind::Session).to_secret_string()),
-        );
+        let first = mint_string(TokenKind::Refresh);
+        let mut a = args(tmp.path(), Some(&mint_string(TokenKind::Session)));
         a.refresh_token = Some(first.clone());
         run(a).await.unwrap();
 
         // A second login with no refresh token at all clears it rather than
         // leaving the previous one behind.
-        let b = args(
-            tmp.path(),
-            Some(&OpaqueToken::mint(TokenKind::Session).to_secret_string()),
-        );
+        let b = args(tmp.path(), Some(&mint_string(TokenKind::Session)));
         run(b).await.unwrap();
         let file = fleet_config::load(&tmp.path().join("default.toml")).unwrap();
         assert!(file.user.unwrap().refresh_token.is_none());

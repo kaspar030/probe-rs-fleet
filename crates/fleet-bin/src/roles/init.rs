@@ -23,6 +23,7 @@ use crate::secrets::{generate_seed_hex, toml_path, write_public, write_secret};
 
 /// Names of the files `init` writes, relative to the config / data dirs.
 const SIGNING_SEED_FILE: &str = "signing.seed";
+const CSRF_SECRET_FILE: &str = "csrf.secret";
 const SQLITE_FILE: &str = "coordinator.sqlite";
 const CONFIG_FILE: &str = "coordinator.toml";
 
@@ -55,13 +56,18 @@ pub fn run(args: InitArgs) -> Result<()> {
     let config_path = config_dir.join(CONFIG_FILE);
     let seed_path = data_dir.join(SIGNING_SEED_FILE);
     let sqlite_path = data_dir.join(SQLITE_FILE);
+    let csrf_path = data_dir.join(CSRF_SECRET_FILE);
 
     // Idempotency guard: refuse to clobber existing files unless --force.
     if !args.force {
-        let existing: Vec<&Path> = [config_path.as_path(), seed_path.as_path()]
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect();
+        let existing: Vec<&Path> = [
+            config_path.as_path(),
+            seed_path.as_path(),
+            csrf_path.as_path(),
+        ]
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect();
         if !existing.is_empty() {
             let list = existing
                 .iter()
@@ -76,13 +82,22 @@ pub fn run(args: InitArgs) -> Result<()> {
     let seed_hex = generate_seed_hex();
     write_secret(&seed_path, seed_hex.as_bytes())
         .with_context(|| format!("writing signing seed {}", seed_path.display()))?;
+    // The cookie/CSRF secret: separate from the signing seed, 32 random bytes
+    // as hex. Rotating it logs every browser out and nothing else.
+    write_secret(&csrf_path, generate_seed_hex().as_bytes())
+        .with_context(|| format!("writing csrf secret {}", csrf_path.display()))?;
 
     let public_url = args
         .public_url
         .unwrap_or_else(|| format!("http://{DEFAULT_LISTEN_ADDR}"));
 
-    let config_toml =
-        render_coordinator_config(&public_url, &sqlite_path, &seed_path, &Policy::default())?;
+    let config_toml = render_coordinator_config(
+        &public_url,
+        &sqlite_path,
+        &seed_path,
+        &csrf_path,
+        &Policy::default(),
+    )?;
     write_public(&config_path, config_toml.as_bytes())
         .with_context(|| format!("writing config {}", config_path.display()))?;
 
@@ -96,6 +111,7 @@ fn render_coordinator_config(
     public_url: &str,
     sqlite_path: &Path,
     signing_key_path: &Path,
+    csrf_secret_path: &Path,
     policy: &Policy,
 ) -> Result<String> {
     let policy_toml = toml::to_string(policy).context("serialising default policy")?;
@@ -124,11 +140,10 @@ listen_addr = "{DEFAULT_LISTEN_ADDR}"
 # Behind a proxy this is NOT derivable from `listen_addr`: the coordinator
 # listens on loopback and the world reaches it at a name it never sees.
 #
-# For the CLI login this is NOT an OAuth callback origin: the GitHub device flow
-# has no redirect_uri. For the web UI's BROWSER login it is: the callback is
-# derived from this value as `<public_url>/auth/github/callback`, and never from
-# the request's Host / X-Forwarded-Host header — behind a proxy that header is
-# attacker-settable, and a redirect it controls is an account takeover.
+# It is also every login provider's OAuth callback origin: the callback is
+# derived from this value as `<public_url>/auth/<provider>/callback`, and never
+# from the request's Host / X-Forwarded-Host header — behind a proxy that header
+# is attacker-settable, and a redirect it controls is an account takeover.
 public_url = {public_url}
 
 # SQLite database file (created on first run).
@@ -137,6 +152,10 @@ sqlite_path = {sqlite_path}
 # ed25519 capability-token signing seed (64 hex chars / 32 bytes).
 # Alternatively inline the seed with `signing_key_hex = "<64 hex chars>"`.
 signing_key_path = {signing_key_path}
+
+# The cookie/CSRF secret for the web UI's browser sessions (>= 32 bytes, hex
+# or raw). Deliberately NOT derived from the signing seed.
+csrf_secret_path = {csrf_secret_path}
 
 # How often (seconds) the lease-expiry sweep runs.
 # sweep_interval_secs = 5
@@ -181,48 +200,26 @@ signing_key_path = {signing_key_path}
 #   openssl x509 -in cert.pem -outform der | openssl dgst -sha256
 # and pass it as `--server-cert-sha256` to `login` / `node up`.
 
-# The GitHub OAuth app backing `probe-rs-fleet login` and the web UI.
+# Login providers, for `probe-rs-fleet login` (CLI device flow) and the web
+# UI. A provider proves who someone is; the username is chosen in fleet on
+# first login. `kind` is github | oidc | codeberg | gitlab; `name` (default:
+# the kind) appears in URLs, and the provider's callback URL to register is
+# `<public_url>/auth/<name>/callback`.
 #
-# Omitting this block is a SUPPORTED deployment, not a broken one: an air-gapped
-# or development fleet bootstraps with `coordinator user-token` instead, and the
-# device-flow routes then answer 503 `device_flow_unconfigured` — a named code
-# the CLI turns into "ask the operator, or use `coordinator user-token`".
+# Configuring none is a SUPPORTED deployment (air-gapped / development):
+# bootstrap with `probe-rs-fleet coordinator user-token --username <you>`.
 #
-# To enable login: register an OAuth app at
-# https://github.com/settings/developers with "Enable Device Flow" TICKED.
-# There is NO callback URL to configure for the CLI — the device flow has no
-# redirect_uri.
-#
-# The web UI's BROWSER login needs exactly one extra step, the only
-# per-deployment setup the device flow did not need: add
-# `<public_url>/auth/github/callback` to the app's callback URLs, set a client
-# secret, and set `callback_registered = true`. Skipping it is supported — the
-# UI then falls back to the in-page device-code login.
-#
-# The coordinator brokers both flows, so the client id/secret never leave this
-# host and the user's GitHub access token never leaves this process.
-#
-# [github]
+# [[auth.providers]]
+# kind = "github"
 # client_id = "Iv1.0123456789abcdef"
-# # Only if your app requires one (OAuth Apps do not, for the device flow).
-# # REQUIRED once `callback_registered = true`: GitHub refuses the
-# # authorization-code exchange without it and implements no PKCE, so the
-# # secret is also what makes an intercepted code unspendable.
-# # client_secret = "…"
-# # Scope to request. Empty is correct for identity-only login: `GET /user`
-# # needs none, and asking for more than you use is hard for a user to undo.
-# # scope = ""
-# # You have added `<public_url>/auth/github/callback` to the OAuth app's
-# # callback URLs. Default: false — an assertion the coordinator cannot verify,
-# # and false means the web UI offers the device-code login rather than a
-# # redirect that dead-ends on GitHub's "redirect_uri is not associated with
-# # this application" page.
-# # callback_registered = false
-# # Endpoint overrides, for GitHub Enterprise. Defaults shown.
-# # device_code_url  = "https://github.com/login/device/code"
-# # access_token_url = "https://github.com/login/oauth/access_token"
-# # authorize_url    = "https://github.com/login/oauth/authorize"
-# # api_base         = "https://api.github.com"
+# client_secret_path = "/path/to/github-client-secret"
+#
+# [[auth.providers]]
+# kind = "oidc"
+# name = "sso"
+# issuer = "https://sso.example"
+# client_id = "fleet"
+# client_secret = "…"
 
 # Lease scheduling policy (defaults shown).
 [policy]
@@ -230,6 +227,7 @@ signing_key_path = {signing_key_path}
         public_url = toml::Value::String(public_url.to_owned()),
         sqlite_path = toml_path(sqlite_path),
         signing_key_path = toml_path(signing_key_path),
+        csrf_secret_path = toml_path(csrf_secret_path),
     );
     Ok(config)
 }
@@ -246,14 +244,11 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("  public URL   {public_url}");
     println!();
     println!("Next steps:");
-    println!("  1. Register a GitHub OAuth app with DEVICE FLOW ENABLED, then");
-    println!("     UNCOMMENT the [github] block and set client_id in");
+    println!("  1. Register an OAuth app with a login provider (GitHub, Codeberg,");
+    println!("     GitLab, or any OIDC issuer) with callback URL");
+    println!("       {public_url}/auth/<name>/callback");
+    println!("     and UNCOMMENT an [[auth.providers]] block in");
     println!("       {}", config_path.display());
-    println!("     (No callback URL is needed for the CLI login. For the web UI's");
-    println!("     browser login, additionally register");
-    println!("       {public_url}/auth/github/callback");
-    println!("     set a client secret, and set callback_registered = true;");
-    println!("     without that the web UI falls back to the device-code login.)");
     println!("  2. Start the coordinator (no --config needed):");
     println!("       probe-rs-fleet coordinator");
     println!("  3. Log in from your laptop:");
@@ -264,17 +259,17 @@ fn print_summary(config_path: &Path, seed_path: &Path, sqlite_path: &Path, publi
     println!("       # on the node:");
     println!("       probe-rs-fleet node up --fleet-url {public_url} --auth-key <key>");
     println!();
-    println!("Without a GitHub app (air-gapped, or a quick trial), skip step 1 and");
-    println!("bootstrap with the INTERIM verb instead:");
-    println!("       probe-rs-fleet coordinator user-token <your-login>");
+    println!("Without a login provider (air-gapped, or a quick trial), skip step 1");
+    println!("and bootstrap from a shell on this host instead:");
+    println!("       probe-rs-fleet coordinator user-token --username <you>");
     println!("       probe-rs-fleet login --fleet-url {public_url} --token <token>");
+    println!("A team org: probe-rs-fleet coordinator org create <name> --admin <you>");
     println!();
     println!("Note: `user-token` and `auth-key` mint credentials from a shell on");
     println!("this host, bypassing the login flow. They are the unattended /");
     println!("air-gapped escape hatch, not the front door. `coordinator auth-key`");
-    println!("is no longer *needed* for step 4 — any member mints one over the API");
-    println!("with `probe-rs-fleet auth-key create` — but it still works with no");
-    println!("login at all, and it is the only way to mint a key that never expires.");
+    println!("still works with no login at all, and it is the only way to mint a");
+    println!("key that never expires.");
 }
 
 #[cfg(test)]
@@ -327,6 +322,11 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "seed perms = {:o}", mode & 0o777);
+        let mode = std::fs::metadata(data.join(CSRF_SECRET_FILE))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "csrf perms = {:o}", mode & 0o777);
     }
 
     #[test]
@@ -343,14 +343,19 @@ mod tests {
         // default, and generating a certificate nobody asked for is how you end
         // up with a self-signed cert in production.
         assert!(cfg.tls.is_none());
-        // `[github]` is commented out for the same reason: an empty table with no
-        // client_id fails validation. The next-steps text therefore says to
-        // UNCOMMENT it — uncommenting it here means fixing that text too.
+        // Providers are commented out for the same reason: a provider with no
+        // client id fails validation. The next-steps text therefore says to
+        // UNCOMMENT one.
         let raw = std::fs::read_to_string(&config_path).unwrap();
         assert!(
-            !raw.lines().any(|l| l.trim_start().starts_with("[github]")),
-            "[github] must stay commented out"
+            !raw.lines()
+                .any(|l| l.trim_start().starts_with("[[auth.providers]]")),
+            "[[auth.providers]] must stay commented out"
         );
+        assert!(cfg.auth.providers.is_empty());
+        // The CSRF secret is written and loads (the daemon refuses to start
+        // without one).
+        assert_eq!(cfg.csrf_secret.as_ref().map(Vec::len), Some(32));
     }
 
     #[test]

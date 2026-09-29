@@ -10,16 +10,17 @@
 //!
 //! [user]                # written by `probe-rs-fleet login`
 //! session_token = "prfs1_…"
-//! org = "gh-4242"
+//! username = "kaspar"
+//! # org = "acme"      # acting org; default: your personal org
 //! refresh_token = "prfr1_…"   # renews the session without a browser
 //!
 //! [node]                # written by `probe-rs-fleet share` / `node up`
 //! node_token = "prfn1_…"
-//! node_id = "gh-4242/rpi-lab-1"
+//! node_id = "01J9Z3Q4…/rpi-lab-1"
 //! coordinator_token_pubkey = "<64 hex>"
 //!
 //! [agent]               # written by `probe-rs-fleet agent login`
-//! auth_key = "prffk1_…"        # the durable credential
+//! auth_key = "prfk1_…"         # the durable credential
 //! name = "desk-bot"            # the --as identity, display only
 //! workload_token = "prfw1_…"   # the current short-lived session
 //! expires = 1788999999         # epoch seconds
@@ -110,14 +111,20 @@ pub struct FleetFile {
 pub struct UserSection {
     /// The user's bearer session token (`prfs1_…`). Short-lived, refreshable.
     pub session_token: String,
-    /// The org id the session belongs to.
-    ///
-    /// For a personal org this is `gh-<github_user_id>`, not the login: GitHub
-    /// logins can be renamed and reused, so nothing keys off one.
-    pub org: String,
-    /// The GitHub login, cached for the CLI's summary line. Display only.
+    /// The username, cached for the CLI's summary line. Display only:
+    /// usernames can be renamed, so nothing keys off one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub login: Option<String>,
+    pub username: Option<String>,
+    /// The user's immutable id (a ULID), as the coordinator reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    /// The org `ctl`, the sidecar and the org-scoped verbs act in, as a path
+    /// (`acme`) or namespace id. Absent means the user's **personal** org
+    /// (whose name is the username). A session is not bound to one org: the
+    /// org is named per request (`/client?org=…`) and membership is checked
+    /// every time. `--org` on a verb overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
     /// When the session token expires (epoch seconds), if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<u64>,
@@ -178,7 +185,7 @@ pub struct NodeSection {
 /// no lost credential to rescue and no advisory locking needed for correctness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSection {
-    /// The durable auth key (`prffk1_…`) this session is re-minted from.
+    /// The durable auth key (`prfk1_…`) this session is re-minted from.
     ///
     /// Storing it is a granted trust decision, taken per machine by running
     /// `agent login`: the premise is a sandbox the operator owns and is content
@@ -289,23 +296,25 @@ fn validate(file: &FleetFile) -> Result<()> {
     }
     if let Some(user) = &file.user {
         anyhow::ensure!(
-            fleet_auth::OpaqueToken::parse(&user.session_token)
-                .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Session),
+            crate::tokens::is_session(&user.session_token),
             "[user].session_token must be a session token (`prfs1_…`)"
         );
-        anyhow::ensure!(!user.org.trim().is_empty(), "[user].org must not be empty");
+        if let Some(org) = &user.org {
+            anyhow::ensure!(
+                !org.trim().is_empty(),
+                "[user].org must not be empty (omit it for your personal org)"
+            );
+        }
         if let Some(refresh) = &user.refresh_token {
             anyhow::ensure!(
-                fleet_auth::OpaqueToken::parse(refresh)
-                    .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Refresh),
+                crate::tokens::is_refresh(refresh),
                 "[user].refresh_token must be a refresh token (`prfr1_…`)"
             );
         }
     }
     if let Some(node) = &file.node {
         anyhow::ensure!(
-            fleet_auth::OpaqueToken::parse(&node.node_token)
-                .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Node),
+            crate::tokens::is_node(&node.node_token),
             "[node].node_token must be a node token (`prfn1_…`)"
         );
         anyhow::ensure!(
@@ -323,13 +332,11 @@ fn validate(file: &FleetFile) -> Result<()> {
     }
     if let Some(agent) = &file.agent {
         anyhow::ensure!(
-            fleet_auth::OpaqueToken::parse(&agent.auth_key)
-                .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::AuthKey),
-            "[agent].auth_key must be an auth key (`prffk1_…`)"
+            crate::tokens::is_api_key(&agent.auth_key),
+            "[agent].auth_key must be an auth key (`prfk1_…`)"
         );
         anyhow::ensure!(
-            fleet_auth::OpaqueToken::parse(&agent.workload_token)
-                .is_ok_and(|t| t.kind() == fleet_auth::TokenKind::Workload),
+            crate::tokens::is_workload(&agent.workload_token),
             "[agent].workload_token must be a workload token (`prfw1_…`)"
         );
         if let Some(name) = &agent.name {
@@ -528,28 +535,16 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
             }
         }
 
-        match fleet_auth::http_client::redeem_refresh_token(&file.url, file.pin(), refresh_token)
-            .await
-        {
+        match redeem_refresh(file, refresh_token).await {
             Ok(response) => {
                 let token = response.token.clone();
-                if response.expires.is_none() {
-                    // Without an expiry we cannot tell when to renew next, so
-                    // every invocation would redeem. Use the token, say so
-                    // once, and do not loop.
-                    tracing::warn!(
-                        "the coordinator returned a session with no expiry; it cannot be \
-                         renewed on a deadline"
-                    );
-                }
                 // Best-effort persist: a token we cannot write down still works
                 // for this invocation, and failing the command over it would be
                 // worse than the next run redeeming again.
                 if let Err(e) = update_named(fleet, |f| {
                     if let Some(u) = f.user.as_mut() {
                         u.session_token.clone_from(&response.token);
-                        u.expires = response.expires;
-                        u.org.clone_from(&response.org);
+                        u.expires = Some(response.expires);
                     }
                 }) {
                     tracing::warn!(error = %e, "redeemed the refresh token but could not save the session");
@@ -592,8 +587,11 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
         ));
     }
 
-    match fleet_auth::http_client::refresh_session(&file.url, file.pin(), &user.session_token).await
-    {
+    let refreshed = match client(file) {
+        Ok(c) => c.refresh_session(&user.session_token).await,
+        Err(e) => Err(e),
+    };
+    match refreshed {
         Ok(response) => {
             let token = response.token.clone();
             // Best-effort persist: a token we cannot write down still works for
@@ -602,8 +600,7 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
             if let Err(e) = update_named(fleet, |f| {
                 if let Some(u) = f.user.as_mut() {
                     u.session_token.clone_from(&response.token);
-                    u.expires = response.expires;
-                    u.org.clone_from(&response.org);
+                    u.expires = Some(response.expires);
                 }
             }) {
                 tracing::warn!(error = %e, "refreshed the session token but could not save it");
@@ -656,7 +653,7 @@ pub async fn ensure_fresh_agent_session(fleet: &str, file: &FleetFile) -> Result
     let agent = file.agent.as_ref().with_context(|| {
         format!(
             "this fleet has no [agent] credential; run `probe-rs-fleet agent login \
-             --fleet {fleet} --auth-key prffk1_\u{2026}`"
+             --fleet {fleet} --auth-key prfk1_\u{2026}`"
         )
     })?;
 
@@ -676,18 +673,13 @@ pub async fn ensure_fresh_agent_session(fleet: &str, file: &FleetFile) -> Result
         }
     }
 
-    match fleet_auth::http_client::exchange_workload_key(
-        &file.url,
-        file.pin(),
-        agent.auth_key.trim(),
-    )
-    .await
-    {
+    let redeemed = match client(file) {
+        Ok(c) => c.exchange_api_key(agent.auth_key.trim()).await,
+        Err(e) => Err(e),
+    };
+    match redeemed {
         Ok(response) => {
-            let expires = response.expires.context(
-                "the coordinator returned a workload token with no expiry, so a \
-                 self-renewing agent session cannot know when to renew",
-            )?;
+            let expires = response.expires;
             let token = response.token.clone();
             // Best-effort persist: a token we cannot write down still works for
             // this invocation, and failing the command over it would be worse
@@ -717,6 +709,21 @@ pub async fn ensure_fresh_agent_session(fleet: &str, file: &FleetFile) -> Result
             ))
         }
     }
+}
+
+/// A forgs client for this fleet's coordinator, pinned as the file says.
+fn client(
+    file: &FleetFile,
+) -> std::result::Result<forgs_client::ForgsClient, forgs_client::ClientError> {
+    forgs_client::ForgsClient::new(&file.url, file.pin())
+}
+
+/// Redeem a refresh token (non-rotating) through forgs.
+async fn redeem_refresh(
+    file: &FleetFile,
+    refresh_token: &str,
+) -> std::result::Result<forgs_client::api::TokenResponse, forgs_client::ClientError> {
+    client(file)?.redeem_refresh_token(refresh_token).await
 }
 
 /// Re-read the named fleet's `[agent]` table from disk, if there is one.
@@ -764,26 +771,27 @@ mod tests {
     #![allow(clippy::await_holding_lock)]
 
     use super::*;
-    use fleet_auth::{OpaqueToken, TokenKind};
+    use crate::tokens::{mint_string, node_kind};
+    use forgs::TokenKind;
 
     fn session_token() -> String {
-        OpaqueToken::mint(TokenKind::Session).to_secret_string()
+        mint_string(TokenKind::Session)
     }
 
     fn node_token() -> String {
-        OpaqueToken::mint(TokenKind::Node).to_secret_string()
+        mint_string(node_kind())
     }
 
     fn auth_key() -> String {
-        OpaqueToken::mint(TokenKind::AuthKey).to_secret_string()
+        mint_string(TokenKind::ApiKey)
     }
 
     fn workload_token() -> String {
-        OpaqueToken::mint(TokenKind::Workload).to_secret_string()
+        mint_string(TokenKind::Workload)
     }
 
     fn refresh_token() -> String {
-        OpaqueToken::mint(TokenKind::Refresh).to_secret_string()
+        mint_string(TokenKind::Refresh)
     }
 
     /// Today's shape: a `[user]` table with **no** `refresh_token`. Every file
@@ -792,8 +800,9 @@ mod tests {
     fn user_section() -> UserSection {
         UserSection {
             session_token: session_token(),
-            org: "gh-4242".to_owned(),
-            login: Some("kaspar".to_owned()),
+            username: Some("kaspar".to_owned()),
+            user_id: None,
+            org: None,
             expires: Some(9_999_999_999),
             refresh_token: None,
         }
@@ -802,7 +811,7 @@ mod tests {
     fn node_section() -> NodeSection {
         NodeSection {
             node_token: node_token(),
-            node_id: "gh-4242/rpi-lab-1".to_owned(),
+            node_id: "01J9Z3Q4ABCDEFGHJKMNPQRSTV/rpi-lab-1".to_owned(),
             coordinator_token_pubkey: "ab".repeat(32),
             previous_node_token: None,
         }
@@ -837,7 +846,10 @@ mod tests {
             loaded.user.as_ref().unwrap().session_token,
             file.user.as_ref().unwrap().session_token
         );
-        assert_eq!(loaded.node.as_ref().unwrap().node_id, "gh-4242/rpi-lab-1");
+        assert_eq!(
+            loaded.node.as_ref().unwrap().node_id,
+            "01J9Z3Q4ABCDEFGHJKMNPQRSTV/rpi-lab-1"
+        );
         let agent = loaded.agent.as_ref().unwrap();
         assert_eq!(agent.auth_key, file.agent.as_ref().unwrap().auth_key);
         assert_eq!(agent.name.as_deref(), Some("desk-bot"));
@@ -967,8 +979,9 @@ mod tests {
             url: "https://fleet.example".to_owned(),
             user: Some(UserSection {
                 session_token: node_token(),
-                org: "gh-1".to_owned(),
-                login: None,
+                username: None,
+                user_id: None,
+                org: None,
                 expires: None,
                 refresh_token: None,
             }),
@@ -1055,7 +1068,7 @@ mod tests {
             &path,
             format!(
                 "url = \"http://127.0.0.1:1\"\n\n[user]\nsession_token = \"{}\"\n\
-                 org = \"gh-4242\"\nexpires = 9999999999\n",
+                 username = \"kaspar\"\nexpires = 9999999999\n",
                 session_token()
             ),
         )
@@ -1389,9 +1402,7 @@ mod tests {
                             body.len()
                         )
                     } else {
-                        let body = format!(
-                            "{{\"token\":\"{token}\",\"org\":\"gh-4242\",\"expires\":{expires}}}"
-                        );
+                        let body = format!("{{\"token\":\"{token}\",\"expires\":{expires}}}");
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",

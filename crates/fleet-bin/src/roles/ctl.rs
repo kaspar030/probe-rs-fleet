@@ -104,7 +104,7 @@ impl CtlConnection {
             format!(
                 "no credential for fleet `{fleet}`; run `probe-rs-fleet login --fleet {fleet}` \
                  (or, for a persistent sandbox, `probe-rs-fleet agent login --fleet {fleet} \
-                 --auth-key prffk1_\u{2026}`; or pass --token / PROBE_RS_FLEET_TOKEN)"
+                 --auth-key prfk1_\u{2026}`; or pass --token / PROBE_RS_FLEET_TOKEN)"
             )
         })?;
         let server_cert_sha256 = args.server_cert_sha256.or(fb_pin);
@@ -431,10 +431,7 @@ impl CtlClient {
                     for h in holders {
                         println!(
                             "{:<8} {:<32} {:<24} {}",
-                            h.lease.0,
-                            h.board,
-                            h.holder.key(),
-                            h.expires
+                            h.lease.0, h.board, h.holder, h.expires
                         );
                     }
                 }
@@ -501,7 +498,7 @@ fn render_board_table(boards: &[BoardSummary]) -> String {
         let holder = b
             .holder
             .as_ref()
-            .map_or_else(String::new, |h| h.key().to_string());
+            .map_or_else(String::new, ToString::to_string);
         let model = b.model.as_deref().unwrap_or("-");
         let _ = writeln!(
             out,
@@ -753,15 +750,15 @@ mod tests {
     fn sample_board(name: &str, tags: &[&str]) -> BoardSummary {
         use fleet_proto::admin::BoardAvailability;
         use fleet_proto::board::PowerKind;
-        use fleet_proto::ids::{BoardRef, NodeId, OrgId, Subject, SubjectKind};
+        use fleet_proto::ids::{BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
 
         BoardSummary {
             board: BoardRef::new(
-                OrgId("gh-1".to_owned()),
-                NodeId("gh-1/beast".to_owned()),
+                OrgId("01J9Z3Q4ABCDEFGHJKMNPQRSTV".to_owned()),
+                NodeId("01J9Z3Q4ABCDEFGHJKMNPQRSTV/beast".to_owned()),
                 name,
             ),
-            node: NodeId("gh-1/beast".to_owned()),
+            node: NodeId("01J9Z3Q4ABCDEFGHJKMNPQRSTV/beast".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
             model: Some("nrf52840dk".to_owned()),
             tags: owned(tags),
@@ -771,11 +768,7 @@ mod tests {
                 port: 3,
             },
             availability: BoardAvailability::Leased,
-            holder: Some(Subject::new(
-                OrgId("gh-1".to_owned()),
-                SubjectKind::User,
-                "gh-9",
-            )),
+            holder: SubjectKey::new(None, SubjectKind::User, "01J9Z3Q4ABCDEFGHJKMNPQRSTW"),
             lease: Some(fleet_proto::LeaseId(7)),
             expires: Some(123),
         }
@@ -785,11 +778,11 @@ mod tests {
         use fleet_proto::ids::NodeId;
 
         NodeSummary {
-            node: NodeId(format!("gh-1/{name}")),
+            node: NodeId(format!("01J9Z3Q4ABCDEFGHJKMNPQRSTV/{name}")),
             name: name.to_owned(),
             tags: owned(tags),
             adopt: fleet_proto::AdoptPolicy::Auto,
-            owner: Some("gh-9".to_owned()),
+            owner: Some("01J9Z3Q4ABCDEFGHJKMNPQRSTW".to_owned()),
             last_seen: Some(1_700_000_000),
             created_at: 1_600_000_000,
             online: true,

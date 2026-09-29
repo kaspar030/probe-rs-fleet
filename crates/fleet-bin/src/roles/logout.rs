@@ -83,15 +83,11 @@ pub async fn run(args: LogoutArgs) -> Result<()> {
 
     let mut server_side_done = false;
     if let Some(session) = session.as_deref() {
-        match fleet_auth::http_client::logout(
-            &file.url,
-            file.pin(),
-            session,
-            refresh_token.as_deref(),
-            all,
-        )
-        .await
-        {
+        let result = match forgs_client::ForgsClient::new(&file.url, file.pin()) {
+            Ok(client) => client.logout(session, refresh_token.as_deref(), all).await,
+            Err(e) => Err(e),
+        };
+        match result {
             Ok(()) => server_side_done = true,
             Err(e) => {
                 tracing::warn!(error = %e, "the coordinator did not confirm the logout");
@@ -129,7 +125,8 @@ pub async fn run(args: LogoutArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crate::fleet_config::{NodeSection, UserSection};
-    use fleet_auth::{OpaqueToken, TokenKind};
+    use crate::tokens::{mint_string, node_kind};
+    use forgs::TokenKind;
 
     fn args(dir: &std::path::Path, all: bool) -> LogoutArgs {
         LogoutArgs {
@@ -146,15 +143,16 @@ mod tests {
             // offline-decommission case these tests are about.
             f.url = "http://127.0.0.1:1".to_owned();
             f.user = Some(UserSection {
-                session_token: OpaqueToken::mint(TokenKind::Session).to_secret_string(),
-                org: "gh-1".to_owned(),
-                login: Some("kaspar".to_owned()),
+                session_token: mint_string(TokenKind::Session),
+                username: Some("kaspar".to_owned()),
+                user_id: None,
+                org: None,
                 expires: Some(9_999_999_999),
-                refresh_token: Some(OpaqueToken::mint(TokenKind::Refresh).to_secret_string()),
+                refresh_token: Some(mint_string(TokenKind::Refresh)),
             });
             f.node = Some(NodeSection {
-                node_token: OpaqueToken::mint(TokenKind::Node).to_secret_string(),
-                node_id: "gh-1/laptop".to_owned(),
+                node_token: mint_string(node_kind()),
+                node_id: "01J9Z3Q4ABCDEFGHJKMNPQRSTV/laptop".to_owned(),
                 coordinator_token_pubkey: "ab".repeat(32),
                 previous_node_token: None,
             });

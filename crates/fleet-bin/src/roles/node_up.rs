@@ -45,8 +45,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use fleet_auth::api::TokenResponse;
+use fleet_proto::auth_api::NodeTokenResponse as TokenResponse;
 use fleet_proto::AdoptPolicy;
+use forgs_client::ClientError;
 
 use crate::cli::NodeUpFlags;
 use crate::fleet_config::{self, FleetFile};
@@ -242,12 +243,15 @@ async fn approval_flow(
     let pin = pin_of(args)?;
     let adopt = args.adopt.map_or(AdoptPolicy::Auto, Into::into);
 
-    let grant = fleet_auth::http_client::node_register_start(
-        &fleet_url,
-        pin,
-        node_name,
-        args.tag.clone(),
-        Some(adopt.as_str()),
+    let client = crate::node_client::client(&fleet_url, pin)
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    let grant = crate::node_client::register_start(
+        &client,
+        &fleet_proto::auth_api::NodeRegisterStartRequest {
+            node_name: node_name.to_owned(),
+            tags: args.tag.clone(),
+            adopt: Some(adopt.as_str().to_owned()),
+        },
     )
     .await
     .map_err(|e| describe_start_error(&e))?;
@@ -283,11 +287,9 @@ async fn approval_flow(
         }
         tokio::time::sleep(Duration::from_secs(interval)).await;
 
-        match fleet_auth::http_client::node_register_poll(&fleet_url, pin, &grant.device_secret)
-            .await
-        {
+        match crate::node_client::register_poll(&client, &grant.device_secret).await {
             Ok(response) => return Ok((response, fleet_url, adopt)),
-            Err(fleet_auth::http_client::ClientError::Rejected { code, .. }) => {
+            Err(ClientError::Rejected { code, .. }) => {
                 consecutive_transport_failures = 0;
                 match code.as_str() {
                     "authorization_pending" => {}
@@ -323,8 +325,8 @@ const EXPIRED: &str = "nobody approved this machine before the code expired; run
                        `probe-rs-fleet node up` again for a fresh one";
 
 /// Turn a `/node/register/start` failure into remediation-shaped text.
-fn describe_start_error(e: &fleet_auth::http_client::ClientError) -> anyhow::Error {
-    let fleet_auth::http_client::ClientError::Rejected { code, status } = e else {
+fn describe_start_error(e: &ClientError) -> anyhow::Error {
+    let ClientError::Rejected { code, status } = e else {
         return anyhow::anyhow!("could not ask the coordinator for an approval code: {e}");
     };
     let hint = match code.as_str() {
@@ -333,7 +335,7 @@ fn describe_start_error(e: &fleet_auth::http_client::ClientError) -> anyhow::Err
              `.`, `_` and `-` only. Pass `--node-name <name>` explicitly if this \
              machine's hostname is unusual"
         }
-        "too_many_pending" => {
+        "too_many_pending" | "temporarily_unavailable" => {
             "the coordinator is already holding as many registrations awaiting \
              approval as it will. Try again in a few minutes, once the abandoned \
              ones expire, or ask its operator to raise `max_pending_nodes`"
@@ -366,15 +368,23 @@ async fn redeem(
              naming a coordinator yet",
         )?;
     let adopt = args.adopt.map_or(AdoptPolicy::Declared, Into::into);
-    let response = fleet_auth::http_client::exchange_auth_key(
-        &fleet_url,
-        pin_of(args)?,
-        auth_key,
-        node_name,
-        args.tag.clone(),
-    )
-    .await
-    .context("redeeming the auth key at <fleet-url>/auth/token")?;
+    if !args.tag.is_empty() {
+        // The key's own payload decides the tags: an enrolling machine may
+        // not choose what it is selected by.
+        tracing::warn!(
+            "--tag is ignored with --auth-key: the node gets the tags the key was minted with"
+        );
+    }
+    let client = crate::node_client::client(&fleet_url, pin_of(args)?)
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    let response = crate::node_client::enroll(&client, auth_key, node_name)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(forgs_client::cli::describe(
+                &e,
+                "redeeming the auth key at <fleet-url>/node/enroll"
+            ))
+        })?;
     Ok((response, fleet_url, adopt))
 }
 
@@ -395,16 +405,25 @@ async fn self_register(
         .await
         .context("refreshing the session token")?;
     let adopt = args.adopt.map_or(AdoptPolicy::Auto, Into::into);
-    let response = fleet_auth::http_client::self_register(
-        &file.url,
-        file.pin(),
+    let client = crate::node_client::client(&file.url, file.pin())
+        .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
+    let response = crate::node_client::self_register(
+        &client,
         &session,
-        node_name,
-        args.tag.clone(),
-        Some(adopt.as_str()),
+        &fleet_proto::auth_api::SelfRegisterRequest {
+            node_name: node_name.to_owned(),
+            tags: args.tag.clone(),
+            adopt: Some(adopt.as_str().to_owned()),
+            org: file.user.as_ref().and_then(|u| u.org.clone()),
+        },
     )
     .await
-    .context("registering this machine as a node at <fleet-url>/auth/token")?;
+    .map_err(|e| {
+        anyhow::anyhow!(forgs_client::cli::describe(
+            &e,
+            "registering this machine as a node at <fleet-url>/node/self-register"
+        ))
+    })?;
     Ok((response, adopt))
 }
 
@@ -434,7 +453,7 @@ fn finish(
         node_setup::scaffold_node_dir(node_dir, adopt, args.force)?;
     node_setup::print_summary(&node_setup::Enrollment {
         node_id: &node_id,
-        org: &response.org,
+        org: response.org_name.as_deref().unwrap_or(&response.org),
         fleet,
         adopt,
         fleet_path,

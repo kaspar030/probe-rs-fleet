@@ -306,7 +306,8 @@ pub async fn run(fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_auth::{OpaqueToken, TokenKind};
+    use crate::tokens::{mint_string, node_kind};
+    use forgs::TokenKind;
 
     /// Assemble an `AgentConfig` from a fleet file the way `run` does, which is
     /// what a restart re-does from disk.
@@ -321,8 +322,8 @@ mod tests {
 
     fn node_section() -> crate::fleet_config::NodeSection {
         crate::fleet_config::NodeSection {
-            node_token: OpaqueToken::mint(TokenKind::Node).to_secret_string(),
-            node_id: "gh-1/pi".to_owned(),
+            node_token: mint_string(node_kind()),
+            node_id: "01J9Z3Q4ABCDEFGHJKMNPQRSTV/pi".to_owned(),
             coordinator_token_pubkey: "ab".repeat(32),
             previous_node_token: None,
         }
@@ -372,14 +373,15 @@ mod tests {
     fn the_token_store_rotates_node_without_touching_user() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("default.toml");
-        let session = OpaqueToken::mint(TokenKind::Session).to_secret_string();
+        let session = mint_string(TokenKind::Session);
         fleet_config::update(&path, |f| {
             f.url = "https://fleet.example".to_owned();
             f.node = Some(node_section());
             f.user = Some(crate::fleet_config::UserSection {
                 session_token: session.clone(),
-                org: "gh-1".to_owned(),
-                login: None,
+                username: None,
+                user_id: None,
+                org: None,
                 expires: None,
                 refresh_token: None,
             });
@@ -388,7 +390,7 @@ mod tests {
         let original = fleet_config::load(&path).unwrap().node.unwrap().node_token;
 
         let store = FleetFileTokenStore { path: path.clone() };
-        let fresh = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+        let fresh = mint_string(node_kind());
         store.persist(&fresh, Some(&original)).unwrap();
 
         let after = fleet_config::load(&path).unwrap();
@@ -427,7 +429,7 @@ mod tests {
 
         let store = FleetFileTokenStore { path: path.clone() };
         let t1 = fleet_config::load(&path).unwrap().node.unwrap().node_token;
-        let t2 = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+        let t2 = mint_string(node_kind());
 
         // Rotation to T2 is persisted; the ack is then lost, so the coordinator
         // still considers T1 current.
@@ -464,9 +466,10 @@ mod tests {
         fleet_config::update(&path, |f| {
             f.url = "https://fleet.example".to_owned();
             f.user = Some(crate::fleet_config::UserSection {
-                session_token: OpaqueToken::mint(TokenKind::Session).to_secret_string(),
-                org: "gh-1".to_owned(),
-                login: None,
+                session_token: mint_string(TokenKind::Session),
+                username: None,
+                user_id: None,
+                org: None,
                 expires: None,
                 refresh_token: None,
             });
@@ -474,7 +477,7 @@ mod tests {
         .unwrap();
 
         let store = FleetFileTokenStore { path };
-        let fresh = OpaqueToken::mint(TokenKind::Node).to_secret_string();
+        let fresh = mint_string(node_kind());
         assert!(store.persist(&fresh, None).is_err());
         assert!(store.commit_current(&fresh).is_err());
     }

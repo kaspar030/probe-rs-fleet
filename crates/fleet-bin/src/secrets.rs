@@ -7,7 +7,7 @@
 //! [`crate::fleet_config`] writes through [`write_secret`] too.
 //!
 //! Random *token* generation deliberately does not live here: it belongs to
-//! `fleet_auth::OpaqueToken`, which owns the prefix scheme and the hashing
+//! `forgs::TokenFormat` (see [`crate::tokens`]), which owns the prefix scheme and the hashing
 //! convention that make a token verifiable.
 
 use std::path::Path;

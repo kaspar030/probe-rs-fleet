@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use fleet_auth::api::TokenResponse;
+use fleet_proto::auth_api::NodeTokenResponse;
 use fleet_proto::AdoptPolicy;
 
 use crate::fleet_config::{self, NodeSection};
@@ -93,19 +93,19 @@ pub fn refuse_if_already_enrolled(fleet: &str, fleet_path: &Path, force: bool) -
 /// public key, or the file cannot be written.
 pub fn record_node_credential(
     fleet_path: &Path,
-    response: &TokenResponse,
+    response: &NodeTokenResponse,
     node_name: &str,
     fleet_url: Option<&str>,
     server_cert_sha256: Option<&str>,
 ) -> Result<String> {
-    let node_id = response
-        .node_id
-        .clone()
-        .unwrap_or_else(|| node_name.to_owned());
-    let token_pubkey = response.coordinator_token_pubkey.clone().context(
+    let _ = node_name;
+    let node_id = response.node_id.clone();
+    let token_pubkey = response.coordinator_token_pubkey.clone();
+    anyhow::ensure!(
+        !token_pubkey.is_empty(),
         "the coordinator did not return its capability-token public key; \
-         it is required to verify per-lease tokens",
-    )?;
+         it is required to verify per-lease tokens"
+    );
 
     let node_id_for_write = node_id.clone();
     fleet_config::update(fleet_path, |f| {

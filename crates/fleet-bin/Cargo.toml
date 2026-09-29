@@ -15,7 +15,11 @@ path = "src/main.rs"
 fleet-proto = { workspace = true }
 fleet-core = { workspace = true }
 fleet-tls = { workspace = true }
+forgs.workspace = true
 forgs-client.workspace = true
+# The shell-on-the-host admin verbs mint through forgs directly.
+forgs-store.workspace = true
+forgs-http.workspace = true
 fleet-wire = { workspace = true, features = ["tungstenite"] }
 fleet-agent = { workspace = true }
 fleet-coordinator = { workspace = true }
