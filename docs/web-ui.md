@@ -399,7 +399,7 @@ admin; the UI's "Org" page has a create form and switches into the new org on
 success. `POST /api/v1/orgs` ignores `?org=` — the new org has no parent to act
 in. The name must be a single path segment of lowercase letters, digits and
 `-` (no leading, trailing or doubled `-`), not a reserved name, and the
-display name must equal its canonical form. Refusals: `400 invalid_request`
+display name must equal its canonical form. Refusals: `400 invalid_name`
 (bad name), `409 name_taken` (collides with an existing org, a username, or a
 tombstoned name), `403 org_creation_disabled` (`allow_org_creation = false`),
 `403 org_limit_reached` (the user already created `max_orgs_per_user` team
