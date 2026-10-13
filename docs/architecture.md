@@ -383,6 +383,14 @@ probe-rs-fleet coordinator
 probe-rs-fleet login --fleet-url https://fleet.example.com
 #    → personal org created at signup; session cached in fleets/default.toml
 
+# 2b. Optional: a team org. Any logged-in user can create one and becomes its
+#     admin (gated by allow_org_creation / max_orgs_per_user in
+#     coordinator.toml); add colleagues once they have logged in once.
+#     `coordinator org create <name> --admin <user>` on the host is the
+#     escape hatch and ignores both keys.
+probe-rs-fleet org create lab
+probe-rs-fleet org members add alice --org lab --role member
+
 # 3. Offer this machine's probes to the fleet. No token, no out-of-band step:
 #    it reuses the session from step 2.
 probe-rs-fleet share
@@ -970,8 +978,21 @@ The decisions that are load-bearing:
   `Schema::builder().kind("org", KindSpec::root().personal_for_users())`.
   Signup creates the user's personal org, named like the username, with the
   user as `admin`, in the same transaction. Team orgs sit beside personal ones
-  in the same root name space (so a user and an org cannot share a name) and
-  are created by `coordinator org create <name> --admin <username>`. The
+  in the same root name space (so a user and an org cannot share a name).
+  Any logged-in user can create one — `probe-rs-fleet org create <name>` or
+  the web UI's Org page (`POST /api/v1/orgs`) — and becomes its admin; the
+  creation is audited as `org.create` in the new org. Two coordinator.toml
+  keys gate it: `allow_org_creation` (default `true`; `false` → `403
+  org_creation_disabled`) and `max_orgs_per_user` (default `10`, `0` =
+  unlimited; counts team orgs the user created; a soft, non-transactional
+  cap → `403 org_limit_reached`). A name colliding with an org, a username or
+  a tombstoned name is `409 name_taken`. `coordinator org create <name>
+  --admin <username>` stays as the host-shell escape hatch and ignores both
+  keys. Admins manage members with `probe-rs-fleet org members
+  add|set-role|remove` (forgs' `/auth/members`) or the web UI
+  (`forgs_http::members::{set,remove}`, audited `member.set` /
+  `member.remove`); removing or demoting the last admin is `409 last_admin`.
+  Invites, join requests and deleting or renaming orgs are follow-ups. The
   config's `default_org` is an org **name** the coordinator ensures exists at
   startup; it is consulted only by operator verbs, never by an authenticated
   request. There is still no user-owned/org-owned branch: one scoping rule
@@ -985,7 +1006,8 @@ The decisions that are load-bearing:
 - **Roles are a two-rung ladder, `member < admin`**
   (`RoleLadder::new(&["member","admin"])`, `subject::FleetRole`). Membership
   is enough to add a node, use the org's boards and mint an API key; admin is
-  needed to create grants, read the audit log, and act on others' objects.
+  needed to create grants, read the audit log, manage members and act on
+  others' objects.
 - **The acting org is chosen per request.** A session is no longer bound to
   one org at mint time. A user request names its org — `/client?org=<path or
   id>`, `/api/v1/…?org=`, an `org` field in `SelfRegister` /

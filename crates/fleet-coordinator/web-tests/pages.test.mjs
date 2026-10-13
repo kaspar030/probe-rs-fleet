@@ -24,6 +24,7 @@ import * as approve from '../web/pages/approve.mjs';
 import * as access from '../web/pages/access.mjs';
 import * as keys from '../web/pages/keys.mjs';
 import * as audit from '../web/pages/audit.mjs';
+import * as org from '../web/pages/org.mjs';
 
 // `GET /api/v1/session`'s shape (src/api.rs `SessionView`).
 const ORG = '01J0000000000000000000ORG1';
@@ -288,6 +289,47 @@ test('audit says a 403 in words and admits it does not page', () => {
   assert.match(text, /no paging/);
 });
 
+const MEMBERS = [
+  { user_id: ADMIN.user_id, username: 'alice', role: 'admin' },
+  { user_id: MEMBER.user_id, username: 'bob', role: 'member' },
+];
+
+test('org gives an admin per-row role, remove and an add form', () => {
+  const tree = org.render({ session: ADMIN, members: MEMBERS });
+  const text = textOf(tree);
+  assert.match(text, /alice/);
+  assert.match(text, /bob/);
+  const selects = findAll(tree, (n) => n.tag === 'select' && n.attrs.name === 'role');
+  // One per row plus the add form's.
+  assert.equal(selects.length, MEMBERS.length + 1);
+  const bobRole = selects[1];
+  assert.equal(find(bobRole, (n) => n.tag === 'option' && n.attrs.selected).attrs.value, 'member');
+  assert.equal(labels(tree).filter((l) => l === 'Remove').length, MEMBERS.length);
+  const add = find(tree, (n) => n.tag === 'form' && n.attrs.name === 'add-member');
+  assert.ok(add, 'an admin sees the add-member form');
+  assert.ok(find(add, (n) => n.tag === 'input' && n.attrs.name === 'username'));
+  const addRole = find(add, (n) => n.tag === 'select' && n.attrs.name === 'role');
+  assert.equal(find(addRole, (n) => n.tag === 'option' && n.attrs.selected).attrs.value, 'member');
+});
+
+test('org is read-only for a member and says why', () => {
+  const tree = org.render({ session: MEMBER, members: MEMBERS });
+  assert.equal(find(tree, (n) => n.tag === 'select'), null);
+  assert.equal(find(tree, (n) => n.tag === 'form'), null);
+  assert.ok(!labels(tree).includes('Remove'));
+  assert.match(textOf(tree), /Only admins/);
+  assert.match(textOf(tree), /admin/);
+});
+
+test('org shows the create form only when the session may create orgs', () => {
+  const create = (tree) => find(tree, (n) => n.tag === 'form' && n.attrs.name === 'create-org');
+  assert.equal(create(org.render({ session: { ...ADMIN, can_create_orgs: false }, members: MEMBERS })), null);
+  assert.equal(create(org.render({ session: MEMBER, members: MEMBERS })), null);
+  assert.ok(create(org.render({ session: { ...ADMIN, can_create_orgs: true }, members: MEMBERS })));
+  // Independent of the role in the acting org.
+  assert.ok(create(org.render({ session: { ...MEMBER, can_create_orgs: true }, members: MEMBERS })));
+});
+
 test('every page renders an empty state without throwing', () => {
   assert.ok(textOf(devices.render({ boards: [], session: MEMBER })).length > 0);
   assert.ok(textOf(agents.render({ nodes: [], session: MEMBER })).length > 0);
@@ -296,4 +338,6 @@ test('every page renders an empty state without throwing', () => {
   assert.ok(textOf(keys.render({ keys: [], limits: null, session: MEMBER, form: { purpose: 'node', tags: '', ttl_secs: 1, multi_use: false } })).length > 0);
   assert.ok(textOf(audit.render({ lines: [], session: ADMIN })).length > 0);
   assert.ok(textOf(login.render({ providers: null })).length > 0);
+  assert.ok(textOf(org.render({ members: [], session: MEMBER })).length > 0);
+  assert.ok(textOf(org.render({ members: null, session: null })).length > 0);
 });

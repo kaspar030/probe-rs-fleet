@@ -249,6 +249,20 @@ struct CoordinatorConfigToml {
     /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`.
     #[serde(default)]
     github_actions: Option<GithubActionsToml>,
+    /// Whether a logged-in user may create a team org over the API.
+    #[serde(default = "default_allow_org_creation")]
+    allow_org_creation: bool,
+    /// How many team orgs one user may create over the API (`0`: no cap).
+    #[serde(default = "default_max_orgs_per_user")]
+    max_orgs_per_user: u32,
+}
+
+fn default_allow_org_creation() -> bool {
+    true
+}
+
+fn default_max_orgs_per_user() -> u32 {
+    10
 }
 
 fn default_sweep_interval_secs() -> u64 {
@@ -360,6 +374,8 @@ pub fn load_coordinator_config_from_str(text: &str) -> Result<CoordinatorConfig>
             jwks_min_refetch_secs: g.jwks_min_refetch_secs,
             workload_token_ttl_secs: g.workload_token_ttl_secs,
         }),
+        allow_org_creation: raw.allow_org_creation,
+        max_orgs_per_user: raw.max_orgs_per_user,
     })
 }
 

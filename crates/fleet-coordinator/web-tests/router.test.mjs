@@ -34,6 +34,13 @@ test('every page has a route, and every route a nav entry', () => {
   }
 });
 
+test('the org page is routed and in the nav', () => {
+  assert.ok(PAGES.includes('org'));
+  assert.equal(route('/ui/org').page, 'org');
+  const entry = NAV.find((n) => n.page === 'org');
+  assert.deepEqual(entry, { page: 'org', path: '/ui/org', label: 'Org' });
+});
+
 test('an unknown path is the not-found page, never a real one', () => {
   for (const path of ['/ui/nope', '/ui/devices/extra', '/healthz', '/api/v1/session']) {
     assert.equal(route(path).page, 'notfound', path);

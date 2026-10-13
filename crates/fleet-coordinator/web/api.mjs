@@ -78,6 +78,16 @@ export function describe(err) {
       return 'The server rejected the request as malformed.';
     case 'conflict':
       return 'Conflict: something changed underneath. Reload and try again.';
+    case 'last_admin':
+      return 'Refused: that would leave the org with no admin. Promote someone else first.';
+    case 'name_taken':
+      return 'That name is already taken by an org or a user.';
+    case 'invalid_name':
+      return 'Invalid name: use lowercase letters, digits and single dashes, not starting or ending with a dash.';
+    case 'org_creation_disabled':
+      return 'This coordinator does not allow creating orgs.';
+    case 'org_limit_reached':
+      return 'You have reached the limit on how many orgs you may create.';
     case 'server_error':
       return 'The coordinator failed to handle that. Check its log.';
     case 'upstream_error':

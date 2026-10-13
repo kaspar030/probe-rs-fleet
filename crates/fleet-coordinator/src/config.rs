@@ -286,6 +286,19 @@ pub struct CoordinatorConfig {
     /// answers a named `503` (`workload_oidc_unconfigured`), mirroring
     /// `device_flow_unconfigured`, so the CLI can say *why*.
     pub github_actions: Option<GithubActionsConfig>,
+    /// Whether a logged-in user may create a team org over the API
+    /// (`POST /api/v1/orgs`, `probe-rs-fleet org create`), becoming its admin.
+    ///
+    /// Default `true`: self-service is the point. A hosted operator who wants
+    /// to provision orgs by hand switches it off; `coordinator org create` on
+    /// the host ignores it.
+    pub allow_org_creation: bool,
+    /// How many team orgs one user may create over the API; `0` is unlimited.
+    ///
+    /// Counts root orgs the user created (not memberships, not their personal
+    /// org). A **soft** cap: counting and creating are not one transaction,
+    /// so two concurrent creations can both pass at `limit - 1`.
+    pub max_orgs_per_user: u32,
 }
 
 impl CoordinatorConfig {
@@ -475,6 +488,8 @@ impl Default for CoordinatorConfig {
             auth: AuthConfig::default(),
             csrf_secret: None,
             github_actions: None,
+            allow_org_creation: true,
+            max_orgs_per_user: 10,
         }
     }
 }

@@ -111,7 +111,9 @@ static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web");
 /// Adding a page means adding it here and to `PAGES` in `web/router.mjs`;
 /// `web-tests/router.test.mjs` asserts the client router knows each of them and
 /// `tests/ui_assets.rs` asserts the two lists have not drifted.
-const PAGES: &[&str] = &["devices", "agents", "approve", "access", "keys", "audit"];
+const PAGES: &[&str] = &[
+    "devices", "agents", "approve", "access", "keys", "org", "audit",
+];
 
 /// The Content-Security-Policy every `/ui*` response carries (D3).
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \

@@ -84,6 +84,15 @@
 //!   including a board org's admin reclaiming their own hardware from someone
 //!   they shared it with; see [`release_lease`].
 //!
+//! Self-service orgs and membership add three more:
+//!
+//! * `POST /api/v1/orgs` — create a team org, the caller becoming its admin
+//!   (gated by `allow_org_creation` / `max_orgs_per_user`); see [`create_org`].
+//! * `POST /api/v1/org/members` / `DELETE /api/v1/org/members/{username}` —
+//!   add, re-role and remove members by **calling** [`forgs_http::members::set`]
+//!   / [`forgs_http::members::remove`], the functions `/auth/members` uses, so
+//!   the admin check and the last-admin guard are forgs'. See [`set_org_member`].
+//!
 //! There is deliberately **no** `POST /api/v1/leases` and no `/delegate`
 //! equivalent (`docs/web-ui.md` D4): a lease taken in a browser has no sidecar
 //! to use it, and delegation hands out a capability token.
@@ -133,7 +142,7 @@ use fleet_proto::board::PowerKind;
 use fleet_proto::ids::{BoardName, BoardRef, LeaseId, SubjectKey};
 use fleet_proto::token::AllowedOp;
 
-use crate::core::{Coordinator, NodeStatus, OpError};
+use crate::core::{Coordinator, NodeStatus, OpError, OrgCreateError};
 use crate::http::{parse_adopt, reject, valid_tags};
 use crate::identity::{CiKeyPayload, NodeKeyPayload, PURPOSE_CI, PURPOSE_NODE};
 use crate::subject::{FleetRole, Subject};
@@ -150,7 +159,9 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
         .route("/api/v1/session", get(session))
         .route("/api/v1/session/logout", post(logout))
         .route("/api/v1/org", get(org))
-        .route("/api/v1/org/members", get(org_members))
+        .route("/api/v1/orgs", post(create_org))
+        .route("/api/v1/org/members", get(org_members).post(set_org_member))
+        .route("/api/v1/org/members/{username}", delete(remove_org_member))
         .route("/api/v1/nodes", get(nodes))
         .route(
             "/api/v1/nodes/{name}",
@@ -570,6 +581,11 @@ struct SessionView {
     /// The session's expiry. The UI needs it to bounce to a fresh login
     /// *before* the next call 401s (`docs/web-ui.md` D1).
     expires: Option<u64>,
+    /// Whether `POST /api/v1/orgs` would currently accept this user
+    /// (`allow_org_creation` on, and under `max_orgs_per_user`), so the UI
+    /// can hide a form that would only be refused. Advisory: the route
+    /// re-checks.
+    can_create_orgs: bool,
 }
 
 /// One membership of `GET /api/v1/session`.
@@ -784,12 +800,14 @@ async fn session(
         }
         Err(_) => None,
     };
+    let can_create_orgs = coord.org_creation_allowed(user).await.is_ok();
     Json(SessionView {
         user_id: user.to_string(),
         username,
         memberships,
         org,
         expires: caller.auth.expires,
+        can_create_orgs,
     })
     .into_response()
 }
@@ -877,8 +895,8 @@ async fn org(
     .into_response()
 }
 
-/// `GET /api/v1/org/members` — the org's membership, read-only in v1
-/// (management is forgs' `/auth/members`).
+/// `GET /api/v1/org/members` — the org's membership. Any member may list;
+/// changing it is [`set_org_member`] / [`remove_org_member`], admin only.
 async fn org_members(
     State(coord): State<Arc<Coordinator>>,
     uri: Uri,
@@ -902,6 +920,140 @@ async fn org_members(
         )
         .into_response(),
         Err(e) => op_error(&e),
+    }
+}
+
+/// The body of `POST /api/v1/orgs`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgCreateRequest {
+    name: String,
+}
+
+/// `POST /api/v1/orgs` — create a team org; the caller becomes its admin.
+///
+/// Not scoped to an acting org (there is none yet), so it calls
+/// [`mutating_caller`] — authentication and CSRF — and ignores `?org=`.
+/// Policy, name rules and the audit row live in
+/// [`Coordinator::create_org_core`]. Unlike the org-scoped routes the
+/// refusals are specific (`invalid_name`, `name_taken`,
+/// `org_creation_disabled`, `org_limit_reached`): the root name space is
+/// global and already observable at signup, so there is no oracle to guard.
+async fn create_org(
+    State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let caller = match mutating_caller(&coord, &method, &uri, &headers).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
+    let Some(user) = caller.user_id() else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    let Ok(request) = serde_json::from_slice::<OrgCreateRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    match coord.create_org_core(user, &request.name).await {
+        Ok((org, name)) => (
+            StatusCode::CREATED,
+            Json(OrgView {
+                id: org.0,
+                name: Some(name),
+                role: FleetRole::Admin.as_str(),
+            }),
+        )
+            .into_response(),
+        Err(OrgCreateError::Disabled) => reject(StatusCode::FORBIDDEN, "org_creation_disabled"),
+        Err(OrgCreateError::LimitReached) => reject(StatusCode::FORBIDDEN, "org_limit_reached"),
+        Err(OrgCreateError::InvalidName) => reject(StatusCode::BAD_REQUEST, "invalid_name"),
+        Err(OrgCreateError::NameTaken) => reject(StatusCode::CONFLICT, "name_taken"),
+        Err(OrgCreateError::Internal(e)) => {
+            warn!(error = %e, "creating an org failed");
+            reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        }
+    }
+}
+
+/// The body of `POST /api/v1/org/members`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberSetRequest {
+    username: String,
+    /// `member` or `admin`; anything else is a `400`.
+    role: String,
+}
+
+/// `POST /api/v1/org/members` — add a member by username, or change a
+/// member's role. Admin only.
+///
+/// The browser cannot call forgs' `/auth/members` (it is bearer-only and the
+/// browser holds a cookie), so this **calls** [`forgs_http::members::set`],
+/// the function that route uses — the admin check, the `409 last_admin`
+/// guard, the `404` for an unknown username and the `member.set` audit row
+/// come with it, exactly as [`create_auth_key`] reuses `keys::create`.
+/// A non-member's `?org=` is refused by [`mutating_auth`] before forgs sees it.
+async fn set_org_member(
+    State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: axum::body::Bytes,
+) -> Response {
+    let ApiCall { caller, subject } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let Ok(request) = serde_json::from_slice::<MemberSetRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    // Fleet's ladder is the vocabulary; refuse anything else before forgs.
+    let Some(role) = FleetRole::from_label(request.role.trim()) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let (Some(org), Some(user)) = (subject.org(), caller.user_id()) else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    match forgs_http::members::set(
+        coord.auth(),
+        user,
+        &org.0,
+        request.username.trim(),
+        role.as_str(),
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => api_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/org/members/{username}` — remove a member. Admin only;
+/// [`forgs_http::members::remove`], with the same guards as
+/// [`set_org_member`]. Removing the last admin is `409 last_admin`.
+async fn remove_org_member(
+    State(coord): State<Arc<Coordinator>>,
+    Path(username): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { caller, subject } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let (Some(org), Some(user)) = (subject.org(), caller.user_id()) else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    match forgs_http::members::remove(coord.auth(), user, &org.0, username.trim()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => api_error(&e),
     }
 }
 
@@ -1774,7 +1926,10 @@ mod tests {
             "dk-3",
         );
         let view = BoardKeyView::from(&board);
-        assert_eq!(view.key, "01J0000000000000000000ORG1/01J0000000000000000000ORG1/rpi-1/dk-3");
+        assert_eq!(
+            view.key,
+            "01J0000000000000000000ORG1/01J0000000000000000000ORG1/rpi-1/dk-3"
+        );
         assert_eq!(view.org, "01J0000000000000000000ORG1");
         assert_eq!(view.node, "01J0000000000000000000ORG1/rpi-1");
         assert_eq!(view.name, "dk-3");

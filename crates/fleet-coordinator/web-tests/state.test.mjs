@@ -221,3 +221,43 @@ test('every action handler a page renders is a function, not a string', () => {
     }
   }
 });
+
+test('org actions post the contract bodies and switch into a created org', async () => {
+  const { load } = await import('../web/pages/org.mjs');
+  const members = [{ user_id: SESSION.user_id, username: 'alice', role: 'admin' }, { user_id: 'u2', username: 'bob', role: 'member' }];
+  const switched = [];
+  const deleted = [];
+  const ctx = makeCtx({ load }, {
+    '/api/v1/org/members': () => null,
+    '/api/v1/orgs': () => ({ id: TEAM, name: 'team', role: 'admin' }),
+  });
+  ctx.session = { ...SESSION, can_create_orgs: true };
+  ctx.api.get = async (path) => { assert.equal(path, '/api/v1/org/members'); return members; };
+  ctx.api.del = async (path) => { deleted.push(path); return null; };
+  ctx.switchOrg = async (id) => { switched.push(id); };
+  const prevWindow = globalThis.window;
+  globalThis.window = { confirm: () => true };
+  try {
+    let tree = await ctx.reload();
+    const roleSelects = findAll(tree, (n) => n.tag === 'select' && n.attrs.name === 'role');
+    await roleSelects[1].on.change({ target: { value: 'admin' } });
+    assert.deepEqual(ctx.api.posts.at(-1), { path: '/api/v1/org/members', body: { username: 'bob', role: 'admin' }, options: undefined });
+    assert.deepEqual(switched, [], 'changing someone else does not touch the session');
+
+    tree = ctx.tree;
+    const remove = findAll(tree, (n) => n.tag === 'button' && n.children.join('') === 'Remove');
+    await remove[1].on.click();
+    assert.deepEqual(deleted, ['/api/v1/org/members/bob']);
+
+    // Removing yourself drops you back to the default org.
+    await remove[0].on.click();
+    assert.deepEqual(switched, [null]);
+
+    const create = find(ctx.tree, (n) => n.tag === 'form' && n.attrs.name === 'create-org');
+    await create.on.submit({ preventDefault() {}, target: { elements: { name: { value: 'team' } } } });
+    assert.deepEqual(ctx.api.posts.at(-1), { path: '/api/v1/orgs', body: { name: 'team' }, options: { org: null } });
+    assert.deepEqual(switched, [null, TEAM]);
+  } finally {
+    globalThis.window = prevWindow;
+  }
+});

@@ -333,6 +333,58 @@ impl Db {
         Ok(())
     }
 
+    /// Create a root team org named `name` and make `admin` its admin.
+    ///
+    /// The org's `owner_user_id` is `admin`, which is what
+    /// [`Db::count_orgs_owned_by`] counts. Two writes rather than one
+    /// transaction (forgs exposes no combined call); if the membership write
+    /// fails, the fresh node is deleted again, best-effort, so a half-made
+    /// org with no admin is not left behind.
+    ///
+    /// # Errors
+    ///
+    /// A store error: an invalid or reserved name ([`forgs_store::StoreError::Name`]),
+    /// a taken or tombstoned one, or a write failure.
+    pub async fn create_team_org(
+        &self,
+        name: &str,
+        admin: UserId,
+        origin: NameOrigin,
+        now: u64,
+    ) -> Result<OrgId> {
+        let ns = self
+            .store
+            .create_node(None, ORG_KIND, name, origin, Some(admin), now)
+            .await?;
+        let org = crate::subject::org_of(ns);
+        if let Err(e) = self.set_member(&org, admin, FleetRole::Admin, now).await {
+            if let Err(cleanup) = self.store.delete_node(ns, now).await {
+                tracing::warn!(error = %cleanup, org = %org, "could not remove an org whose admin membership failed");
+            }
+            return Err(e);
+        }
+        Ok(org)
+    }
+
+    /// How many team orgs `user` created (root orgs they own that are not
+    /// their personal org).
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn count_orgs_owned_by(&self, user: UserId) -> Result<u64> {
+        let (n,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM forgs_ns_node \
+             WHERE parent_id IS NULL AND kind = ?1 AND owner_user_id = ?2 \
+               AND personal_of_user_id IS NULL",
+        )
+        .bind(ORG_KIND)
+        .bind(user.to_string())
+        .fetch_one(self.pool())
+        .await?;
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     /// Every member of `org`, with username and role.
     ///
     /// # Errors

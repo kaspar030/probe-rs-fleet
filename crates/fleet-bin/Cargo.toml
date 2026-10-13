@@ -37,6 +37,13 @@ serde_json = { workspace = true }
 directories = { workspace = true }
 sha2 = { workspace = true }
 rand_core = { workspace = true, features = ["getrandom"] }
+# `api_client`'s GET for the coordinator's own JSON routes, over the same
+# connector and trust config as forgs-client.
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls.workspace = true
+http-body-util.workspace = true
+http.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }

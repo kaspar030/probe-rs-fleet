@@ -13,6 +13,7 @@
 //!   every one the caller holds, the lost-machine answer)
 //! - [`share`] → self-register this machine as a node with the login it has
 //! - [`auth_key`] → mint/list/revoke this org's auth keys with that same login
+//! - [`org`] → create team orgs and manage their members with that same login
 //! - [`grant`] → share a subset of this org's boards with another person
 //! - [`ci`] → exchange a CI job's workload identity for a per-job fleet token
 //! - [`agent_login`] → store a durable auth key so a persistent sandbox holds a
@@ -47,6 +48,7 @@ pub mod node_board;
 pub mod node_run;
 pub mod node_setup;
 pub mod node_up;
+pub mod org;
 pub mod share;
 pub mod sidecar;
 

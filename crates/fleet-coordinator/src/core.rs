@@ -42,11 +42,13 @@ use crate::auth::Ed25519Signer;
 use crate::authz::{self, AuthzError};
 use crate::clock::SharedClock;
 use crate::config::CoordinatorConfig;
-use crate::error::Result;
+use crate::error::{CoordinatorError, Result};
 use crate::proto::{CoordToSidecar, SidecarToCoord};
 use crate::registry::{ChannelTable, NodeRegistry, SidecarHandle, SidecarRegistry};
 use crate::relay;
 use crate::state::{AuditEntry, Db};
+use forgs::schema::NameOrigin;
+use forgs::UserId;
 
 /// The shared coordinator state and control-plane logic.
 pub struct Coordinator {
@@ -123,6 +125,25 @@ pub(crate) enum OpError {
     /// A fault in the coordinator itself (database, token signing). Propagated
     /// by the adapters as `Err(..)` exactly as `?` did before; HTTP: 500
     /// `server_error`. Never rendered to the operator verbatim.
+    Internal(crate::error::CoordinatorError),
+}
+
+/// Why [`Coordinator::create_org_core`] refused. Each maps to its own
+/// `/api/v1` code, because unlike the org-scoped verbs there is no
+/// existence oracle to protect: the namespace is global and a taken name
+/// is already observable at signup.
+#[derive(Debug)]
+pub(crate) enum OrgCreateError {
+    /// `allow_org_creation = false`: 403 `org_creation_disabled`.
+    Disabled,
+    /// The caller already created `max_orgs_per_user` orgs: 403
+    /// `org_limit_reached`.
+    LimitReached,
+    /// Not a canonical, user-choosable org name: 400 `invalid_name`.
+    InvalidName,
+    /// An org, a user or a tombstone holds the name: 409 `name_taken`.
+    NameTaken,
+    /// A coordinator fault: 500.
     Internal(crate::error::CoordinatorError),
 }
 
@@ -957,6 +978,96 @@ impl Coordinator {
         }
     }
 
+    /// Whether `user` may create a team org over the API right now:
+    /// `allow_org_creation` is on and they are under `max_orgs_per_user`.
+    ///
+    /// # Errors
+    ///
+    /// [`OrgCreateError::Disabled`], [`OrgCreateError::LimitReached`], or
+    /// [`OrgCreateError::Internal`] on a database error.
+    pub(crate) async fn org_creation_allowed(
+        &self,
+        user: UserId,
+    ) -> std::result::Result<(), OrgCreateError> {
+        if !self.config.allow_org_creation {
+            return Err(OrgCreateError::Disabled);
+        }
+        let cap = self.config.max_orgs_per_user;
+        if cap > 0 {
+            let owned = self
+                .db
+                .count_orgs_owned_by(user)
+                .await
+                .map_err(OrgCreateError::Internal)?;
+            if owned >= u64::from(cap) {
+                return Err(OrgCreateError::LimitReached);
+            }
+        }
+        Ok(())
+    }
+
+    /// Create a team org named `raw_name` with `user` as its admin — the
+    /// self-service path behind `POST /api/v1/orgs`.
+    ///
+    /// Policy first (`allow_org_creation`, `max_orgs_per_user`), then the
+    /// name: it must already be canonical (`Acme` is refused rather than
+    /// silently lowercased, so the display name and the path agree), and
+    /// forgs' naming rules, reserved list and collision check (orgs,
+    /// usernames, tombstones — they share the root) apply. Audited as
+    /// `org.create` in the new org, so it shows in its `GET /api/v1/audit`.
+    ///
+    /// The per-user cap is **soft**: counting and creating are not one
+    /// transaction, so two concurrent creations can both pass at the limit.
+    ///
+    /// # Errors
+    ///
+    /// See [`OrgCreateError`].
+    pub(crate) async fn create_org_core(
+        &self,
+        user: UserId,
+        raw_name: &str,
+    ) -> std::result::Result<(OrgId, String), OrgCreateError> {
+        self.org_creation_allowed(user).await?;
+        let name = raw_name.trim();
+        let canonical = self
+            .db
+            .forgs()
+            .schema()
+            .canonical_name(crate::subject::ORG_KIND, name, NameOrigin::User)
+            .map_err(|_| OrgCreateError::InvalidName)?;
+        if canonical != name {
+            return Err(OrgCreateError::InvalidName);
+        }
+        let now = self.now();
+        let org = match self
+            .db
+            .create_team_org(&canonical, user, NameOrigin::User, now)
+            .await
+        {
+            Ok(org) => org,
+            Err(CoordinatorError::Store(
+                forgs_store::StoreError::Name(_) | forgs_store::StoreError::NotUserNameable,
+            )) => return Err(OrgCreateError::InvalidName),
+            Err(CoordinatorError::Store(
+                forgs_store::StoreError::NameTaken | forgs_store::StoreError::NameTombstoned,
+            )) => return Err(OrgCreateError::NameTaken),
+            Err(e) => return Err(OrgCreateError::Internal(e)),
+        };
+        if let Some(ns) = crate::subject::ns_of(&org) {
+            self.auth
+                .audit()
+                .record(
+                    forgs_http::AuditEvent::new(now, "org.create")
+                        .ns(ns)
+                        .subject(&forgs::SubjectKey::user(user))
+                        .target(canonical.clone()),
+                )
+                .await;
+        }
+        tracing::info!(org = %org, name = %canonical, user = %user, "team org created");
+        Ok((org, canonical))
+    }
+
     /// The org's membership, for the browser API.
     ///
     /// **New surface, no wire counterpart**, so there is no adapter: nothing on
@@ -967,9 +1078,9 @@ impl Coordinator {
     /// [`crate::state::OrgDb`] itself would have no authorization at all.
     ///
     /// Membership suffices — a member can already infer the roster from
-    /// `grant list` and the audit log — and membership is **read-only** in v1
-    /// (`docs/web-ui.md` D4), so there is deliberately no counterpart that
-    /// writes.
+    /// `grant list` and the audit log. Writes are admin-only and go through
+    /// forgs' own `members::{set, remove}` (the functions `/auth/members`
+    /// calls), which own the admin check and the last-admin guard.
     ///
     /// # Errors
     ///

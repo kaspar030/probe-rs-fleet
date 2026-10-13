@@ -9,7 +9,7 @@
 // instead of as HTML parsed as JavaScript. `tests/ui_assets.rs` asserts the two
 // lists have not drifted.
 
-export const PAGES = ['devices', 'agents', 'approve', 'access', 'keys', 'audit'];
+export const PAGES = ['devices', 'agents', 'approve', 'access', 'keys', 'org', 'audit'];
 
 /** The nav bar's entries, in order. */
 export const NAV = [
@@ -18,6 +18,7 @@ export const NAV = [
   { page: 'approve', path: '/ui/approve', label: 'Approve' },
   { page: 'access', path: '/ui/access', label: 'Access' },
   { page: 'keys', path: '/ui/keys', label: 'Auth keys' },
+  { page: 'org', path: '/ui/org', label: 'Org' },
   { page: 'audit', path: '/ui/audit', label: 'Audit' },
 ];
 

@@ -63,6 +63,9 @@ pub enum Command {
     /// Mint, list and revoke this org's node-enrollment auth keys, using the
     /// login you already have.
     AuthKey(AuthKeyCliArgs),
+    /// Create team orgs and manage their members, using the login you
+    /// already have.
+    Org(OrgCliArgs),
     /// Share a subset of this org's boards with another person.
     Grant(GrantArgs),
     /// CI-runner verbs. Today: exchange a workload identity for a fleet token.
@@ -641,6 +644,112 @@ pub struct AuthKeyRevokeCliArgs {
     /// packaging support.
     #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
     pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet org`.
+///
+/// The **self-service** counterpart of `coordinator org create`: every verb
+/// runs over the authenticated API with the `[user]` session in the fleet
+/// file. `coordinator org create` remains the shell-on-the-host escape hatch
+/// (it ignores `allow_org_creation` and the per-user cap).
+///
+/// Named `Org…Cli…` because `OrgArgs` / `OrgCommand` / `OrgCreateArgs`
+/// belong to `coordinator org`.
+#[derive(Debug, Args)]
+pub struct OrgCliArgs {
+    /// The org verb.
+    #[command(subcommand)]
+    pub command: OrgCliCommand,
+}
+
+/// `org` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum OrgCliCommand {
+    /// Create a team org; you become its admin.
+    Create(OrgCliCreateArgs),
+    /// List the orgs you are a member of, with your role.
+    List(OrgSessionArgs),
+    /// List an org's members, or (admin only) change them.
+    Members(OrgMembersArgs),
+}
+
+/// The fleet whose `[user]` session authorises an `org` verb.
+#[derive(Debug, Clone, Args)]
+pub struct OrgSessionArgs {
+    /// The fleet whose `[user]` session authorises the request.
+    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+        global = true, add = crate::completion::fleet_candidates())]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true, global = true, value_hint = clap::ValueHint::DirPath)]
+    pub config_dir: Option<std::path::PathBuf>,
+}
+
+/// Arguments for `probe-rs-fleet org create`.
+#[derive(Debug, Args)]
+pub struct OrgCliCreateArgs {
+    /// The org name: one path segment of lowercase letters, digits and `-`
+    /// (no leading, trailing or doubled `-`). Must not collide with an
+    /// existing org or username.
+    pub name: String,
+    #[command(flatten)]
+    pub session: OrgSessionArgs,
+}
+
+/// Arguments for `probe-rs-fleet org members`.
+///
+/// With no verb, lists the members (any member may). `add`, `set-role` and
+/// `remove` are admin only; removing or demoting the last admin is refused.
+#[derive(Debug, Args)]
+pub struct OrgMembersArgs {
+    /// The membership change; omitted, list the members.
+    #[command(subcommand)]
+    pub command: Option<OrgMembersCommand>,
+    /// The org to act in (path or id). Defaults to the fleet file's
+    /// `[user].org`, else your personal org.
+    #[arg(long, global = true)]
+    pub org: Option<String>,
+    #[command(flatten)]
+    pub session: OrgSessionArgs,
+}
+
+/// `org members` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum OrgMembersCommand {
+    /// Add an existing user (they must have logged in once) to the org.
+    Add(OrgMemberAddArgs),
+    /// Change a member's role.
+    SetRole(OrgMemberSetRoleArgs),
+    /// Remove a member from the org.
+    Remove(OrgMemberRemoveArgs),
+}
+
+/// Arguments for `probe-rs-fleet org members add`.
+#[derive(Debug, Args)]
+pub struct OrgMemberAddArgs {
+    /// The username to add.
+    pub username: String,
+    /// Their role.
+    #[arg(long, value_enum, default_value_t = RoleArg::Member)]
+    pub role: RoleArg,
+}
+
+/// Arguments for `probe-rs-fleet org members set-role`.
+#[derive(Debug, Args)]
+pub struct OrgMemberSetRoleArgs {
+    /// The member whose role changes.
+    pub username: String,
+    /// The new role.
+    #[arg(value_enum)]
+    pub role: RoleArg,
+}
+
+/// Arguments for `probe-rs-fleet org members remove`.
+#[derive(Debug, Args)]
+pub struct OrgMemberRemoveArgs {
+    /// The member to remove.
+    pub username: String,
 }
 
 /// Arguments for `probe-rs-fleet node`.
@@ -1563,6 +1672,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     roles::auth_key::run(args).await?;
                     Ok(ExitCode::SUCCESS)
                 }
+                Command::Org(args) => {
+                    roles::org::run(args).await?;
+                    Ok(ExitCode::SUCCESS)
+                }
                 Command::Grant(args) => {
                     roles::grant::run(args).await?;
                     Ok(ExitCode::SUCCESS)
@@ -1718,6 +1831,113 @@ mod tests {
 
     /// The hosted verb: `auth-key create|list|revoke`, minting with the login
     /// you already have rather than a shell on the coordinator.
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn org_verbs_parse() {
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "org",
+            "create",
+            "acme",
+            "--fleet",
+            "lab1",
+        ]));
+        match cli.command {
+            Command::Org(a) => match a.command {
+                OrgCliCommand::Create(c) => {
+                    assert_eq!(c.name, "acme");
+                    assert_eq!(c.session.fleet, "lab1");
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected org, got {other:?}"),
+        }
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "list"]));
+        assert!(matches!(
+            cli.command,
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::List(_)
+            })
+        ));
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "members", "--org", "acme"]));
+        match cli.command {
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Members(m),
+            }) => {
+                assert!(m.command.is_none());
+                assert_eq!(m.org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected members, got {other:?}"),
+        }
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "org",
+            "members",
+            "add",
+            "bob",
+            "--org",
+            "acme",
+            "--fleet",
+            "lab1",
+        ]));
+        match cli.command {
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Members(m),
+            }) => {
+                assert_eq!(m.org.as_deref(), Some("acme"));
+                assert_eq!(m.session.fleet, "lab1");
+                match m.command {
+                    Some(OrgMembersCommand::Add(a)) => {
+                        assert_eq!(a.username, "bob");
+                        assert_eq!(a.role, RoleArg::Member, "member is the default");
+                    }
+                    other => panic!("expected add, got {other:?}"),
+                }
+            }
+            other => panic!("expected members, got {other:?}"),
+        }
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "org",
+            "members",
+            "set-role",
+            "bob",
+            "admin",
+        ]));
+        match cli.command {
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Members(m),
+            }) => match m.command {
+                Some(OrgMembersCommand::SetRole(r)) => {
+                    assert_eq!(r.username, "bob");
+                    assert_eq!(r.role, RoleArg::Admin);
+                }
+                other => panic!("expected set-role, got {other:?}"),
+            },
+            other => panic!("expected members, got {other:?}"),
+        }
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "members", "remove", "bob"]));
+        assert!(matches!(
+            cli.command,
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Members(OrgMembersArgs {
+                    command: Some(OrgMembersCommand::Remove(_)),
+                    ..
+                })
+            })
+        ));
+        assert!(Cli::try_parse_from(os(&[
+            "probe-rs-fleet",
+            "org",
+            "members",
+            "set-role",
+            "bob",
+            "owner"
+        ]))
+        .is_err());
+    }
+
     #[test]
     fn parses_auth_key_create_list_revoke() {
         let cli = Cli::parse_from(os(&[

@@ -49,8 +49,11 @@
 #   4. On your laptop: probe-rs-fleet login --fleet-url <url>
 #      → the CLI prints a code and a link; you sign in with the provider in a
 #        browser, pick a username on first login, and get a personal org of
-#        one named after it. Team orgs: `coordinator org create <name>
-#        --admin <username>`, then `login --org <name>`.
+#        one named after it. Team orgs: `probe-rs-fleet org create <name>`
+#        (you become its admin; see allow_org_creation below), then
+#        `org members add <username> --org <name>` and use `--org <name>`.
+#        `coordinator org create <name> --admin <username>` is the
+#        shell-on-this-host escape hatch and ignores those limits.
 #   5. For a node: on your laptop, probe-rs-fleet auth-key create --tag lab
 #      (prints an auth key; needs only a login, no shell on this host)
 #      on the node: node up --fleet-url <url> --auth-key <key>
@@ -68,7 +71,8 @@
 # bypassing any login flow. It creates (or reuses) a LOCAL user with that
 # username, one with no linked provider identity, and makes it a member of
 # `--org` (default: default_org below). It is the escape hatch, not the front
-# door.
+# door — as is `coordinator org create`: team orgs are normally created by any
+# logged-in user with `probe-rs-fleet org create` or the web UI's Org page.
 
 # ---------------------------------------------------------------------------
 # Required keys
@@ -197,6 +201,21 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # when it names none) and only if they are a member there, so a credential
 # cannot be replayed into another tenant.
 # default_org = "default"
+
+# Whether any logged-in user may create a team org (`probe-rs-fleet org
+# create`, the web UI's Org page) and become its admin. Default: true.
+#
+# false refuses self-service creation with 403 `org_creation_disabled`; team
+# orgs can then only be made from this host with `coordinator org create`.
+# allow_org_creation = true
+
+# How many team orgs one user may create. Default: 10; 0 means unlimited.
+#
+# Counts orgs the user created (not ones they were added to; the personal org
+# does not count). A soft cap: it is checked, not enforced transactionally, so
+# concurrent creates can overshoot it. At the cap: 403 `org_limit_reached`.
+# `coordinator org create` ignores it.
+# max_orgs_per_user = 10
 
 # The cookie/CSRF secret: a file holding at least 32 bytes (hex or raw), 0600.
 # REQUIRED to run the daemon — it signs the browser login's state and session

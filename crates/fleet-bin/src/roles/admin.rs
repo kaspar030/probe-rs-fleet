@@ -585,28 +585,14 @@ pub async fn org_create(args: OrgCreateArgs) -> Result<()> {
             )
         })?;
     let now = admin.now();
+    // The same call `POST /api/v1/orgs` makes, minus its policy: this is the
+    // host-shell escape hatch, so `allow_org_creation` and the per-user cap
+    // do not apply.
     let ns = admin
-        .store()
-        .create_node(
-            None,
-            fleet_coordinator::subject::ORG_KIND,
-            &args.name,
-            forgs::schema::NameOrigin::User,
-            None,
-            now,
-        )
+        .db()
+        .create_team_org(&args.name, user.id, forgs::schema::NameOrigin::User, now)
         .await
         .with_context(|| format!("creating the org `{}`", args.name))?;
-    admin
-        .db()
-        .set_member(
-            &fleet_coordinator::subject::org_of(ns),
-            user.id,
-            FleetRole::Admin,
-            now,
-        )
-        .await
-        .context("making the admin a member")?;
     println!(
         "Created org '{}' ({ns}); admin: {}.",
         args.name, user.username

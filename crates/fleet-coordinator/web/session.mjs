@@ -3,7 +3,7 @@
 // The shape (`src/api.rs` `SessionView`):
 //
 //   { user_id, username, memberships: [{id, name, role}],
-//     org: {id, name, role} | null, expires }
+//     org: {id, name, role} | null, expires, can_create_orgs }
 //
 // `org` is the org this session is acting in (the `?org=` the request carried,
 // default the personal org), with the caller's role *there*; it is `null` when

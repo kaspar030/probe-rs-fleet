@@ -306,7 +306,8 @@ the binary and is publicly served.
 log), plus the management verbs — power-cycle, release someone else's lease as
 admin, node tags / adopt-policy / delete (**not** rename; see §3), pending-node
 approval, grant
-create / list / revoke, auth-key mint / list / revoke.
+create / list / revoke, auth-key mint / list / revoke, team-org creation and
+member management (add, change role, remove).
 
 **Out**, each with its reason:
 
@@ -323,9 +324,11 @@ create / list / revoke, auth-key mint / list / revoke.
   browser. That would mean a second relay ingress with a browser-shaped
   credential.
 - **No `delegate`.** It hands out a capability token; see the threat notes.
-- **No org creation and no invites.** The personal org is created at signup
-  (architecture §6.1); membership is **read-only** in the UI. The org switcher
-  only picks among existing memberships.
+- **No invites/join requests; no delete or rename of orgs (follow-up).** An
+  admin adds an *existing* user by username (one who has logged in at least
+  once); there is no email or link invite and no way to ask to join. Orgs can
+  be created (any logged-in user, gated by `allow_org_creation` /
+  `max_orgs_per_user`) but not deleted or renamed from the UI.
 - **No capability token ever reaches the browser.** Not `LeaseGrant::token`, not
   `ChannelOpened::token`, not the `/delegate` bearer. This should be enforced by
   a test over the API response types, not by review vigilance.
@@ -369,26 +372,52 @@ Login itself is forgs' (D1); these are the routes the UI touches.
 | `GET /auth/{provider}/start?return_to=/ui/` | — | `302` to the provider; `state` (+ PKCE verifier) in a sealed `HttpOnly` flow cookie | forgs | anyone |
 | `GET /auth/{provider}/callback?code&state` | — | known identity: `302 /ui/`, `Set-Cookie: prfs_session`, `Set-Cookie: prfs_csrf`; first login: `302 /auth/signup` with a sealed ticket cookie | forgs | anyone with a valid `state` |
 | `GET`/`POST /auth/signup` | username | forgs' HTML form; on success the cookies above | forgs | holder of a signup ticket |
-| `GET /api/v1/session[?org=]` | — | `{"user_id","username","memberships":[{"id","name","role"}],"org":{"id","name","role"}\|null,"expires"}` | forgs store | any session |
+| `GET /api/v1/session[?org=]` | — | `{"user_id","username","memberships":[{"id","name","role"}],"org":{"id","name","role"}\|null,"expires","can_create_orgs"}` | forgs store | any session |
 | `POST /api/v1/session/logout` | `{}` | `204`, cookies cleared | `forgs_http::session::logout` | any session |
 
 `memberships` drives the org switcher; `org` is the org this request acted in
 (`?org=`, default the personal org), `null` if the user does not belong to the
-requested one. `expires` lets the UI bounce to login *before* the next call
+requested one. `can_create_orgs` is `true` when the deployment allows
+self-service org creation and the user is under `max_orgs_per_user`; the UI
+shows the create form only then. `expires` lets the UI bounce to login *before* the next call
 `401`s. The page never sees a token: no route on this surface returns one in a
 body (the old `/api/v1/session/device/*` and `/api/v1/auth/methods` routes are
 gone with the device fallback).
 
-### Orgs and membership (read-only in the UI)
+### Orgs and membership
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
 | `GET /api/v1/org[?org=]` | — | `{"id","name","role"}` | forgs store | member |
 | `GET /api/v1/org/members[?org=]` | — | `[{"user_id","username","role"}]` | `NsScope::list_members` | member |
+| `POST /api/v1/orgs` | `{"name"}` | `201 {"id","name","role":"admin"}` | namespace creation + admin membership for the caller; audited `org.create` in the new org | any session, if `allow_org_creation` and under `max_orgs_per_user` |
+| `POST /api/v1/org/members[?org=]` | `{"username","role":"member"\|"admin"}` | `204` (adds the user, or changes an existing member's role) | `forgs_http::members::set`; audited `member.set` | **admin** |
+| `DELETE /api/v1/org/members/{username}[?org=]` | — | `204` | `forgs_http::members::remove`; audited `member.remove` | **admin** |
 
-Org creation and membership changes are not in the UI: team orgs are created
-with `coordinator org create <name> --admin <username>`, and membership is
-managed through forgs' `/auth/members` (bearer-only).
+**Creating an org.** Any logged-in user can create a team org and becomes its
+admin; the UI's "Org" page has a create form and switches into the new org on
+success. `POST /api/v1/orgs` ignores `?org=` — the new org has no parent to act
+in. The name must be a single path segment of lowercase letters, digits and
+`-` (no leading, trailing or doubled `-`), not a reserved name, and the
+display name must equal its canonical form. Refusals: `400 invalid_request`
+(bad name), `409 name_taken` (collides with an existing org, a username, or a
+tombstoned name), `403 org_creation_disabled` (`allow_org_creation = false`),
+`403 org_limit_reached` (the user already created `max_orgs_per_user` team
+orgs; `0` means unlimited). The cap counts team orgs the user created and is a
+soft cap — checked, not transactional, so concurrent creates can overshoot
+it. The host-shell `coordinator org create <name> --admin <username>`
+remains the escape hatch and ignores both keys.
+
+**Managing members.** Admins get an editable members panel — add by existing
+username with a role dropdown, change a role, remove; non-admins see the same
+list read-only. The mutating routes call `forgs_http::members::{set,remove}`
+directly, the same functions behind forgs' `/auth/members`, so the browser and
+the CLI (`probe-rs-fleet org members …`, which uses `/auth/members` with the
+fleet file's session) share one implementation; CSRF is the existing
+double-submit. Errors: `403 forbidden` (not an admin of the acting org),
+`404 not_found` (no such user — they must have logged in once — or no such
+member), `409 last_admin` (removing or demoting the last admin, which would
+leave the org unmanageable), `400 invalid_request` (malformed body or role).
 
 ### Nodes
 
@@ -608,6 +637,8 @@ against the *target object's* org through the existing evaluator —
 | auth-key revoke | **creator, or admin** | `forgs_http::keys::revoke` |
 | audit log | **admin** | `Coordinator::logs_core` (+ `OrgDb` scoping, a second independent fence; forgs' identity audit rows are merged in, unfiltered view only) |
 | org / member list | membership | `require_role(Member)` in the acting org |
+| member add / set-role / remove | **admin** (+ last-admin guard) | `forgs_http::members::{set,remove}` |
+| org create | any session, gated by `allow_org_creation` / `max_orgs_per_user` | new; not scoped to an acting org |
 | pending-node approve / deny | membership | §6.4, `decide_pending_node` (there is no listing; see §3/§4) |
 | node list | membership | new |
 | node tags / adopt / delete | **owner (`node.owner_user_id`), or admin** | **new policy, fixed here** (rename is refused; see §3) |
@@ -741,8 +772,13 @@ else.
 **Phase 4 — board actions.** *Shipped.* Power-cycle, and admin release of
 someone else's lease.
 
-**Deliberately unscheduled:** lease acquisition, delegation, board console, org
-creation, invites and membership management.
+**Phase 5 — orgs and members.** *Shipped.* Self-service team-org creation
+(`POST /api/v1/orgs`, `can_create_orgs`) and admin member management
+(`POST`/`DELETE /api/v1/org/members`), with the CLI's `org create` / `org
+members` verbs alongside.
+
+**Deliberately unscheduled:** lease acquisition, delegation, board console,
+invites / join requests, and deleting or renaming orgs.
 
 ---
 

@@ -16,9 +16,10 @@ import * as agents from './pages/agents.mjs';
 import * as approve from './pages/approve.mjs';
 import * as access from './pages/access.mjs';
 import * as keys from './pages/keys.mjs';
+import * as orgPage from './pages/org.mjs';
 import * as audit from './pages/audit.mjs';
 
-const PAGE_MODULES = { devices, agents, approve, access, keys, audit };
+const PAGE_MODULES = { devices, agents, approve, access, keys, org: orgPage, audit };
 
 // In-memory only. Nothing here is ever persisted: no storage of any kind is
 // touched anywhere in this tree (see api.mjs).
@@ -62,6 +63,7 @@ function contextFor(page) {
   pageState.session = session;
   pageState.navigate = navigate;
   pageState.reload = draw;
+  pageState.switchOrg = switchOrg;
   return pageState;
 }
 
