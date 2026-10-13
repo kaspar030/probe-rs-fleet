@@ -333,37 +333,89 @@ impl Db {
         Ok(())
     }
 
-    /// Create a root team org named `name` and make `admin` its admin.
+    /// Create a root team org named `name` and make `admin` its admin — one
+    /// transaction ([`forgs_store::Store::create_node_with_admin`]).
     ///
     /// The org's `owner_user_id` is `admin`, which is what
-    /// [`Db::count_orgs_owned_by`] counts. Two writes rather than one
-    /// transaction (forgs exposes no combined call); if the membership write
-    /// fails, the fresh node is deleted again, best-effort, so a half-made
-    /// org with no admin is not left behind.
+    /// [`Db::count_orgs_owned_by`] counts. With `max_owned = Some(cap)` the
+    /// creation is refused ([`forgs_store::StoreError::OwnedLimit`]) once
+    /// `admin` already owns `cap` team orgs: a hard cap, checked inside the
+    /// creating transaction.
     ///
     /// # Errors
     ///
     /// A store error: an invalid or reserved name ([`forgs_store::StoreError::Name`]),
-    /// a taken or tombstoned one, or a write failure.
+    /// a taken or tombstoned one, the cap, or a write failure.
     pub async fn create_team_org(
         &self,
         name: &str,
         admin: UserId,
         origin: NameOrigin,
+        max_owned: Option<u64>,
         now: u64,
     ) -> Result<OrgId> {
         let ns = self
             .store
-            .create_node(None, ORG_KIND, name, origin, Some(admin), now)
+            .create_node_with_admin(None, ORG_KIND, name, origin, admin, max_owned, now)
             .await?;
-        let org = crate::subject::org_of(ns);
-        if let Err(e) = self.set_member(&org, admin, FleetRole::Admin, now).await {
-            if let Err(cleanup) = self.store.delete_node(ns, now).await {
-                tracing::warn!(error = %cleanup, org = %org, "could not remove an org whose admin membership failed");
-            }
-            return Err(e);
+        Ok(crate::subject::org_of(ns))
+    }
+
+    /// Whether `org` is some user's personal org (which follows the username
+    /// and can be neither renamed nor deleted as an org).
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn is_personal_org(&self, org: &OrgId) -> Result<bool> {
+        let Some(ns) = crate::subject::ns_of(org) else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .node(ns)
+            .await?
+            .is_some_and(|n| n.personal_of.is_some()))
+    }
+
+    /// Prepare `org` for deletion: refuse while it still has hardware or
+    /// live leases, otherwise purge its fleet **history** — closed leases and
+    /// the fleet audit log — which would otherwise block the namespace delete
+    /// forever (`ON DELETE RESTRICT` on `forgs_ns_node`).
+    ///
+    /// Returns `false`, writing nothing, while any `node`, `board` or open
+    /// lease row references the org. One transaction.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn clear_org_history(&self, org: &OrgId) -> Result<bool> {
+        let Some(ns) = crate::subject::ns_of(org) else {
+            return Ok(false);
+        };
+        let ns = ns.to_string();
+        let mut tx = self.pool().begin().await?;
+        let (busy,): (i64,) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM node WHERE ns_node_id = ?1) \
+                  + (SELECT COUNT(*) FROM board WHERE ns_node_id = ?1) \
+                  + (SELECT COUNT(*) FROM leases WHERE ns_node_id = ?1 AND closed_at IS NULL)",
+        )
+        .bind(&ns)
+        .fetch_one(&mut *tx)
+        .await?;
+        if busy > 0 {
+            return Ok(false);
         }
-        Ok(org)
+        sqlx::query("DELETE FROM leases WHERE ns_node_id = ?1")
+            .bind(&ns)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM audit_log WHERE ns_node_id = ?1")
+            .bind(&ns)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// How many team orgs `user` created (root orgs they own that are not

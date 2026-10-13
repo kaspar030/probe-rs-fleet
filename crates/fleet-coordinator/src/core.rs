@@ -147,6 +147,26 @@ pub(crate) enum OrgCreateError {
     Internal(crate::error::CoordinatorError),
 }
 
+/// Why [`Coordinator::rename_org_core`] / [`Coordinator::delete_org_core`]
+/// refused. The caller is already a member of the org (the acting-org
+/// resolution saw to that), so the specific codes reveal nothing new.
+#[derive(Debug)]
+pub(crate) enum OrgAdminError {
+    /// Not an admin of the org: 403 `forbidden`.
+    Denied,
+    /// The org is a user's personal org: 409 `personal_org`.
+    Personal,
+    /// Not a canonical, user-choosable org name: 400 `invalid_name`.
+    InvalidName,
+    /// An org, a user or a tombstone holds the name: 409 `name_taken`.
+    NameTaken,
+    /// Nodes, boards, open leases or live grants still reference the org:
+    /// 409 `org_not_empty`.
+    NotEmpty,
+    /// A coordinator fault: 500.
+    Internal(crate::error::CoordinatorError),
+}
+
 impl OpError {
     /// Render this failure the way today's sidecar wire renders it.
     ///
@@ -981,6 +1001,9 @@ impl Coordinator {
     /// Whether `user` may create a team org over the API right now:
     /// `allow_org_creation` is on and they are under `max_orgs_per_user`.
     ///
+    /// Advisory (it feeds `SessionView.can_create_orgs`); the cap itself is
+    /// enforced inside the creating transaction by [`Self::create_org_core`].
+    ///
     /// # Errors
     ///
     /// [`OrgCreateError::Disabled`], [`OrgCreateError::LimitReached`], or
@@ -989,35 +1012,60 @@ impl Coordinator {
         &self,
         user: UserId,
     ) -> std::result::Result<(), OrgCreateError> {
-        if !self.config.allow_org_creation {
-            return Err(OrgCreateError::Disabled);
-        }
-        let cap = self.config.max_orgs_per_user;
-        if cap > 0 {
+        self.org_creation_enabled()?;
+        if let Some(cap) = self.org_cap() {
             let owned = self
                 .db
                 .count_orgs_owned_by(user)
                 .await
                 .map_err(OrgCreateError::Internal)?;
-            if owned >= u64::from(cap) {
+            if owned >= cap {
                 return Err(OrgCreateError::LimitReached);
             }
         }
         Ok(())
     }
 
+    /// `allow_org_creation`, as a refusal.
+    fn org_creation_enabled(&self) -> std::result::Result<(), OrgCreateError> {
+        if self.config.allow_org_creation {
+            Ok(())
+        } else {
+            Err(OrgCreateError::Disabled)
+        }
+    }
+
+    /// `max_orgs_per_user`, with `0` meaning no cap.
+    fn org_cap(&self) -> Option<u64> {
+        let cap = self.config.max_orgs_per_user;
+        (cap > 0).then(|| u64::from(cap))
+    }
+
+    /// Canonicalise a user-supplied org name, refusing one that is not
+    /// already canonical (`Acme` is refused rather than silently lowercased,
+    /// so the display name and the path agree).
+    fn canonical_org_name(&self, raw_name: &str) -> Option<String> {
+        let name = raw_name.trim();
+        let canonical = self
+            .db
+            .forgs()
+            .schema()
+            .canonical_name(crate::subject::ORG_KIND, name, NameOrigin::User)
+            .ok()?;
+        (canonical == name).then_some(canonical)
+    }
+
     /// Create a team org named `raw_name` with `user` as its admin — the
     /// self-service path behind `POST /api/v1/orgs`.
     ///
-    /// Policy first (`allow_org_creation`, `max_orgs_per_user`), then the
-    /// name: it must already be canonical (`Acme` is refused rather than
-    /// silently lowercased, so the display name and the path agree), and
-    /// forgs' naming rules, reserved list and collision check (orgs,
-    /// usernames, tombstones — they share the root) apply. Audited as
-    /// `org.create` in the new org, so it shows in its `GET /api/v1/audit`.
-    ///
-    /// The per-user cap is **soft**: counting and creating are not one
-    /// transaction, so two concurrent creations can both pass at the limit.
+    /// Policy first (`allow_org_creation`), then the name: it must already
+    /// be canonical, and forgs' naming rules, reserved list and collision
+    /// check (orgs, usernames, tombstones — they share the root) apply.
+    /// Creation goes through [`forgs_http::members::create_namespace`]: the
+    /// node, the admin membership and the `max_orgs_per_user` check are one
+    /// transaction, so the cap is **hard** — concurrent creations cannot both
+    /// pass at the limit. Audited as `org.create` in the new org, so it shows
+    /// in its `GET /api/v1/audit`.
     ///
     /// # Errors
     ///
@@ -1027,32 +1075,41 @@ impl Coordinator {
         user: UserId,
         raw_name: &str,
     ) -> std::result::Result<(OrgId, String), OrgCreateError> {
-        self.org_creation_allowed(user).await?;
-        let name = raw_name.trim();
+        self.org_creation_enabled()?;
         let canonical = self
-            .db
-            .forgs()
-            .schema()
-            .canonical_name(crate::subject::ORG_KIND, name, NameOrigin::User)
-            .map_err(|_| OrgCreateError::InvalidName)?;
-        if canonical != name {
-            return Err(OrgCreateError::InvalidName);
-        }
+            .canonical_org_name(raw_name)
+            .ok_or(OrgCreateError::InvalidName)?;
         let now = self.now();
-        let org = match self
-            .db
-            .create_team_org(&canonical, user, NameOrigin::User, now)
-            .await
+        let org = match forgs_http::members::create_namespace(
+            self.auth(),
+            user,
+            None,
+            crate::subject::ORG_KIND,
+            &canonical,
+            self.org_cap(),
+        )
+        .await
         {
-            Ok(org) => org,
-            Err(CoordinatorError::Store(
-                forgs_store::StoreError::Name(_) | forgs_store::StoreError::NotUserNameable,
-            )) => return Err(OrgCreateError::InvalidName),
-            Err(CoordinatorError::Store(
-                forgs_store::StoreError::NameTaken | forgs_store::StoreError::NameTombstoned,
-            )) => return Err(OrgCreateError::NameTaken),
-            Err(e) => return Err(OrgCreateError::Internal(e)),
+            Ok(ns) => crate::subject::org_of(ns),
+            Err(e) if e == forgs_http::ApiError::NAMESPACE_LIMIT => {
+                return Err(OrgCreateError::LimitReached)
+            }
+            Err(e)
+                if e == forgs_http::ApiError::USERNAME_INVALID
+                    || e == forgs_http::ApiError::BadRequest =>
+            {
+                return Err(OrgCreateError::InvalidName)
+            }
+            Err(e) if e == forgs_http::ApiError::USERNAME_TAKEN => {
+                return Err(OrgCreateError::NameTaken)
+            }
+            Err(e) => {
+                return Err(OrgCreateError::Internal(CoordinatorError::State(format!(
+                    "creating org `{canonical}`: {e}"
+                ))))
+            }
         };
+
         if let Some(ns) = crate::subject::ns_of(&org) {
             self.auth
                 .audit()
@@ -1066,6 +1123,151 @@ impl Coordinator {
         }
         tracing::info!(org = %org, name = %canonical, user = %user, "team org created");
         Ok((org, canonical))
+    }
+
+    /// Require `user` to be an admin of a non-personal `org`.
+    async fn require_team_org_admin(
+        &self,
+        org: &OrgId,
+        user: UserId,
+    ) -> std::result::Result<(), OrgAdminError> {
+        match self.db.role_of(org, user).await {
+            Ok(Some(FleetRole::Admin)) => {}
+            Ok(_) => return Err(OrgAdminError::Denied),
+            Err(e) => return Err(OrgAdminError::Internal(e)),
+        }
+        match self.db.is_personal_org(org).await {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(OrgAdminError::Personal),
+            Err(e) => Err(OrgAdminError::Internal(e)),
+        }
+    }
+
+    /// Map a forgs namespace-admin error onto [`OrgAdminError`].
+    fn org_admin_api_error(e: &forgs_http::ApiError, what: &str) -> OrgAdminError {
+        use forgs_http::ApiError as E;
+        if *e == E::USERNAME_INVALID || *e == E::BadRequest {
+            OrgAdminError::InvalidName
+        } else if *e == E::USERNAME_TAKEN {
+            OrgAdminError::NameTaken
+        } else if *e == E::CONFLICT {
+            OrgAdminError::Personal
+        } else if *e == E::NOT_EMPTY {
+            OrgAdminError::NotEmpty
+        } else if *e == E::Forbidden {
+            OrgAdminError::Denied
+        } else {
+            OrgAdminError::Internal(CoordinatorError::State(format!("{what}: {e}")))
+        }
+    }
+
+    /// Rename the acting team org to `raw_name` — `POST /api/v1/org/rename`.
+    /// Admin only; a personal org follows its user's name and is refused.
+    /// The name rules are those of [`Self::create_org_core`]; the old name is
+    /// tombstoned by forgs. Audited as `org.rename` in the org.
+    ///
+    /// # Errors
+    ///
+    /// See [`OrgAdminError`].
+    pub(crate) async fn rename_org_core(
+        &self,
+        subject: &Subject,
+        user: UserId,
+        raw_name: &str,
+    ) -> std::result::Result<(OrgId, String), OrgAdminError> {
+        let org = subject.org().cloned().ok_or(OrgAdminError::Denied)?;
+        self.require_team_org_admin(&org, user).await?;
+        let canonical = self
+            .canonical_org_name(raw_name)
+            .ok_or(OrgAdminError::InvalidName)?;
+        let old = self
+            .db
+            .org_name(&org)
+            .await
+            .map_err(OrgAdminError::Internal)?
+            .unwrap_or_default();
+        forgs_http::members::rename_namespace(self.auth(), user, &org.0, &canonical)
+            .await
+            .map_err(|e| Self::org_admin_api_error(&e, "renaming an org"))?;
+        if let Some(ns) = crate::subject::ns_of(&org) {
+            self.auth
+                .audit()
+                .record(
+                    forgs_http::AuditEvent::new(self.now(), "org.rename")
+                        .ns(ns)
+                        .subject(&forgs::SubjectKey::user(user))
+                        .target(canonical.clone())
+                        .detail(format!("from {old}")),
+                )
+                .await;
+        }
+        tracing::info!(org = %org, from = %old, to = %canonical, user = %user, "team org renamed");
+        Ok((org, canonical))
+    }
+
+    /// Delete the acting team org — `DELETE /api/v1/org`. Admin only;
+    /// personal orgs are refused.
+    ///
+    /// Refused with [`OrgAdminError::NotEmpty`] while the org has nodes,
+    /// boards, open leases or unexpired grants. Otherwise its fleet history
+    /// (closed leases, the fleet audit log) is purged — those rows would block
+    /// the namespace delete forever — and the namespace is deleted through
+    /// [`forgs_http::members::delete_namespace`], which tombstones the name
+    /// and takes memberships and org-scoped API keys with it. The purge and
+    /// the delete are two transactions: a node enrolled in between fails the
+    /// delete (`not_empty`), losing only history. Audited as `org.delete` in
+    /// the forgs audit log, which has no foreign key and so survives.
+    ///
+    /// # Errors
+    ///
+    /// See [`OrgAdminError`].
+    pub(crate) async fn delete_org_core(
+        &self,
+        subject: &Subject,
+        user: UserId,
+    ) -> std::result::Result<String, OrgAdminError> {
+        let org = subject.org().cloned().ok_or(OrgAdminError::Denied)?;
+        let ns = crate::subject::ns_of(&org).ok_or(OrgAdminError::Denied)?;
+        self.require_team_org_admin(&org, user).await?;
+        let name = self
+            .db
+            .org_name(&org)
+            .await
+            .map_err(OrgAdminError::Internal)?
+            .unwrap_or_else(|| org.0.clone());
+        let now = self.now();
+        let grants = self
+            .db
+            .forgs()
+            .scoped(ns)
+            .list_grants()
+            .await
+            .map_err(|e| OrgAdminError::Internal(e.into()))?;
+        if grants.iter().any(|g| g.expires.is_none_or(|t| t > now)) {
+            return Err(OrgAdminError::NotEmpty);
+        }
+        if !self
+            .db
+            .clear_org_history(&org)
+            .await
+            .map_err(OrgAdminError::Internal)?
+        {
+            return Err(OrgAdminError::NotEmpty);
+        }
+        forgs_http::members::delete_namespace(self.auth(), user, &org.0)
+            .await
+            .map_err(|e| Self::org_admin_api_error(&e, "deleting an org"))?;
+        self.auth
+            .audit()
+            .record(
+                forgs_http::AuditEvent::new(now, "org.delete")
+                    .ns(ns)
+                    .subject(&forgs::SubjectKey::user(user))
+                    .target(name.clone()),
+            )
+            .await;
+        tracing::info!(org = %org, name = %name, user = %user, "team org deleted");
+        Ok(name)
     }
 
     /// The org's membership, for the browser API.

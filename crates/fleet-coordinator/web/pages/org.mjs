@@ -14,9 +14,14 @@
 // Changing *your own* membership changes the session: demoting yourself
 // re-resolves it (your role here is now different), removing yourself means
 // you no longer act in this org at all, so the UI falls back to the default.
+//
+// Admins of a team org (not a personal one, which follows the username) may
+// rename it — the old name is released for good — or delete it. The server
+// refuses a delete (`org_not_empty`) while nodes, boards, leases or grants
+// still reference the org.
 
 import { h, errorBox } from '../dom.mjs';
-import { isAdmin, orgLabel } from '../session.mjs';
+import { isAdmin, isPersonal, orgLabel } from '../session.mjs';
 
 const ROLES = ['member', 'admin'];
 
@@ -93,6 +98,36 @@ export function render(state) {
         ),
         h('label', {}, h('span', { class: 'label' }, 'Role'), roleSelect('role', 'member', null)),
         h('button', { class: 'primary', type: 'submit' }, 'Add member'),
+      ),
+    );
+  }
+
+  if (admin && !isPersonal(session)) {
+    children.push(
+      h('h2', {}, 'Rename org'),
+      h(
+        'form',
+        { class: 'panel', name: 'rename-org', on: { submit: (e) => { e.preventDefault(); return state.onRenameOrg(e.target); } } },
+        h(
+          'label',
+          {},
+          h('span', { class: 'label' }, 'New name'),
+          h('input', { name: 'name', autocomplete: 'off', required: true, value: (acting && acting.name) || '' }),
+          h('span', { class: 'hint' }, 'The old name is released for good: nobody can take it again.'),
+        ),
+        h('button', { class: 'primary', type: 'submit' }, 'Rename org'),
+      ),
+      h('h2', {}, 'Delete org'),
+      h(
+        'div',
+        { class: 'panel', name: 'delete-org' },
+        h(
+          'p',
+          { class: 'hint' },
+          'Only an empty org can be deleted: remove its nodes, release its leases and revoke its grants first. ',
+          'Its members lose access and its name is released for good.',
+        ),
+        h('button', { class: 'danger', name: 'delete-org', on: { click: () => state.onDeleteOrg() } }, 'Delete org'),
       ),
     );
   }
@@ -214,6 +249,47 @@ export async function load(ctx) {
     }
     if (created && created.id && typeof ctx.switchOrg === 'function') {
       await ctx.switchOrg(created.id);
+    } else {
+      await ctx.reload();
+    }
+  };
+
+  state.onRenameOrg = async (form) => {
+    const name = String(form.elements.name.value || '').trim();
+    if (!name) {
+      ctx.orgNotice = 'Enter a new name for the org.';
+      await ctx.reload();
+      return;
+    }
+    let renamed;
+    try {
+      renamed = await api.post('/api/v1/org/rename', { name });
+    } catch (err) {
+      ctx.orgNotice = api.describe(err);
+      await ctx.reload();
+      return;
+    }
+    ctx.orgNotice = `Renamed the org to ${(renamed && renamed.name) || name}.`;
+    // The acting org may have been held by its old name: re-select it by id.
+    if (renamed && renamed.id && typeof ctx.switchOrg === 'function') {
+      await ctx.switchOrg(renamed.id);
+    } else {
+      await ctx.reload();
+    }
+  };
+
+  state.onDeleteOrg = async () => {
+    const label = orgLabel(session && session.org);
+    if (!window.confirm(`Delete the org ${label}? Its members lose access and the name is released for good.`)) return;
+    try {
+      await api.del('/api/v1/org');
+    } catch (err) {
+      ctx.orgNotice = api.describe(err);
+      await ctx.reload();
+      return;
+    }
+    if (typeof ctx.switchOrg === 'function') {
+      await ctx.switchOrg(null);
     } else {
       await ctx.reload();
     }

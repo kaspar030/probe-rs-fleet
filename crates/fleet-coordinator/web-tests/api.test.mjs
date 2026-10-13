@@ -89,7 +89,7 @@ test('a 401 triggers the login transition exactly once, and still throws', async
 });
 
 test('the coarse error codes all have human copy', () => {
-  for (const code of ['forbidden', 'not_found', 'invalid_request', 'conflict', 'server_error', 'upstream_error']) {
+  for (const code of ['forbidden', 'not_found', 'invalid_request', 'conflict', 'server_error', 'upstream_error', 'personal_org', 'org_not_empty']) {
     const text = describe(new ApiError(400, code, null));
     assert.ok(text.length > 10, code);
     assert.notEqual(text, code, `${code} must not be shown raw`);

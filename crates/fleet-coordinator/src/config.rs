@@ -296,8 +296,9 @@ pub struct CoordinatorConfig {
     /// How many team orgs one user may create over the API; `0` is unlimited.
     ///
     /// Counts root orgs the user created (not memberships, not their personal
-    /// org). A **soft** cap: counting and creating are not one transaction,
-    /// so two concurrent creations can both pass at `limit - 1`.
+    /// org). A **hard** cap: it is checked inside the creating transaction
+    /// (forgs' `create_node_with_admin`), so concurrent creations cannot
+    /// overshoot it.
     pub max_orgs_per_user: u32,
 }
 

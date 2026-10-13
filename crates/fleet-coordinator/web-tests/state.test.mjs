@@ -261,3 +261,39 @@ test('org actions post the contract bodies and switch into a created org', async
     globalThis.window = prevWindow;
   }
 });
+
+test('org rename posts the new name and delete drops back to the default org', async () => {
+  const { load } = await import('../web/pages/org.mjs');
+  const switched = [];
+  const deleted = [];
+  const ctx = makeCtx({ load }, {
+    '/api/v1/org/rename': () => ({ id: TEAM, name: 'acme2', role: 'admin', personal: false }),
+  });
+  ctx.session = { ...SESSION, org: { id: TEAM, name: 'acme', role: 'admin', personal: false } };
+  ctx.api.get = async () => [];
+  ctx.api.del = async (path) => { deleted.push(path); return null; };
+  ctx.switchOrg = async (id) => { switched.push(id); };
+  const prevWindow = globalThis.window;
+  let confirmed = [];
+  globalThis.window = { confirm: (m) => { confirmed.push(m); return true; } };
+  try {
+    const tree = await ctx.reload();
+    const rename = find(tree, (n) => n.tag === 'form' && n.attrs.name === 'rename-org');
+    await rename.on.submit({ preventDefault() {}, target: { elements: { name: { value: ' acme2 ' } } } });
+    assert.deepEqual(ctx.api.posts.at(-1), { path: '/api/v1/org/rename', body: { name: 'acme2' }, options: undefined });
+    assert.deepEqual(switched, [TEAM]);
+
+    const del = find(ctx.tree, (n) => n.tag === 'button' && n.attrs.name === 'delete-org');
+    await del.on.click();
+    assert.match(confirmed.at(-1), /acme/);
+    assert.deepEqual(deleted, ['/api/v1/org']);
+    assert.deepEqual(switched, [TEAM, null]);
+
+    // Declining the confirm does nothing.
+    globalThis.window = { confirm: () => false };
+    await del.on.click();
+    assert.deepEqual(deleted, ['/api/v1/org']);
+  } finally {
+    globalThis.window = prevWindow;
+  }
+});

@@ -324,11 +324,11 @@ member management (add, change role, remove).
   browser. That would mean a second relay ingress with a browser-shaped
   credential.
 - **No `delegate`.** It hands out a capability token; see the threat notes.
-- **No invites/join requests; no delete or rename of orgs (follow-up).** An
+- **No invites/join requests.** An
   admin adds an *existing* user by username (one who has logged in at least
   once); there is no email or link invite and no way to ask to join. Orgs can
   be created (any logged-in user, gated by `allow_org_creation` /
-  `max_orgs_per_user`) but not deleted or renamed from the UI.
+  `max_orgs_per_user`), and renamed or deleted by their admins.
 - **No capability token ever reaches the browser.** Not `LeaseGrant::token`, not
   `ChannelOpened::token`, not the `/delegate` bearer. This should be enforced by
   a test over the API response types, not by review vigilance.
@@ -388,11 +388,13 @@ gone with the device fallback).
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/org[?org=]` | — | `{"id","name","role"}` | forgs store | member |
+| `GET /api/v1/org[?org=]` | — | `{"id","name","role","personal"}` | forgs store | member |
 | `GET /api/v1/org/members[?org=]` | — | `[{"user_id","username","role"}]` | `NsScope::list_members` | member |
 | `POST /api/v1/orgs` | `{"name"}` | `201 {"id","name","role":"admin"}` | namespace creation + admin membership for the caller; audited `org.create` in the new org | any session, if `allow_org_creation` and under `max_orgs_per_user` |
 | `POST /api/v1/org/members[?org=]` | `{"username","role":"member"\|"admin"}` | `204` (adds the user, or changes an existing member's role) | `forgs_http::members::set`; audited `member.set` | **admin** |
 | `DELETE /api/v1/org/members/{username}[?org=]` | — | `204` | `forgs_http::members::remove`; audited `member.remove` | **admin** |
+| `POST /api/v1/org/rename[?org=]` | `{"name"}` | `200 {"id","name","role":"admin","personal":false}` | `forgs_http::members::rename_namespace`; audited `org.rename` (detail `from <old>`) | **admin**, team orgs only |
+| `DELETE /api/v1/org[?org=]` (alias `POST /api/v1/org/delete`) | — | `204` | fleet emptiness check + history purge, then `forgs_http::members::delete_namespace`; audited `org.delete` | **admin**, team orgs only, empty orgs only |
 
 **Creating an org.** Any logged-in user can create a team org and becomes its
 admin; the UI's "Org" page has a create form and switches into the new org on
@@ -404,9 +406,29 @@ display name must equal its canonical form. Refusals: `400 invalid_name`
 tombstoned name), `403 org_creation_disabled` (`allow_org_creation = false`),
 `403 org_limit_reached` (the user already created `max_orgs_per_user` team
 orgs; `0` means unlimited). The cap counts team orgs the user created and is a
-soft cap — checked, not transactional, so concurrent creates can overshoot
-it. The host-shell `coordinator org create <name> --admin <username>`
+hard cap: forgs' `create_namespace` creates the node, the admin membership and
+checks the cap in one transaction, so concurrent creates cannot overshoot it.
+The host-shell `coordinator org create <name> --admin <username>`
 remains the escape hatch and ignores both keys.
+
+**Renaming and deleting an org.** An admin of a *team* org can rename it
+(`POST /api/v1/org/rename`, same name rules and refusals as create:
+`400 invalid_name`, `409 name_taken`) or delete it (`DELETE /api/v1/org`).
+The old name is tombstoned either way — nobody can take it again. A user's
+personal org follows their username and is refused with `409 personal_org`;
+a member gets `403 forbidden`. Delete is refused with `409 org_not_empty`
+while nodes, boards, open leases or unexpired grants reference the org:
+remove the nodes, release the leases and revoke the grants first. The
+trade-off of an accepted delete: the org's fleet *history* — closed leases and
+the fleet audit log (node and board events) — is purged with it, because those
+rows reference the namespace `ON DELETE RESTRICT`; forgs' identity audit
+(including `org.delete` itself) is kept. Memberships and any API keys scoped
+to the org (auth keys) go with the namespace (forgs cascades them). The
+purge and the namespace delete are two transactions; a node enrolled in
+between fails the delete (`org_not_empty`) and loses only history. The Org
+page shows rename and delete controls to admins of a team org
+(`SessionView` and `GET /api/v1/org` carry `personal`); the CLI has
+`probe-rs-fleet org rename <new>` and `org delete [--yes]`.
 
 **Managing members.** Admins get an editable members panel — add by existing
 username with a role dropdown, change a role, remove; non-admins see the same
@@ -639,6 +661,7 @@ against the *target object's* org through the existing evaluator —
 | org / member list | membership | `require_role(Member)` in the acting org |
 | member add / set-role / remove | **admin** (+ last-admin guard) | `forgs_http::members::{set,remove}` |
 | org create | any session, gated by `allow_org_creation` / `max_orgs_per_user` | new; not scoped to an acting org |
+| org rename / delete | **admin**, team orgs only (`409 personal_org`); delete only when empty (`409 org_not_empty`) | `Coordinator::{rename,delete}_org_core` → `forgs_http::members::{rename,delete}_namespace` |
 | pending-node approve / deny | membership | §6.4, `decide_pending_node` (there is no listing; see §3/§4) |
 | node list | membership | new |
 | node tags / adopt / delete | **owner (`node.owner_user_id`), or admin** | **new policy, fixed here** (rename is refused; see §3) |
@@ -775,10 +798,12 @@ someone else's lease.
 **Phase 5 — orgs and members.** *Shipped.* Self-service team-org creation
 (`POST /api/v1/orgs`, `can_create_orgs`) and admin member management
 (`POST`/`DELETE /api/v1/org/members`), with the CLI's `org create` / `org
-members` verbs alongside.
+members` verbs alongside. Admins rename and delete team orgs
+(`POST /api/v1/org/rename`, `DELETE /api/v1/org`; CLI `org rename` / `org
+delete`).
 
 **Deliberately unscheduled:** lease acquisition, delegation, board console,
-invites / join requests, and deleting or renaming orgs.
+and invites / join requests.
 
 ---
 

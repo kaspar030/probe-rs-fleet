@@ -2,8 +2,11 @@
 //
 // The shape (`src/api.rs` `SessionView`):
 //
-//   { user_id, username, memberships: [{id, name, role}],
-//     org: {id, name, role} | null, expires, can_create_orgs }
+//   { user_id, username, memberships: [{id, name, role, personal}],
+//     org: {id, name, role, personal} | null, expires, can_create_orgs }
+//
+// `personal` marks the user's personal org, which follows the username and
+// cannot be renamed or deleted as an org.
 //
 // `org` is the org this session is acting in (the `?org=` the request carried,
 // default the personal org), with the caller's role *there*; it is `null` when
@@ -23,6 +26,11 @@ export function role(session) {
 /** Whether the session is an admin of the org it is acting in. */
 export function isAdmin(session) {
   return role(session) === 'admin';
+}
+
+/** Whether the acting org is the user's personal org. */
+export function isPersonal(session) {
+  return Boolean(session && session.org && session.org.personal);
 }
 
 /** Every membership, as the server listed it (never null). */

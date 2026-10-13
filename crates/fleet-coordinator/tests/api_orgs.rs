@@ -264,6 +264,9 @@ async fn mutations_need_the_csrf_header() {
             r#"{"username":"bob","role":"member"}"#,
         ),
         ("DELETE", "/api/v1/org/members/alice?org=acme", ""),
+        ("POST", "/api/v1/org/rename?org=acme", r#"{"name":"acme2"}"#),
+        ("DELETE", "/api/v1/org?org=acme", ""),
+        ("POST", "/api/v1/org/delete?org=acme", ""),
     ] {
         let (status, _, response) = fleet
             .http_full(method, path, &[("cookie", &cookie)], Some(body.to_owned()))
@@ -271,6 +274,7 @@ async fn mutations_need_the_csrf_header() {
         assert_eq!(status, 403, "{method} {path}: {response}");
     }
     assert!(fleet.db().resolve_org("beta").await.unwrap().is_none());
+    assert!(fleet.db().resolve_org("acme2").await.unwrap().is_none());
     assert_eq!(members(&fleet, &alice, "acme").await.len(), 1);
 }
 
@@ -409,4 +413,199 @@ async fn a_bearer_session_can_create_without_csrf() {
         )
         .await;
     assert_eq!(status, 201, "{body}");
+}
+
+async fn rename(fleet: &TestCoordinator, token: &str, org: &str, name: &str) -> (u16, String) {
+    as_browser(
+        fleet,
+        "POST",
+        &format!("/api/v1/org/rename?org={org}"),
+        token,
+        Some(serde_json::json!({ "name": name })),
+    )
+    .await
+}
+
+async fn delete_org(fleet: &TestCoordinator, token: &str, org: &str) -> (u16, String) {
+    as_browser(
+        fleet,
+        "DELETE",
+        &format!("/api/v1/org?org={org}"),
+        token,
+        None,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_rename_team_orgs() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _, _) = fleet.seed_user("alice").await;
+    let (bob, _, _) = fleet.seed_user("bob").await;
+    let (status, created) = create(&fleet, &alice, "acme").await;
+    assert_eq!(status, 201, "{created}");
+    let id = created["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        set_member(&fleet, &alice, "acme", "bob", "member").await.0,
+        204
+    );
+    fleet.org("other").await;
+
+    // A member may not.
+    let (status, body) = rename(&fleet, &bob, "acme", "acme2").await;
+    assert_eq!((status, error_code(&body).as_str()), (403, "forbidden"));
+    // Name refusals as for create.
+    let (status, body) = rename(&fleet, &alice, "acme", "Acme2").await;
+    assert_eq!((status, error_code(&body).as_str()), (400, "invalid_name"));
+    for taken in ["other", "bob", "default"] {
+        let (status, body) = rename(&fleet, &alice, "acme", taken).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (409, "name_taken"),
+            "{taken}"
+        );
+    }
+
+    let (status, body) = rename(&fleet, &alice, "acme", "acme2").await;
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["id"], id.as_str());
+    assert_eq!(view["name"], "acme2");
+    assert_eq!(view["personal"], false);
+
+    let (status, body) = as_browser(&fleet, "GET", "/api/v1/org?org=acme2", &alice, None).await;
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["name"], "acme2");
+    assert_eq!(view["personal"], false);
+    // The old name is tombstoned.
+    let (status, body) = create(&fleet, &alice, "acme").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("name_taken")));
+    // Audited, with where it came from.
+    let (status, audit) = as_browser(&fleet, "GET", "/api/v1/audit?org=acme2", &alice, None).await;
+    assert_eq!(status, 200, "{audit}");
+    assert!(
+        audit.contains("org.rename") && audit.contains("from acme"),
+        "{audit}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn personal_orgs_cannot_be_renamed_or_deleted() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _, _) = fleet.seed_user("alice").await;
+    let (status, body) = rename(&fleet, &alice, "alice", "alice2").await;
+    assert_eq!((status, error_code(&body).as_str()), (409, "personal_org"));
+    let (status, body) = delete_org(&fleet, &alice, "alice").await;
+    assert_eq!((status, error_code(&body).as_str()), (409, "personal_org"));
+    assert!(fleet.db().resolve_org("alice").await.unwrap().is_some());
+
+    // The flag the UI hides the controls on.
+    let session = session_json(&fleet, &alice).await;
+    assert_eq!(session["org"]["personal"], true, "{session}");
+    assert_eq!(session["memberships"][0]["personal"], true, "{session}");
+    let (status, body) = as_browser(&fleet, "GET", "/api/v1/org", &alice, None).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains(r#""personal":true"#), "{body}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_delete_empty_team_orgs() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _, _) = fleet.seed_user("alice").await;
+    let (bob, _, _) = fleet.seed_user("bob").await;
+    assert_eq!(create(&fleet, &alice, "acme").await.0, 201);
+    assert_eq!(
+        set_member(&fleet, &alice, "acme", "bob", "member").await.0,
+        204
+    );
+    let session = session_json(&fleet, &alice).await;
+    assert!(
+        session["memberships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "acme" && m["personal"] == false),
+        "{session}"
+    );
+
+    let (status, body) = delete_org(&fleet, &bob, "acme").await;
+    assert_eq!((status, error_code(&body).as_str()), (403, "forbidden"));
+
+    let (status, body) = delete_org(&fleet, &alice, "acme").await;
+    assert_eq!(status, 204, "{body}");
+    assert!(fleet.db().resolve_org("acme").await.unwrap().is_none());
+    let (status, _) = as_browser(&fleet, "GET", "/api/v1/org?org=acme", &alice, None).await;
+    assert_eq!(status, 403);
+    // The name is released for good.
+    let (status, body) = create(&fleet, &alice, "acme").await;
+    assert_eq!((status, body["error"].as_str()), (409, Some("name_taken")));
+    assert!(fleet
+        .forgs_audit_actions()
+        .await
+        .contains(&"org.delete".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orgs_with_hardware_or_grants_are_not_deleted() {
+    let fleet = TestCoordinator::start().await;
+    let (alice, _, _) = fleet.seed_user("alice").await;
+    assert_eq!(create(&fleet, &alice, "acme").await.0, 201);
+    let org = fleet.db().resolve_org("acme").await.unwrap().unwrap();
+    fleet.seed_node_in(&org, "rpi-1").await;
+
+    let (status, body) = delete_org(&fleet, &alice, "acme").await;
+    assert_eq!((status, error_code(&body).as_str()), (409, "org_not_empty"));
+    assert!(fleet.db().resolve_org("acme").await.unwrap().is_some());
+
+    // Remove the node; its audit history alone does not block the delete.
+    let (status, body) = as_browser(
+        &fleet,
+        "DELETE",
+        "/api/v1/nodes/rpi-1?org=acme",
+        &alice,
+        None,
+    )
+    .await;
+    assert!(status == 200 || status == 204, "{status}: {body}");
+
+    // A live grant does.
+    fleet
+        .seed_workload_grant(
+            "acme",
+            "octo/repo",
+            "tag=nrf52",
+            &[fleet_proto::token::AllowedOp::Attach],
+            None,
+        )
+        .await;
+    let (status, body) = delete_org(&fleet, &alice, "acme").await;
+    assert_eq!((status, error_code(&body).as_str()), (409, "org_not_empty"));
+
+    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let scoped = fleet.db().forgs().scoped(ns);
+    for g in scoped.list_grants().await.unwrap() {
+        scoped.delete_grant(g.id).await.unwrap();
+    }
+    let (status, body) = delete_org(&fleet, &alice, "acme").await;
+    assert_eq!(status, 204, "{body}");
+    assert!(fleet.db().resolve_org("acme").await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_per_user_cap_is_hard_under_concurrency() {
+    let fleet = TestCoordinator::start_with(|c| c.max_orgs_per_user = 2).await;
+    let (alice, _, _) = fleet.seed_user("alice").await;
+    let names = ["c1", "c2", "c3", "c4", "c5"];
+    let results =
+        futures_util::future::join_all(names.iter().map(|n| create(&fleet, &alice, n))).await;
+    let created = results.iter().filter(|(s, _)| *s == 201).count();
+    assert_eq!(created, 2, "{results:?}");
+    for (status, body) in results.iter().filter(|(s, _)| *s != 201) {
+        assert_eq!(
+            (*status, body["error"].as_str()),
+            (403, Some("org_limit_reached")),
+            "{results:?}"
+        );
+    }
 }

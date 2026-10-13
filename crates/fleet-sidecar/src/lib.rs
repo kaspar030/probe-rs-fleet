@@ -777,13 +777,15 @@ async fn run_delegated(
         cli::ProbeRsInvocation::Gdb {
             connection_string, ..
         } => run_fleet_gdb(&session, opened.channel, connection_string.as_deref()).await,
-        _ => run_fleet_data(
-            &session,
-            opened.channel,
-            &opened.serve_token,
-            &original_argv,
-        )
-        .await,
+        _ => {
+            run_fleet_data(
+                &session,
+                opened.channel,
+                &opened.serve_token,
+                &original_argv,
+            )
+            .await
+        }
     }
     // Deliberately no `session.release(lease)`: the lease is not ours.
 }
@@ -887,13 +889,8 @@ async fn run_fleet_data_inner(
             let _ = transport::splice_client(session, channel, client).await;
         }
     };
-    let child = transport::exec_remote_probe_rs(
-        &real,
-        &args,
-        &remote_host,
-        token,
-        &selector::ProcessEnv,
-    );
+    let child =
+        transport::exec_remote_probe_rs(&real, &args, &remote_host, token, &selector::ProcessEnv);
 
     // The child drives the session; when it exits we stop accepting/splicing.
     tokio::pin!(splice);

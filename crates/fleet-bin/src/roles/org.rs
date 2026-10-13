@@ -1,4 +1,4 @@
-//! `probe-rs-fleet org {create,list,members}`: self-service team orgs and
+//! `probe-rs-fleet org {create,list,members,rename,delete}`: self-service team orgs and
 //! their membership, with the login you already have.
 //!
 //! Before this existed a team org could only be made from a shell on the
@@ -15,6 +15,12 @@
 //!   [`ForgsClient::list_members`] / [`ForgsClient::set_member`] /
 //!   [`ForgsClient::remove_member`]: the admin check and the last-admin guard
 //!   are the server's.
+//! * `rename` posts `/api/v1/org/rename` and `delete` posts
+//!   `/api/v1/org/delete` (the alias of `DELETE /api/v1/org`), both for the
+//!   acting org and admin only. A personal org follows its username and is
+//!   refused; delete is refused while the org still has nodes, boards, leases
+//!   or grants. The fleet file's `[user].org` follows a rename and is cleared
+//!   by a delete.
 //!
 //! As in [`super::auth_key`], the work ([`create`], [`list`], [`members`],
 //! [`add_member`], …) is separate from the printing in [`run`], so tests
@@ -27,14 +33,14 @@ use forgs_client::api::MemberList;
 use forgs_client::{ClientError, ForgsClient, Secret};
 
 use crate::cli::{
-    OrgCliArgs, OrgCliCommand, OrgCliCreateArgs, OrgMembersArgs, OrgMembersCommand, OrgSessionArgs,
-    RoleArg,
+    OrgCliArgs, OrgCliCommand, OrgCliCreateArgs, OrgDeleteArgs, OrgMembersArgs, OrgMembersCommand,
+    OrgRenameArgs, OrgSessionArgs, RoleArg,
 };
 use crate::fleet_config::{self, FleetFile};
 use crate::roles::auth_key::acting_org;
 use crate::roles::node_setup;
 
-/// `POST /api/v1/orgs`' answer.
+/// `POST /api/v1/orgs`' (and `POST /api/v1/org/rename`'s) answer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CreatedOrg {
     /// The org's namespace id.
@@ -101,6 +107,16 @@ pub async fn run(args: OrgCliArgs) -> Result<()> {
                 println!("Removed {} from '{org}'.", remove.username);
             }
         },
+        OrgCliCommand::Rename(args) => {
+            let (old, renamed) = rename(&args).await?;
+            let name = renamed.name.as_deref().unwrap_or(&renamed.id);
+            println!("Renamed org '{old}' to '{name}'.");
+            println!("The old name is released for good; act in it with `--org {name}`.");
+        }
+        OrgCliCommand::Delete(args) => {
+            let name = delete(&args).await?;
+            println!("Deleted org '{name}'.");
+        }
     }
     Ok(())
 }
@@ -197,11 +213,115 @@ pub async fn remove_member(args: &OrgMembersArgs, username: &str) -> Result<Stri
     Ok(org)
 }
 
-/// A client, a live session token, and the loaded fleet file.
+/// Rename the acting org to `args.new_name`. Returns the old name and the
+/// coordinator's answer. If the fleet file's `[user].org` named the org, it
+/// follows the rename.
+///
+/// # Errors
+///
+/// See [`run`].
+pub async fn rename(args: &OrgRenameArgs) -> Result<(String, CreatedOrg)> {
+    let (ctx, org) = acting_session(&args.session, args.org.as_deref()).await?;
+    let new_name = args.new_name.trim();
+    let renamed: CreatedOrg = ctx
+        .client
+        .post_json(
+            &org_route("/api/v1/org/rename", &org),
+            Some(&Secret::from(ctx.session.as_str())),
+            &serde_json::json!({ "name": new_name }),
+        )
+        .await
+        .map_err(|e| describe(&e, &format!("renaming the org `{org}`")))?;
+    let new = renamed.name.clone().unwrap_or_else(|| new_name.to_owned());
+    update_default_org(&ctx, &org, Some(&new))?;
+    Ok((org, renamed))
+}
+
+/// Delete the acting org, after confirmation (`--yes`, or a `y` on a
+/// terminal). Returns the deleted org. If the fleet file's `[user].org`
+/// named it, that default is cleared.
+///
+/// # Errors
+///
+/// See [`run`]; also a refused or impossible confirmation.
+pub async fn delete(args: &OrgDeleteArgs) -> Result<String> {
+    let (ctx, org) = acting_session(&args.session, args.org.as_deref()).await?;
+    confirm_delete(args.yes, &org)?;
+    ctx.client
+        .post(
+            &org_route("/api/v1/org/delete", &org),
+            Some(&Secret::from(ctx.session.as_str())),
+            &serde_json::json!({}),
+        )
+        .await
+        .map_err(|e| describe(&e, &format!("deleting the org `{org}`")))?;
+    update_default_org(&ctx, &org, None)?;
+    Ok(org)
+}
+
+/// `route?org=<org>`, percent-encoding the org.
+fn org_route(route: &str, org: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(org.len());
+    for b in org.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(b));
+        } else {
+            let _ = write!(encoded, "%{b:02X}");
+        }
+    }
+    format!("{route}?org={encoded}")
+}
+
+/// Ask before deleting `org`, unless `yes`. Refuses on a non-terminal.
+fn confirm_delete(yes: bool, org: &str) -> Result<()> {
+    use std::io::{IsTerminal, Write};
+    if yes {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        std::io::stdin().is_terminal(),
+        "stdin is not a terminal, so there is nobody here to confirm this. \
+         Re-run with --yes if you really mean to delete `{org}`."
+    );
+    print!("Delete org '{org}'? Its name is released for good. [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading the confirmation")?;
+    let answer = answer.trim().to_ascii_lowercase();
+    anyhow::ensure!(
+        answer == "y" || answer == "yes",
+        "cancelled — nothing was changed"
+    );
+    Ok(())
+}
+
+/// If the fleet file's `[user].org` is `old`, point it at `new` (or clear
+/// it). Re-reads the file first: refreshing the session may have rewritten
+/// it since [`session`] loaded it.
+fn update_default_org(ctx: &OrgContext, old: &str, new: Option<&str>) -> Result<()> {
+    let mut file = fleet_config::load(&ctx.path)
+        .with_context(|| format!("re-reading fleet config {}", ctx.path.display()))?;
+    let Some(user) = file.user.as_mut() else {
+        return Ok(());
+    };
+    if user.org.as_deref() != Some(old) {
+        return Ok(());
+    }
+    user.org = new.map(ToOwned::to_owned);
+    fleet_config::save_atomic(&ctx.path, &file)
+        .with_context(|| format!("updating the default org in {}", ctx.path.display()))
+}
+
+/// A client, a live session token, and the loaded fleet file (and where it
+/// lives).
 struct OrgContext {
     client: ForgsClient,
     session: String,
     file: FleetFile,
+    path: std::path::PathBuf,
 }
 
 /// Load the fleet file and produce a fresh session (as `auth-key` does).
@@ -231,16 +351,26 @@ async fn session(args: &OrgSessionArgs) -> Result<OrgContext> {
         client,
         session,
         file,
+        path: fleet_path,
     })
 }
 
 /// [`session`] plus the org a `members` verb acts in.
 async fn org_session(args: &OrgMembersArgs) -> Result<(OrgContext, String)> {
-    let ctx = session(&args.session).await?;
-    let org = acting_org(&ctx.file, args.org.as_deref()).with_context(|| {
+    acting_session(&args.session, args.org.as_deref()).await
+}
+
+/// [`session`] plus the org to act in: `explicit`, else the fleet file's
+/// default.
+async fn acting_session(
+    args: &OrgSessionArgs,
+    explicit: Option<&str>,
+) -> Result<(OrgContext, String)> {
+    let ctx = session(args).await?;
+    let org = acting_org(&ctx.file, explicit).with_context(|| {
         format!(
             "no org to act in for fleet `{}`: pass `--org <name>`",
-            args.session.fleet
+            args.fleet
         )
     })?;
     Ok((ctx, org))
@@ -254,7 +384,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
     let hint = match code.as_str() {
         "forbidden" => {
             "you are not an admin of that org (members may list it; only admins \
-             change it), or you are not a member of it at all"
+             change, rename or delete it), or you are not a member of it at all"
         }
         "not_found" => {
             "no such user (they must log in to this fleet once first), or they \
@@ -276,6 +406,15 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         "org_creation_disabled" => {
             "this coordinator does not allow creating orgs over the API; ask its \
              operator (`probe-rs-fleet coordinator org create` on the host)"
+        }
+        "personal_org" => {
+            "your personal org follows your username; it cannot be renamed or \
+             deleted here"
+        }
+        "org_not_empty" => {
+            "the org still has hardware or sharing. Remove its nodes (web UI, \
+             Devices page), release its leases and revoke its grants \
+             (`probe-rs-fleet grant revoke`) first"
         }
         "org_limit_reached" => {
             "you have created as many orgs as this coordinator allows \
@@ -364,5 +503,23 @@ mod tests {
         assert!(e.contains("existing org or user"), "{e}");
         let e = describe(&rejected("weird", 418), "creating").to_string();
         assert!(e.contains("418") && e.contains("weird"), "{e}");
+        let e = describe(&rejected("personal_org", 409), "renaming").to_string();
+        assert!(e.contains("personal org follows your username"), "{e}");
+        let e = describe(&rejected("org_not_empty", 409), "deleting").to_string();
+        assert!(e.contains("Remove its nodes"), "{e}");
+    }
+
+    #[test]
+    fn org_route_encodes_the_org() {
+        assert_eq!(
+            org_route("/api/v1/org/rename", "acme"),
+            "/api/v1/org/rename?org=acme"
+        );
+        assert_eq!(org_route("/x", "a b/c"), "/x?org=a%20b%2Fc");
+    }
+
+    #[test]
+    fn delete_needs_yes_without_a_terminal() {
+        assert!(confirm_delete(true, "acme").is_ok());
     }
 }

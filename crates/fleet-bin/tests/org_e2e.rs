@@ -1,4 +1,4 @@
-//! `probe-rs-fleet org {create,list,members}` end to end, through the CLI's
+//! `probe-rs-fleet org {create,list,members,rename,delete}` end to end, through the CLI's
 //! own code paths.
 //!
 //! A user who has only run `probe-rs-fleet login` — no shell on the
@@ -11,7 +11,10 @@
 mod common;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{LoginArgs, OrgCliCreateArgs, OrgMembersArgs, OrgSessionArgs, RoleArg};
+use fleet_bin::cli::{
+    LoginArgs, OrgCliCreateArgs, OrgDeleteArgs, OrgMembersArgs, OrgRenameArgs, OrgSessionArgs,
+    RoleArg,
+};
 use fleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [31u8; 32];
@@ -229,4 +232,116 @@ async fn members_defaults_to_the_fleet_files_org() {
     )
     .await
     .is_err());
+}
+
+fn rename_args(config_dir: &std::path::Path, org: Option<&str>, new_name: &str) -> OrgRenameArgs {
+    OrgRenameArgs {
+        new_name: new_name.to_owned(),
+        org: org.map(ToOwned::to_owned),
+        session: session(config_dir),
+    }
+}
+
+fn delete_args(config_dir: &std::path::Path, org: Option<&str>) -> OrgDeleteArgs {
+    OrgDeleteArgs {
+        yes: true,
+        org: org.map(ToOwned::to_owned),
+        session: session(config_dir),
+    }
+}
+
+/// The fleet file's `[user].org`.
+fn default_org(config_dir: &std::path::Path) -> Option<String> {
+    let path = config_dir.join("default.toml");
+    let text = std::fs::read_to_string(path).unwrap();
+    let value: toml::Value = toml::from_str(&text).unwrap();
+    value
+        .get("user")
+        .and_then(|u| u.get("org"))
+        .and_then(|o| o.as_str())
+        .map(ToOwned::to_owned)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admins_rename_and_delete_team_orgs() {
+    let fleet = start_fleet(SEED).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = tmp.path().join("alice");
+    let bob = tmp.path().join("bob");
+    login(&fleet, &alice, "alice", None).await;
+    fleet_bin::roles::org::create(&create_args(&alice, "acme"))
+        .await
+        .expect("org create");
+    // Re-login acting in acme, so the fleet file's default follows.
+    login(&fleet, &alice, "alice", Some("acme")).await;
+    login(&fleet, &bob, "bob", None).await;
+    fleet_bin::roles::org::add_member(&members_args(&alice, Some("acme")), "bob", RoleArg::Member)
+        .await
+        .expect("members add");
+
+    // A member may not rename.
+    let err = fleet_bin::roles::org::rename(&rename_args(&bob, Some("acme"), "acme2"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not an admin"), "{err}");
+
+    // The admin renames the default org; the fleet file follows.
+    assert_eq!(default_org(&alice).as_deref(), Some("acme"));
+    let (old, renamed) = fleet_bin::roles::org::rename(&rename_args(&alice, None, "acme2"))
+        .await
+        .expect("org rename");
+    assert_eq!(old, "acme");
+    assert_eq!(renamed.name.as_deref(), Some("acme2"));
+    assert_eq!(default_org(&alice).as_deref(), Some("acme2"));
+    assert_eq!(fleet.org("acme2").await.0, renamed.id);
+
+    // A personal org is refused, with why.
+    let err = fleet_bin::roles::org::delete(&delete_args(&alice, Some("alice")))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("personal org"), "{err}");
+
+    // An org with a node is refused, with what to do.
+    let org = fleet.org("acme2").await;
+    fleet
+        .coord
+        .register_node_and_mint(
+            &org,
+            "rpi-1",
+            &[],
+            None,
+            fleet_proto::AdoptPolicy::Declared,
+            "node.enroll",
+            "test fixture",
+        )
+        .await
+        .unwrap();
+    let err = fleet_bin::roles::org::delete(&delete_args(&alice, None))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Remove its nodes"), "{err}");
+    assert!(fleet
+        .coord
+        .db()
+        .scoped(org.clone())
+        .delete_node("rpi-1")
+        .await
+        .unwrap());
+
+    // Empty: deleted, and the fleet file's default cleared.
+    let name = fleet_bin::roles::org::delete(&delete_args(&alice, None))
+        .await
+        .expect("org delete");
+    assert_eq!(name, "acme2");
+    assert!(fleet
+        .coord
+        .db()
+        .resolve_org("acme2")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(default_org(&alice), None);
 }

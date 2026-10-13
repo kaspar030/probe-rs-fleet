@@ -330,6 +330,24 @@ test('org shows the create form only when the session may create orgs', () => {
   assert.ok(create(org.render({ session: { ...MEMBER, can_create_orgs: true }, members: MEMBERS })));
 });
 
+test('org shows rename and delete only to an admin of a team org', () => {
+  const rename = (tree) => find(tree, (n) => n.tag === 'form' && n.attrs.name === 'rename-org');
+  const del = (tree) => find(tree, (n) => n.tag === 'button' && n.attrs.name === 'delete-org');
+  const team = { ...ADMIN, org: { id: ORG, name: 'acme', role: 'admin', personal: false } };
+  const tree = org.render({ session: team, members: MEMBERS });
+  assert.ok(rename(tree));
+  assert.equal(find(rename(tree), (n) => n.tag === 'input' && n.attrs.name === 'name').attrs.value, 'acme');
+  assert.ok(del(tree));
+  // A personal org follows the username.
+  const personal = { ...ADMIN, org: { ...ADMIN.org, personal: true } };
+  assert.equal(rename(org.render({ session: personal, members: MEMBERS })), null);
+  assert.equal(del(org.render({ session: personal, members: MEMBERS })), null);
+  // A member of a team org.
+  const member = { ...MEMBER, org: { id: ORG, name: 'acme', role: 'member', personal: false } };
+  assert.equal(rename(org.render({ session: member, members: MEMBERS })), null);
+  assert.equal(del(org.render({ session: member, members: MEMBERS })), null);
+});
+
 test('every page renders an empty state without throwing', () => {
   assert.ok(textOf(devices.render({ boards: [], session: MEMBER })).length > 0);
   assert.ok(textOf(agents.render({ nodes: [], session: MEMBER })).length > 0);

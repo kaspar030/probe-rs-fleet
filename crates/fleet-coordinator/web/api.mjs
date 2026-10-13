@@ -86,6 +86,10 @@ export function describe(err) {
       return 'Invalid name: use lowercase letters, digits and single dashes, not starting or ending with a dash.';
     case 'org_creation_disabled':
       return 'This coordinator does not allow creating orgs.';
+    case 'personal_org':
+      return 'Your personal org follows your username; it cannot be renamed or deleted.';
+    case 'org_not_empty':
+      return 'The org still has hardware or sharing: remove its nodes, release its leases and revoke its grants first.';
     case 'org_limit_reached':
       return 'You have reached the limit on how many orgs you may create.';
     case 'server_error':

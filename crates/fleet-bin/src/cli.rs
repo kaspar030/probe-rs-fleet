@@ -671,6 +671,38 @@ pub enum OrgCliCommand {
     List(OrgSessionArgs),
     /// List an org's members, or (admin only) change them.
     Members(OrgMembersArgs),
+    /// Rename a team org (admin only). The old name is released for good.
+    Rename(OrgRenameArgs),
+    /// Delete a team org (admin only). Refused while it still has nodes,
+    /// boards, leases or grants.
+    Delete(OrgDeleteArgs),
+}
+
+/// Arguments for `probe-rs-fleet org rename`.
+#[derive(Debug, Args)]
+pub struct OrgRenameArgs {
+    /// The new name, under the same rules as `org create`.
+    pub new_name: String,
+    /// The org to rename (path or id). Defaults to the fleet file's
+    /// `[user].org`.
+    #[arg(long)]
+    pub org: Option<String>,
+    #[command(flatten)]
+    pub session: OrgSessionArgs,
+}
+
+/// Arguments for `probe-rs-fleet org delete`.
+#[derive(Debug, Args)]
+pub struct OrgDeleteArgs {
+    /// Skip the confirmation prompt (required when stdin is not a terminal).
+    #[arg(long)]
+    pub yes: bool,
+    /// The org to delete (path or id). Defaults to the fleet file's
+    /// `[user].org`.
+    #[arg(long)]
+    pub org: Option<String>,
+    #[command(flatten)]
+    pub session: OrgSessionArgs,
 }
 
 /// The fleet whose `[user]` session authorises an `org` verb.
@@ -1936,6 +1968,40 @@ mod tests {
             "owner"
         ]))
         .is_err());
+        let cli = Cli::parse_from(os(&[
+            "probe-rs-fleet",
+            "org",
+            "rename",
+            "acme2",
+            "--org",
+            "acme",
+        ]));
+        match cli.command {
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Rename(r),
+            }) => {
+                assert_eq!(r.new_name, "acme2");
+                assert_eq!(r.org.as_deref(), Some("acme"));
+            }
+            other => panic!("expected rename, got {other:?}"),
+        }
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "delete", "--yes"]));
+        match cli.command {
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Delete(d),
+            }) => {
+                assert!(d.yes);
+                assert!(d.org.is_none());
+            }
+            other => panic!("expected delete, got {other:?}"),
+        }
+        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "delete"]));
+        assert!(matches!(
+            cli.command,
+            Command::Org(OrgCliArgs {
+                command: OrgCliCommand::Delete(OrgDeleteArgs { yes: false, .. })
+            })
+        ));
     }
 
     #[test]

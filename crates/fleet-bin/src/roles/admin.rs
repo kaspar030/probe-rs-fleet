@@ -585,12 +585,18 @@ pub async fn org_create(args: OrgCreateArgs) -> Result<()> {
             )
         })?;
     let now = admin.now();
-    // The same call `POST /api/v1/orgs` makes, minus its policy: this is the
+    // The same transaction `POST /api/v1/orgs` uses, minus its policy: this is the
     // host-shell escape hatch, so `allow_org_creation` and the per-user cap
     // do not apply.
     let ns = admin
         .db()
-        .create_team_org(&args.name, user.id, forgs::schema::NameOrigin::User, now)
+        .create_team_org(
+            &args.name,
+            user.id,
+            forgs::schema::NameOrigin::User,
+            None,
+            now,
+        )
         .await
         .with_context(|| format!("creating the org `{}`", args.name))?;
     println!(

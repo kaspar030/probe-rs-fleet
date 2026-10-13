@@ -390,6 +390,9 @@ probe-rs-fleet login --fleet-url https://fleet.example.com
 #     escape hatch and ignores both keys.
 probe-rs-fleet org create lab
 probe-rs-fleet org members add alice --org lab --role member
+#     Admins can later rename or delete it (an empty org only):
+#     probe-rs-fleet org rename lab2 --org lab
+#     probe-rs-fleet org delete --org lab2
 
 # 3. Offer this machine's probes to the fleet. No token, no out-of-band step:
 #    it reuses the session from step 2.
@@ -984,15 +987,23 @@ The decisions that are load-bearing:
   creation is audited as `org.create` in the new org. Two coordinator.toml
   keys gate it: `allow_org_creation` (default `true`; `false` → `403
   org_creation_disabled`) and `max_orgs_per_user` (default `10`, `0` =
-  unlimited; counts team orgs the user created; a soft, non-transactional
-  cap → `403 org_limit_reached`). A name colliding with an org, a username or
+  unlimited; counts team orgs the user created; a hard cap, checked in the
+  creating transaction by forgs' `create_namespace` → `403
+  org_limit_reached`). A name colliding with an org, a username or
   a tombstoned name is `409 name_taken`. `coordinator org create <name>
   --admin <username>` stays as the host-shell escape hatch and ignores both
   keys. Admins manage members with `probe-rs-fleet org members
   add|set-role|remove` (forgs' `/auth/members`) or the web UI
   (`forgs_http::members::{set,remove}`, audited `member.set` /
   `member.remove`); removing or demoting the last admin is `409 last_admin`.
-  Invites, join requests and deleting or renaming orgs are follow-ups. The
+  Admins rename a team org with `probe-rs-fleet org rename <new>` or the web
+  UI (`POST /api/v1/org/rename`, audited `org.rename`; the old name is
+  tombstoned) and delete one with `probe-rs-fleet org delete` (`DELETE
+  /api/v1/org`, audited `org.delete`). Personal orgs are refused (`409
+  personal_org`); delete is refused while nodes, boards, open leases or live
+  grants reference the org (`409 org_not_empty`), and purges the org's closed
+  leases and fleet audit log, which would otherwise block it (`ON DELETE
+  RESTRICT`). Invites and join requests are follow-ups. The
   config's `default_org` is an org **name** the coordinator ensures exists at
   startup; it is consulted only by operator verbs, never by an authenticated
   request. There is still no user-owned/org-owned branch: one scoping rule

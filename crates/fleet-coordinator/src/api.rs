@@ -84,10 +84,15 @@
 //!   including a board org's admin reclaiming their own hardware from someone
 //!   they shared it with; see [`release_lease`].
 //!
-//! Self-service orgs and membership add three more:
+//! Self-service orgs and membership add more:
 //!
 //! * `POST /api/v1/orgs` — create a team org, the caller becoming its admin
 //!   (gated by `allow_org_creation` / `max_orgs_per_user`); see [`create_org`].
+//! * `POST /api/v1/org/rename` / `DELETE /api/v1/org` (alias
+//!   `POST /api/v1/org/delete`) — rename or delete the
+//!   acting team org (admin only; personal orgs refused, delete refused while
+//!   the org still has hardware, leases or grants); see [`rename_org`] /
+//!   [`delete_org`].
 //! * `POST /api/v1/org/members` / `DELETE /api/v1/org/members/{username}` —
 //!   add, re-role and remove members by **calling** [`forgs_http::members::set`]
 //!   / [`forgs_http::members::remove`], the functions `/auth/members` uses, so
@@ -142,7 +147,7 @@ use fleet_proto::board::PowerKind;
 use fleet_proto::ids::{BoardName, BoardRef, LeaseId, SubjectKey};
 use fleet_proto::token::AllowedOp;
 
-use crate::core::{Coordinator, NodeStatus, OpError, OrgCreateError};
+use crate::core::{Coordinator, NodeStatus, OpError, OrgAdminError, OrgCreateError};
 use crate::http::{parse_adopt, reject, valid_tags};
 use crate::identity::{CiKeyPayload, NodeKeyPayload, PURPOSE_CI, PURPOSE_NODE};
 use crate::subject::{FleetRole, Subject};
@@ -158,7 +163,9 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
     Router::new()
         .route("/api/v1/session", get(session))
         .route("/api/v1/session/logout", post(logout))
-        .route("/api/v1/org", get(org))
+        .route("/api/v1/org", get(org).delete(delete_org))
+        .route("/api/v1/org/rename", post(rename_org))
+        .route("/api/v1/org/delete", post(delete_org))
         .route("/api/v1/orgs", post(create_org))
         .route("/api/v1/org/members", get(org_members).post(set_org_member))
         .route("/api/v1/org/members/{username}", delete(remove_org_member))
@@ -594,6 +601,9 @@ struct MembershipView {
     id: String,
     name: Option<String>,
     role: &'static str,
+    /// Whether this is the user's personal org (which follows the username
+    /// and cannot be renamed or deleted as an org).
+    personal: bool,
 }
 
 /// `GET /api/v1/org`'s body.
@@ -603,6 +613,8 @@ struct OrgView {
     /// The org's current path (display name).
     name: Option<String>,
     role: &'static str,
+    /// Whether this is a personal org (see [`MembershipView::personal`]).
+    personal: bool,
 }
 
 /// One row of `GET /api/v1/org/members`.
@@ -775,10 +787,18 @@ async fn session(
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
+    let personal = match coord.db().personal_org(user).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "failed to resolve the personal org");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
     let mut memberships = Vec::with_capacity(orgs.len());
     for (org, role) in orgs {
         memberships.push(MembershipView {
             name: coord.db().org_name(&org).await.ok().flatten(),
+            personal: personal.as_ref() == Some(&org),
             id: org.0,
             role: role.as_str(),
         });
@@ -794,6 +814,7 @@ async fn session(
                     id: m.id.clone(),
                     name: m.name.clone(),
                     role: m.role,
+                    personal: m.personal,
                 }),
                 None => None,
             }
@@ -887,12 +908,106 @@ async fn org(
             return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
         }
     };
+    let personal = match coord.db().is_personal_org(&org).await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "failed to resolve an org");
+            return reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error");
+        }
+    };
     Json(OrgView {
         id: org.0,
         name,
         role: role.as_str(),
+        personal,
     })
     .into_response()
+}
+
+/// The body of `POST /api/v1/org/rename`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrgRenameRequest {
+    name: String,
+}
+
+/// Render an [`OrgAdminError`].
+fn org_admin_error(e: &OrgAdminError) -> Response {
+    match e {
+        OrgAdminError::Denied => reject(StatusCode::FORBIDDEN, "forbidden"),
+        OrgAdminError::Personal => reject(StatusCode::CONFLICT, "personal_org"),
+        OrgAdminError::InvalidName => reject(StatusCode::BAD_REQUEST, "invalid_name"),
+        OrgAdminError::NameTaken => reject(StatusCode::CONFLICT, "name_taken"),
+        OrgAdminError::NotEmpty => reject(StatusCode::CONFLICT, "org_not_empty"),
+        OrgAdminError::Internal(err) => {
+            warn!(error = %err, "an org admin operation failed");
+            reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        }
+    }
+}
+
+/// `POST /api/v1/org/rename` — rename the acting team org. Admin only;
+/// a personal org is `409 personal_org`. Name refusals are those of
+/// [`create_org`] (`invalid_name`, `name_taken`). See
+/// [`Coordinator::rename_org_core`].
+async fn rename_org(
+    State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: axum::body::Bytes,
+) -> Response {
+    let ApiCall { caller, subject } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let Some(user) = caller.user_id() else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    let Ok(request) = serde_json::from_slice::<OrgRenameRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    match coord.rename_org_core(&subject, user, &request.name).await {
+        Ok((org, name)) => Json(OrgView {
+            id: org.0,
+            name: Some(name),
+            role: FleetRole::Admin.as_str(),
+            personal: false,
+        })
+        .into_response(),
+        Err(e) => org_admin_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/org` — delete the acting team org. Admin only; a
+/// personal org is `409 personal_org`, and an org that still has nodes,
+/// boards, open leases or live grants is `409 org_not_empty`. `204` on
+/// success. See [`Coordinator::delete_org_core`] for what goes with it.
+///
+/// Also routed as `POST /api/v1/org/delete`, for clients that only speak
+/// `GET`/`POST` (the CLI's `forgs_client::ForgsClient`); same handler, same
+/// CSRF gate.
+async fn delete_org(
+    State(coord): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { caller, subject } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let Some(user) = caller.user_id() else {
+        return reject(StatusCode::FORBIDDEN, "forbidden");
+    };
+    match coord.delete_org_core(&subject, user).await {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => org_admin_error(&e),
+    }
 }
 
 /// `GET /api/v1/org/members` — the org's membership. Any member may list;
@@ -963,6 +1078,7 @@ async fn create_org(
                 id: org.0,
                 name: Some(name),
                 role: FleetRole::Admin.as_str(),
+                personal: false,
             }),
         )
             .into_response(),

@@ -212,8 +212,10 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # How many team orgs one user may create. Default: 10; 0 means unlimited.
 #
 # Counts orgs the user created (not ones they were added to; the personal org
-# does not count). A soft cap: it is checked, not enforced transactionally, so
-# concurrent creates can overshoot it. At the cap: 403 `org_limit_reached`.
+# does not count). A hard cap, checked in the same transaction as the creation,
+# so concurrent creates cannot overshoot it. At the cap: 403
+# `org_limit_reached`. Deleting an org (`probe-rs-fleet org delete`) frees a
+# slot; renaming one (`probe-rs-fleet org rename`) does not use one.
 # `coordinator org create` ignores it.
 # max_orgs_per_user = 10
 
