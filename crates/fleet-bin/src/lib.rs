@@ -5,7 +5,6 @@
 //! in-process (see `tests/bearer_e2e.rs`, which drives `login --token` /
 //! `share` / `node up` against a live coordinator).
 
-pub mod api_client;
 pub mod cli;
 pub mod completion;
 pub mod config;

@@ -131,14 +131,11 @@ pub async fn create(args: &OrgCliCreateArgs) -> Result<CreatedOrg> {
 /// See [`run`].
 pub async fn list(args: &OrgSessionArgs) -> Result<(Vec<Membership>, Option<String>)> {
     let ctx = session(args).await?;
-    let body: SessionBody = crate::api_client::get_json(
-        &ctx.file.url,
-        ctx.file.pin(),
-        Some(&Secret::from(ctx.session.as_str())),
-        "/api/v1/session",
-    )
-    .await
-    .map_err(|e| describe(&e, "listing your orgs"))?;
+    let body: SessionBody = ctx
+        .client
+        .get_json("/api/v1/session", Some(&Secret::from(ctx.session.as_str())))
+        .await
+        .map_err(|e| describe(&e, "listing your orgs"))?;
     Ok((body.memberships, acting_org(&ctx.file, None)))
 }
 
