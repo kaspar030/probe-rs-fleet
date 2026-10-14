@@ -6,6 +6,25 @@
 # source of truth. The secrets are generated once and kept in the volume.
 set -eu
 
+# Started as root: make /data writable for PUID:PGID (a bind-mounted host
+# directory is typically owned by the host user or root), then re-run this
+# script unprivileged. Only mismatched entries are touched.
+if [ "$(id -u)" = 0 ]; then
+    : "${PUID:=10001}" "${PGID:=10001}"
+    if [ "$PUID" = 0 ]; then
+        echo "refusing to run as root (PUID=0)" >&2
+        exit 1
+    fi
+    find /data \( \! -user "$PUID" -o \! -group "$PGID" \) \
+        -exec chown "$PUID:$PGID" {} +
+    exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$0" "$@"
+fi
+
+if [ ! -w /data ]; then
+    echo "/data is not writable by uid $(id -u); chown it on the host or set PUID/PGID" >&2
+    exit 1
+fi
+
 : "${PROBEFLEET_PUBLIC_URL:?set PROBEFLEET_PUBLIC_URL (e.g. https://fleet.example)}"
 
 config_dir="$XDG_CONFIG_HOME/probefleet/coordinator"

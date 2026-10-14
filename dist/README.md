@@ -39,6 +39,23 @@ location / {
 }
 ```
 
+## Data directory and permissions
+
+The container starts as root, chowns `/data` to `PUID:PGID` (default
+`10001:10001`), and then runs the coordinator unprivileged. To keep state in
+a host directory instead of the named volume, add a
+`docker-compose.override.yml`:
+
+```yaml
+services:
+  coordinator:
+    volumes:
+      - ./data:/data
+```
+
+and set `PUID`/`PGID` in `.env` to your host user (`id -u`, `id -g`) so the
+files stay readable to you.
+
 ## Admin commands
 
 The host-shell admin verbs run inside the container and find the config
