@@ -15,7 +15,7 @@
 //! `ci login` reads `ACTIONS_ID_TOKEN_REQUEST_*` and `GITHUB_ENV` from the
 //! environment, because that is how a runner hands them over. Every test here
 //! therefore takes the crate's process-wide `ENV_LOCK` (see
-//! `fleet_bin::test_support`) — but that lock is `pub(crate)`, so an
+//! `probefleet::test_support`) — but that lock is `pub(crate)`, so an
 //! integration test cannot reach it and declares its own. The two do not
 //! mutually exclude, which is why nothing in the *unit* tests touches these
 //! particular variables.
@@ -38,9 +38,9 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use common::Fleet;
-use fleet_bin::cli::CiLoginArgs;
-use fleet_coordinator::config::GithubActionsConfig;
-use fleet_proto::token::AllowedOp;
+use probefleet::cli::CiLoginArgs;
+use probefleet_coordinator::config::GithubActionsConfig;
+use probefleet_proto::token::AllowedOp;
 
 /// Serialises the tests in this file, which all mutate the same env vars.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -256,7 +256,7 @@ async fn start_fleet(github_actions: Option<GithubActionsConfig>) -> Fleet {
 /// Grant `REPO` access to the default org's `nrf52`-tagged boards.
 async fn grant_repo(fleet: &Fleet) {
     let org = fleet.default_org().await;
-    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
     let repo = forgs::subject::normalise_repo(REPO).unwrap();
     let now = fleet.coord.now();
     fleet
@@ -268,7 +268,10 @@ async fn grant_repo(fleet: &Fleet) {
             &forgs_store::NewGrant {
                 subject: forgs::subject::workload_subject_key(&repo),
                 selector: "tag=nrf52".to_owned(),
-                ops: fleet_coordinator::state::join_ops(&[AllowedOp::Flash, AllowedOp::Attach]),
+                ops: probefleet_coordinator::state::join_ops(&[
+                    AllowedOp::Flash,
+                    AllowedOp::Attach,
+                ]),
                 expires: Some(now + 86_400),
                 created_by: None,
             },
@@ -293,7 +296,7 @@ async fn mint_ci_key(fleet: &Fleet, name: Option<&str>) -> String {
 
 /// The default org's grants, straight from the store.
 async fn grants(fleet: &Fleet) -> Vec<forgs_store::GrantRow> {
-    let ns = fleet_coordinator::subject::ns_of(&fleet.default_org().await).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&fleet.default_org().await).unwrap();
     fleet
         .coord
         .db()
@@ -384,7 +387,7 @@ async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
         ("GITHUB_ENV", github_env.to_string_lossy().into_owned()),
     ]);
 
-    fleet_bin::roles::ci::run(args(&fleet, dir.path()))
+    probefleet::roles::ci::run(args(&fleet, dir.path()))
         .await
         .expect("ci login");
 
@@ -415,7 +418,7 @@ async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
 
     // The token really works: a real `/client` upgrade against the real
     // coordinator, seeing the granted org.
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: fleet.base_url.clone(),
         path: "/client",
         bearer: token_line.to_owned(),
@@ -441,7 +444,7 @@ async fn a_runner_without_id_token_permission_gets_actionable_advice() {
         "GITHUB_ENV",
     ]);
 
-    let err = fleet_bin::roles::ci::run(args(&fleet, dir.path()))
+    let err = probefleet::roles::ci::run(args(&fleet, dir.path()))
         .await
         .expect_err("a runner with no identity must fail");
     let text = format!("{err:#}");
@@ -476,7 +479,7 @@ async fn an_ungranted_repo_is_told_about_the_per_repo_rule() {
     ]);
     let _no_github_env = RunnerEnv::unset(&["GITHUB_ENV"]);
 
-    let err = fleet_bin::roles::ci::run(args(&fleet, dir.path()))
+    let err = probefleet::roles::ci::run(args(&fleet, dir.path()))
         .await
         .expect_err("an ungranted repo must fail");
     let text = format!("{err:#}");
@@ -503,7 +506,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
 
     let mut a = args(&fleet, dir.path());
     a.auth_key = Some(key);
-    fleet_bin::roles::ci::run(a)
+    probefleet::roles::ci::run(a)
         .await
         .expect("ci login --auth-key");
 
@@ -538,7 +541,7 @@ async fn a_named_ci_auth_key_authenticates_as_its_identity() {
 
     let mut a = args(&fleet, dir.path());
     a.auth_key = Some(key);
-    fleet_bin::roles::ci::run(a)
+    probefleet::roles::ci::run(a)
         .await
         .expect("ci login --auth-key");
 

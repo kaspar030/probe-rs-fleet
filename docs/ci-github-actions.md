@@ -152,7 +152,7 @@ log. Off GitHub Actions (no `$GITHUB_ENV`) it prints `export …` lines for
 
 It writes **nothing** to the fleet file. A CI runner's credential comes from the
 environment and lives for one job; the sidecar reads exactly those variables
-(`crates/fleet-sidecar/src/selector.rs`), so nothing else has to know.
+(`crates/probefleet-sidecar/src/selector.rs`), so nothing else has to know.
 
 ### The job must be shorter than the token
 

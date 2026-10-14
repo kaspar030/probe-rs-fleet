@@ -28,9 +28,9 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::OrgId;
-use fleet_proto::token::AllowedOp;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::OrgId;
+use probefleet_proto::token::AllowedOp;
 
 /// Every mutating route this file covers, as `(method, path)`.
 const MUTATING: [(&str, &str); 4] = [
@@ -80,7 +80,7 @@ async fn list_grants(fleet: &TestCoordinator, org: &OrgId) -> Vec<forgs_store::G
     fleet
         .db()
         .forgs()
-        .scoped(fleet_coordinator::subject::ns_of(org).unwrap())
+        .scoped(probefleet_coordinator::subject::ns_of(org).unwrap())
         .list_grants()
         .await
         .unwrap()
@@ -104,12 +104,12 @@ fn auth_key_body(tags: &[&str], ttl_secs: u64) -> String {
 
 /// Take a lease on `board_name` through the real wire surface.
 async fn take_lease(
-    session: &fleet_sidecar::transport::CoordSession,
+    session: &probefleet_sidecar::transport::CoordSession,
     board_name: &str,
-) -> fleet_proto::ids::LeaseId {
-    use fleet_proto::ids::BoardName;
-    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-    use fleet_wire::{CoordToSidecar, SidecarToCoord};
+) -> probefleet_proto::ids::LeaseId {
+    use probefleet_proto::ids::BoardName;
+    use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
     match session
         .request(SidecarToCoord::Lease(LeaseRequest {
@@ -270,7 +270,7 @@ async fn a_revoked_membership_is_refused_like_an_absent_one() {
     fleet
         .db()
         .forgs()
-        .scoped(fleet_coordinator::subject::ns_of(&acme).unwrap())
+        .scoped(probefleet_coordinator::subject::ns_of(&acme).unwrap())
         .remove_member(&forgs::SubjectKey::user(carol_id))
         .await
         .unwrap();
@@ -338,7 +338,7 @@ async fn a_grants_expiry_is_required_and_bounded_on_both_ends() {
         ("exactly now", Some(now)),
         (
             "beyond the cap",
-            Some(now + fleet_coordinator::core::Coordinator::MAX_GRANT_TTL_SECS + 60),
+            Some(now + probefleet_coordinator::core::Coordinator::MAX_GRANT_TTL_SECS + 60),
         ),
     ] {
         let (status, body) = as_browser(
@@ -360,7 +360,7 @@ async fn a_grants_expiry_is_required_and_bounded_on_both_ends() {
         "/api/v1/grants",
         &alice,
         Some(&with_expiry(Some(
-            fleet.coord.now() + fleet_coordinator::core::Coordinator::MAX_GRANT_TTL_SECS,
+            fleet.coord.now() + probefleet_coordinator::core::Coordinator::MAX_GRANT_TTL_SECS,
         ))),
     )
     .await;
@@ -372,7 +372,7 @@ async fn a_grants_expiry_is_required_and_bounded_on_both_ends() {
     let limits = parse(&body);
     assert_eq!(
         limits["max_ttl_secs"],
-        serde_json::json!(fleet_coordinator::core::Coordinator::MAX_GRANT_TTL_SECS),
+        serde_json::json!(probefleet_coordinator::core::Coordinator::MAX_GRANT_TTL_SECS),
     );
     assert_eq!(limits["expires_optional"], false);
     // The *server's* now, not the browser's: the difference is exactly what
@@ -500,7 +500,7 @@ async fn ops_are_normalised_and_an_empty_set_is_refused() {
 
     let stored = list_grants(&fleet, &org).await;
     assert_eq!(stored.len(), 1);
-    let stored_ops = fleet_coordinator::state::parsed_ops(&stored[0].ops);
+    let stored_ops = probefleet_coordinator::state::parsed_ops(&stored[0].ops);
     assert!(
         stored_ops.contains(&AllowedOp::Attach),
         "the stored row must carry the implied attach: {stored_ops:?}"
@@ -1166,7 +1166,7 @@ async fn no_response_body_carries_a_capability_token() {
     // The serve token the coordinator would mint for that lease, derived the
     // way production derives it, so the sweep below tests the real value rather
     // than a hex shape that happens to look like it.
-    let serve_token = fleet_coordinator::auth::serve_token(&common::SEED, lease, &board);
+    let serve_token = probefleet_coordinator::auth::serve_token(&common::SEED, lease, &board);
 
     // Mint the two objects, then sweep everything.
     let (_, created_grant) = as_browser(
@@ -1304,7 +1304,7 @@ fn contains_long_hex_run(body: &str) -> bool {
 /// for the identical operation, not against strings copied out of the source.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_browser_path_audits_exactly_as_the_wire_path_does() {
-    use fleet_wire::{CoordToSidecar, SidecarToCoord};
+    use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
     /// `(action, detail)` for every fleet audit row, in order.
     async fn detailed_rows(fleet: &TestCoordinator) -> Vec<(String, Option<String>)> {

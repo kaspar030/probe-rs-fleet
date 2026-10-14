@@ -25,17 +25,17 @@
 
 use std::sync::Arc;
 
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_coordinator::FleetRole;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::ids::{BoardRef, NodeId, OrgId};
 use forgs::{TokenKind, UserId};
+use probefleet_coordinator::auth::Ed25519Signer;
+use probefleet_coordinator::clock::SystemClock;
+use probefleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
+use probefleet_coordinator::core::Coordinator;
+use probefleet_coordinator::state::Db;
+use probefleet_coordinator::FleetRole;
+use probefleet_core::policy::Policy;
+use probefleet_core::scheduler::Scheduler;
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::ids::{BoardRef, NodeId, OrgId};
 
 /// The signing seed every test coordinator uses.
 pub const SEED: [u8; 32] = [7u8; 32];
@@ -82,10 +82,13 @@ impl TestCoordinator {
         providers: Vec<Arc<dyn forgs_idp::IdentityProvider>>,
     ) -> Self {
         let db = Db::connect_in_memory().await.unwrap();
-        // What `fleet_coordinator::build` does at startup.
-        db.ensure_org_named(&config.default_org, fleet_coordinator::now_epoch_secs())
-            .await
-            .unwrap();
+        // What `probefleet_coordinator::build` does at startup.
+        db.ensure_org_named(
+            &config.default_org,
+            probefleet_coordinator::now_epoch_secs(),
+        )
+        .await
+        .unwrap();
         let coord = Arc::new(
             Coordinator::with_providers(
                 config,
@@ -98,7 +101,7 @@ impl TestCoordinator {
             .unwrap(),
         );
 
-        let router = fleet_coordinator::http::router(Arc::clone(&coord));
+        let router = probefleet_coordinator::http::router(Arc::clone(&coord));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -287,7 +290,7 @@ impl TestCoordinator {
     pub async fn seed_node_at(&self, org: &str, name: &str, issued_at: u64) -> (String, NodeId) {
         let org = self.org(org).await;
         let format = self.auth().format();
-        let token = format.mint(fleet_coordinator::identity::node_token_kind(format));
+        let token = format.mint(probefleet_coordinator::identity::node_token_kind(format));
         let node = self
             .db()
             .register_node(
@@ -323,7 +326,7 @@ impl TestCoordinator {
             .check_payload(purpose, Some(payload))
             .unwrap();
         let token = self.auth().format().mint(TokenKind::ApiKey);
-        let ns = fleet_coordinator::subject::ns_of(org).unwrap();
+        let ns = probefleet_coordinator::subject::ns_of(org).unwrap();
         self.db()
             .forgs()
             .scoped(ns)
@@ -355,7 +358,7 @@ impl TestCoordinator {
         let org = self.org(org).await;
         self.insert_key(
             &org,
-            fleet_coordinator::identity::PURPOSE_NODE,
+            probefleet_coordinator::identity::PURPOSE_NODE,
             &serde_json::json!({ "tags": tags }),
             single_use,
             expires,
@@ -387,7 +390,7 @@ impl TestCoordinator {
         let org = self.org(org).await;
         self.insert_key(
             &org,
-            fleet_coordinator::identity::PURPOSE_CI,
+            probefleet_coordinator::identity::PURPOSE_CI,
             &serde_json::json!({ "tags": tags }),
             false,
             expires,
@@ -404,18 +407,18 @@ impl TestCoordinator {
         org: &str,
         repo: &str,
         selector: &str,
-        ops: &[fleet_proto::token::AllowedOp],
+        ops: &[probefleet_proto::token::AllowedOp],
         expires: Option<u64>,
     ) -> String {
         let org = self.org(org).await;
         let normalised = forgs::subject::normalise_repo(repo)
             .unwrap_or_else(|| panic!("{repo} is not a valid owner/name"));
         let subject = forgs::subject::workload_subject_key(&normalised);
-        let selector = fleet_proto::lease::parse_constraint(selector)
+        let selector = probefleet_proto::lease::parse_constraint(selector)
             .unwrap()
             .to_string();
         let now = self.now();
-        let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+        let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
         self.db()
             .forgs()
             .scoped(ns)
@@ -423,7 +426,7 @@ impl TestCoordinator {
                 &forgs_store::NewGrant {
                     subject,
                     selector,
-                    ops: fleet_coordinator::state::join_ops(ops),
+                    ops: probefleet_coordinator::state::join_ops(ops),
                     expires: expires.or(Some(now + 86_400)),
                     created_by: None,
                 },
@@ -476,9 +479,9 @@ impl TestCoordinator {
         tags: &[&str],
         model: Option<&str>,
     ) -> BoardRef {
-        use fleet_proto::board::{Board, BoardState, PowerKind};
+        use probefleet_proto::board::{Board, BoardState, PowerKind};
 
-        let node = fleet_coordinator::node_id_for(org, node);
+        let node = probefleet_coordinator::node_id_for(org, node);
         let now = i64::try_from(self.now()).unwrap();
         self.db()
             .scoped(org.clone())
@@ -497,7 +500,11 @@ impl TestCoordinator {
         };
         self.db()
             .scoped(org.clone())
-            .record_board(&board, fleet_proto::node_api::BoardPresence::Online, now)
+            .record_board(
+                &board,
+                probefleet_proto::node_api::BoardPresence::Online,
+                now,
+            )
             .await
             .unwrap();
         let id = board.id.clone();
@@ -515,12 +522,17 @@ impl TestCoordinator {
         &self,
         path: &str,
         bearer: &str,
-    ) -> Result<(fleet_wire::client::DialedTx, fleet_wire::client::DialedRx), fleet_wire::WireError>
-    {
+    ) -> Result<
+        (
+            probefleet_wire::client::DialedTx,
+            probefleet_wire::client::DialedRx,
+        ),
+        probefleet_wire::WireError,
+    > {
         // `DialOpts::path` is `'static` for production's fixed routes; a test
         // leaks its few dynamic ones.
         let path: &'static str = Box::leak(path.to_owned().into_boxed_str());
-        fleet_wire::client::dial(fleet_wire::client::DialOpts {
+        probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
             url: self.base_url.clone(),
             path,
             bearer: bearer.to_owned(),
@@ -639,7 +651,10 @@ impl TestCoordinator {
 
     /// Open a `/client` session as the holder of `bearer`, acting in its
     /// default org (a user's personal org; a workload's none).
-    pub async fn client_session(&self, bearer: &str) -> fleet_sidecar::transport::CoordSession {
+    pub async fn client_session(
+        &self,
+        bearer: &str,
+    ) -> probefleet_sidecar::transport::CoordSession {
         self.client_session_at("/client", bearer).await
     }
 
@@ -648,7 +663,7 @@ impl TestCoordinator {
         &self,
         bearer: &str,
         org: &str,
-    ) -> fleet_sidecar::transport::CoordSession {
+    ) -> probefleet_sidecar::transport::CoordSession {
         self.client_session_at(&format!("/client?org={org}"), bearer)
             .await
     }
@@ -657,9 +672,9 @@ impl TestCoordinator {
         &self,
         path: &str,
         bearer: &str,
-    ) -> fleet_sidecar::transport::CoordSession {
+    ) -> probefleet_sidecar::transport::CoordSession {
         let (tx, rx) = self.dial(path, bearer).await.unwrap();
-        fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
+        probefleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
             .await
             .unwrap()
     }
@@ -684,12 +699,12 @@ impl TestCoordinator {
 /// A stand-in for a connected node, registered directly in the coordinator's
 /// registry.
 pub struct NodeStub {
-    rx: tokio::sync::mpsc::Receiver<fleet_coordinator::registry::NodeMessage>,
+    rx: tokio::sync::mpsc::Receiver<probefleet_coordinator::registry::NodeMessage>,
 }
 
 /// What a node was told to open, as observed by a [`NodeStub`].
 pub struct OpenedSession {
-    pub channel: fleet_proto::ChannelId,
+    pub channel: probefleet_proto::ChannelId,
     pub token: Vec<u8>,
     pub serve_token: String,
 }
@@ -703,7 +718,7 @@ impl NodeStub {
             .nodes()
             .insert(
                 node.clone(),
-                fleet_coordinator::registry::NodeHandle::new(tx),
+                probefleet_coordinator::registry::NodeHandle::new(tx),
             )
             .await;
         Self { rx }
@@ -712,8 +727,8 @@ impl NodeStub {
     /// Await the next `OpenSession` command.
     pub async fn expect_open_session(&mut self) -> OpenedSession {
         match self.rx.recv().await.expect("node connection closed") {
-            fleet_coordinator::registry::NodeMessage::Command(
-                fleet_proto::CoordinatorCommand::OpenSession {
+            probefleet_coordinator::registry::NodeMessage::Command(
+                probefleet_proto::CoordinatorCommand::OpenSession {
                     channel,
                     token,
                     serve_token,
@@ -729,20 +744,20 @@ impl NodeStub {
     }
 
     /// Await the next `PowerCycle` command, returning the board name.
-    pub async fn expect_power_cycle(&mut self) -> fleet_proto::ids::BoardName {
+    pub async fn expect_power_cycle(&mut self) -> probefleet_proto::ids::BoardName {
         match self.rx.recv().await.expect("node connection closed") {
-            fleet_coordinator::registry::NodeMessage::Command(
-                fleet_proto::CoordinatorCommand::PowerCycle { board },
+            probefleet_coordinator::registry::NodeMessage::Command(
+                probefleet_proto::CoordinatorCommand::PowerCycle { board },
             ) => board,
             other => panic!("expected PowerCycle, got {other:?}"),
         }
     }
 
     /// Await the next `KillSession` command, returning the channel.
-    pub async fn expect_kill_session(&mut self) -> fleet_proto::ChannelId {
+    pub async fn expect_kill_session(&mut self) -> probefleet_proto::ChannelId {
         match self.rx.recv().await.expect("node connection closed") {
-            fleet_coordinator::registry::NodeMessage::Command(
-                fleet_proto::CoordinatorCommand::KillSession { channel },
+            probefleet_coordinator::registry::NodeMessage::Command(
+                probefleet_proto::CoordinatorCommand::KillSession { channel },
             ) => channel,
             other => panic!("expected KillSession, got {other:?}"),
         }

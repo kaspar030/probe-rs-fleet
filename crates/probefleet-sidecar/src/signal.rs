@@ -8,8 +8,8 @@
 //! cover SIGKILL; that case is bounded by the lease TTL instead, which is why
 //! the sidecar no longer requests a hardcoded hour.
 //!
-//! `fleet-bin`'s daemon roles use the same plumbing through
-//! `fleet_bin::signal::shutdown`, which delegates here so the two cannot drift.
+//! `probefleet`'s daemon roles use the same plumbing through
+//! `probefleet::signal::shutdown`, which delegates here so the two cannot drift.
 
 /// Wait for a shutdown signal, returning the signal number that fired.
 ///

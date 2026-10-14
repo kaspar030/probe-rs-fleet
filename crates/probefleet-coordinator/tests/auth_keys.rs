@@ -21,9 +21,9 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::auth_api::NodeTokenResponse;
 use forgs::api::{ApiKeyCreated, ApiKeyList, ApiKeyRevoked};
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::auth_api::NodeTokenResponse;
 
 /// A day, comfortably inside the cap.
 const DAY: u64 = 86_400;
@@ -116,7 +116,7 @@ async fn a_member_mints_a_node_key_that_enrolls_into_the_keys_org() {
     assert!(resp.token.starts_with("prfn1_"));
     assert_eq!(
         resp.node_id,
-        fleet_coordinator::node_id_for(&acme, "rpi-lab-1").0
+        probefleet_coordinator::node_id_for(&acme, "rpi-lab-1").0
     );
 
     // ... and the key's tags reached the node row.

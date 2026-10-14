@@ -1,7 +1,7 @@
 //! Shell completion end to end, through the **real** `COMPLETE=<shell>`
 //! protocol.
 //!
-//! The unit tests in `fleet_bin::completion` call the candidate providers
+//! The unit tests in `probefleet::completion` call the candidate providers
 //! directly, so they never exercise the part that actually has to work: the
 //! shell setting `COMPLETE`, the binary noticing before it does anything else,
 //! and clap's engine mapping a half-typed command line onto our candidates.
@@ -233,7 +233,7 @@ fn ops_complete_from_the_protocol_definition() {
         dir.path(),
         &["probe-rs-fleet", "ctl", "delegate", "--ops", ""],
     );
-    for op in fleet_proto::token::AllowedOp::all() {
+    for op in probefleet_proto::token::AllowedOp::all() {
         assert!(
             got.contains(&op.as_str().to_owned()),
             "missing {op} in {got:?}"

@@ -22,7 +22,7 @@
 mod common;
 
 use common::TestCoordinator;
-use fleet_coordinator::FleetRole;
+use probefleet_coordinator::FleetRole;
 
 /// Every read-only route, for the assertions that hold across all of them.
 const READ_ROUTES: [&str; 6] = [
@@ -63,10 +63,10 @@ fn parse(body: &str) -> serde_json::Value {
 /// Remove `user` from `org` through forgs' store.
 async fn remove_member(
     fleet: &TestCoordinator,
-    org: &fleet_proto::ids::OrgId,
+    org: &probefleet_proto::ids::OrgId,
     user: forgs::UserId,
 ) {
-    let ns = fleet_coordinator::subject::ns_of(org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(org).unwrap();
     assert!(fleet
         .db()
         .forgs()
@@ -308,13 +308,14 @@ async fn audit_is_admin_only_and_filters_by_board() {
     let org = fleet.org("acme").await;
     let admin = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
     let member = fleet.seed_session("acme", "bob", FleetRole::Member).await;
-    let alice_key = fleet_coordinator::subject::user_key(fleet.user("alice").await).to_string();
+    let alice_key =
+        probefleet_coordinator::subject::user_key(fleet.user("alice").await).to_string();
     let node = format!("{}/rpi-1", org.0);
 
     fleet
         .db()
         .scoped(org.clone())
-        .append_audit(&fleet_coordinator::state::AuditEntry {
+        .append_audit(&probefleet_coordinator::state::AuditEntry {
             ts: 100,
             subject: Some(&alice_key),
             action: "board.power-cycle",
@@ -328,7 +329,7 @@ async fn audit_is_admin_only_and_filters_by_board() {
     fleet
         .db()
         .scoped(org.clone())
-        .append_audit(&fleet_coordinator::state::AuditEntry {
+        .append_audit(&probefleet_coordinator::state::AuditEntry {
             ts: 101,
             subject: Some(&alice_key),
             action: "lease.release",
@@ -434,7 +435,8 @@ async fn one_orgs_session_sees_nothing_of_another() {
     let _mallory = fleet
         .seed_session("globex", "mallory", FleetRole::Admin)
         .await;
-    let mallory_key = fleet_coordinator::subject::user_key(fleet.user("mallory").await).to_string();
+    let mallory_key =
+        probefleet_coordinator::subject::user_key(fleet.user("mallory").await).to_string();
     let node_b = format!("{}/rpi-b", org_b.0);
 
     // Org B has a node, a board and an audit row; org A has nothing at all.
@@ -442,7 +444,7 @@ async fn one_orgs_session_sees_nothing_of_another() {
     fleet
         .db()
         .scoped(org_b.clone())
-        .append_audit(&fleet_coordinator::state::AuditEntry {
+        .append_audit(&probefleet_coordinator::state::AuditEntry {
             ts: 100,
             subject: Some(&mallory_key),
             action: "board.power-cycle",

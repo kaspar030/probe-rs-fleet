@@ -21,7 +21,7 @@ use std::sync::Arc;
 use serde_json::json;
 
 use common::TestCoordinator;
-use fleet_coordinator::FleetRole;
+use probefleet_coordinator::FleetRole;
 
 /// Pull one `Set-Cookie` value by cookie name.
 fn set_cookie<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
@@ -281,10 +281,10 @@ async fn the_providers_route_lists_what_is_configured() {
         "client-secret",
     ))
     .unwrap();
-    let config = fleet_coordinator::config::CoordinatorConfig {
+    let config = probefleet_coordinator::config::CoordinatorConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         sqlite_path: ":memory:".into(),
-        signing_key: fleet_coordinator::config::SigningKeySource::Seed(common::SEED),
+        signing_key: probefleet_coordinator::config::SigningKeySource::Seed(common::SEED),
         csrf_secret: Some(common::CSRF_SECRET.to_vec()),
         ..Default::default()
     };

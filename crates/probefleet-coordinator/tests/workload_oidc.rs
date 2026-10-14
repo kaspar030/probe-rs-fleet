@@ -44,12 +44,12 @@ use base64::Engine as _;
 use serde_json::{json, Value};
 
 use common::TestCoordinator;
-use fleet_coordinator::config::GithubActionsConfig;
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::OrgId;
-use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-use fleet_proto::token::AllowedOp;
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_coordinator::config::GithubActionsConfig;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::OrgId;
+use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use probefleet_proto::token::AllowedOp;
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -330,7 +330,7 @@ async fn grant_ariel(fleet: &TestCoordinator, ops: &[AllowedOp]) -> String {
 
 /// `org`'s grants, straight from forgs' store.
 async fn grants_of(fleet: &TestCoordinator, org: &OrgId) -> Vec<forgs_store::GrantRow> {
-    let ns = fleet_coordinator::subject::ns_of(org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(org).unwrap();
     fleet.db().forgs().scoped(ns).list_grants().await.unwrap()
 }
 
@@ -369,8 +369,8 @@ fn lease_by_tag(tag: &str, priority: Priority) -> SidecarToCoord {
 }
 
 async fn lease_nrf52(
-    ci: &fleet_sidecar::transport::CoordSession,
-) -> fleet_proto::lease::LeaseGrant {
+    ci: &probefleet_sidecar::transport::CoordSession,
+) -> probefleet_proto::lease::LeaseGrant {
     match ci
         .request(lease_by_tag("nrf52", Priority::Interactive))
         .await
@@ -381,7 +381,7 @@ async fn lease_nrf52(
     }
 }
 
-async fn lease_is_gone(fleet: &TestCoordinator, lease: fleet_proto::ids::LeaseId) -> bool {
+async fn lease_is_gone(fleet: &TestCoordinator, lease: probefleet_proto::ids::LeaseId) -> bool {
     fleet
         .coord
         .scheduler()
@@ -855,7 +855,7 @@ async fn an_expired_workload_token_is_refused_and_swept() {
         .await;
     assert_eq!(fleet.upgrade_status("/client", Some(&token)).await, 401);
 
-    fleet_coordinator::sweep::sweep_once(&fleet.coord).await;
+    probefleet_coordinator::sweep::sweep_once(&fleet.coord).await;
     let hash = fleet.auth().format().parse(&token).unwrap().hash();
     let left: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM forgs_workload_token WHERE token_hash = ?1")
@@ -1250,7 +1250,7 @@ async fn a_ci_key_with_no_tags_cannot_be_redeemed() {
     // second belt, for a key that reached the table some other way (a shell
     // insert, a hand-edited row).
     let token = fleet.auth().format().mint(forgs::TokenKind::ApiKey);
-    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
     fleet
         .db()
         .forgs()
@@ -1258,7 +1258,7 @@ async fn a_ci_key_with_no_tags_cannot_be_redeemed() {
         .insert_api_key(
             &forgs_store::NewApiKey {
                 hash: token.hash(),
-                purpose: fleet_coordinator::identity::PURPOSE_CI.to_owned(),
+                purpose: probefleet_coordinator::identity::PURPOSE_CI.to_owned(),
                 subject_name: None,
                 payload: Some(r#"{"tags":[]}"#.to_owned()),
                 single_use: false,
@@ -1536,10 +1536,13 @@ async fn an_unnamed_ci_key_has_a_hash_derived_identity() {
     assert_eq!(grants.len(), 1);
     let subject = format!("{}/workload:key:{}", org.0, &hash[..8]);
     assert_eq!(grants[0].subject, subject);
-    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
     assert_eq!(
         grants[0].id,
-        fleet_coordinator::identity::ci_grant_id(ns, &forgs::SubjectKey::parse(&subject).unwrap())
+        probefleet_coordinator::identity::ci_grant_id(
+            ns,
+            &forgs::SubjectKey::parse(&subject).unwrap()
+        )
     );
     assert_eq!(grants[0].selector, "tag=nrf52");
 }

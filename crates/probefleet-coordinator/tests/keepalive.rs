@@ -18,8 +18,8 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::node_api::NodeReport;
-use fleet_wire::{NodeToCoord, WireEvent, WireRx, WireTx};
+use probefleet_proto::node_api::NodeReport;
+use probefleet_wire::{NodeToCoord, WireEvent, WireRx, WireTx};
 
 /// An idle connection stays up: the coordinator pings, tungstenite answers
 /// automatically, and nothing is dropped.
@@ -35,11 +35,11 @@ async fn an_idle_connection_survives_several_ping_intervals() {
     let (mut tx, mut rx) = fleet.dial("/agent", &token).await.unwrap();
 
     // Register, then go completely silent at the application level.
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::Register {
             node: node.clone(),
-            protocol_version: fleet_proto::PROTOCOL_VERSION,
+            protocol_version: probefleet_proto::PROTOCOL_VERSION,
         }),
     )
     .await
@@ -82,11 +82,11 @@ async fn a_peer_that_never_pongs_is_eventually_dropped() {
     let (token, node) = fleet.seed_node("default", "rpi-1").await;
 
     let (mut tx, rx) = fleet.dial("/agent", &token).await.unwrap();
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::Register {
             node: node.clone(),
-            protocol_version: fleet_proto::PROTOCOL_VERSION,
+            protocol_version: probefleet_proto::PROTOCOL_VERSION,
         }),
     )
     .await
@@ -131,7 +131,7 @@ async fn inbound_traffic_counts_as_liveness() {
 
     // Heartbeat faster than the pong timeout for a few rounds.
     for _ in 0..8 {
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut tx,
             &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )

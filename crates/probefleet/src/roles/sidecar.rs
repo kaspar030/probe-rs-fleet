@@ -4,7 +4,7 @@
 //! or `probe-rs-fleet sidecar -- <args…>`. In both cases `probe_rs_args` holds
 //! only the probe-rs arguments *after* the program name; we prepend a synthetic
 //! `probe-rs` program token to form the full argv that
-//! [`fleet_sidecar::run_async`] expects (its parser treats `argv[0]` as the
+//! [`probefleet_sidecar::run_async`] expects (its parser treats `argv[0]` as the
 //! program name).
 //!
 //! # Selecting the board
@@ -23,7 +23,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 
-use fleet_sidecar::selector::{env, EnvSource, ProcessEnv};
+use probefleet_sidecar::selector::{env, EnvSource, ProcessEnv};
 
 /// The sidecar's CLI selector flags: `--board` (a board **model**), `--id` (one
 /// board instance) and `--select` (a full expression).
@@ -58,12 +58,12 @@ impl SelectorFlags {
 
     /// Validate a `--select` expression eagerly, so a typo names the *flag*.
     ///
-    /// [`fleet_sidecar::selector::resolve`] would reject it too, but its error
+    /// [`probefleet_sidecar::selector::resolve`] would reject it too, but its error
     /// talks about `PROBE_RS_FLEET_SELECT`, which is confusing when the value
     /// came from the command line.
     fn validate(&self) -> Result<()> {
         if let Some(expr) = &self.select {
-            fleet_proto::lease::parse_constraint(expr)
+            probefleet_proto::lease::parse_constraint(expr)
                 .with_context(|| format!("invalid --select {expr:?}"))?;
         }
         Ok(())
@@ -109,7 +109,7 @@ impl<E: EnvSource> EnvSource for SelectorOverride<E> {
 /// Run the sidecar shim, returning the probe-rs exit code to propagate.
 ///
 /// `async` so the fleet data/gdb path runs on the binary's existing tokio
-/// runtime via [`fleet_sidecar::run_async`] instead of building a nested
+/// runtime via [`probefleet_sidecar::run_async`] instead of building a nested
 /// runtime (which would panic with "Cannot start a runtime from within a
 /// runtime").
 ///
@@ -151,7 +151,7 @@ pub async fn run(
     argv.push(OsString::from("probe-rs"));
     argv.extend(probe_rs_args);
 
-    let code = fleet_sidecar::run_async(argv, &flags.over(ProcessEnv)).await?;
+    let code = probefleet_sidecar::run_async(argv, &flags.over(ProcessEnv)).await?;
     Ok(exit_code_from_i32(code))
 }
 
@@ -230,7 +230,7 @@ async fn resolve_client_config(fleet: &str) -> Option<(String, String, Option<St
 
 /// [`resolve_client_config`], exposed for the end-to-end test.
 ///
-/// Exposed the way `fleet_coordinator::state::Db::pool_for_test` is: the
+/// Exposed the way `probefleet_coordinator::state::Db::pool_for_test` is: the
 /// reported failure — an expired `[user]` session on a workstation whose only
 /// fleet use is the shim — is *this function's* behaviour, and asserting it
 /// against a live coordinator is the only test that would actually have caught
@@ -336,9 +336,9 @@ mod tests {
     //
     // Pure overlay tests: no process-env mutation, so these are parallel-safe.
 
-    use fleet_proto::ids::BoardName;
-    use fleet_proto::lease::Constraint;
-    use fleet_sidecar::selector::{resolve, Resolution, SelectorError};
+    use probefleet_proto::ids::BoardName;
+    use probefleet_proto::lease::Constraint;
+    use probefleet_sidecar::selector::{resolve, Resolution, SelectorError};
 
     /// A closure-backed [`EnvSource`] over a fixed key/value list.
     fn map_env(pairs: &'static [(&'static str, &'static str)]) -> impl EnvSource {

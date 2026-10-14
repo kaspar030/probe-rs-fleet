@@ -27,9 +27,9 @@ mod common;
 
 use common::{NodeStub, TestCoordinator};
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::LeaseId;
-use fleet_proto::token::AllowedOp;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::LeaseId;
+use probefleet_proto::token::AllowedOp;
 
 /// Every mutating route this file covers, as `(method, path)`.
 const MUTATING: [(&str, &str); 2] = [
@@ -68,10 +68,13 @@ fn power_cycle_body(board: &str) -> String {
 
 /// Take a lease on `board_name` through the real wire surface, so the
 /// scheduler, the `leases` table and the audit log all agree it exists.
-async fn take_lease(session: &fleet_sidecar::transport::CoordSession, board_name: &str) -> LeaseId {
-    use fleet_proto::ids::BoardName;
-    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-    use fleet_wire::{CoordToSidecar, SidecarToCoord};
+async fn take_lease(
+    session: &probefleet_sidecar::transport::CoordSession,
+    board_name: &str,
+) -> LeaseId {
+    use probefleet_proto::ids::BoardName;
+    use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
     match session
         .request(SidecarToCoord::Lease(LeaseRequest {
@@ -388,7 +391,7 @@ async fn power_cycle_rejects_a_non_member_and_a_malformed_body() {
     let removed = fleet
         .db()
         .forgs()
-        .scoped(fleet_coordinator::subject::ns_of(&org).unwrap())
+        .scoped(probefleet_coordinator::subject::ns_of(&org).unwrap())
         .remove_member(&forgs::SubjectKey::user(carol_id))
         .await
         .unwrap();

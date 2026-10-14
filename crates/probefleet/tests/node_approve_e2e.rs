@@ -10,7 +10,7 @@
 //!
 //! Modelled on `share_e2e.rs`. As there, `login --token` stands in for the
 //! device flow (covered against a stub GitHub in
-//! `fleet-coordinator/tests/device_flow.rs`), and the sessions are minted far
+//! `probefleet-coordinator/tests/device_flow.rs`), and the sessions are minted far
 //! from expiry so `ensure_fresh_session` never writes to the real XDG path.
 //!
 //! **How the approver learns the code.** `node up` prints it, and a sibling
@@ -24,10 +24,10 @@ mod common;
 use std::time::Duration;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{LoginArgs, NodeApproveArgs, NodeUpFlags};
-use fleet_coordinator::FleetRole;
-use fleet_proto::auth_api::NodeRegisterStartRequest;
-use fleet_proto::ids::NodeId;
+use probefleet::cli::{LoginArgs, NodeApproveArgs, NodeUpFlags};
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::auth_api::NodeRegisterStartRequest;
+use probefleet_proto::ids::NodeId;
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -39,7 +39,7 @@ async fn mint_user_token(fleet: &Fleet, login: &str) -> String {
 /// Run `login --token` into `config_dir`.
 async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str) {
     let token = mint_user_token(fleet, login_name).await;
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token),
@@ -113,13 +113,13 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
     let args = up_args(&fleet, "rpi-lab-3");
     let pi_dir = pi.clone();
     let bootstrap = tokio::spawn(async move {
-        fleet_bin::roles::node_up::bootstrap(&args, "default", Some(&pi_dir)).await
+        probefleet::roles::node_up::bootstrap(&args, "default", Some(&pi_dir)).await
     });
 
     // The laptop: read the code (as a human would off the Pi's screen) and
     // approve.
     let code = await_pending_code(&fleet, "rpi-lab-3").await;
-    fleet_bin::roles::node_approve::run(&approve_args(&laptop, &code))
+    probefleet::roles::node_approve::run(&approve_args(&laptop, &code))
         .await
         .expect("node approve");
 
@@ -128,7 +128,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
         .unwrap()
         .expect("node up must finish once the registration is approved");
 
-    let node = fleet_bin::fleet_config::load(&pi.join("default.toml"))
+    let node = probefleet::fleet_config::load(&pi.join("default.toml"))
         .unwrap()
         .node
         .expect("[node] was written");
@@ -137,7 +137,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
 
     // The credential works against the live coordinator: a real token, not a
     // plausible-looking string.
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: fleet.base_url.clone(),
         path: "/agent",
         bearer: node.node_token.clone(),
@@ -158,7 +158,7 @@ async fn a_headless_machine_is_approved_from_a_logged_in_laptop() {
         .unwrap()
         .unwrap();
     assert_eq!(org, default_org);
-    assert_eq!(adopt, fleet_proto::AdoptPolicy::Auto);
+    assert_eq!(adopt, probefleet_proto::AdoptPolicy::Auto);
     assert_eq!(
         fleet
             .coord
@@ -188,13 +188,13 @@ async fn a_denied_machine_is_told_and_gives_up() {
     let args = up_args(&fleet, "rpi-lab-4");
     let pi_dir = pi.clone();
     let bootstrap = tokio::spawn(async move {
-        fleet_bin::roles::node_up::bootstrap(&args, "default", Some(&pi_dir)).await
+        probefleet::roles::node_up::bootstrap(&args, "default", Some(&pi_dir)).await
     });
 
     let code = await_pending_code(&fleet, "rpi-lab-4").await;
     let mut deny = approve_args(&laptop, &code);
     deny.deny = true;
-    fleet_bin::roles::node_approve::run(&deny)
+    probefleet::roles::node_approve::run(&deny)
         .await
         .expect("node approve --deny");
 
@@ -229,7 +229,7 @@ async fn approving_requires_membership_of_the_org_the_node_would_join() {
         .await
         .unwrap()
         .token;
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token),
@@ -243,8 +243,8 @@ async fn approving_requires_membership_of_the_org_the_node_would_join() {
     .expect("login --token");
 
     // Start a registration directly: no `node up` task to leave running.
-    let client = fleet_bin::node_client::client(&fleet.base_url, None).unwrap();
-    let grant = fleet_bin::node_client::register_start(
+    let client = probefleet::node_client::client(&fleet.base_url, None).unwrap();
+    let grant = probefleet::node_client::register_start(
         &client,
         &NodeRegisterStartRequest {
             node_name: "rpi-lab-5".to_owned(),
@@ -255,7 +255,7 @@ async fn approving_requires_membership_of_the_org_the_node_would_join() {
     .await
     .expect("node register start");
 
-    let err = fleet_bin::roles::node_approve::run(&approve_args(&stranger_dir, &grant.user_code))
+    let err = probefleet::roles::node_approve::run(&approve_args(&stranger_dir, &grant.user_code))
         .await
         .expect_err("a non-member must not approve");
     let rendered = format!("{err:#}");
@@ -267,7 +267,7 @@ async fn approving_requires_membership_of_the_org_the_node_would_join() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mistyped_code_is_refused_with_the_shape_it_should_have() {
     let tmp = tempfile::tempdir().unwrap();
-    let err = fleet_bin::roles::node_approve::run(&approve_args(tmp.path(), "nope"))
+    let err = probefleet::roles::node_approve::run(&approve_args(tmp.path(), "nope"))
         .await
         .expect_err("a malformed code");
     let rendered = format!("{err:#}");

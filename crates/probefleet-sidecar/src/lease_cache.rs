@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 
-use fleet_proto::ids::SubjectKey;
-use fleet_proto::lease::{Constraint, LeaseGrant};
+use probefleet_proto::ids::SubjectKey;
+use probefleet_proto::lease::{Constraint, LeaseGrant};
 
 /// Cache key: a stable fingerprint of the selector plus the calling subject.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,7 +44,7 @@ impl CacheKey {
 ///
 /// # Not the same job as `Constraint`'s `Display`
 ///
-/// [`fleet_proto::lease::Constraint`] gained a canonical, **round-trippable**
+/// [`probefleet_proto::lease::Constraint`] gained a canonical, **round-trippable**
 /// rendering in architecture §6.5, which is what a grant stores and what the
 /// evaluator re-parses. This function is a *cache key*: it sorts and dedups
 /// tags for set-equality, which is exactly what a cache wants and exactly what
@@ -169,7 +169,9 @@ impl LeaseCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey, SubjectKind};
+    use probefleet_proto::ids::{
+        BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey, SubjectKind,
+    };
 
     fn subject(holder: &str) -> SubjectKey {
         subject_in("default", holder)

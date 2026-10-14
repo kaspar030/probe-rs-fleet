@@ -9,15 +9,15 @@
 //! (`crate::http::acting_subject`). A node acts in its own node's org; a
 //! workload acts in none and reaches boards only through grants.
 //!
-//! [`fleet_proto::ids::SubjectKey`] is the wire mirror of
+//! [`probefleet_proto::ids::SubjectKey`] is the wire mirror of
 //! [`forgs::SubjectKey`] and renders identically, so the conversions here are
 //! a render + parse; a key that does not survive the round trip is dropped
 //! closed (`None`).
 
 use std::fmt;
 
-use fleet_proto::ids::{NodeId, OrgId, SubjectKey, SubjectKind};
 use forgs::{NsNodeId, Role, RoleLadder, UserId};
+use probefleet_proto::ids::{NodeId, OrgId, SubjectKey, SubjectKind};
 
 /// fleet's one app subject kind, and the label of the node token kind.
 pub const NODE_KIND: &str = "node";

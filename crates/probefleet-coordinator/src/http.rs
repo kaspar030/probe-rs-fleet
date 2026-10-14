@@ -51,13 +51,13 @@ use forgs::TokenKind;
 use forgs_http::{Caller, Carrier, JsonBody};
 use tracing::{debug, info, warn};
 
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::auth_api::{
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::auth_api::{
     NodeApprovalDecision, NodeApprovalRequest, NodeApprovalResponse, NodeEnrollRequest,
     NodeRegisterPollRequest, NodeRegisterStartRequest, NodeRegisterStartResponse,
     SelfRegisterRequest,
 };
-use fleet_proto::ids::{NodeId, OrgId};
+use probefleet_proto::ids::{NodeId, OrgId};
 
 use crate::core::Coordinator;
 use crate::identity::{NodeKeyPayload, PendingNodePayload, PURPOSE_NODE};
@@ -193,15 +193,15 @@ async fn node_ws(
     );
     info!(%node_id, %org, "node connected");
 
-    ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
-        .max_frame_size(fleet_wire::MAX_FRAME_LEN)
+    ws.max_message_size(probefleet_wire::MAX_FRAME_LEN)
+        .max_frame_size(probefleet_wire::MAX_FRAME_LEN)
         .on_upgrade(move |socket| async move {
             let (tx, rx) = crate::ws_axum::split(socket);
             if let Err(e) =
                 crate::server::handle_node(coord, Box::new(tx), Box::new(rx), node_id.clone(), auth)
                     .await
             {
-                if fleet_wire::is_benign_close(&e.as_wire()) {
+                if probefleet_wire::is_benign_close(&e.as_wire()) {
                     debug!(%node_id, "node connection closed");
                 } else {
                     debug!(%node_id, error = %e, "node connection closed");
@@ -241,14 +241,14 @@ async fn client_ws(
     };
     debug!(%subject, "client connected");
 
-    ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
-        .max_frame_size(fleet_wire::MAX_FRAME_LEN)
+    ws.max_message_size(probefleet_wire::MAX_FRAME_LEN)
+        .max_frame_size(probefleet_wire::MAX_FRAME_LEN)
         .on_upgrade(move |socket| async move {
             let (tx, rx) = crate::ws_axum::split(socket);
             if let Err(e) =
                 crate::server::handle_sidecar(coord, Box::new(tx), Box::new(rx), subject).await
             {
-                if fleet_wire::is_benign_close(&e.as_wire()) {
+                if probefleet_wire::is_benign_close(&e.as_wire()) {
                     tracing::trace!("client connection closed by peer");
                 } else {
                     debug!(error = %e, "client connection closed");
@@ -261,7 +261,7 @@ async fn client_ws(
 ///
 /// The one authenticated route that mints **no subject** (see the module
 /// docs). The bearer is the hex-encoded wire form of a
-/// [`fleet_proto::token::SignedToken`]; the coordinator verifies the signature
+/// [`probefleet_proto::token::SignedToken`]; the coordinator verifies the signature
 /// with its own key — it minted the token, so no new key material is involved
 /// — and checks expiry. Everything else the connection may do is enforced by
 /// [`crate::server::handle_delegate`]'s message allowlist.
@@ -275,7 +275,7 @@ async fn delegate_ws(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    use fleet_proto::token::{SignedToken, TokenVerifier as _};
+    use probefleet_proto::token::{SignedToken, TokenVerifier as _};
 
     let bearer = bearer_of(&headers).unwrap_or("");
     let Some(wire) = decode_hex(bearer) else {
@@ -309,14 +309,14 @@ async fn delegate_ws(
     }
     debug!(lease = ?token.lease, board = %token.board, "delegated connection");
 
-    ws.max_message_size(fleet_wire::MAX_FRAME_LEN)
-        .max_frame_size(fleet_wire::MAX_FRAME_LEN)
+    ws.max_message_size(probefleet_wire::MAX_FRAME_LEN)
+        .max_frame_size(probefleet_wire::MAX_FRAME_LEN)
         .on_upgrade(move |socket| async move {
             let (tx, rx) = crate::ws_axum::split(socket);
             if let Err(e) =
                 crate::server::handle_delegate(coord, Box::new(tx), Box::new(rx), token).await
             {
-                if fleet_wire::is_benign_close(&e.as_wire()) {
+                if probefleet_wire::is_benign_close(&e.as_wire()) {
                     tracing::trace!("delegated connection closed by peer");
                 } else {
                     debug!(error = %e, "delegated connection closed");

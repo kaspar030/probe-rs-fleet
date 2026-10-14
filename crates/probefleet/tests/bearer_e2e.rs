@@ -17,14 +17,14 @@
 //!    its own route.
 //!
 //! `login --token` rather than the device flow: the flow itself is covered
-//! against a stub GitHub in `fleet-coordinator/tests/device_flow.rs`, and these
+//! against a stub GitHub in `probefleet-coordinator/tests/device_flow.rs`, and these
 //! tests are about the *file* the CLI writes.
 
 mod common;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{LoginArgs, NodeUpFlags};
-use fleet_coordinator::FleetRole;
+use probefleet::cli::{LoginArgs, NodeUpFlags};
+use probefleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [11u8; 32];
 
@@ -51,7 +51,7 @@ async fn auth_key_to_node_up_yields_a_working_node_token() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("agent");
 
-    fleet_bin::roles::node_up::bootstrap(
+    probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(key),
@@ -74,7 +74,7 @@ async fn auth_key_to_node_up_yields_a_working_node_token() {
 
     // The written fleet file parses ...
     let config_path = config_dir.join("default.toml");
-    let file = fleet_bin::fleet_config::load(&config_path).unwrap();
+    let file = probefleet::fleet_config::load(&config_path).unwrap();
     assert_eq!(file.url, fleet.base_url);
     let node = file.node.clone().expect("[node] table");
     assert!(node.node_token.starts_with("prfn1_"));
@@ -103,7 +103,7 @@ async fn auth_key_to_node_up_yields_a_working_node_token() {
     }
 
     // ... and, the point of the whole test, the token actually connects.
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: file.url.clone(),
         path: "/agent",
         bearer: node.node_token.clone(),
@@ -118,7 +118,7 @@ async fn auth_key_to_node_up_yields_a_working_node_token() {
         .coord
         .db()
         .node_by_token_hash(
-            fleet_bin::tokens::format()
+            probefleet::tokens::format()
                 .parse(&node.node_token)
                 .unwrap()
                 .hash()
@@ -138,7 +138,7 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
 
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token.clone()),
@@ -152,7 +152,7 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
     .expect("login --token");
 
     let config_path = config_dir.join("default.toml");
-    let file = fleet_bin::fleet_config::load(&config_path).unwrap();
+    let file = probefleet::fleet_config::load(&config_path).unwrap();
     assert_eq!(file.url, fleet.base_url);
     let user = file.user.clone().expect("[user] table");
     assert_eq!(user.session_token, token);
@@ -174,7 +174,7 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
     }
 
     // `ctl list` over the real transport, through the real session type.
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: file.url.clone(),
         path: "/client",
         bearer: user.session_token.clone(),
@@ -182,15 +182,15 @@ async fn user_token_to_login_yields_a_client_that_can_list() {
     })
     .await
     .expect("the minted session token must authenticate on /client");
-    let session = fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
+    let session = probefleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
         .await
         .unwrap();
     match session
-        .request(fleet_wire::SidecarToCoord::ListBoards)
+        .request(probefleet_wire::SidecarToCoord::ListBoards)
         .await
         .unwrap()
     {
-        fleet_wire::CoordToSidecar::BoardList(boards) => assert!(boards.is_empty()),
+        probefleet_wire::CoordToSidecar::BoardList(boards) => assert!(boards.is_empty()),
         other => panic!("expected BoardList, got {other:?}"),
     }
 }
@@ -203,10 +203,10 @@ async fn node_up_refuses_an_invalid_auth_key_and_writes_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("agent");
 
-    let result = fleet_bin::roles::node_up::bootstrap(
+    let result = probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
-            auth_key: Some(fleet_bin::tokens::mint_string(forgs::TokenKind::ApiKey)),
+            auth_key: Some(probefleet::tokens::mint_string(forgs::TokenKind::ApiKey)),
             node_name: Some("rpi-1".to_owned()),
             tag: vec![],
             adopt: None,
@@ -248,7 +248,7 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
     let config_dir = tmp.path().join("fleets");
 
     // The human logs in first ...
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(session.clone()),
@@ -262,7 +262,7 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
     .expect("login --token");
 
     // ... then enrolls the same machine as a node.
-    fleet_bin::roles::node_up::bootstrap(
+    probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(key),
@@ -283,14 +283,14 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
     .await
     .expect("node up");
 
-    let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
+    let file = probefleet::fleet_config::load(&config_dir.join("default.toml")).unwrap();
     let user = file.user.clone().expect("[user] survived node up");
     let node = file.node.clone().expect("[node] was written");
     assert_eq!(user.session_token, session);
     assert_ne!(user.session_token, node.node_token);
 
     // Each token authenticates on its own route ...
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: file.url.clone(),
         path: "/agent",
         bearer: node.node_token.clone(),
@@ -300,7 +300,7 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
     .expect("the node token must authenticate on /agent");
     drop((tx, rx));
 
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: file.url.clone(),
         path: "/client",
         bearer: user.session_token.clone(),
@@ -312,7 +312,7 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
 
     // ... and only on its own route.
     assert!(
-        fleet_wire::client::dial(fleet_wire::client::DialOpts {
+        probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
             url: file.url.clone(),
             path: "/client",
             bearer: node.node_token.clone(),
@@ -323,7 +323,7 @@ async fn a_laptop_holds_both_credentials_in_one_fleet_file() {
         "a node token must not open the operator plane"
     );
     assert!(
-        fleet_wire::client::dial(fleet_wire::client::DialOpts {
+        probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
             url: file.url.clone(),
             path: "/agent",
             bearer: user.session_token.clone(),

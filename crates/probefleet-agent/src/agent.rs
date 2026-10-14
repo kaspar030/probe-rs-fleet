@@ -18,8 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 
-use fleet_proto::token::AllowedOp;
-use fleet_proto::{
+use probefleet_proto::token::AllowedOp;
+use probefleet_proto::{
     BoardName, BoardRef, ChannelId, ChannelKind, CoordinatorCommand, LeaseId, NodeReport,
     PowerAction, PowerKind, ProbeInventory,
 };
@@ -124,7 +124,7 @@ fn wall_clock_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The [`BoardStatus`](fleet_proto::BoardStatus) a **declared** board is
+/// The [`BoardStatus`](probefleet_proto::BoardStatus) a **declared** board is
 /// advertised as when seeding the inventory from `boards.toml` alone (no live
 /// discovery yet).
 ///
@@ -132,11 +132,11 @@ fn wall_clock_secs() -> u64 {
 /// [`adopted_board_status`](crate::discovery::adopted_board_status); both
 /// derive the status from a [`BoardSpec`], so the id a board is reported under
 /// and the id [`Agent::board_spec`] resolves cannot drift apart.
-fn declared_board_status(b: &BoardSpec) -> fleet_proto::BoardStatus {
-    fleet_proto::BoardStatus {
+fn declared_board_status(b: &BoardSpec) -> probefleet_proto::BoardStatus {
+    probefleet_proto::BoardStatus {
         board: BoardName(b.id.clone()),
         serial: b.serial.clone(),
-        presence: fleet_proto::BoardPresence::Online,
+        presence: probefleet_proto::BoardPresence::Online,
         chip: b.chip.clone(),
         model: b.model.clone(),
         tags: b.tags.clone(),
@@ -529,7 +529,7 @@ impl<B: ProbeRsBackend> Agent<B> {
         drop(sessions);
 
         self.emit(NodeReport::Log {
-            level: fleet_proto::LogLevel::Info,
+            level: probefleet_proto::LogLevel::Info,
             board: Some(board.clone()),
             message: format!(
                 "opened session on channel {} for lease {} (serve {outcome})",
@@ -670,7 +670,7 @@ impl<B: ProbeRsBackend> Agent<B> {
             },
         );
         self.emit(NodeReport::Log {
-            level: fleet_proto::LogLevel::Info,
+            level: probefleet_proto::LogLevel::Info,
             board: Some(board.clone()),
             message: format!(
                 "opened gdb tunnel on channel {} for lease {}",
@@ -780,7 +780,7 @@ impl<B: ProbeRsBackend> Agent<B> {
             // `serve` for the probe, and whatever session it opens must not
             // outlive it.
             self.emit(NodeReport::Log {
-                level: fleet_proto::LogLevel::Info,
+                level: probefleet_proto::LogLevel::Info,
                 board: Some(board.clone()),
                 message: "erase-on-release requested (pending backend wiring)".to_owned(),
             })
@@ -937,7 +937,7 @@ mod tests {
     use super::*;
     use crate::probers::mock::MockBackend;
     use ed25519_dalek::{Signer, SigningKey};
-    use fleet_proto::token::{CapabilityToken, SignedToken};
+    use probefleet_proto::token::{CapabilityToken, SignedToken};
 
     const SEED: [u8; 32] = [3u8; 32];
 
@@ -955,8 +955,8 @@ mod tests {
     /// The node id the coordinator handed this node at enrolment.
     ///
     /// Org-namespaced, because that is what the coordinator mints
-    /// (`fleet-coordinator/src/state.rs::node_id_for`) and returns as
-    /// `TokenResponse::node_id`, which `fleet-bin`'s `node_setup` writes into
+    /// (`probefleet-coordinator/src/state.rs::node_id_for`) and returns as
+    /// `TokenResponse::node_id`, which `probefleet`'s `node_setup` writes into
     /// the config verbatim. The node never builds this itself — it cannot,
     /// not knowing its own org — so a fixture that invents a bare `"pi-1"`
     /// describes a config production never writes.
@@ -973,7 +973,7 @@ mod tests {
             boards_path: std::path::PathBuf::from("/boards.toml"),
             heartbeat_secs: crate::config::default_heartbeat_secs(),
             discovery_secs: crate::config::default_discovery_secs(),
-            adopt: fleet_proto::AdoptPolicy::Declared,
+            adopt: probefleet_proto::AdoptPolicy::Declared,
             erase_on_release: false,
         }
     }
@@ -1009,8 +1009,8 @@ port = 2
     /// node half is the coordinator's org-namespaced id, not a bare name.
     fn board_ref(name: &str) -> BoardRef {
         BoardRef::new(
-            fleet_proto::ids::OrgId("default".to_owned()),
-            fleet_proto::ids::NodeId(NODE_ID.to_owned()),
+            probefleet_proto::ids::OrgId("default".to_owned()),
+            probefleet_proto::ids::NodeId(NODE_ID.to_owned()),
             name,
         )
     }
@@ -1707,9 +1707,9 @@ port = 2
 
         let backend = Arc::new(MockBackend::new());
         let mut config = agent_config();
-        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        config.adopt = probefleet_proto::AdoptPolicy::Auto;
         // A probe nobody declared: `boards()` knows only S1.
-        let probe = fleet_proto::DiscoveredProbe {
+        let probe = probefleet_proto::DiscoveredProbe {
             serial: "ZZZ".to_owned(),
             vid: 0x1366,
             pid: 0x1015,
@@ -1760,8 +1760,8 @@ port = 2
         use crate::discovery::{ProbeLister, SwappableLister};
 
         let mut config = agent_config();
-        config.adopt = fleet_proto::AdoptPolicy::Auto;
-        let probe = fleet_proto::DiscoveredProbe {
+        config.adopt = probefleet_proto::AdoptPolicy::Auto;
+        let probe = probefleet_proto::DiscoveredProbe {
             serial: "ZZZ".to_owned(),
             vid: 0x1366,
             pid: 0x1015,
@@ -1795,7 +1795,7 @@ port = 2
             .iter()
             .find(|b| b.board == board)
             .expect("the board must still be REPORTED, so the coordinator drops it");
-        assert_eq!(status.presence, fleet_proto::BoardPresence::Offline);
+        assert_eq!(status.presence, probefleet_proto::BoardPresence::Offline);
         assert!(status.adopted);
 
         // ... and the agent no longer resolves it, so the two ends agree.
@@ -1811,7 +1811,7 @@ port = 2
     async fn replugging_restores_the_same_board_id() {
         use crate::discovery::{ProbeLister, SwappableLister};
 
-        let probe = fleet_proto::DiscoveredProbe {
+        let probe = probefleet_proto::DiscoveredProbe {
             serial: "ZZZ".to_owned(),
             vid: 0x1366,
             pid: 0x1015,
@@ -1819,7 +1819,7 @@ port = 2
             inaccessible: false,
         };
         let mut config = agent_config();
-        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        config.adopt = probefleet_proto::AdoptPolicy::Auto;
         let lister = Arc::new(SwappableLister::new(vec![probe.clone()]));
         let mut agent = Agent::new(config, boards(), Arc::new(MockBackend::new())).unwrap();
         agent.set_clock(|| 1_000);
@@ -1842,7 +1842,7 @@ port = 2
         let back = third
             .boards
             .iter()
-            .find(|b| b.adopted && b.presence == fleet_proto::BoardPresence::Online)
+            .find(|b| b.adopted && b.presence == probefleet_proto::BoardPresence::Online)
             .expect("the board is back");
         assert_eq!(back.board, name, "a lease selector must keep working");
         assert!(agent.board_spec(&name).await.is_ok());
@@ -1856,8 +1856,8 @@ port = 2
 
         let backend = Arc::new(MockBackend::new());
         let mut config = agent_config();
-        config.adopt = fleet_proto::AdoptPolicy::Declared;
-        let probe = fleet_proto::DiscoveredProbe {
+        config.adopt = probefleet_proto::AdoptPolicy::Declared;
+        let probe = probefleet_proto::DiscoveredProbe {
             serial: "ZZZ".to_owned(),
             vid: 0x1366,
             pid: 0x1015,
@@ -1941,7 +1941,7 @@ port = 2
     async fn an_unchanged_pass_reports_nothing() {
         use crate::discovery::StubLister;
 
-        let probes = vec![fleet_proto::DiscoveredProbe {
+        let probes = vec![probefleet_proto::DiscoveredProbe {
             serial: "S1".to_owned(),
             vid: 0x1366,
             pid: 0x1015,

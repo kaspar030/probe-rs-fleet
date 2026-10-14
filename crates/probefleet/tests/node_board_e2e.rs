@@ -17,7 +17,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use fleet_bin::cli::{NodeBoardAddArgs, NodeBoardListArgs};
+use probefleet::cli::{NodeBoardAddArgs, NodeBoardListArgs};
 
 /// The one executable this file ever writes: a `sh` script that prints the
 /// contents of a data file sitting beside the name it was invoked as.
@@ -90,11 +90,11 @@ async fn a_discovered_probe_is_declared_through_the_real_lister() {
     args.model = Some("nrf52840dk".to_owned());
     args.tags = vec!["nrf52".to_owned()];
 
-    fleet_bin::roles::node_board::add(&args).await.unwrap();
+    probefleet::roles::node_board::add(&args).await.unwrap();
 
     let boards_path = config_dir.join("node").join("boards.toml");
     let text = std::fs::read_to_string(&boards_path).unwrap();
-    let cfg = fleet_agent::config::BoardsConfig::from_str(&text).unwrap();
+    let cfg = probefleet_agent::config::BoardsConfig::from_str(&text).unwrap();
     cfg.validate().unwrap();
     assert_eq!(cfg.boards.len(), 1);
     assert_eq!(cfg.boards[0].id, "nrf52840-dk-1");
@@ -103,7 +103,7 @@ async fn a_discovered_probe_is_declared_through_the_real_lister() {
 
     // `list` must run over the same files without erroring, which is the other
     // half of the verb group.
-    fleet_bin::roles::node_board::list(&NodeBoardListArgs {
+    probefleet::roles::node_board::list(&NodeBoardListArgs {
         boards_path: None,
         config_dir: Some(config_dir.clone()),
         probe_rs: probe_rs.display().to_string(),
@@ -117,7 +117,7 @@ async fn a_discovered_probe_is_declared_through_the_real_lister() {
     let mut dup = add_args(&config_dir, &probe_rs);
     dup.serial = Some("001050047405".to_owned());
     dup.id = Some("another".to_owned());
-    let err = fleet_bin::roles::node_board::add(&dup).await.unwrap_err();
+    let err = probefleet::roles::node_board::add(&dup).await.unwrap_err();
     assert!(
         format!("{err:#}").contains("duplicate probe serial"),
         "{err:#}"
@@ -137,7 +137,7 @@ async fn an_unattached_serial_is_refused_with_the_attached_ones() {
     args.serial = Some("NOPE".to_owned());
     args.id = Some("b1".to_owned());
 
-    let err = fleet_bin::roles::node_board::add(&args).await.unwrap_err();
+    let err = probefleet::roles::node_board::add(&args).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("NOPE"), "{text}");
     assert!(text.contains("000776543210"), "{text}");
@@ -166,16 +166,17 @@ async fn the_node_toml_boards_path_override_is_honoured() {
     let mut args = add_args(&config_dir, &probe_rs);
     args.serial = Some("000776543210".to_owned());
     args.id = Some("j-link-1".to_owned());
-    fleet_bin::roles::node_board::add(&args).await.unwrap();
+    probefleet::roles::node_board::add(&args).await.unwrap();
 
     assert!(elsewhere.exists(), "the override must be what was written");
     assert!(
         !node_dir.join("boards.toml").exists(),
         "the default path must not be created behind the override"
     );
-    let cfg =
-        fleet_agent::config::BoardsConfig::from_str(&std::fs::read_to_string(&elsewhere).unwrap())
-            .unwrap();
+    let cfg = probefleet_agent::config::BoardsConfig::from_str(
+        &std::fs::read_to_string(&elsewhere).unwrap(),
+    )
+    .unwrap();
     assert_eq!(cfg.boards[0].id, "j-link-1");
 }
 
@@ -195,10 +196,10 @@ async fn an_inaccessible_probe_is_still_declarable() {
     let mut args = add_args(&config_dir, &probe_rs);
     args.serial = Some("000776543210".to_owned());
     args.id = Some("j-link-1".to_owned());
-    fleet_bin::roles::node_board::add(&args).await.unwrap();
+    probefleet::roles::node_board::add(&args).await.unwrap();
 
     let text = std::fs::read_to_string(config_dir.join("node").join("boards.toml")).unwrap();
-    let cfg = fleet_agent::config::BoardsConfig::from_str(&text).unwrap();
+    let cfg = probefleet_agent::config::BoardsConfig::from_str(&text).unwrap();
     assert_eq!(cfg.boards[0].serial, "000776543210");
 }
 
@@ -212,7 +213,7 @@ async fn no_probes_at_all_is_a_clear_refusal() {
 
     let mut args = add_args(&config_dir, &probe_rs);
     args.id = Some("b1".to_owned());
-    let err = fleet_bin::roles::node_board::add(&args).await.unwrap_err();
+    let err = probefleet::roles::node_board::add(&args).await.unwrap_err();
     assert!(
         format!("{err:#}").contains("no probes are attached"),
         "{err:#}"
@@ -230,7 +231,7 @@ async fn a_missing_probe_rs_binary_names_the_flag() {
     let mut args = add_args(&config_dir, &missing);
     args.id = Some("b1".to_owned());
 
-    let err = fleet_bin::roles::node_board::add(&args).await.unwrap_err();
+    let err = probefleet::roles::node_board::add(&args).await.unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("--probe-rs"), "{text}");
     assert!(
@@ -250,7 +251,7 @@ async fn a_failing_list_names_the_binary_the_operator_chose() {
     let config_dir = tmp.path().join("config");
     let missing = tmp.path().join("definitely-not-here");
 
-    let err = fleet_bin::roles::node_board::list(&NodeBoardListArgs {
+    let err = probefleet::roles::node_board::list(&NodeBoardListArgs {
         boards_path: None,
         config_dir: Some(config_dir),
         probe_rs: missing.display().to_string(),

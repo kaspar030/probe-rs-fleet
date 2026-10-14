@@ -269,7 +269,7 @@ pub struct LeaseGrant {
     pub holder: SubjectKey,
     /// Expiry as epoch seconds; extend via heartbeat before this.
     pub expires: u64,
-    /// Opaque signed capability token (see `fleet-coordinator` auth).
+    /// Opaque signed capability token (see `probefleet-coordinator` auth).
     ///
     /// **This is not a data-plane credential.** It is the *delegation*
     /// artefact (`ctl delegate` hands exactly these bytes to a sandbox) and

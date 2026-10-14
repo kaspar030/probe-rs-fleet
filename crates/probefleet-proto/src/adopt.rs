@@ -5,10 +5,10 @@
 //! probe becomes a leasable board is now a per-node setting rather than a
 //! global gate.
 //!
-//! The enum lives in `fleet-proto` because three crates name it: the agent
+//! The enum lives in `probefleet-proto` because three crates name it: the agent
 //! (which decides whether to synthesise board metadata for undeclared probes),
 //! the coordinator (which stores it on the `node` row and enforces it), and
-//! `fleet-bin` (which writes it into `node/node.toml` and sends it at
+//! `probefleet` (which writes it into `node/node.toml` and sends it at
 //! registration).
 //!
 //! **The coordinator's row is authoritative for enforcement.** The node's local

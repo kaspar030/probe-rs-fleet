@@ -4,7 +4,7 @@
 //! this module only defines the type and the *pure* functions that apply caps.
 //! No clock, no I/O — all duration math is deterministic given the inputs.
 
-use fleet_proto::lease::Priority;
+use probefleet_proto::lease::Priority;
 use serde::{Deserialize, Serialize};
 
 /// Leasing policy: duration caps per priority class, a per-subject
@@ -21,7 +21,7 @@ pub struct Policy {
     /// Maximum lease duration (seconds) for [`Priority::Interactive`] requests.
     pub max_duration_interactive: u64,
     /// Maximum number of concurrently-held leases per subject, keyed by
-    /// [`fleet_proto::ids::SubjectKey`].
+    /// [`probefleet_proto::ids::SubjectKey`].
     pub max_concurrent_per_subject: u32,
     /// Default TTL (seconds) applied when a request's `duration_secs` is `0`.
     pub default_ttl_secs: u64,

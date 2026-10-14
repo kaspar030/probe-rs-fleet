@@ -21,8 +21,8 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::adopt::AdoptPolicy;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::adopt::AdoptPolicy;
 
 /// Call a route the way the UI does: session cookie + CSRF header.
 async fn as_browser(
@@ -137,9 +137,9 @@ async fn a_stranger_cannot_release_a_lease_and_learns_nothing_from_trying() {
     // Alice takes a lease through the real sidecar path.
     let session = fleet.client_session_in(&alice, "acme").await;
     let lease = {
-        use fleet_proto::ids::BoardName;
-        use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-        use fleet_wire::{CoordToSidecar, SidecarToCoord};
+        use probefleet_proto::ids::BoardName;
+        use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+        use probefleet_wire::{CoordToSidecar, SidecarToCoord};
         match session
             .request(SidecarToCoord::Lease(LeaseRequest {
                 select: Constraint::Id(BoardName("dk-3".to_owned())),

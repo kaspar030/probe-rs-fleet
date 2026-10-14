@@ -15,7 +15,7 @@
 //!   (`~/.config/probe-rs-fleet/fleets/*.toml`);
 //! * `ctl release <board>` / `node board add --serial` complete from local
 //!   state (`boards.toml`, attached probes);
-//! * `--ops` completes the op labels [`fleet_proto::token::AllowedOp`] actually
+//! * `--ops` completes the op labels [`probefleet_proto::token::AllowedOp`] actually
 //!   defines, so adding an op cannot leave a stale script behind.
 //!
 //! A generated script would freeze all of that at build time.
@@ -160,7 +160,7 @@ pub fn fleet_candidates() -> ArgValueCandidates {
 #[must_use]
 pub fn ops_candidates() -> ArgValueCandidates {
     ArgValueCandidates::new(|| {
-        fleet_proto::token::AllowedOp::all()
+        probefleet_proto::token::AllowedOp::all()
             .into_iter()
             .map(|op| CompletionCandidate::new(op.as_str()))
             .collect()
@@ -319,8 +319,8 @@ const PROBE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 /// `cli::main` creates the real one, and a current-thread runtime for one
 /// bounded subprocess is cheaper than moving the hook after runtime setup
 /// (which would put runtime-init errors ahead of the shell's stdout).
-fn attached_probes() -> Vec<fleet_proto::node_api::DiscoveredProbe> {
-    use fleet_agent::discovery::{ProbeLister as _, ProbeRsListLister};
+fn attached_probes() -> Vec<probefleet_proto::node_api::DiscoveredProbe> {
+    use probefleet_agent::discovery::{ProbeLister as _, ProbeRsListLister};
 
     let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -344,14 +344,14 @@ fn attached_probes() -> Vec<fleet_proto::node_api::DiscoveredProbe> {
 /// Silent on every failure (no node config, malformed file, unreadable path):
 /// this runs on a keypress, and the only sane response to "I cannot tell" is to
 /// offer nothing.
-fn local_boards() -> Vec<fleet_agent::config::BoardSpec> {
+fn local_boards() -> Vec<probefleet_agent::config::BoardSpec> {
     let Ok(node_dir) = crate::paths::node_config_dir() else {
         return Vec::new();
     };
     let Ok(path) = crate::roles::node_run::resolve_boards_path(&node_dir, None) else {
         return Vec::new();
     };
-    fleet_agent::config::BoardsConfig::from_path(&path)
+    probefleet_agent::config::BoardsConfig::from_path(&path)
         .map(|cfg| cfg.boards)
         .unwrap_or_default()
 }
@@ -444,7 +444,7 @@ mod tests {
             .into_iter()
             .map(|c| c.get_value().to_string_lossy().into_owned())
             .collect();
-        for op in fleet_proto::token::AllowedOp::all() {
+        for op in probefleet_proto::token::AllowedOp::all() {
             assert!(got.contains(&op.as_str().to_owned()), "missing {op}");
         }
     }

@@ -21,11 +21,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use fleet_agent::agent::Agent;
-use fleet_agent::config::{AgentConfig, BoardsConfig, NodeTokenStore};
-use fleet_agent::connection;
-use fleet_agent::probers::ProcessBackend;
-use fleet_proto::AdoptPolicy;
+use probefleet_agent::agent::Agent;
+use probefleet_agent::config::{AgentConfig, BoardsConfig, NodeTokenStore};
+use probefleet_agent::connection;
+use probefleet_agent::probers::ProcessBackend;
+use probefleet_proto::AdoptPolicy;
 
 use crate::fleet_config;
 use crate::paths;
@@ -195,10 +195,10 @@ fn assemble_agent_config(
         boards_path,
         heartbeat_secs: settings
             .heartbeat_secs
-            .unwrap_or_else(fleet_agent::config::default_heartbeat_secs),
+            .unwrap_or_else(probefleet_agent::config::default_heartbeat_secs),
         discovery_secs: settings
             .discovery_secs
-            .unwrap_or_else(fleet_agent::config::default_discovery_secs),
+            .unwrap_or_else(probefleet_agent::config::default_discovery_secs),
         adopt: settings.adopt.unwrap_or_default(),
         erase_on_release: settings.erase_on_release,
     }

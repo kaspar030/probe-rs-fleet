@@ -45,9 +45,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use fleet_proto::auth_api::NodeTokenResponse as TokenResponse;
-use fleet_proto::AdoptPolicy;
 use forgs_client::ClientError;
+use probefleet_proto::auth_api::NodeTokenResponse as TokenResponse;
+use probefleet_proto::AdoptPolicy;
 
 use crate::cli::NodeUpFlags;
 use crate::fleet_config::{self, FleetFile};
@@ -247,7 +247,7 @@ async fn approval_flow(
         .map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;
     let grant = crate::node_client::register_start(
         &client,
-        &fleet_proto::auth_api::NodeRegisterStartRequest {
+        &probefleet_proto::auth_api::NodeRegisterStartRequest {
             node_name: node_name.to_owned(),
             tags: args.tag.clone(),
             adopt: Some(adopt.as_str().to_owned()),
@@ -410,7 +410,7 @@ async fn self_register(
     let response = crate::node_client::self_register(
         &client,
         &session,
-        &fleet_proto::auth_api::SelfRegisterRequest {
+        &probefleet_proto::auth_api::SelfRegisterRequest {
             node_name: node_name.to_owned(),
             tags: args.tag.clone(),
             adopt: Some(adopt.as_str().to_owned()),
@@ -469,7 +469,7 @@ fn finish(
 fn pin_of(args: &NodeUpFlags) -> Result<Option<[u8; 32]>> {
     match &args.server_cert_sha256 {
         Some(hex) => Ok(Some(
-            fleet_tls::parse_fingerprint(hex)
+            probefleet_tls::parse_fingerprint(hex)
                 .context("--server-cert-sha256 must be 64 hex characters")?,
         )),
         None => Ok(None),

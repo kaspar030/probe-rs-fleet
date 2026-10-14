@@ -1,14 +1,14 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/fleet-proto",
-    "crates/fleet-core",
-    "crates/fleet-tls",
-    "crates/fleet-wire",
-    "crates/fleet-agent",
-    "crates/fleet-coordinator",
-    "crates/fleet-sidecar",
-    "crates/fleet-bin",
+    "crates/probefleet-proto",
+    "crates/probefleet-core",
+    "crates/probefleet-tls",
+    "crates/probefleet-wire",
+    "crates/probefleet-agent",
+    "crates/probefleet-coordinator",
+    "crates/probefleet-sidecar",
+    "crates/probefleet",
 ]
 
 [workspace.lints.rust]
@@ -31,13 +31,13 @@ categories = ["embedded", "development-tools::testing", "hardware-support"]
 [workspace.dependencies]
 # internal. The `version` here must be bumped together with
 # `workspace.package.version` (crates.io requires it next to `path`).
-fleet-proto = { version = "0.1.0", path = "crates/fleet-proto" }
-fleet-core = { version = "0.1.0", path = "crates/fleet-core" }
-fleet-tls = { version = "0.1.0", path = "crates/fleet-tls" }
-fleet-wire = { version = "0.1.0", path = "crates/fleet-wire" }
-fleet-agent = { version = "0.1.0", path = "crates/fleet-agent" }
-fleet-coordinator = { version = "0.1.0", path = "crates/fleet-coordinator" }
-fleet-sidecar = { version = "0.1.0", path = "crates/fleet-sidecar" }
+probefleet-proto = { version = "0.1.0", path = "crates/probefleet-proto" }
+probefleet-core = { version = "0.1.0", path = "crates/probefleet-core" }
+probefleet-tls = { version = "0.1.0", path = "crates/probefleet-tls" }
+probefleet-wire = { version = "0.1.0", path = "crates/probefleet-wire" }
+probefleet-agent = { version = "0.1.0", path = "crates/probefleet-agent" }
+probefleet-coordinator = { version = "0.1.0", path = "crates/probefleet-coordinator" }
+probefleet-sidecar = { version = "0.1.0", path = "crates/probefleet-sidecar" }
 
 # identity / auth (forgs), from crates.io. Bump all five together. For local
 # co-development against a sibling forgs checkout, see the commented-out
@@ -64,13 +64,13 @@ base64 = "0.22"
 # records the verification.
 #
 # Layering: `axum`/`hyper`'s *server* half is a coordinator-only dependency.
-# `fleet-agent` / `fleet-sidecar` pull only `tokio-tungstenite` (through
-# `fleet-wire`'s `tungstenite` feature) — see
-# `crates/fleet-agent/tests/no_http_server_dep.rs`.
+# `probefleet-agent` / `probefleet-sidecar` pull only `tokio-tungstenite` (through
+# `probefleet-wire`'s `tungstenite` feature) — see
+# `crates/probefleet-agent/tests/no_http_server_dep.rs`.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "ws", "json"] }
 # Pinned to the major axum 0.8 depends on. A newer tokio-tungstenite compiles
 # fine but ships a SECOND copy of tungstenite on every Raspberry Pi, since
-# `fleet-bin` links both the coordinator (axum's copy) and the dialer (ours).
+# `probefleet` links both the coordinator (axum's copy) and the dialer (ours).
 # Bump this together with axum.
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 hyper = { version = "1", default-features = false }
@@ -93,7 +93,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-pemfile = "2"
 # Test-only since revision 2: the private CA is gone, so nothing in the shipping
 # binary mints a certificate. It survives as a dev-dependency for the tests that
-# need a self-signed server cert (fleet-tls's trust tests, the coordinator's
+# need a self-signed server cert (probefleet-tls's trust tests, the coordinator's
 # self-hosted-TLS test).
 rcgen = { version = "0.13", default-features = false, features = ["x509-parser", "ring", "pem"] }
 sha2 = "0.10"

@@ -6,7 +6,7 @@
 //! through [`Db::forgs`]). What fleet persists itself is what only fleet knows
 //! about: the nodes each org enrolled, the boards they declare, the leases the
 //! coordinator granted (with close reason), and an append-only board / node /
-//! lease audit log. The in-memory [`fleet_core::scheduler::Scheduler`] remains
+//! lease audit log. The in-memory [`probefleet_core::scheduler::Scheduler`] remains
 //! the source of truth for *live* lease state; this layer records history.
 //!
 //! An org is a forgs namespace node of kind [`crate::subject::ORG_KIND`]; an
@@ -58,12 +58,12 @@ use forgs::schema::NameOrigin;
 use forgs::{KindSpec, NsNodeId, RoleLadder, Schema, UserId};
 use forgs_store::Store;
 
-use fleet_core::access::GrantScope;
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
-use fleet_proto::node_api::BoardPresence;
-use fleet_proto::token::AllowedOp;
+use probefleet_core::access::GrantScope;
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::board::{Board, BoardState};
+use probefleet_proto::ids::{BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
+use probefleet_proto::node_api::BoardPresence;
+use probefleet_proto::token::AllowedOp;
 
 use crate::error::{CoordinatorError, Result};
 use crate::subject::{FleetRole, NODE_KIND, ORG_KIND};
@@ -742,7 +742,7 @@ impl Db {
 /// catastrophic; a grant with no recognisable op confers nothing anyway.
 #[must_use]
 pub fn grant_scope(row: &forgs_store::GrantRow) -> Option<GrantScope> {
-    let selector = fleet_proto::lease::parse_constraint(&row.selector).ok()?;
+    let selector = probefleet_proto::lease::parse_constraint(&row.selector).ok()?;
     let ops = parsed_ops(&row.ops);
     if ops.is_empty() {
         return None;
@@ -1144,7 +1144,7 @@ impl OrgDb<'_> {
         &self,
         board: Option<&str>,
         limit: i64,
-    ) -> Result<Vec<fleet_proto::admin::LogLine>> {
+    ) -> Result<Vec<probefleet_proto::admin::LogLine>> {
         let rows: Vec<(i64, String, Option<String>, Option<String>)> = match board {
             Some(b) => {
                 sqlx::query_as(
@@ -1170,12 +1170,14 @@ impl OrgDb<'_> {
         };
         Ok(rows
             .into_iter()
-            .map(|(ts, action, board, detail)| fleet_proto::admin::LogLine {
-                ts,
-                action,
-                board,
-                detail,
-            })
+            .map(
+                |(ts, action, board, detail)| probefleet_proto::admin::LogLine {
+                    ts,
+                    action,
+                    board,
+                    detail,
+                },
+            )
             .collect())
     }
 
@@ -1403,7 +1405,7 @@ pub struct MemberRow {
 /// One row of [`OrgDb::list_nodes`].
 ///
 /// Deliberately **not** the wire type: that is
-/// [`fleet_proto::admin::NodeSummary`], carried by `CoordToSidecar::NodeList`
+/// [`probefleet_proto::admin::NodeSummary`], carried by `CoordToSidecar::NodeList`
 /// for `ctl nodes`. This stays the *database* shape — it is free to carry
 /// columns the wire projection does not — and `core.rs`'s `node_summary` maps
 /// one to the other, alongside `api.rs`'s `NodeView` for the browser.
@@ -1506,7 +1508,7 @@ fn board_state_label(state: &BoardState) -> &'static str {
 mod tests {
     use super::*;
     use crate::subject::testkit;
-    use fleet_proto::board::PowerKind;
+    use probefleet_proto::board::PowerKind;
 
     fn board_in(org: &OrgId, node: &str, name: &str) -> Board {
         Board {

@@ -2,24 +2,24 @@
 //!
 //! The command surface (parsing, selector grammar, output formatting) is fully
 //! implemented and unit-tested here. The *transport* is not: `ctl` is a caller
-//! of [`fleet_sidecar::transport::CoordSession`], the same client the sidecar
+//! of [`probefleet_sidecar::transport::CoordSession`], the same client the sidecar
 //! uses.
 //!
 //! That is a deliberate consolidation. Before revision 2, `ctl` hand-rolled a
 //! second coordinator client — its own TLS config, its own `server_name`, its
 //! own Hello handshake — alongside the sidecar's and the agent's, and the three
-//! had drifted. There is now one dial path (`fleet_wire::client::dial`), one
-//! trust configuration (`fleet_tls::client_trust_config`), and one session type.
+//! had drifted. There is now one dial path (`probefleet_wire::client::dial`), one
+//! trust configuration (`probefleet_tls::client_trust_config`), and one session type.
 
 use anyhow::{Context, Result};
 use std::process::ExitCode;
 
-use fleet_proto::admin::{BoardSummary, NodeSummary};
-use fleet_proto::ids::BoardName;
-use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-use fleet_proto::token::AllowedOp;
-use fleet_sidecar::transport::CoordSession;
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_proto::admin::{BoardSummary, NodeSummary};
+use probefleet_proto::ids::BoardName;
+use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use probefleet_proto::token::AllowedOp;
+use probefleet_sidecar::transport::CoordSession;
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 use crate::cli::{CtlArgs, CtlClientArgs, CtlCommand};
 
@@ -110,7 +110,7 @@ impl CtlConnection {
         let server_cert_sha256 = args.server_cert_sha256.or(fb_pin);
         if let Some(pin) = &server_cert_sha256 {
             anyhow::ensure!(
-                fleet_tls::parse_fingerprint(pin).is_some(),
+                probefleet_tls::parse_fingerprint(pin).is_some(),
                 "--server-cert-sha256 must be 64 hex characters"
             );
         }
@@ -126,13 +126,13 @@ impl CtlConnection {
     pub fn pin(&self) -> Option<[u8; 32]> {
         self.server_cert_sha256
             .as_deref()
-            .and_then(fleet_tls::parse_fingerprint)
+            .and_then(probefleet_tls::parse_fingerprint)
     }
 }
 
 /// Parse a `lease`/board selector into a [`Constraint`].
 ///
-/// A thin delegate to [`fleet_proto::lease::parse_constraint`], the fleet's one
+/// A thin delegate to [`probefleet_proto::lease::parse_constraint`], the fleet's one
 /// selector grammar (architecture §6.5). There is no per-surface dialect: the
 /// same expression means the same thing here, in the sidecar's
 /// `PROBE_RS_FLEET_SELECT` and in `grant --select`.
@@ -149,7 +149,7 @@ impl CtlConnection {
 ///
 /// Returns the parse error's message for a malformed expression.
 pub fn parse_selector(selector: &str) -> Result<Constraint, String> {
-    fleet_proto::lease::parse_constraint(selector).map_err(|e| e.to_string())
+    probefleet_proto::lease::parse_constraint(selector).map_err(|e| e.to_string())
 }
 
 /// A thin client of the coordinator's admin/operator surface.
@@ -173,7 +173,7 @@ impl CtlClient {
     ///
     /// Returns an error if the connection or the Hello handshake fails.
     pub async fn connect_session(&self) -> Result<CoordSession> {
-        let cfg = fleet_sidecar::selector::FleetConfig {
+        let cfg = probefleet_sidecar::selector::FleetConfig {
             coordinator: self.conn.fleet_url.clone(),
             token: self.conn.token.clone(),
             // `ctl` never leases through this path (it sends explicit operator
@@ -364,7 +364,7 @@ impl CtlClient {
             .await?
         {
             CoordToSidecar::Lease(grant) => {
-                let token = fleet_sidecar::transport::hex_encode(&grant.token);
+                let token = probefleet_sidecar::transport::hex_encode(&grant.token);
                 let ops = decode_token_ops(&grant.token);
                 println!("# board {} (lease {})", grant.board, grant.lease.0);
                 println!("# expires {} (epoch); ops: {ops}", grant.expires);
@@ -594,7 +594,7 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
 /// output. Decode-only — no signature check, since we just received it from
 /// the coordinator we authenticated to.
 fn decode_token_ops(wire: &[u8]) -> String {
-    let Ok(signed) = fleet_proto::token::SignedToken::from_wire(wire) else {
+    let Ok(signed) = probefleet_proto::token::SignedToken::from_wire(wire) else {
         return "unknown".to_owned();
     };
     let Ok(token) = signed.decode_token() else {
@@ -748,9 +748,9 @@ mod tests {
     }
 
     fn sample_board(name: &str, tags: &[&str]) -> BoardSummary {
-        use fleet_proto::admin::BoardAvailability;
-        use fleet_proto::board::PowerKind;
-        use fleet_proto::ids::{BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
+        use probefleet_proto::admin::BoardAvailability;
+        use probefleet_proto::board::PowerKind;
+        use probefleet_proto::ids::{BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
 
         BoardSummary {
             board: BoardRef::new(
@@ -769,19 +769,19 @@ mod tests {
             },
             availability: BoardAvailability::Leased,
             holder: SubjectKey::new(None, SubjectKind::User, "01J9Z3Q4ABCDEFGHJKMNPQRSTW"),
-            lease: Some(fleet_proto::LeaseId(7)),
+            lease: Some(probefleet_proto::LeaseId(7)),
             expires: Some(123),
         }
     }
 
     fn sample_node(name: &str, tags: &[&str], boards: &[&str]) -> NodeSummary {
-        use fleet_proto::ids::NodeId;
+        use probefleet_proto::ids::NodeId;
 
         NodeSummary {
             node: NodeId(format!("01J9Z3Q4ABCDEFGHJKMNPQRSTV/{name}")),
             name: name.to_owned(),
             tags: owned(tags),
-            adopt: fleet_proto::AdoptPolicy::Auto,
+            adopt: probefleet_proto::AdoptPolicy::Auto,
             owner: Some("01J9Z3Q4ABCDEFGHJKMNPQRSTW".to_owned()),
             last_seen: Some(1_700_000_000),
             created_at: 1_600_000_000,

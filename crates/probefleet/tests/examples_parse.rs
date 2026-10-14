@@ -24,7 +24,7 @@ fn examples_dir() -> PathBuf {
 fn fleet_example_parses_with_all_three_tables() {
     let path = examples_dir().join("fleet.toml");
     let text = std::fs::read_to_string(&path).unwrap();
-    let file: fleet_bin::fleet_config::FleetFile = toml::from_str(&text).unwrap();
+    let file: probefleet::fleet_config::FleetFile = toml::from_str(&text).unwrap();
 
     assert_eq!(file.url, "https://fleet.example.com");
     let user = file.user.expect("[user] table");
@@ -128,7 +128,7 @@ fn the_fleet_example_states_what_the_refresh_token_can_and_cannot_do() {
 fn node_example_parses_as_all_defaults() {
     let path = examples_dir().join("node.toml");
     let text = std::fs::read_to_string(&path).unwrap();
-    let settings: fleet_bin::roles::node_run::NodeSettings = toml::from_str(&text).unwrap();
+    let settings: probefleet::roles::node_run::NodeSettings = toml::from_str(&text).unwrap();
     assert!(settings.boards_path.is_none());
     assert!(settings.heartbeat_secs.is_none());
     assert!(settings.discovery_secs.is_none());
@@ -154,10 +154,10 @@ fn the_node_example_documents_both_adopt_policies_and_they_parse() {
         let uncommented = text
             .replace("# adopt = ", "adopt = ")
             .replace("adopt = \"declared\"", &format!("adopt = \"{policy}\""));
-        let settings: fleet_bin::roles::node_run::NodeSettings =
+        let settings: probefleet::roles::node_run::NodeSettings =
             toml::from_str(&uncommented).unwrap();
         assert_eq!(
-            settings.adopt.map(fleet_proto::AdoptPolicy::as_str),
+            settings.adopt.map(probefleet_proto::AdoptPolicy::as_str),
             Some(policy),
             "uncommenting `adopt` must yield a file that loads"
         );
@@ -191,7 +191,7 @@ fn coordinator_example_loads_and_its_providers_block_works_uncommented() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let cfg = fleet_bin::config::load_coordinator_config_from_str(&text).unwrap();
+    let cfg = probefleet::config::load_coordinator_config_from_str(&text).unwrap();
     cfg.validate().unwrap();
     // Commented out, so login is unconfigured — which the example says is a
     // supported deployment.
@@ -222,7 +222,7 @@ fn coordinator_example_loads_and_its_providers_block_works_uncommented() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let cfg = fleet_bin::config::load_coordinator_config_from_str(&uncommented).unwrap();
+    let cfg = probefleet::config::load_coordinator_config_from_str(&uncommented).unwrap();
     cfg.validate().unwrap();
     assert_eq!(cfg.auth.providers.len(), 1);
     let p = &cfg.auth.providers[0];
@@ -262,7 +262,7 @@ fn the_coordinator_example_documents_the_refresh_token_ttl() {
     );
 
     // Commented out, so the code's default applies — and the two must agree.
-    let cfg = fleet_bin::config::load_coordinator_config_from_str(&text).unwrap();
+    let cfg = probefleet::config::load_coordinator_config_from_str(&text).unwrap();
     assert_eq!(cfg.refresh_token_ttl_secs, 30 * 24 * 3600);
 
     // Uncommenting it yields a file that loads and validates.
@@ -270,7 +270,7 @@ fn the_coordinator_example_documents_the_refresh_token_ttl() {
         "# refresh_token_ttl_secs = 2592000",
         "refresh_token_ttl_secs = 604800",
     );
-    let cfg = fleet_bin::config::load_coordinator_config_from_str(&uncommented).unwrap();
+    let cfg = probefleet::config::load_coordinator_config_from_str(&uncommented).unwrap();
     cfg.validate().unwrap();
     assert_eq!(cfg.refresh_token_ttl_secs, 604_800);
 }
@@ -302,7 +302,7 @@ fn coordinator_example_github_actions_block_works_uncommented() {
 
     // Commented out by default: a fleet with no CI is supported, and the
     // exchange then answers a named 503.
-    let cfg = fleet_bin::config::load_coordinator_config_from_str(&text).unwrap();
+    let cfg = probefleet::config::load_coordinator_config_from_str(&text).unwrap();
     assert!(cfg.github_actions.is_none());
 
     // Uncomment the block the way a reader would: strip one `# ` from the
@@ -330,7 +330,7 @@ fn coordinator_example_github_actions_block_works_uncommented() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let cfg = fleet_bin::config::load_coordinator_config_from_str(&uncommented).unwrap();
+    let cfg = probefleet::config::load_coordinator_config_from_str(&uncommented).unwrap();
     cfg.validate().unwrap();
     let gha = cfg
         .github_actions
@@ -354,7 +354,7 @@ fn coordinator_example_github_actions_block_works_uncommented() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        fleet_bin::config::load_coordinator_config_from_str(&without_audience).is_err(),
+        probefleet::config::load_coordinator_config_from_str(&without_audience).is_err(),
         "`audience` is required, and the example must not parse without it"
     );
 }
@@ -389,7 +389,7 @@ fn the_coordinator_example_explains_why_the_audience_has_no_default() {
 fn boards_example_parses_and_validates() {
     let path = examples_dir().join("boards.toml");
     let text = std::fs::read_to_string(&path).unwrap();
-    let boards = fleet_agent::config::BoardsConfig::from_str(&text).unwrap();
+    let boards = probefleet_agent::config::BoardsConfig::from_str(&text).unwrap();
     boards.validate().unwrap();
     assert!(!boards.boards.is_empty());
     // The worked board must declare a `model`: it is the field a reader is

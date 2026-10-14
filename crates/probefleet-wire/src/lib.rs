@@ -12,7 +12,7 @@
 //! 2. The **control-plane envelopes** for both planes: the node direction
 //!    ([`NodeToCoord`] / [`CoordToNode`]) and the sidecar direction
 //!    ([`SidecarToCoord`] / [`CoordToSidecar`]). The payload types they wrap
-//!    live in [`fleet_proto`]; the envelopes add an unambiguous discriminator
+//!    live in [`probefleet_proto`]; the envelopes add an unambiguous discriminator
 //!    so control and data frames demultiplex over one connection. **These are
 //!    unchanged by the transport move** — that is the point of the seam.
 //!
@@ -20,19 +20,21 @@
 //!
 //! The coordinator serves `axum`'s `WebSocket`; the node, sidecar and ctl dial
 //! with `tokio-tungstenite`. Abstracting over "a stream of binary messages"
-//! rather than over one library's type is what lets `fleet-wire` — and
-//! therefore `fleet-agent` and `fleet-sidecar` — stay free of `axum`. Those
+//! rather than over one library's type is what lets `probefleet-wire` — and
+//! therefore `probefleet-agent` and `probefleet-sidecar` — stay free of `axum`. Those
 //! crates are libraries that move probe bytes; requiring an HTTP *server*
 //! framework to link them would be the dependency direction backwards. The
-//! `axum` adapter lives in `fleet-coordinator`; the `tokio-tungstenite` one
+//! `axum` adapter lives in `probefleet-coordinator`; the `tokio-tungstenite` one
 //! lives here behind the `tungstenite` feature.
 
-use fleet_proto::admin::{BoardSummary, GrantSummary, LeaseHolderSummary, LogLine, NodeSummary};
-use fleet_proto::ids::BoardName;
-use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest};
-use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
-use fleet_proto::token::AllowedOp;
-use fleet_proto::{ChannelId, ChannelKind, DataFrame, LeaseId};
+use probefleet_proto::admin::{
+    BoardSummary, GrantSummary, LeaseHolderSummary, LogLine, NodeSummary,
+};
+use probefleet_proto::ids::BoardName;
+use probefleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest};
+use probefleet_proto::node_api::{CoordinatorCommand, NodeReport};
+use probefleet_proto::token::AllowedOp;
+use probefleet_proto::{ChannelId, ChannelKind, DataFrame, LeaseId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -216,7 +218,7 @@ pub async fn recv<T: DeserializeOwned>(rx: &mut (impl WireRx + ?Sized)) -> Resul
 
 /// A framed message from a node up to the coordinator.
 ///
-/// The node control plane multiplexes shared `fleet-proto` control payloads
+/// The node control plane multiplexes shared `probefleet-proto` control payloads
 /// ([`NodeReport`]) and opaque data-plane bytes ([`DataFrame`]) over one
 /// length-delimited stream. Wrapping them in this envelope gives the reader an
 /// unambiguous discriminator (the proto types themselves carry no tag
@@ -398,11 +400,11 @@ pub enum CoordToSidecar {
         /// sent the owning node in its `OpenSession` command.
         ///
         /// This is the per-channel **authorization** credential the node
-        /// verifies (`fleet-agent`'s `token::verify_wire`), and it is what the
+        /// verifies (`probefleet-agent`'s `token::verify_wire`), and it is what the
         /// sidecar cross-checks the board of on a reused lease. It is minted
         /// afresh per channel and re-attenuated to the holder's current
         /// effective ops, so it changes across an `Extend` or a narrowed
-        /// grant. It is **not** [`fleet_proto::LeaseGrant::token`], and since
+        /// grant. It is **not** [`probefleet_proto::LeaseGrant::token`], and since
         /// protocol 11 it is no longer what `probe-rs serve` accepts either —
         /// that is `serve_token`.
         ///
@@ -570,10 +572,10 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::admin::NodeSummary;
-    use fleet_proto::ids::{BoardRef, NodeId, OrgId};
-    use fleet_proto::lease::Priority;
-    use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
+    use probefleet_proto::admin::NodeSummary;
+    use probefleet_proto::ids::{BoardRef, NodeId, OrgId};
+    use probefleet_proto::lease::Priority;
+    use probefleet_proto::node_api::{CoordinatorCommand, NodeReport};
 
     fn test_board_ref() -> BoardRef {
         BoardRef::new(
@@ -604,7 +606,7 @@ mod tests {
             node: NodeId("default/beast".to_owned()),
             name: "beast".to_owned(),
             tags: vec!["desk".to_owned(), "nrf52".to_owned()],
-            adopt: fleet_proto::AdoptPolicy::Auto,
+            adopt: probefleet_proto::AdoptPolicy::Auto,
             owner: Some("01J0000000000000000000USR1".to_owned()),
             last_seen: None,
             created_at: 1_700_000_000,

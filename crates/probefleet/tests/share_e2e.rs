@@ -7,16 +7,16 @@
 //!
 //! Modelled on `bearer_e2e.rs`, which does the same for the auth-key path. As
 //! there, `login --token` stands in for the device flow: the flow itself is
-//! covered against a stub GitHub in `fleet-coordinator/tests/device_flow.rs`,
+//! covered against a stub GitHub in `probefleet-coordinator/tests/device_flow.rs`,
 //! and these tests are about what the CLI writes and whether it works.
 
 mod common;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{AdoptArg, LoginArgs, NodeUpFlags, ShareArgs};
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::NodeId;
-use fleet_proto::AdoptPolicy;
+use probefleet::cli::{AdoptArg, LoginArgs, NodeUpFlags, ShareArgs};
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::NodeId;
+use probefleet_proto::AdoptPolicy;
 
 const SEED: [u8; 32] = [23u8; 32];
 
@@ -31,7 +31,7 @@ async fn mint_user_token(fleet: &Fleet, org: &str, login: &str) -> String {
 /// Run `login --token` into `config_dir`, returning the session token written.
 async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str) -> String {
     let token = mint_user_token(fleet, "default", login_name).await;
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token.clone()),
@@ -71,12 +71,12 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
     let config_dir = tmp.path().join("fleets");
     let session = login(&fleet, &config_dir, "alice").await;
 
-    fleet_bin::roles::share::run(share_args(&config_dir, "alice-laptop"))
+    probefleet::roles::share::run(share_args(&config_dir, "alice-laptop"))
         .await
         .expect("share");
 
     let config_path = config_dir.join("default.toml");
-    let file = fleet_bin::fleet_config::load(&config_path).unwrap();
+    let file = probefleet::fleet_config::load(&config_path).unwrap();
 
     // Both tables, and the [user] one is byte-for-byte what login wrote.
     let user = file.user.clone().expect("[user] survived share");
@@ -104,11 +104,11 @@ async fn login_then_share_yields_a_working_node_owned_by_the_user() {
     // out where the operator can read it.
     let node_toml = config_dir.join("node").join("node.toml");
     assert!(config_dir.join("node").join("boards.toml").exists());
-    let settings = fleet_bin::roles::node_run::load_node_settings(&node_toml).unwrap();
+    let settings = probefleet::roles::node_run::load_node_settings(&node_toml).unwrap();
     assert_eq!(settings.adopt, Some(AdoptPolicy::Auto));
 
     // ... and, the point of the whole test, the token actually connects.
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: file.url.clone(),
         path: "/agent",
         bearer: node.node_token.clone(),
@@ -154,9 +154,9 @@ async fn share_honours_an_explicit_adopt_policy() {
 
     let mut args = share_args(&config_dir, "lab-laptop");
     args.adopt = Some(AdoptArg::Declared);
-    fleet_bin::roles::share::run(args).await.expect("share");
+    probefleet::roles::share::run(args).await.expect("share");
 
-    let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
+    let file = probefleet::fleet_config::load(&config_dir.join("default.toml")).unwrap();
     let node_id = NodeId(file.node.unwrap().node_id);
     assert_eq!(
         fleet
@@ -171,7 +171,7 @@ async fn share_honours_an_explicit_adopt_policy() {
     );
 
     let settings =
-        fleet_bin::roles::node_run::load_node_settings(&config_dir.join("node").join("node.toml"))
+        probefleet::roles::node_run::load_node_settings(&config_dir.join("node").join("node.toml"))
             .unwrap();
     assert_eq!(settings.adopt, Some(AdoptPolicy::Declared));
 }
@@ -185,7 +185,7 @@ async fn share_without_a_login_names_the_remedy() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
 
-    let err = fleet_bin::roles::share::run(share_args(&config_dir, "laptop"))
+    let err = probefleet::roles::share::run(share_args(&config_dir, "laptop"))
         .await
         .expect_err("share with no [user] must fail");
     let rendered = format!("{err:#}");
@@ -208,22 +208,22 @@ async fn sharing_twice_without_force_is_refused() {
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
 
-    fleet_bin::roles::share::run(share_args(&config_dir, "laptop"))
+    probefleet::roles::share::run(share_args(&config_dir, "laptop"))
         .await
         .expect("first share");
-    let first = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
+    let first = probefleet::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
         .node
         .unwrap()
         .node_token;
 
-    let err = fleet_bin::roles::share::run(share_args(&config_dir, "laptop"))
+    let err = probefleet::roles::share::run(share_args(&config_dir, "laptop"))
         .await
         .expect_err("a second share must be refused");
     assert!(format!("{err:#}").contains("--force"));
 
     // And the working credential is untouched.
-    let after = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
+    let after = probefleet::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
         .node
         .unwrap()
@@ -242,7 +242,7 @@ async fn sharing_twice_without_force_is_refused() {
     let mine = "[[board]]\nid = \"my-dk\"\nserial = \"ZZZ\"\nchip = \"nRF52840_xxAA\"\n";
     std::fs::write(&boards_path, mine).unwrap();
 
-    fleet_bin::roles::share::run(forced)
+    probefleet::roles::share::run(forced)
         .await
         .expect("share --force");
 
@@ -252,20 +252,22 @@ async fn sharing_twice_without_force_is_refused() {
         "re-sharing must not destroy a hand-written board inventory"
     );
 
-    let fresh = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
+    let fresh = probefleet::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
         .node
         .unwrap()
         .node_token;
     assert_ne!(fresh, first);
-    assert!(fleet_wire::client::dial(fleet_wire::client::DialOpts {
-        url: fleet.base_url.clone(),
-        path: "/agent",
-        bearer: first,
-        pin: None,
-    })
-    .await
-    .is_err());
+    assert!(
+        probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
+            url: fleet.base_url.clone(),
+            path: "/agent",
+            bearer: first,
+            pin: None,
+        })
+        .await
+        .is_err()
+    );
 }
 
 /// `node up` on a laptop that has logged in takes the same path `share` does,
@@ -278,7 +280,7 @@ async fn node_up_self_registers_from_an_existing_session() {
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
 
-    fleet_bin::roles::node_up::bootstrap(
+    probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: None,
             auth_key: None,
@@ -299,7 +301,7 @@ async fn node_up_self_registers_from_an_existing_session() {
     .await
     .expect("node up with a session and no flags");
 
-    let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
+    let file = probefleet::fleet_config::load(&config_dir.join("default.toml")).unwrap();
     let node = file.node.expect("[node] written");
     assert!(file.user.is_some(), "[user] must survive");
     let node_id = NodeId(node.node_id);
@@ -336,16 +338,16 @@ async fn node_up_reuses_an_existing_node_credential() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
     login(&fleet, &config_dir, "alice").await;
-    fleet_bin::roles::share::run(share_args(&config_dir, "laptop"))
+    probefleet::roles::share::run(share_args(&config_dir, "laptop"))
         .await
         .expect("share");
-    let before = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
+    let before = probefleet::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
         .node
         .unwrap()
         .node_token;
 
-    fleet_bin::roles::node_up::bootstrap(
+    probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: None,
             auth_key: None,
@@ -366,7 +368,7 @@ async fn node_up_reuses_an_existing_node_credential() {
     .await
     .expect("node up on an already-enrolled node");
 
-    let after = fleet_bin::fleet_config::load(&config_dir.join("default.toml"))
+    let after = probefleet::fleet_config::load(&config_dir.join("default.toml"))
         .unwrap()
         .node
         .unwrap()
@@ -383,7 +385,7 @@ async fn node_up_with_no_credential_at_all_explains_itself() {
     let tmp = tempfile::tempdir().unwrap();
     let config_dir = tmp.path().join("fleets");
 
-    let err = fleet_bin::roles::node_up::bootstrap(
+    let err = probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: None,
             auth_key: None,
@@ -440,7 +442,7 @@ async fn an_explicit_auth_key_beats_an_incidental_session() {
         )
         .await;
 
-    fleet_bin::roles::node_up::bootstrap(
+    probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(key),
@@ -461,7 +463,7 @@ async fn an_explicit_auth_key_beats_an_incidental_session() {
     .await
     .expect("node up --auth-key");
 
-    let file = fleet_bin::fleet_config::load(&config_dir.join("default.toml")).unwrap();
+    let file = probefleet::fleet_config::load(&config_dir.join("default.toml")).unwrap();
     let node_id = NodeId(file.node.unwrap().node_id);
     // The auth-key path leaves the node unowned and `declared` — which is how
     // you can tell which rung ran.

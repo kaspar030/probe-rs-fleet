@@ -36,7 +36,7 @@
 //! That injectability is also how the CLI selector flags work: this crate still
 //! resolves purely from an `EnvSource`, but `probe-rs-fleet sidecar --board` /
 //! `--id` / `--select` layers the flag over the process environment in
-//! `fleet-bin`
+//! `probefleet`
 //! (`roles::sidecar::SelectorFlags`). The flag wins and *replaces all three*
 //! selector variables, so it never produces [`SelectorError::AmbiguousSelector`]
 //! against a stale one; `PROBE_RS_FLEET_CAPABILITY` is not intercepted, so a
@@ -45,8 +45,8 @@
 //! no flags at all (it forwards every argument verbatim to stay transparent to
 //! laze), so there the environment remains the only mechanism.
 
-use fleet_proto::ids::BoardName;
-use fleet_proto::lease::Constraint;
+use probefleet_proto::ids::BoardName;
+use probefleet_proto::lease::Constraint;
 
 /// Environment variable names the sidecar consults.
 pub mod env {
@@ -166,7 +166,7 @@ impl FleetConfig {
     pub fn server_pin(&self) -> Option<[u8; 32]> {
         self.server_cert_sha256
             .as_deref()
-            .and_then(fleet_tls::parse_fingerprint)
+            .and_then(probefleet_tls::parse_fingerprint)
     }
 }
 
@@ -193,7 +193,7 @@ impl DelegatedConfig {
     pub fn server_pin(&self) -> Option<[u8; 32]> {
         self.server_cert_sha256
             .as_deref()
-            .and_then(fleet_tls::parse_fingerprint)
+            .and_then(probefleet_tls::parse_fingerprint)
     }
 
     /// The lease id the token authorises, decoded locally.
@@ -203,9 +203,9 @@ impl DelegatedConfig {
     /// the token. This only saves a round trip to learn which lease to open a
     /// channel on; a forged token gets a `401` at the door regardless.
     #[must_use]
-    pub fn lease(&self) -> Option<fleet_proto::LeaseId> {
+    pub fn lease(&self) -> Option<probefleet_proto::LeaseId> {
         let wire = decode_hex(&self.capability)?;
-        let signed = fleet_proto::token::SignedToken::from_wire(&wire).ok()?;
+        let signed = probefleet_proto::token::SignedToken::from_wire(&wire).ok()?;
         signed.decode_token().ok().map(|t| t.lease)
     }
 }
@@ -344,7 +344,7 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     }
 
     if let Some(pin) = &pin {
-        if fleet_tls::parse_fingerprint(pin).is_none() {
+        if probefleet_tls::parse_fingerprint(pin).is_none() {
             return Err(SelectorError::InvalidPin);
         }
     }
@@ -394,14 +394,14 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
 /// Parse a `PROBE_RS_FLEET_SELECT` constraint expression into a
 /// [`Constraint`].
 ///
-/// A thin delegate to [`fleet_proto::lease::parse_constraint`], the fleet's one
+/// A thin delegate to [`probefleet_proto::lease::parse_constraint`], the fleet's one
 /// selector grammar (architecture §6.5), where a bare term is a **tag** —
 /// `PROBE_RS_FLEET_SELECT=nrf52 && bluetooth` describes a set of boards.
 /// `board=<model>` selects any board of a model and `id=<name>` one specific
 /// board; `PROBE_RS_FLEET_BOARD` / `PROBE_RS_FLEET_ID` are the shorthands for
 /// those two.
 fn parse_select(expr: &str) -> Result<Constraint, SelectorError> {
-    fleet_proto::lease::parse_constraint(expr).map_err(|e| SelectorError::InvalidSelect {
+    probefleet_proto::lease::parse_constraint(expr).map_err(|e| SelectorError::InvalidSelect {
         reason: e.to_string(),
     })
 }
@@ -771,11 +771,11 @@ mod tests {
     /// The lease is decoded from the token locally — no key, no round trip.
     #[test]
     fn the_lease_is_decodable_from_the_capability_token() {
-        use fleet_proto::ids::{BoardRef, NodeId, OrgId};
-        use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
+        use probefleet_proto::ids::{BoardRef, NodeId, OrgId};
+        use probefleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
 
         let token = CapabilityToken {
-            lease: fleet_proto::LeaseId(42),
+            lease: probefleet_proto::LeaseId(42),
             board: BoardRef::new(
                 OrgId("acme".to_owned()),
                 NodeId("rpi-1".to_owned()),
@@ -787,7 +787,7 @@ mod tests {
         let signed = SignedToken {
             token_bytes: token.serialize_for_signing().unwrap(),
             // The sidecar never checks the signature: the coordinator does.
-            signature: [0u8; fleet_proto::SIGNATURE_LEN],
+            signature: [0u8; probefleet_proto::SIGNATURE_LEN],
         };
         let hex = crate::transport::hex_encode(&signed.to_wire());
 
@@ -796,7 +796,7 @@ mod tests {
             capability: hex,
             server_cert_sha256: None,
         };
-        assert_eq!(cfg.lease(), Some(fleet_proto::LeaseId(42)));
+        assert_eq!(cfg.lease(), Some(probefleet_proto::LeaseId(42)));
     }
 
     #[test]

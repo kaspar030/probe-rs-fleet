@@ -11,7 +11,7 @@
 //! token ([`SignedToken`]), and the [`TokenSigner`] / [`TokenVerifier`] traits.
 //! The concrete signature algorithm (ed25519) lives in the coordinator (signer)
 //! and agent (verifier) crates, behind these traits. Keeping the algorithm out
-//! of `fleet-proto` keeps this crate dependency-light while letting both ends
+//! of `probefleet-proto` keeps this crate dependency-light while letting both ends
 //! share one definition and the same test vectors.
 //!
 //! Wire shape of a signed token (what travels in [`crate::LeaseGrant::token`]):

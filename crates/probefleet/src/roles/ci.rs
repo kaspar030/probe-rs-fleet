@@ -40,7 +40,7 @@
 //! * otherwise, `export …` lines go to stdout for `eval "$(…)"`.
 //!
 //! The variables are exactly the two the sidecar already reads
-//! (`fleet_sidecar::selector`), so nothing in the sidecar changes.
+//! (`probefleet_sidecar::selector`), so nothing in the sidecar changes.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -76,14 +76,14 @@ pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
     )?;
     if let Some(pin) = &args.server_cert_sha256 {
         anyhow::ensure!(
-            fleet_tls::parse_fingerprint(pin).is_some(),
+            probefleet_tls::parse_fingerprint(pin).is_some(),
             "--server-cert-sha256 must be 64 hex characters"
         );
     }
     let pin = args
         .server_cert_sha256
         .as_deref()
-        .and_then(fleet_tls::parse_fingerprint);
+        .and_then(probefleet_tls::parse_fingerprint);
 
     let client =
         ForgsClient::new(&url, pin).map_err(|e| anyhow::anyhow!("invalid coordinator URL: {e}"))?;

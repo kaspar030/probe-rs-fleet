@@ -43,11 +43,11 @@
 //! TCP gdb stub, not over the remote WebSocket). The fleet path therefore does not exec
 //! the genuine client for `gdb`; instead it tunnels raw gdbremote bytes to an
 //! agent that runs `probe-rs gdb` locally, as a **second relay channel**
-//! ([`fleet_proto::ChannelKind::Gdb`]). The workstation-side listener + byte
+//! ([`probefleet_proto::ChannelKind::Gdb`]). The workstation-side listener + byte
 //! splice live in [`crate::gdb`]; the gdb channel is opened over the same live
 //! transport.
 
-use fleet_proto::lease::{LeaseGrant, LeaseRequest};
+use probefleet_proto::lease::{LeaseGrant, LeaseRequest};
 
 /// Errors from the relay / lease seam.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

@@ -1,4 +1,4 @@
-//! Shared fixtures for the fleet-bin e2e tests.
+//! Shared fixtures for the probefleet e2e tests.
 //!
 //! Users and orgs are built with the production constructors
 //! (`create_local_user`, `ensure_org_named`, `set_member`, forgs'
@@ -7,15 +7,15 @@
 
 use std::sync::Arc;
 
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, GithubActionsConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_coordinator::FleetRole;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::OrgId;
+use probefleet_coordinator::auth::Ed25519Signer;
+use probefleet_coordinator::clock::SystemClock;
+use probefleet_coordinator::config::{CoordinatorConfig, GithubActionsConfig, SigningKeySource};
+use probefleet_coordinator::core::Coordinator;
+use probefleet_coordinator::state::Db;
+use probefleet_coordinator::FleetRole;
+use probefleet_core::policy::Policy;
+use probefleet_core::scheduler::Scheduler;
+use probefleet_proto::ids::OrgId;
 
 /// The shared org every fixture coordinator has.
 pub const DEFAULT_ORG: &str = "default";
@@ -113,7 +113,7 @@ impl Fleet {
         subject_name: Option<&str>,
     ) -> String {
         let org = self.org(org_name).await;
-        let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+        let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
         let ctx = self.coord.auth();
         let payload = ctx
             .purposes()
@@ -191,7 +191,7 @@ pub async fn start_fleet_with(
     };
     let db = Db::connect_in_memory().await.unwrap();
     let clock = Arc::new(SystemClock);
-    db.ensure_org_named(DEFAULT_ORG, fleet_coordinator::now_epoch_secs())
+    db.ensure_org_named(DEFAULT_ORG, probefleet_coordinator::now_epoch_secs())
         .await
         .unwrap();
     let coord = Arc::new(Coordinator::new(
@@ -205,7 +205,7 @@ pub async fn start_fleet_with(
     // coordinator through this link.
     coord.attach();
 
-    let router = fleet_coordinator::http::router(Arc::clone(&coord));
+    let router = probefleet_coordinator::http::router(Arc::clone(&coord));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {

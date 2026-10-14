@@ -14,10 +14,10 @@ use std::sync::Arc;
 use common::TestCoordinator;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use fleet_agent::{Agent, ProbeRsBackend, Session, SpliceIo};
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::{BoardName, BoardRef};
-use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use probefleet_agent::{Agent, ProbeRsBackend, Session, SpliceIo};
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::{BoardName, BoardRef};
+use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 /// A backend whose `probe-rs serve` session echoes every byte back — a fresh
 /// echoing duplex **per channel**, since one server now serves many.
@@ -59,8 +59,8 @@ impl Session for EchoSession {
     async fn kill(&self) -> Result<(), String> {
         Ok(())
     }
-    async fn wait(&self) -> fleet_agent::probers::SessionExit {
-        fleet_agent::probers::SessionExit::Killed
+    async fn wait(&self) -> probefleet_agent::probers::SessionExit {
+        probefleet_agent::probers::SessionExit::Killed
     }
 }
 
@@ -68,7 +68,7 @@ impl Session for EchoSession {
 impl ProbeRsBackend for EchoBackend {
     async fn open(
         &self,
-        board: &fleet_agent::config::BoardSpec,
+        board: &probefleet_agent::config::BoardSpec,
         _serve_token: &str,
     ) -> Result<Box<dyn Session>, String> {
         Ok(Box::new(EchoSession {
@@ -91,8 +91,8 @@ fn agent_config(
     fleet_url: &str,
     node_token: &str,
     token_pubkey: &[u8; 32],
-) -> fleet_agent::config::AgentConfig {
-    fleet_agent::config::AgentConfig {
+) -> probefleet_agent::config::AgentConfig {
+    probefleet_agent::config::AgentConfig {
         node_id: node_id.to_owned(),
         fleet_url: fleet_url.to_owned(),
         node_token: node_token.to_owned(),
@@ -103,13 +103,13 @@ fn agent_config(
         heartbeat_secs: 30,
         // Long enough that these transport tests never tick discovery.
         discovery_secs: 3_600,
-        adopt: fleet_proto::AdoptPolicy::Declared,
+        adopt: probefleet_proto::AdoptPolicy::Declared,
         erase_on_release: false,
     }
 }
 
-fn boards() -> fleet_agent::config::BoardsConfig {
-    fleet_agent::config::BoardsConfig::from_str(
+fn boards() -> probefleet_agent::config::BoardsConfig {
+    probefleet_agent::config::BoardsConfig::from_str(
         r#"
 [[board]]
 id = "nrf52840-dk-1"
@@ -148,10 +148,10 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
         let node = Arc::clone(&node);
         tokio::spawn(async move {
             // A node that never persists its rotated token: these tests are
-            // about the wire, and the storage half is covered in fleet-bin.
-            let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
-                Arc::new(fleet_agent::config::NullTokenStore);
-            let _ = fleet_agent::connection::serve_connection(
+            // about the wire, and the storage half is covered in probefleet.
+            let store: Arc<dyn probefleet_agent::config::NodeTokenStore> =
+                Arc::new(probefleet_agent::config::NullTokenStore);
+            let _ = probefleet_agent::connection::serve_connection(
                 &node,
                 &mut config,
                 &store,
@@ -187,9 +187,10 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
         .dial("/client?org=default", &session_token)
         .await
         .unwrap();
-    let session = fleet_sidecar::transport::CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
-        .await
-        .unwrap();
+    let session =
+        probefleet_sidecar::transport::CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+            .await
+            .unwrap();
 
     let grant = session
         .lease(
@@ -206,7 +207,7 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
     assert_eq!(grant.node, node_id);
 
     let channel = session
-        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .open_channel(grant.lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap()
         .channel;
@@ -216,7 +217,7 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
     let (mut client, client_peer) = tokio::io::duplex(4096);
     {
         let session = &session;
-        let splice = fleet_sidecar::transport::splice_client(session, channel, client_peer);
+        let splice = probefleet_sidecar::transport::splice_client(session, channel, client_peer);
         let exchange = async {
             client.write_all(b"$AttachRequest#").await.unwrap();
             client.flush().await.unwrap();
@@ -234,15 +235,15 @@ async fn sidecar_to_agent_round_trip_over_a_real_websocket() {
 
     // The operator surface sees the same fleet: the board is leased.
     let reply = session
-        .request(fleet_wire::SidecarToCoord::ListBoards)
+        .request(probefleet_wire::SidecarToCoord::ListBoards)
         .await
         .unwrap();
     match reply {
-        fleet_wire::CoordToSidecar::BoardList(boards) => {
+        probefleet_wire::CoordToSidecar::BoardList(boards) => {
             let b = boards.iter().find(|b| b.board == board_id).unwrap();
             assert_eq!(
                 b.availability,
-                fleet_proto::admin::BoardAvailability::Leased
+                probefleet_proto::admin::BoardAvailability::Leased
             );
         }
         other => panic!("expected BoardList, got {other:?}"),
@@ -266,9 +267,9 @@ async fn a_nodes_org_comes_from_its_row_not_the_config_default() {
 
     let (tx, rx) = fleet.dial("/agent", &node_token).await.unwrap();
     tokio::spawn(async move {
-        let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
-            Arc::new(fleet_agent::config::NullTokenStore);
-        let _ = fleet_agent::connection::serve_connection(
+        let store: Arc<dyn probefleet_agent::config::NodeTokenStore> =
+            Arc::new(probefleet_agent::config::NullTokenStore);
+        let _ = probefleet_agent::connection::serve_connection(
             &node,
             &mut config,
             &store,
@@ -375,7 +376,7 @@ async fn a_deadline_that_fires_leaves_no_waiter_behind() {
         {
             let sched = fleet.coord.scheduler().lock().await;
             if sched.board(&board).map(|b| b.state.clone())
-                == Some(fleet_proto::board::BoardState::Idle)
+                == Some(probefleet_proto::board::BoardState::Idle)
             {
                 break;
             }

@@ -45,9 +45,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use fleet_agent::config::BoardsConfig;
-use fleet_agent::discovery::{reconcile, ProbeLister, ProbeRsListLister};
-use fleet_proto::{AdoptPolicy, BoardPresence, DiscoveredProbe};
+use probefleet_agent::config::BoardsConfig;
+use probefleet_agent::discovery::{reconcile, ProbeLister, ProbeRsListLister};
+use probefleet_proto::{AdoptPolicy, BoardPresence, DiscoveredProbe};
 
 use crate::cli::{NodeBoardAddArgs, NodeBoardListArgs};
 use crate::roles::node_run::{load_node_settings, resolve_boards_path};
@@ -115,10 +115,10 @@ struct BoardDraft {
 /// A stable, filesystem-safe id derived from a probe, offered as the prompt
 /// default.
 ///
-/// Deliberately the same shape as `fleet_agent::discovery`'s auto-adoption id
+/// Deliberately the same shape as `probefleet_agent::discovery`'s auto-adoption id
 /// (`{product-slug}-{serial}`, else `probe-{vid:04x}{pid:04x}-{serial}`), but a
 /// *reimplementation*: that helper is private, and exporting it would drag
-/// fleet-agent into a change this task does not need.
+/// probefleet-agent into a change this task does not need.
 ///
 /// The duplication is safe because this value is **cosmetic**: it is only ever
 /// shown as a prompt default that the operator sees and confirms, never used
@@ -159,7 +159,7 @@ fn toml_string(value: &str) -> String {
 ///
 /// # Which keys are always written
 ///
-/// `chip` is **required** by [`fleet_agent::config::BoardSpec`] — unlike `tags`,
+/// `chip` is **required** by [`probefleet_agent::config::BoardSpec`] — unlike `tags`,
 /// `exclusive` and `power` it has no `#[serde(default)]` — so it is always
 /// emitted, as `chip = ""` when the operator declared none. An empty value
 /// parses and validates; an absent key is a `missing field` parse error.
@@ -707,7 +707,7 @@ mod tests {
 
     use crate::test_support::ENV_LOCK;
 
-    /// The stub `fleet-agent`'s own one is `#[cfg(test)]`-private, so it cannot
+    /// The stub `probefleet-agent`'s own one is `#[cfg(test)]`-private, so it cannot
     /// be borrowed from here.
     struct StubLister(Vec<DiscoveredProbe>);
 
@@ -779,7 +779,7 @@ mod tests {
         assert!(board.exclusive, "exclusive defaults to true");
         assert_eq!(
             board.power,
-            fleet_agent::config::PowerSpec::None,
+            probefleet_agent::config::PowerSpec::None,
             "power defaults to none; the template stays commented"
         );
     }

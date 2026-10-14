@@ -8,7 +8,7 @@
 //!
 //! ## Core vs coordinator split
 //!
-//! The scheduler never builds the wire [`fleet_proto::LeaseGrant`], because the
+//! The scheduler never builds the wire [`probefleet_proto::LeaseGrant`], because the
 //! grant carries a signed capability `token` that is the coordinator's
 //! responsibility. Instead the scheduler returns value objects —
 //! [`GrantedLease`] (which mirrors `LeaseGrant` minus `token`) and
@@ -65,9 +65,9 @@
 
 use std::collections::BTreeMap;
 
-use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{BoardRef, LeaseId, NodeId, SubjectKey};
-use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use probefleet_proto::board::{Board, BoardState};
+use probefleet_proto::ids::{BoardRef, LeaseId, NodeId, SubjectKey};
+use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
 
 use crate::access::{selector_matches, Access};
 
@@ -89,7 +89,7 @@ pub enum LeaseAuthError {
 
 /// A lease the scheduler has granted, minus the signed wire token.
 ///
-/// Maps onto [`fleet_proto::LeaseGrant`] field-for-field except `token`, which
+/// Maps onto [`probefleet_proto::LeaseGrant`] field-for-field except `token`, which
 /// the coordinator fills in. Returned from [`Scheduler::request_lease`],
 /// [`Scheduler::release_lease`], and [`Scheduler::expire`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -882,9 +882,9 @@ impl Scheduler {
 mod tests {
     use super::*;
     use crate::access::GrantScope;
-    use fleet_proto::board::PowerKind;
-    use fleet_proto::ids::{BoardName, OrgId, SubjectKind};
-    use fleet_proto::token::AllowedOp;
+    use probefleet_proto::board::PowerKind;
+    use probefleet_proto::ids::{BoardName, OrgId, SubjectKind};
+    use probefleet_proto::token::AllowedOp;
 
     const ORG: &str = "org1";
 

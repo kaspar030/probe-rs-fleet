@@ -135,7 +135,7 @@
 //!   can name a different lease after a restart. Rather than document the
 //!   window, [`crate::open_channel_verified`] closes it by decoding the returned
 //!   channel token and comparing its `board` with the record's. Adding a boot id
-//!   to `Welcome` would be the systemic fix and is a `fleet-wire` protocol
+//!   to `Welcome` would be the systemic fix and is a `probefleet-wire` protocol
 //!   change; noted as a follow-up.
 
 #[cfg(unix)]
@@ -148,9 +148,9 @@ mod unix_imp {
     use serde::{Deserialize, Serialize};
     use sha2::{Digest as _, Sha256};
 
-    use fleet_proto::ids::{BoardRef, NodeId, SubjectKey, SubjectKind};
-    use fleet_proto::lease::{Constraint, LeaseGrant};
-    use fleet_proto::LeaseId;
+    use probefleet_proto::ids::{BoardRef, NodeId, SubjectKey, SubjectKind};
+    use probefleet_proto::lease::{Constraint, LeaseGrant};
+    use probefleet_proto::LeaseId;
 
     use crate::lease_cache::{fingerprint, CachedLease, LeaseCache};
     use crate::selector::EnvSource;
@@ -674,7 +674,7 @@ mod unix_imp {
     /// Parse a [`crate::lease_cache::fingerprint`] back into a [`Constraint`],
     /// so a loaded record can be judged by [`LeaseCache`] under its own key.
     fn parse_selector_key(selector: &str) -> Result<Constraint, ()> {
-        use fleet_proto::ids::BoardName;
+        use probefleet_proto::ids::BoardName;
 
         let (kind, value) = selector.split_once(':').ok_or(())?;
         match kind {
@@ -702,7 +702,7 @@ mod unix_imp {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use fleet_proto::ids::{BoardName, OrgId};
+        use probefleet_proto::ids::{BoardName, OrgId};
 
         fn grant(expires: u64, kind: SubjectKind) -> LeaseGrant {
             LeaseGrant {
@@ -1091,9 +1091,9 @@ mod unix_imp {
 /// existed (lease and release per invocation).
 #[cfg(not(unix))]
 mod other_imp {
-    use fleet_proto::ids::{BoardRef, NodeId, SubjectKey};
-    use fleet_proto::lease::{Constraint, LeaseGrant};
-    use fleet_proto::LeaseId;
+    use probefleet_proto::ids::{BoardRef, NodeId, SubjectKey};
+    use probefleet_proto::lease::{Constraint, LeaseGrant};
+    use probefleet_proto::LeaseId;
 
     use crate::selector::EnvSource;
 

@@ -66,7 +66,7 @@ fn the_frontend_unit_tests_pass() {
             // toolchain. Loud, so nobody reads a green run as coverage.
             println!(
                 "SKIPPING the frontend JavaScript tests: could not run `node` ({e}). \
-                 Install node to run {} test file(s) in crates/fleet-coordinator/web-tests/.",
+                 Install node to run {} test file(s) in crates/probefleet-coordinator/web-tests/.",
                 files.len()
             );
             return;

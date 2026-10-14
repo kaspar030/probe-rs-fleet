@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use fleet_core::policy::Policy;
+use probefleet_core::policy::Policy;
 
 use crate::cli::InitArgs;
 use crate::paths;

@@ -3,7 +3,7 @@
 //!
 //! # There is no build step, and that is the mechanism
 //!
-//! The asset tree in `crates/fleet-coordinator/web/` is hand-written HTML, CSS
+//! The asset tree in `crates/probefleet-coordinator/web/` is hand-written HTML, CSS
 //! and plain ES modules. No npm, no bundler, no TypeScript compile, no
 //! generated artifact. [`include_dir!`](include_dir::include_dir) embeds it at
 //! compile time, so `cargo build` on a machine with no node or npm installed
@@ -12,7 +12,7 @@
 //! nothing to keep in sync.
 //!
 //! The cost, recorded in D3: no type checking, and hand-rolled DOM code. The
-//! JavaScript unit tests in `crates/fleet-coordinator/web-tests/` need `node`
+//! JavaScript unit tests in `crates/probefleet-coordinator/web-tests/` need `node`
 //! on `PATH`, but `tests/ui_js.rs` skips them loudly when it is absent, so
 //! neither `cargo build` nor `cargo test` requires a JavaScript toolchain. A CI
 //! pipeline that ever exists should install node (one line, no npm, no network)

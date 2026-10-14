@@ -7,7 +7,7 @@
 //! * `--until 2026-12-31` — an *absolute* deadline, as a civil date or an
 //!   epoch-seconds integer.
 //!
-//! Deliberately dependency-free. Pulling `chrono`/`time` into `fleet-bin` to
+//! Deliberately dependency-free. Pulling `chrono`/`time` into `probefleet` to
 //! parse `YYYY-MM-DD` would be a poor trade: the days-from-civil algorithm
 //! below is fifteen lines and exact, and a date flag is the only calendar
 //! arithmetic in the tree.

@@ -24,8 +24,8 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
 use forgs::TokenKind;
+use probefleet_coordinator::FleetRole;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 /// A `POST /node/enroll` body.
@@ -60,7 +60,7 @@ async fn a_well_formed_but_unknown_token_is_rejected() {
     let fleet = TestCoordinator::start().await;
     let format = fleet.auth().format();
     let orphan_node = format
-        .mint(fleet_coordinator::identity::node_token_kind(format))
+        .mint(probefleet_coordinator::identity::node_token_kind(format))
         .to_secret_string();
     let orphan_session = format.mint(TokenKind::Session).to_secret_string();
     assert_eq!(

@@ -19,10 +19,10 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::SubjectKind;
-use fleet_proto::token::AllowedOp;
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::SubjectKind;
+use probefleet_proto::token::AllowedOp;
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 /// Open a `/client` session at `path` and issue one operator request.
 async fn operator_request(
@@ -32,7 +32,7 @@ async fn operator_request(
     msg: SidecarToCoord,
 ) -> CoordToSidecar {
     let (tx, rx) = fleet.dial(path, token).await.expect("upgrade accepted");
-    let session = fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
+    let session = probefleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
         .await
         .expect("handshake");
     session.request(msg).await.expect("reply")
@@ -205,7 +205,7 @@ async fn a_revoked_membership_stops_working_at_once() {
     let removed = fleet
         .db()
         .forgs()
-        .scoped(fleet_coordinator::subject::ns_of(&acme).unwrap())
+        .scoped(probefleet_coordinator::subject::ns_of(&acme).unwrap())
         .remove_member(&forgs::SubjectKey::user(carol))
         .await
         .unwrap();

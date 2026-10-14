@@ -18,9 +18,9 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
-use fleet_proto::PROTOCOL_VERSION;
-use fleet_wire::{CoordToNode, NodeToCoord};
+use probefleet_proto::node_api::{CoordinatorCommand, NodeReport};
+use probefleet_proto::PROTOCOL_VERSION;
+use probefleet_wire::{CoordToNode, NodeToCoord};
 
 /// Rotate anything older than a second, and give the node a second to ack, so
 /// the state machine is exercised without a long test.
@@ -34,9 +34,9 @@ async fn eager_rotation_fleet() -> TestCoordinator {
 }
 
 /// Await the rotation push the coordinator sends on connect.
-async fn expect_push(rx: &mut fleet_wire::client::DialedRx) -> (String, u64) {
+async fn expect_push(rx: &mut probefleet_wire::client::DialedRx) -> (String, u64) {
     loop {
-        match fleet_wire::recv::<CoordToNode>(rx).await.unwrap() {
+        match probefleet_wire::recv::<CoordToNode>(rx).await.unwrap() {
             CoordToNode::Command(CoordinatorCommand::RotateNodeToken { token, rotation_id }) => {
                 return (token, rotation_id)
             }
@@ -60,7 +60,7 @@ async fn ack_promotes_the_new_token_and_retires_the_old() {
     assert_eq!(fleet.upgrade_status("/agent", Some(&new_token)).await, 401);
 
     // Ack it, as the node does after persisting.
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::TokenRotated { rotation_id }),
     )
@@ -169,7 +169,7 @@ async fn a_stale_rotation_ack_is_ignored() {
     let (mut tx, mut rx) = fleet.dial("/agent", &old_token).await.unwrap();
     let (new_token, rotation_id) = expect_push(&mut rx).await;
 
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::TokenRotated {
             rotation_id: rotation_id.wrapping_add(999),
@@ -178,7 +178,7 @@ async fn a_stale_rotation_ack_is_ignored() {
     .await
     .unwrap();
     // Keep the connection alive long enough for the ack to be processed.
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
     )
@@ -213,7 +213,7 @@ async fn an_unacked_rotation_times_out_and_is_retried() {
     // coordinator abandons the pending rotation and mints another.
     let keepalive = tokio::spawn(async move {
         loop {
-            if fleet_wire::send(
+            if probefleet_wire::send(
                 &mut tx,
                 &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
             )
@@ -254,7 +254,7 @@ async fn a_fresh_token_is_not_rotated_on_connect() {
     let (token, node) = fleet.seed_node("default", "rpi-1").await;
 
     let (mut tx, mut rx) = fleet.dial("/agent", &token).await.unwrap();
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::Register {
             node: node.clone(),
@@ -267,7 +267,7 @@ async fn a_fresh_token_is_not_rotated_on_connect() {
     // Nothing should arrive within a short window.
     let pushed = tokio::time::timeout(
         std::time::Duration::from_millis(300),
-        fleet_wire::recv::<CoordToNode>(&mut rx),
+        probefleet_wire::recv::<CoordToNode>(&mut rx),
     )
     .await;
     assert!(
@@ -310,7 +310,7 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
     let (new_token, rotation_id) = expect_push(&mut rx).await;
 
     // Ack it, as the node does after persisting.
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::TokenRotated { rotation_id }),
     )
@@ -338,7 +338,7 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
     while std::time::Instant::now() < watch_until {
         match tokio::time::timeout(
             std::time::Duration::from_millis(250),
-            fleet_wire::recv::<CoordToNode>(&mut rx),
+            probefleet_wire::recv::<CoordToNode>(&mut rx),
         )
         .await
         {
@@ -347,7 +347,7 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
             }
             // Timeouts and other frames are the expected quiet case.
             _ => {
-                let _ = fleet_wire::send(
+                let _ = probefleet_wire::send(
                     &mut tx,
                     &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
                 )
@@ -372,7 +372,7 @@ async fn a_completed_rotation_does_not_re_fire_every_ping() {
 ///
 /// The rotation push is the observable proxy for "the tick arm was polled":
 /// the coordinator's own ping is invisible to the client, because tungstenite
-/// answers inbound pings itself and `fleet_wire` does not surface them.
+/// answers inbound pings itself and `probefleet_wire` does not surface them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_flooding_node_does_not_starve_the_rotation_tick() {
     let fleet = eager_rotation_fleet().await;
@@ -384,7 +384,7 @@ async fn a_flooding_node_does_not_starve_the_rotation_tick() {
 
     let (mut tx, mut rx) = fleet.dial("/agent", &token).await.unwrap();
     let flood = tokio::spawn(async move {
-        while fleet_wire::send(
+        while probefleet_wire::send(
             &mut tx,
             &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )

@@ -6,13 +6,13 @@
 //! coordinator round-trip (architecture §6).
 //!
 //! The signing counterpart lives in the coordinator (task 1711); the two share
-//! the [`fleet_proto::token`] scheme and the test vectors in this module's
+//! the [`probefleet_proto::token`] scheme and the test vectors in this module's
 //! tests.
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken, TokenError, TokenVerifier};
-use fleet_proto::{BoardRef, LeaseId};
+use probefleet_proto::token::{AllowedOp, CapabilityToken, SignedToken, TokenError, TokenVerifier};
+use probefleet_proto::{BoardRef, LeaseId};
 
 /// Verifies capability tokens against the coordinator's ed25519 public key.
 #[derive(Debug, Clone)]
@@ -103,7 +103,7 @@ pub fn verify_wire(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use fleet_proto::ids::{NodeId, OrgId};
+    use probefleet_proto::ids::{NodeId, OrgId};
 
     /// The fleet-unique board key a token is scoped to. The agent treats it as
     /// opaque for matching: it compares the whole `(org, node, name)` triple,
@@ -111,7 +111,7 @@ mod tests {
     ///
     /// The node half is org-namespaced, because a `BoardRef` is only ever
     /// minted by the coordinator (`state.rs::node_id_for`). Kept identical to
-    /// `fleet-coordinator/src/auth.rs`'s `test_board()`: the two crates' token
+    /// `probefleet-coordinator/src/auth.rs`'s `test_board()`: the two crates' token
     /// tests are a shared vector, so a token signed there verifies here.
     fn board() -> BoardRef {
         BoardRef::new(

@@ -12,7 +12,7 @@
 //! they always meant, plus one sibling case pinning the `Keep` arm.
 //! `tests/lease_reuse.rs` covers the sharing itself.
 //!
-//! Everything runs over `fleet_wire::mock::pair`: no coordinator, no TLS, no
+//! Everything runs over `probefleet_wire::mock::pair`: no coordinator, no TLS, no
 //! probe-rs binary. `hold_and_run` takes its shutdown future as a parameter
 //! precisely so this file can fire "a signal" without raising a real one at the
 //! test process.
@@ -20,12 +20,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
-use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
-use fleet_proto::{LeaseId, PROTOCOL_VERSION};
-use fleet_sidecar::lease_store::Disposition;
-use fleet_sidecar::transport::CoordSession;
-use fleet_wire::{CoordToSidecar, SidecarToCoord, WireRx, WireTx};
+use probefleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
+use probefleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
+use probefleet_proto::{LeaseId, PROTOCOL_VERSION};
+use probefleet_sidecar::lease_store::Disposition;
+use probefleet_sidecar::transport::CoordSession;
+use probefleet_wire::{CoordToSidecar, SidecarToCoord, WireRx, WireTx};
 use tokio::sync::{mpsc, Mutex};
 
 /// The grant every peer in this file hands out.
@@ -51,11 +51,11 @@ fn lease_request() -> LeaseRequest {
 
 /// Answer the Hello with a Welcome.
 async fn handshake(tx: &mut impl WireTx, rx: &mut impl WireRx) {
-    match fleet_wire::recv::<SidecarToCoord>(rx).await.unwrap() {
+    match probefleet_wire::recv::<SidecarToCoord>(rx).await.unwrap() {
         SidecarToCoord::Hello { .. } => {}
         other => panic!("expected Hello, got {other:?}"),
     }
-    fleet_wire::send(
+    probefleet_wire::send(
         tx,
         &CoordToSidecar::Welcome {
             protocol_version: PROTOCOL_VERSION,
@@ -71,11 +71,11 @@ async fn handshake(tx: &mut impl WireTx, rx: &mut impl WireRx) {
 /// overriding the operator's policy with a constant nobody can configure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_lease_request_carries_no_hardcoded_duration() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let req = match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        let req = match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
@@ -91,7 +91,7 @@ async fn the_lease_request_carries_no_hardcoded_duration() {
             "0 means the coordinator's policy default"
         );
         assert_eq!(req.priority, Priority::Interactive);
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
             .await
             .unwrap();
     });
@@ -113,36 +113,36 @@ async fn the_lease_request_carries_no_hardcoded_duration() {
 /// `probe-rs run` left the board leased until the TTL expired.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shutdown_signal_releases_the_lease() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
     let released = Arc::new(Mutex::new(false));
     let released_peer = Arc::clone(&released);
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
             .await
             .unwrap();
         // The only other frame we expect is the release.
         loop {
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
                 Ok(SidecarToCoord::Release { lease }) => {
                     assert_eq!(lease, LeaseId(1));
                     *released_peer.lock().await = true;
-                    fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease })
+                    probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease })
                         .await
                         .unwrap();
                     break;
                 }
                 // A heartbeat may race in; ignore it.
                 Ok(SidecarToCoord::Extend { lease }) => {
-                    fleet_wire::send(
+                    probefleet_wire::send(
                         &mut coord_tx,
                         &CoordToSidecar::Extended {
                             lease,
@@ -176,7 +176,7 @@ async fn a_shutdown_signal_releases_the_lease() {
     };
     let shutdown = async move { fire_rx.recv().await.unwrap_or(2) };
 
-    let held = fleet_sidecar::hold_and_run(
+    let held = probefleet_sidecar::hold_and_run(
         &session,
         &granted,
         Disposition::Release,
@@ -209,23 +209,23 @@ async fn a_shutdown_signal_releases_the_lease() {
 /// returns `128 + signum`, and it still kills the child first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_shutdown_signal_keeps_a_shareable_lease() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
     let released = Arc::new(Mutex::new(false));
     let released_peer = Arc::clone(&released);
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
             .await
             .unwrap();
-        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+        while let Ok(msg) = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
             match msg {
                 SidecarToCoord::Release { .. } => {
                     *released_peer.lock().await = true;
@@ -233,7 +233,7 @@ async fn a_shutdown_signal_keeps_a_shareable_lease() {
                 }
                 // A heartbeat may race in; ignore it.
                 SidecarToCoord::Extend { lease } => {
-                    fleet_wire::send(
+                    probefleet_wire::send(
                         &mut coord_tx,
                         &CoordToSidecar::Extended {
                             lease,
@@ -263,7 +263,7 @@ async fn a_shutdown_signal_keeps_a_shareable_lease() {
     };
     let shutdown = async move { fire_rx.recv().await.unwrap_or(2) };
 
-    let mut held = Box::pin(fleet_sidecar::hold_and_run(
+    let mut held = Box::pin(probefleet_sidecar::hold_and_run(
         &session,
         &granted,
         Disposition::Keep,
@@ -300,12 +300,12 @@ async fn a_shutdown_signal_keeps_a_shareable_lease() {
 /// heartbeat *sequence*, never on wall-clock.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_long_session_is_kept_alive() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
     let (seen_tx, mut seen_rx) = mpsc::channel::<u64>(64);
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
@@ -319,16 +319,16 @@ async fn a_long_session_is_kept_alive() {
             .unwrap()
             .as_secs()
             + 900;
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(expires)))
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(expires)))
             .await
             .unwrap();
 
         let mut n = 0u64;
-        while let Ok(msg) = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
+        while let Ok(msg) = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await {
             match msg {
                 SidecarToCoord::Extend { lease } => {
                     n += 1;
-                    fleet_wire::send(
+                    probefleet_wire::send(
                         &mut coord_tx,
                         &CoordToSidecar::Extended {
                             lease,
@@ -343,7 +343,8 @@ async fn a_long_session_is_kept_alive() {
                 }
                 SidecarToCoord::Release { lease } => {
                     let _ =
-                        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease }).await;
+                        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Released { lease })
+                            .await;
                     break;
                 }
                 other => panic!("unexpected frame {other:?}"),
@@ -366,7 +367,7 @@ async fn a_long_session_is_kept_alive() {
         Ok(7)
     };
     let shutdown = std::future::pending::<i32>();
-    let code = fleet_sidecar::hold_and_run(
+    let code = probefleet_sidecar::hold_and_run(
         &session,
         &granted,
         Disposition::Release,
@@ -396,25 +397,25 @@ async fn a_long_session_is_kept_alive() {
 /// have delayed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_queued_request_returns_the_grant_when_it_is_promoted() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 1 })
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 1 })
             .await
             .unwrap();
         // Some other traffic in the meantime must not abort the wait.
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::BoardList(Vec::new()))
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::BoardList(Vec::new()))
             .await
             .unwrap();
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Lease(grant(9_999)))
             .await
             .unwrap();
     });
@@ -435,18 +436,18 @@ async fn a_queued_request_returns_the_grant_when_it_is_promoted() {
 /// exercises the real 300s-shaped deadline without sleeping.
 #[tokio::test(start_paused = true)]
 async fn a_queued_request_gives_up_at_its_deadline() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
             SidecarToCoord::Lease(_) => {}
             other => panic!("expected Lease, got {other:?}"),
         }
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 3 })
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 3 })
             .await
             .unwrap();
         // ...and then nothing at all. Hold the connection open so the failure
@@ -473,14 +474,14 @@ async fn a_queued_request_gives_up_at_its_deadline() {
 /// the sidecar did before the wait existed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_zero_wait_fails_fast_on_contention() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        let _ = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 2 })
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Queued { position: 2 })
             .await
             .unwrap();
     });
@@ -500,14 +501,14 @@ async fn a_zero_wait_fails_fast_on_contention() {
 /// a board that does not exist can only ever time out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn no_candidate_fails_fast_with_a_useful_message() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        let _ = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut coord_tx,
             &CoordToSidecar::NoCandidate {
                 selector: "id=b9".to_owned(),
@@ -536,14 +537,14 @@ async fn no_candidate_fails_fast_with_a_useful_message() {
 /// names the knob rather than blaming the fleet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn at_cap_fails_fast_and_blames_the_right_thing() {
-    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+    let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
     let peer = tokio::spawn(async move {
         handshake(&mut coord_tx, &mut coord_rx).await;
-        let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+        let _ = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        fleet_wire::send(&mut coord_tx, &CoordToSidecar::AtCap { held: 2, cap: 2 })
+        probefleet_wire::send(&mut coord_tx, &CoordToSidecar::AtCap { held: 2, cap: 2 })
             .await
             .unwrap();
     });

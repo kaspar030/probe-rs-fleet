@@ -16,11 +16,11 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::ids::{BoardName, OrgId};
-use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-use fleet_proto::token::{AllowedOp, SignedToken};
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::ids::{BoardName, OrgId};
+use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use probefleet_proto::token::{AllowedOp, SignedToken};
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 /// One hour from now, as a grant deadline.
 fn soon(fleet: &TestCoordinator) -> u64 {
@@ -231,12 +231,12 @@ async fn an_expired_grant_is_denied() {
     fleet
         .db()
         .forgs()
-        .scoped(fleet_coordinator::subject::ns_of(&alice_org).unwrap())
+        .scoped(probefleet_coordinator::subject::ns_of(&alice_org).unwrap())
         .insert_grant(
             &forgs_store::NewGrant {
                 subject: forgs::SubjectKey::user(bob_id),
                 selector: "tag=nrf52".to_owned(),
-                ops: fleet_coordinator::state::join_ops(&[AllowedOp::Attach]),
+                ops: probefleet_coordinator::state::join_ops(&[AllowedOp::Attach]),
                 expires: Some(now - 1),
                 created_by: None,
             },
@@ -629,7 +629,7 @@ async fn list_grants(fleet: &TestCoordinator, org: &OrgId) -> Vec<forgs_store::G
     fleet
         .db()
         .forgs()
-        .scoped(fleet_coordinator::subject::ns_of(org).unwrap())
+        .scoped(probefleet_coordinator::subject::ns_of(org).unwrap())
         .list_grants()
         .await
         .unwrap()

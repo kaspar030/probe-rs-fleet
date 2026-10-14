@@ -21,7 +21,7 @@
 //! Ship the multi-role `fleet` binary with an **argv0 `probe-rs` symlink on
 //! `PATH`** as the primary install story: argv0 dispatch is what lets laze run
 //! unmodified. Provide `fleet sidecar run -- <args>` as an explicit escape
-//! hatch for debugging. argv0 dispatch wiring lives in `fleet-bin` (task 1714);
+//! hatch for debugging. argv0 dispatch wiring lives in `probefleet` (task 1714);
 //! this crate exposes the reusable [`run`] entry point.
 //!
 //! ## Module map
@@ -79,8 +79,8 @@ pub mod transport;
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fleet_proto::ids::BoardRef;
-use fleet_proto::{ChannelId, ChannelKind, LeaseId};
+use probefleet_proto::ids::BoardRef;
+use probefleet_proto::{ChannelId, ChannelKind, LeaseId};
 
 use lease_store::{Disposition, LeaseStore, UseGuard};
 use selector::{EnvSource, Resolution};
@@ -248,7 +248,7 @@ async fn run_fleet(
     invocation: cli::ProbeRsInvocation,
     original_argv: Vec<String>,
 ) -> Result<i32, RunError> {
-    use fleet_proto::ChannelKind;
+    use probefleet_proto::ChannelKind;
 
     let session = transport::CoordSession::connect(&cfg).await?;
     let mut store = lease_store::LeaseStore::open(&selector::ProcessEnv);
@@ -370,7 +370,7 @@ pub struct Acquired {
     /// The lease. On a cache hit this is *reconstructed* from the store and its
     /// `token` is deliberately empty — the data-plane credential comes fresh
     /// from `ChannelOpened` on every path (architecture §6.5).
-    pub grant: fleet_proto::lease::LeaseGrant,
+    pub grant: probefleet_proto::lease::LeaseGrant,
     /// Whether the lease came from the store rather than a fresh `Lease`.
     pub reused: bool,
     /// Release at exit, or keep the lease for the next invocation.
@@ -424,7 +424,7 @@ pub async fn acquire_lease(
     store: Option<&mut LeaseStore>,
     now_secs: u64,
 ) -> Result<Acquired, RunError> {
-    use fleet_proto::lease::{LeaseRequest, Priority};
+    use probefleet_proto::lease::{LeaseRequest, Priority};
     use transport::Revalidation;
 
     let mut store = store;
@@ -555,7 +555,7 @@ pub async fn open_channel_verified(
     };
     // The **capability** token is what names a board; the serve token is an
     // opaque loopback secret and says nothing about which board it belongs to.
-    let named = fleet_proto::token::SignedToken::from_wire(&opened.token)
+    let named = probefleet_proto::token::SignedToken::from_wire(&opened.token)
         .ok()
         .and_then(|signed| signed.decode_token().ok())
         .map(|decoded| decoded.board);
@@ -623,7 +623,7 @@ fn now_secs() -> u64 {
 /// Propagates whatever `work` returns.
 pub async fn hold_and_run<F>(
     session: &transport::CoordSession,
-    grant: &fleet_proto::lease::LeaseGrant,
+    grant: &probefleet_proto::lease::LeaseGrant,
     disposition: Disposition,
     expires_out: Option<&AtomicU64>,
     work: F,
@@ -685,7 +685,7 @@ where
 /// closes the channel. The interval gives three attempts per TTL.
 async fn keepalive(
     session: &transport::CoordSession,
-    grant: &fleet_proto::lease::LeaseGrant,
+    grant: &probefleet_proto::lease::LeaseGrant,
     expires_out: Option<&AtomicU64>,
 ) -> std::convert::Infallible {
     // The *local* clock is used only to pick an interval, never to judge

@@ -12,5 +12,5 @@
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    fleet_bin::cli::main()
+    probefleet::cli::main()
 }

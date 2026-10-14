@@ -1,5 +1,5 @@
 [package]
-name = "fleet-sidecar"
+name = "probefleet-sidecar"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,9 +13,9 @@ include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 description = "Sidecar role implementation for probe-rs-fleet."
 
 [dependencies]
-fleet-proto = { workspace = true }
-fleet-tls = { workspace = true }
-fleet-wire = { workspace = true, features = ["tungstenite"] }
+probefleet-proto = { workspace = true }
+probefleet-tls = { workspace = true }
+probefleet-wire = { workspace = true, features = ["tungstenite"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -29,8 +29,8 @@ rustix = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-fleet-agent = { workspace = true }
-fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+probefleet-agent = { workspace = true }
+probefleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
 tempfile = { workspace = true }
 
 [lints]

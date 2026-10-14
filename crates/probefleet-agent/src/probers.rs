@@ -724,7 +724,7 @@ mod tests {
     use crate::config::BoardsConfig;
     // One definition, three users: see `discovery::StubLister`.
     use crate::discovery::StubLister;
-    use fleet_proto::DiscoveredProbe;
+    use probefleet_proto::DiscoveredProbe;
 
     fn discovered(serial: &str, vid: u16, pid: u16) -> DiscoveredProbe {
         DiscoveredProbe {

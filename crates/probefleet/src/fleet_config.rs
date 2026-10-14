@@ -290,7 +290,7 @@ fn validate(file: &FleetFile) -> Result<()> {
     anyhow::ensure!(!file.url.trim().is_empty(), "`url` must not be empty");
     if let Some(pin) = &file.server_cert_sha256 {
         anyhow::ensure!(
-            fleet_tls::parse_fingerprint(pin).is_some(),
+            probefleet_tls::parse_fingerprint(pin).is_some(),
             "`server_cert_sha256` must be 64 hex characters"
         );
     }
@@ -437,7 +437,7 @@ impl FleetFile {
     pub fn pin(&self) -> Option<[u8; 32]> {
         self.server_cert_sha256
             .as_deref()
-            .and_then(fleet_tls::parse_fingerprint)
+            .and_then(probefleet_tls::parse_fingerprint)
     }
 }
 
@@ -1347,7 +1347,7 @@ mod tests {
 
     /// A minimal `/auth/token` stub.
     ///
-    /// Hand-rolled rather than borrowing `fleet-coordinator`'s router: what is
+    /// Hand-rolled rather than borrowing `probefleet-coordinator`'s router: what is
     /// under test here is the *client's* branching on a coordinator's answer,
     /// including an answer no real coordinator in this tree still gives (an
     /// unknown `grant_type`). A stub is the only way to express that.

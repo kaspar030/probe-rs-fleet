@@ -134,9 +134,10 @@ pub async fn dial_stream(
     );
 
     // One trust path, shared with the `/auth/token` HTTP client: see
-    // `fleet_tls::client_trust_config`.
-    let connector =
-        tokio_tungstenite::Connector::Rustls(Arc::new(fleet_tls::client_trust_config(opts.pin)));
+    // `probefleet_tls::client_trust_config`.
+    let connector = tokio_tungstenite::Connector::Rustls(Arc::new(
+        probefleet_tls::client_trust_config(opts.pin),
+    ));
 
     let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
         request,

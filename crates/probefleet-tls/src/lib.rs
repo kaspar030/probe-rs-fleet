@@ -11,7 +11,7 @@
 //! * [`client_trust_config`] — the single trust path every outbound connection
 //!   in the tree uses. `WebPKI` roots by default; optionally a pinned server-leaf
 //!   SHA-256 for a self-hosted coordinator with no public DNS name. Both the WS
-//!   dialer (`fleet_wire::client`) and the CLI's HTTP client for the `/auth/*`
+//!   dialer (`probefleet_wire::client`) and the CLI's HTTP client for the `/auth/*`
 //!   and `/node/*` surfaces build from this one function, so
 //!   `--server-cert-sha256` covers both. If that ever forks, pinning silently
 //!   stops covering the token exchange.
@@ -84,7 +84,7 @@ pub enum TlsError {
 /// rustls panics if `install_default` is called twice, and returns an error if a
 /// provider is already installed — both of which are trivially reachable once
 /// the node, the coordinator and the token-exchange client all build configs in
-/// one process (`fleet-bin` links all three). Every entry point that builds a
+/// one process (`probefleet` links all three). Every entry point that builds a
 /// rustls config calls this first; it is idempotent and cheap.
 pub fn install_crypto_provider() {
     use std::sync::Once;

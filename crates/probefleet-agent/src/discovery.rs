@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use fleet_proto::{
+use probefleet_proto::{
     AdoptPolicy, BoardName, BoardPresence, BoardStatus, DiscoveredProbe, ProbeInventory,
 };
 
@@ -436,7 +436,7 @@ pub fn parse_probe_list_line(line: &str) -> Option<DiscoveredProbe> {
 /// A [`ProbeLister`] that shells out to `probe-rs list` and parses its
 /// human-readable output.
 ///
-/// fleet-agent deliberately carries **no** probe-rs library / USB dependency
+/// probefleet-agent deliberately carries **no** probe-rs library / USB dependency
 /// (see the module-level doc): enumeration is a swappable shell-out to the same
 /// `probe-rs` binary the agent already spawns `serve` with.
 #[derive(Debug, Clone)]

@@ -4,7 +4,7 @@
 //! Unix, SIGTERM. Daemons `select!` their service against this future to wind
 //! down cleanly.
 //!
-//! The plumbing itself lives in [`fleet_sidecar::signal::shutdown_signal`],
+//! The plumbing itself lives in [`probefleet_sidecar::signal::shutdown_signal`],
 //! which the sidecar's fleet path needs in order to release its lease on
 //! Ctrl-C. This is a thin re-point rather than a second copy, so the two cannot
 //! drift; the daemons simply do not care *which* signal fired.
@@ -14,5 +14,5 @@
 /// Resolves once any of the watched signals fires. On non-Unix platforms only
 /// Ctrl-C is awaited.
 pub async fn shutdown() {
-    let _signum = fleet_sidecar::signal::shutdown_signal().await;
+    let _signum = probefleet_sidecar::signal::shutdown_signal().await;
 }

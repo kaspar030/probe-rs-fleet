@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use fleet_proto::{AdoptPolicy, BoardName, PowerKind};
+use probefleet_proto::{AdoptPolicy, BoardName, PowerKind};
 use serde::Deserialize;
 
 /// Errors arising from configuration parsing and validation.
@@ -49,7 +49,7 @@ pub enum ConfigError {
 /// USB power-control specification as written in `boards.toml`.
 ///
 /// Deserialised from the `[board.power]` table (tagged by `kind`). Maps to
-/// [`fleet_proto::PowerKind`], which is the canonical wire shape.
+/// [`probefleet_proto::PowerKind`], which is the canonical wire shape.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum PowerSpec {
@@ -241,13 +241,13 @@ impl BoardsConfig {
     }
 }
 
-/// The heartbeat interval `fleet-bin` applies when `node.toml` omits one.
+/// The heartbeat interval `probefleet` applies when `node.toml` omits one.
 #[must_use]
 pub fn default_heartbeat_secs() -> u64 {
     15
 }
 
-/// The probe-discovery interval `fleet-bin` applies when `node.toml` omits one.
+/// The probe-discovery interval `probefleet` applies when `node.toml` omits one.
 ///
 /// 30s is a compromise: a `probe-rs list` shell-out per tick is cheap but not
 /// free, and half a minute between plugging a board in and it becoming leasable
@@ -263,8 +263,8 @@ pub fn default_discovery_secs() -> u64 {
 ///
 /// Revision 2 deleted `agent.toml`: a node's credential now lives in the
 /// `[node]` table of its fleet file and its non-credential settings in
-/// `~/.config/probe-rs-fleet/node/node.toml`, both owned by `fleet-bin`. This
-/// struct is therefore a plain **parameter struct** that `fleet-bin` assembles,
+/// `~/.config/probe-rs-fleet/node/node.toml`, both owned by `probefleet`. This
+/// struct is therefore a plain **parameter struct** that `probefleet` assembles,
 /// not something with a `Deserialize` impl and a source path.
 ///
 /// That is the point: this crate has no business knowing where credentials are
@@ -329,7 +329,7 @@ pub struct AgentConfig {
 /// The coordinator rotates node tokens over the established connection, and the
 /// agent must persist the replacement **before** acking it — an ack the node
 /// cannot honour after a restart is how a Pi bricks itself. Where "persist"
-/// writes to is `fleet-bin`'s business (today: the `[node]` table of the fleet
+/// writes to is `probefleet`'s business (today: the `[node]` table of the fleet
 /// file, read-modify-write so a concurrent `login` is not clobbered), so this
 /// crate takes the capability rather than a path.
 pub trait NodeTokenStore: Send + Sync {
@@ -389,7 +389,7 @@ impl NodeTokenStore for NullTokenStore {
 impl AgentConfig {
     /// Validate an assembled configuration.
     ///
-    /// Called by `fleet-bin` after building the struct from the fleet file plus
+    /// Called by `probefleet` after building the struct from the fleet file plus
     /// `node.toml`, so a malformed pin or pubkey fails at startup rather than at
     /// the dial (where it would silently downgrade to `WebPKI` verification).
     ///
@@ -414,7 +414,7 @@ impl AgentConfig {
             ));
         }
         if let Some(pin) = &self.server_cert_sha256 {
-            if fleet_tls::parse_fingerprint(pin).is_none() {
+            if probefleet_tls::parse_fingerprint(pin).is_none() {
                 return Err(ConfigError::Invalid(
                     "server_cert_sha256 must be 64 hex characters".to_owned(),
                 ));
@@ -433,7 +433,7 @@ impl AgentConfig {
     pub fn server_pin(&self) -> Option<[u8; 32]> {
         self.server_cert_sha256
             .as_deref()
-            .and_then(fleet_tls::parse_fingerprint)
+            .and_then(probefleet_tls::parse_fingerprint)
     }
 
     /// Swap in the previous token for a one-shot retry after an auth rejection.

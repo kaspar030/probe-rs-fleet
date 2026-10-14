@@ -6,9 +6,9 @@
 //! seconds) from the caller. That keeps the scheduling logic fully
 //! unit-testable in isolation.
 //!
-//! The only domain dependency is [`fleet_proto`]. The coordinator wraps this
+//! The only domain dependency is [`probefleet_proto`]. The coordinator wraps this
 //! crate's value objects ([`GrantedLease`], [`ExpiredLease`]) into the wire
-//! [`fleet_proto::LeaseGrant`], minting the signed capability token that is
+//! [`probefleet_proto::LeaseGrant`], minting the signed capability token that is
 //! deliberately out of scope here.
 
 pub mod access;

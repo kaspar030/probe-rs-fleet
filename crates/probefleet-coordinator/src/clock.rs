@@ -1,6 +1,6 @@
 //! Clock seam so the scheduler's epoch-seconds time source is injectable.
 //!
-//! The pure scheduler in `fleet-core` takes `now: u64` (epoch seconds) on every
+//! The pure scheduler in `probefleet-core` takes `now: u64` (epoch seconds) on every
 //! time-sensitive call; the coordinator owns the actual clock. Keeping it
 //! behind a tiny trait lets tests drive deterministic time without touching the
 //! wall clock.

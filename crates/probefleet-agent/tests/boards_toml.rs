@@ -1,7 +1,7 @@
 //! End-to-end parse of a realistic `boards.toml` fixture (architecture §8).
 
-use fleet_agent::config::BoardsConfig;
-use fleet_proto::{BoardName, PowerKind};
+use probefleet_agent::config::BoardsConfig;
+use probefleet_proto::{BoardName, PowerKind};
 
 #[test]
 fn parses_realistic_boards_fixture() {

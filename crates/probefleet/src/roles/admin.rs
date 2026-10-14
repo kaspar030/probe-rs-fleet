@@ -36,9 +36,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::warn;
 
-use fleet_coordinator::identity::{PURPOSE_CI, PURPOSE_NODE};
-use fleet_coordinator::{Coordinator, Db, FleetRole};
 use forgs::TokenKind;
+use probefleet_coordinator::identity::{PURPOSE_CI, PURPOSE_NODE};
+use probefleet_coordinator::{Coordinator, Db, FleetRole};
 
 use crate::cli::{AuthKeyArgs, OrgCreateArgs, UserTokenArgs};
 use crate::paths;
@@ -77,7 +77,7 @@ impl Admin {
                      {raw} --admin <username>`"
                 )
             })?;
-        fleet_coordinator::subject::ns_of(&org).context("the org id is not a namespace id")
+        probefleet_coordinator::subject::ns_of(&org).context("the org id is not a namespace id")
     }
 }
 
@@ -98,7 +98,7 @@ async fn open(config_dir: Option<std::path::PathBuf>) -> Result<Admin> {
     let db = Db::connect(&sqlite)
         .await
         .with_context(|| format!("opening coordinator database {sqlite}"))?;
-    let clock: fleet_coordinator::SharedClock = Arc::new(fleet_coordinator::SystemClock);
+    let clock: probefleet_coordinator::SharedClock = Arc::new(probefleet_coordinator::SystemClock);
     // The daemon ensures the default org at startup; so does every admin
     // verb, so the first one run before the daemon ever started works.
     db.ensure_org_named(&config.default_org, clock.now_secs())
@@ -106,11 +106,11 @@ async fn open(config_dir: Option<std::path::PathBuf>) -> Result<Admin> {
         .context("ensuring the default org exists")?;
     let default_org = config.default_org.clone();
     let signer = match &config.signing_key {
-        fleet_coordinator::SigningKeySource::Seed(seed) => {
-            fleet_coordinator::Ed25519Signer::from_seed(seed)
+        probefleet_coordinator::SigningKeySource::Seed(seed) => {
+            probefleet_coordinator::Ed25519Signer::from_seed(seed)
         }
     };
-    let scheduler = fleet_core::scheduler::Scheduler::new(config.policy.clone());
+    let scheduler = probefleet_core::scheduler::Scheduler::new(config.policy.clone());
     let coord = Arc::new(
         Coordinator::with_providers(config, scheduler, db, signer, clock, Vec::new())
             .context("building the coordinator's auth context")?,
@@ -163,14 +163,16 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
             .map(|t| format!("tag={t}"))
             .collect::<Vec<_>>()
             .join(" && ");
-        fleet_proto::lease::parse_constraint(&selector)
+        probefleet_proto::lease::parse_constraint(&selector)
             .map_err(|e| anyhow::anyhow!("invalid `--tag`: {e}"))?;
     }
     let ops: Vec<String> = match &args.ops {
-        Some(spec) => fleet_proto::token::normalize_ops(crate::roles::grant::parse_ops_arg(spec)?)
-            .iter()
-            .map(|o| o.as_str().to_owned())
-            .collect(),
+        Some(spec) => {
+            probefleet_proto::token::normalize_ops(crate::roles::grant::parse_ops_arg(spec)?)
+                .iter()
+                .map(|o| o.as_str().to_owned())
+                .collect()
+        }
         None => Vec::new(),
     };
     anyhow::ensure!(
@@ -504,7 +506,7 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     admin
         .db()
         .set_member(
-            &fleet_coordinator::subject::org_of(ns),
+            &probefleet_coordinator::subject::org_of(ns),
             user,
             role,
             admin.now(),
@@ -679,7 +681,7 @@ mod tests {
             .await
             .unwrap()
             .expect("alice exists");
-        let org = fleet_coordinator::subject::org_of(admin.org(None).await.unwrap());
+        let org = probefleet_coordinator::subject::org_of(admin.org(None).await.unwrap());
         assert_eq!(
             admin.db().role_of(&org, alice.id).await.unwrap(),
             Some(FleetRole::Admin)
@@ -735,7 +737,7 @@ mod tests {
         assert_eq!(
             admin
                 .db()
-                .role_of(&fleet_coordinator::subject::org_of(ns), bob.id)
+                .role_of(&probefleet_coordinator::subject::org_of(ns), bob.id)
                 .await
                 .unwrap(),
             Some(FleetRole::Admin)
@@ -769,7 +771,7 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].purpose, PURPOSE_CI);
         assert_eq!(keys[0].expires, None, "--ttl 0 means no expiry");
-        let payload: fleet_coordinator::identity::CiKeyPayload =
+        let payload: probefleet_coordinator::identity::CiKeyPayload =
             serde_json::from_str(keys[0].payload.as_deref().unwrap()).unwrap();
         assert_eq!(payload.tags, vec!["desk".to_owned()]);
         let mut ops = payload.ops.clone();
@@ -790,7 +792,7 @@ mod tests {
         let keys = keys_of(&dir).await;
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].purpose, PURPOSE_NODE);
-        let payload: fleet_coordinator::identity::NodeKeyPayload =
+        let payload: probefleet_coordinator::identity::NodeKeyPayload =
             serde_json::from_str(keys[0].payload.as_deref().unwrap()).unwrap();
         assert_eq!(payload.tags, vec!["lab".to_owned()]);
     }

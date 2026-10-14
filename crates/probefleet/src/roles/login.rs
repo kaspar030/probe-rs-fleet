@@ -70,11 +70,13 @@ pub async fn run(args: LoginArgs) -> Result<()> {
         server_cert_sha256.or_else(|| existing.as_ref().and_then(|f| f.server_cert_sha256.clone()));
     if let Some(pin) = &pin_hex {
         anyhow::ensure!(
-            fleet_tls::parse_fingerprint(pin).is_some(),
+            probefleet_tls::parse_fingerprint(pin).is_some(),
             "--server-cert-sha256 must be 64 hex characters"
         );
     }
-    let pin = pin_hex.as_deref().and_then(fleet_tls::parse_fingerprint);
+    let pin = pin_hex
+        .as_deref()
+        .and_then(probefleet_tls::parse_fingerprint);
 
     if let Some(org) = &org {
         anyhow::ensure!(!org.trim().is_empty(), "--org must not be empty");

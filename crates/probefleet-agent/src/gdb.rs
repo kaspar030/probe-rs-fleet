@@ -10,7 +10,7 @@
 //! stub to an **ephemeral loopback port**, connects a [`TcpStream`] to it, and
 //! byte-splices that stream onto the relay channel.
 //!
-//! [`ChannelKind::Gdb`]: fleet_proto::ChannelKind
+//! [`ChannelKind::Gdb`]: probefleet_proto::ChannelKind
 //!
 //! ## Two halves
 //!
@@ -22,7 +22,7 @@
 //!   *does* accept `--probe` / `--chip`, so per-board isolation is by argument.
 //! * [`splice`] — the bidirectional byte pump that copies the connected TCP
 //!   stream ↔ the relay channel verbatim. The same shape runs on the sidecar
-//!   end ([`crate`] mirror in `fleet-sidecar`); it is pure byte relay with
+//!   end ([`crate`] mirror in `probefleet-sidecar`); it is pure byte relay with
 //!   **zero** gdbremote parsing.
 //!
 //! Latency: the pump flushes each chunk immediately and sets `TCP_NODELAY` on
@@ -39,7 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use fleet_proto::{ChannelId, DataFrame};
+use probefleet_proto::{ChannelId, DataFrame};
 
 use crate::config::BoardSpec;
 

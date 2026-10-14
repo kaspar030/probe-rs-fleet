@@ -2,13 +2,13 @@
 //! (simulated coordinator relay) ↔ agent splice ↔ board-local gdb stub.
 //!
 //! This exercises *both* halves of the tunnel together — the sidecar-side pump
-//! ([`fleet_sidecar::gdb::splice`]) and the agent-side pump
-//! ([`fleet_agent::gdb::splice`]) — wired through an in-memory `DataFrame`
+//! ([`probefleet_sidecar::gdb::splice`]) and the agent-side pump
+//! ([`probefleet_agent::gdb::splice`]) — wired through an in-memory `DataFrame`
 //! relay that stands in for the coordinator. It proves bytes round-trip both
 //! directions, in order and without loss, across the full two-hop path, with no
 //! real coordinator, TLS, or probe-rs binary.
 
-use fleet_proto::{ChannelId, DataFrame};
+use probefleet_proto::{ChannelId, DataFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -30,12 +30,12 @@ async fn gdb_tunnel_round_trips_end_to_end() {
     let channel = ChannelId(42);
 
     // --- sidecar local listener + the user's gdb client ------------------
-    let listen = fleet_sidecar::gdb::resolve_listen_addr(Some("127.0.0.1:0")).unwrap();
-    let listener = fleet_sidecar::gdb::bind(listen).await.unwrap();
+    let listen = probefleet_sidecar::gdb::resolve_listen_addr(Some("127.0.0.1:0")).unwrap();
+    let listener = probefleet_sidecar::gdb::bind(listen).await.unwrap();
     let listen_addr = listener.local_addr().unwrap();
 
     let client_connect = TcpStream::connect(listen_addr);
-    let sidecar_accept = fleet_sidecar::gdb::accept(&listener);
+    let sidecar_accept = probefleet_sidecar::gdb::accept(&listener);
     let (client, sidecar_client_stream) = tokio::join!(client_connect, sidecar_accept);
     let mut gdb_client = client.unwrap();
     let sidecar_client_stream = sidecar_client_stream.unwrap();
@@ -61,14 +61,14 @@ async fn gdb_tunnel_round_trips_end_to_end() {
     pump_relay(agent_to_coord_rx, coord_to_side_tx);
 
     // Sidecar splice: gdb client <-> (to coordinator / from coordinator).
-    let sidecar_task = tokio::spawn(fleet_sidecar::gdb::splice(
+    let sidecar_task = tokio::spawn(probefleet_sidecar::gdb::splice(
         channel,
         sidecar_client_stream,
         side_to_coord_tx,
         coord_to_side_rx,
     ));
     // Agent splice: board stub <-> (to coordinator / from coordinator).
-    let agent_task = tokio::spawn(fleet_agent::gdb::splice(
+    let agent_task = tokio::spawn(probefleet_agent::gdb::splice(
         channel,
         agent_stub_stream,
         agent_to_coord_tx,

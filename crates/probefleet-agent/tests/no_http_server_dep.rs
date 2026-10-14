@@ -1,14 +1,14 @@
-//! Layering guard: `fleet-agent` must not depend on an HTTP *server* framework.
+//! Layering guard: `probefleet-agent` must not depend on an HTTP *server* framework.
 //!
 //! The agent is a library that discovers probes and moves bytes over a
-//! connection it dials out. It speaks `WebSocket`s through `fleet-wire`'s
+//! connection it dials out. It speaks `WebSocket`s through `probefleet-wire`'s
 //! `tokio-tungstenite` adapter; the `axum` adapter deliberately lives in
-//! `fleet-coordinator` instead ([`fleet_coordinator::ws_axum`]).
+//! `probefleet-coordinator` instead ([`probefleet_coordinator::ws_axum`]).
 //!
 //! To be precise about what this test is and is not: it is a **layering** rule,
-//! not what keeps the Raspberry Pi build alive. `fleet-bin` links the
+//! not what keeps the Raspberry Pi build alive. `probefleet` links the
 //! coordinator, so axum ships on the Pi regardless. What the rule buys is that
-//! the wire abstraction stays honest — the moment `fleet-agent` can reach for
+//! the wire abstraction stays honest — the moment `probefleet-agent` can reach for
 //! `axum::extract::ws::WebSocket`, the `WireTx`/`WireRx` seam stops being load
 //! bearing and the next transport change has to be made twice.
 //!
@@ -36,12 +36,12 @@ const SIDECAR_FORBIDDEN: &[&str] = &["forgs-http", "forgs-store", "axum", "sqlx"
 
 #[test]
 fn agent_does_not_depend_on_an_http_server_framework() {
-    assert_graph_excludes("fleet-agent", FORBIDDEN);
+    assert_graph_excludes("probefleet-agent", FORBIDDEN);
 }
 
 #[test]
 fn sidecar_does_not_depend_on_the_identity_server() {
-    assert_graph_excludes("fleet-sidecar", SIDECAR_FORBIDDEN);
+    assert_graph_excludes("probefleet-sidecar", SIDECAR_FORBIDDEN);
 }
 
 fn assert_graph_excludes(package: &str, forbidden: &[&str]) {
@@ -74,7 +74,7 @@ fn assert_graph_excludes(package: &str, forbidden: &[&str]) {
             panic!(
                 "{package} depends on `{crate_name}`, which breaks the layering rule: HTTP \
                  server frameworks (the axum adapter lives in \
-                 crates/fleet-coordinator/src/ws_axum.rs) and the forgs identity store belong \
+                 crates/probefleet-coordinator/src/ws_axum.rs) and the forgs identity store belong \
                  to the coordinator only.\n\n{stdout}"
             );
         }

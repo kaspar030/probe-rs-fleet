@@ -99,7 +99,7 @@ Small typed request/response + a few server→client pushes.
 
 ### 3.5 WebSocket over HTTPS (decided)
 
-The postcard frames (`fleet-wire`) are carried as **WebSocket binary messages
+The postcard frames (`probefleet-wire`) are carried as **WebSocket binary messages
 over HTTPS**, not over a bespoke length-prefixed TCP protocol. Drivers, in
 order of force:
 
@@ -116,9 +116,9 @@ order of force:
 5. **probe-rs already speaks WebSocket** (`/worker`), so the whole stack becomes
    one protocol family.
 
-WebSocket delimits messages, so there is no length prefix: `fleet-wire`'s codec
-is a thin adapter over WS binary payloads carrying the `fleet-wire` envelopes,
-the relay's byte-opaque splice, and every `fleet-proto` payload type.
+WebSocket delimits messages, so there is no length prefix: `probefleet-wire`'s codec
+is a thin adapter over WS binary payloads carrying the `probefleet-wire` envelopes,
+the relay's byte-opaque splice, and every `probefleet-proto` payload type.
 
 Routes:
 
@@ -167,7 +167,7 @@ here rather than only in that document:
   property of the router's shape rather than of a test — an unknown top-level
   path is an empty 404. Please do not add `.fallback(...)` to fix a
   client-side route that 404s; add the page to `PAGES` in
-  `crates/fleet-coordinator/src/assets.rs`, which registers both its bare and
+  `crates/probefleet-coordinator/src/assets.rs`, which registers both its bare and
   its trailing-slash spelling.
 
 **Keepalive is now load-bearing.** A proxy in front means idle WebSockets are
@@ -194,7 +194,7 @@ same constraint that forced `ring` over `aws-lc-rs`.
 
 In the hosted deployment the reverse proxy terminates TLS and the coordinator
 speaks plain HTTP on loopback; in a self-hosted deployment the coordinator may
-terminate TLS itself. Either way the framing above is unchanged. `fleet-tls`
+terminate TLS itself. Either way the framing above is unchanged. `probefleet-tls`
 is only client-side trust configuration: normal WebPKI roots by default,
 plus an optional pinned server-cert fingerprint for local/self-hosted
 deployments with no public DNS (§10). There are no **client** certificates
@@ -563,7 +563,7 @@ findings, each independently sufficient:
 **What it would have bought.** Only `alloc_ephemeral_port` plus the connect-retry
 that covers its bind/close race — about ten lines. Not even conceptually, since
 `probe-rs gdb` independently binds an ephemeral loopback port for
-`--gdb-connection-string` (`crates/fleet-agent/src/gdb.rs`), so the agent keeps
+`--gdb-connection-string` (`crates/probefleet-agent/src/gdb.rs`), so the agent keeps
 port allocation regardless. Trading the per-board `ProbeAccess` fence and the
 end-to-end token for ten lines is not a trade worth making.
 
@@ -847,7 +847,7 @@ proxy (§3.5). Over this connection:
 
 The server→client direction rides the same WebSocket: the coordinator writes
 command frames down the node's dial-out connection, multiplexed with the opaque
-data channel by the `fleet-wire` envelopes.
+data channel by the `probefleet-wire` envelopes.
 
 ## 6. Identity, auth & leases (on forgs)
 
@@ -887,7 +887,7 @@ forgs_api_key   { ns_node_id, key_hash, purpose, payload, single_use, expires,
 forgs_session / forgs_refresh_token / forgs_workload_token / forgs_pending_device /
 forgs_audit / …
 
--- fleet (crates/fleet-coordinator/migrations/0001_fleet.sql)
+-- fleet (crates/probefleet-coordinator/migrations/0001_fleet.sql)
 node      { id "<org id>/<name>", ns_node_id → forgs_ns_node,
             owner_user_id → forgs_user NULL, name, tags, token_hash,
             token_issued_at, adopt_policy, last_seen }   UNIQUE (ns_node_id, name)
@@ -904,7 +904,7 @@ The decisions that are load-bearing:
   handle is resolved to an id **once**, where the reference is written (e.g.
   `grant bob …` resolves `bob` at grant creation). A released name is
   tombstoned forever, so a rename cannot hand the old path to a squatter.
-  `OrgId` in `fleet-proto` carries the ns-node ULID text.
+  `OrgId` in `probefleet-proto` carries the ns-node ULID text.
 - **A login provider proves who you are; it does not name you.** Providers
   (GitHub, Codeberg/Forgejo, GitLab, generic OIDC — §6.4) supply
   `(provider, immutable subject id, verified email)`. The identity is keyed on
@@ -967,7 +967,7 @@ The decisions that are load-bearing:
   org-namespaced (`state.rs::node_id_for` → `"<org id>/<name>"`), so the same
   machine name in two tenants is two nodes.
 - **Subjects.** forgs builds a `forgs::Subject` from a credential;
-  `fleet-proto::ids::SubjectKey` is its wire mirror and renders identically,
+  `probefleet-proto::ids::SubjectKey` is its wire mirror and renders identically,
   `[<ns>/]<kind>:<id>`:
 
   | kind | key | from |
@@ -1355,7 +1355,7 @@ The model, deliberately minimal:
 
 **One selector grammar, one reading of every term.** `id=<name>`,
 `board=<model>`, `chip=<c>`, `tag=<t>`, and `a && b` conjunctions of tags,
-parsed by a single function in `fleet-proto`. The sidecar's
+parsed by a single function in `probefleet-proto`. The sidecar's
 `PROBE_RS_FLEET_SELECT`, `ctl lease <sel>`, `ctl delegate --select` and
 `grant --select` are thin delegates with **no per-surface dialect**: a bare word
 is a *tag* everywhere (so `ctl lease nrf52840-dk-3` is a tag selector and the
@@ -1390,7 +1390,7 @@ such a rule would reject working configs at selection time, far from the file. A
 CI auth key's tags *are* charset-validated at mint, since redemption turns them
 into a selector.
 
-**Evaluation is a pure value object** (`fleet_core::access::Access`): ownership
+**Evaluation is a pure value object** (`probefleet_core::access::Access`): ownership
 (a member of the board's org) or a live grant, deny by default, with `now`
 always a parameter — so the whole (subject, object, op) matrix is a
 table-driven unit test. `Access { member_of: Vec<OrgId>, grants }` is built
@@ -1986,7 +1986,7 @@ promoting it to the priority-class cap. A **SIGKILLed** sidecar releases
 nothing, but the board returns to the pool after one policy TTL instead of the
 hardcoded hour the sidecar used to request.
 
-The *cross-invocation* half: `fleet_sidecar::lease_store` persists a grant under
+The *cross-invocation* half: `probefleet_sidecar::lease_store` persists a grant under
 `$XDG_RUNTIME_DIR/probe-rs-fleet/leases.json` (0600, in a 0700 directory,
 written via a temp file + `fsync` + `rename` under a `flock`), and
 `acquire_lease` consults it before leasing. `lease_cache` stays pure logic and is
@@ -2177,24 +2177,24 @@ that the agent must be restarted.
 probe-rs-fleet/
 ├─ Cargo.toml                  # workspace
 ├─ crates/
-│  ├─ fleet-proto/             # shared wire types + ids / SubjectKey mirror, auth_api (no I/O)
-│  ├─ fleet-core/              # Board/Lease/Policy domain + scheduler (pure, unit-testable)
-│  ├─ fleet-tls/               # client trust config (WebPKI + optional pin); no client certs
-│  ├─ fleet-wire/              # WS codec + tokio-tungstenite dial-out client
-│  ├─ fleet-agent/            # probe-rs process control, USB power, boards.toml
-│  ├─ fleet-coordinator/      # sqlite state, scheduler, authz, relay, HTTP/WS surface
-│  ├─ fleet-sidecar/          # probe-rs CLI shim + relay client
-│  └─ fleet-bin/              # single multi-role binary; thin dispatch
+│  ├─ probefleet-proto/             # shared wire types + ids / SubjectKey mirror, auth_api (no I/O)
+│  ├─ probefleet-core/              # Board/Lease/Policy domain + scheduler (pure, unit-testable)
+│  ├─ probefleet-tls/               # client trust config (WebPKI + optional pin); no client certs
+│  ├─ probefleet-wire/              # WS codec + tokio-tungstenite dial-out client
+│  ├─ probefleet-agent/            # probe-rs process control, USB power, boards.toml
+│  ├─ probefleet-coordinator/      # sqlite state, scheduler, authz, relay, HTTP/WS surface
+│  ├─ probefleet-sidecar/          # probe-rs CLI shim + relay client
+│  └─ probefleet/              # single multi-role binary; thin dispatch
 └─ docs/
 ```
 
-`fleet-core` stays pure so the scheduler is testable without sockets or USB.
+`probefleet-core` stays pure so the scheduler is testable without sockets or USB.
 There is no `fleet-auth` any more: identity lives in the **forgs**
 workspace (github.com/kaspar030/forgs, a crates.io dependency;
 `forgs` pure core, `forgs-store`, `forgs-http`, `forgs-idp`,
-`forgs-client`). `fleet-coordinator` links the server half; `fleet-bin` links
-`forgs` + `forgs-client`; `fleet-agent`, `fleet-sidecar`, `fleet-proto`,
-`fleet-core` and `fleet-wire` link **no** forgs crate (see
+`forgs-client`). `probefleet-coordinator` links the server half; `probefleet` links
+`forgs` + `forgs-client`; `probefleet-agent`, `probefleet-sidecar`, `probefleet-proto`,
+`probefleet-core` and `probefleet-wire` link **no** forgs crate (see
 `docs/cross-compiling.md`).
 
 ## 10. Open questions / decisions to confirm
@@ -2227,7 +2227,7 @@ workspace (github.com/kaspar030/forgs, a crates.io dependency;
 **Still open:**
 
 1. **Self-hosted TLS story.** A self-hosted coordinator without public DNS
-   cannot get a publicly trusted certificate, so `fleet-tls` keeps an optional
+   cannot get a publicly trusted certificate, so `probefleet-tls` keeps an optional
    **pinned server-cert fingerprint** (`server_cert_sha256` in the fleet
    config). Whether we
    also ship a self-hosting story beyond dev use is a **product** question, not

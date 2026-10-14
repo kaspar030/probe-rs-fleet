@@ -30,9 +30,9 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::auth_api::NodeRegisterStartResponse;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::auth_api::NodeRegisterStartResponse;
 
 /// Every mutating route this phase adds, as `(method, path)`, acting in `acme`.
 const MUTATING: [(&str, &str); 3] = [
@@ -95,7 +95,7 @@ async fn user_key(fleet: &TestCoordinator, user: &str) -> String {
 async fn remove_member(fleet: &TestCoordinator, org: &str, user: &str) {
     let org = fleet.org(org).await;
     let user = fleet.user(user).await;
-    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
     assert!(fleet
         .db()
         .forgs()
@@ -496,12 +496,12 @@ async fn a_non_member_cannot_probe_which_nodes_exist() {
 /// Factored out of the delete tests because seeding a lease by hand would not
 /// exercise the path whose teardown is under test.
 async fn take_lease(
-    session: &fleet_sidecar::transport::CoordSession,
+    session: &probefleet_sidecar::transport::CoordSession,
     board_name: &str,
-) -> fleet_proto::ids::LeaseId {
-    use fleet_proto::ids::BoardName;
-    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-    use fleet_wire::{CoordToSidecar, SidecarToCoord};
+) -> probefleet_proto::ids::LeaseId {
+    use probefleet_proto::ids::BoardName;
+    use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
     match session
         .request(SidecarToCoord::Lease(LeaseRequest {
@@ -524,7 +524,7 @@ async fn take_lease(
 /// believes it is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
-    use fleet_wire::WireRx as _;
+    use probefleet_wire::WireRx as _;
 
     let fleet = TestCoordinator::start().await;
     let alice = fleet.seed_session("acme", "alice", FleetRole::Admin).await;
@@ -612,7 +612,7 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
     let closed_within = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match node_rx.recv().await {
-                Ok(fleet_wire::WireEvent::Closed) | Err(_) => return,
+                Ok(probefleet_wire::WireEvent::Closed) | Err(_) => return,
                 Ok(_) => {}
             }
         }
@@ -659,9 +659,9 @@ async fn deleting_a_node_tears_down_its_live_leases_and_boards() {
 /// mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_waiter_promoted_during_the_teardown_is_not_stranded() {
-    use fleet_proto::ids::BoardName;
-    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-    use fleet_wire::{CoordToSidecar, SidecarToCoord};
+    use probefleet_proto::ids::BoardName;
+    use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
     let fleet = TestCoordinator::start().await;
     let admin = fleet.seed_session("acme", "root", FleetRole::Admin).await;

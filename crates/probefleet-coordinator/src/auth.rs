@@ -1,14 +1,14 @@
 //! Capability-token signing (ed25519).
 //!
 //! The coordinator is the **signer**: it holds the ed25519 private key and
-//! mints a [`fleet_proto::token::SignedToken`] for every lease it grants. The
+//! mints a [`probefleet_proto::token::SignedToken`] for every lease it grants. The
 //! node (task 1712) holds only the public key and verifies the signature
 //! locally — no per-operation coordinator round-trip (architecture §6).
 //!
 //! This module is intentionally thin: the token *shape*, the canonical signing
 //! bytes ([`CapabilityToken::serialize_for_signing`]), the on-wire framing
 //! ([`SignedToken`]), and the [`TokenSigner`] trait all live in
-//! [`fleet_proto::token`]. Here we only (a) hold the signing key, (b) implement
+//! [`probefleet_proto::token`]. Here we only (a) hold the signing key, (b) implement
 //! [`TokenSigner`] with ed25519, and (c) build a [`LeaseGrant`]'s `token` field
 //! from a scheduler [`GrantedLease`].
 
@@ -16,10 +16,10 @@ use ed25519_dalek::{Signer, SigningKey};
 use hmac::{Mac as _, SimpleHmac};
 use sha2::Sha256;
 
-use fleet_core::scheduler::GrantedLease;
-use fleet_proto::ids::{BoardRef, LeaseId};
-use fleet_proto::lease::LeaseGrant;
-use fleet_proto::token::{
+use probefleet_core::scheduler::GrantedLease;
+use probefleet_proto::ids::{BoardRef, LeaseId};
+use probefleet_proto::lease::LeaseGrant;
+use probefleet_proto::token::{
     AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner, TokenVerifier,
 };
 
@@ -174,7 +174,7 @@ impl TokenVerifier for Ed25519Signer {
 /// Until architecture §6.5 landed this was the *default* op set a lease minted:
 /// v1 had no attenuation, so every token carried everything. It has no
 /// production caller any more — [`crate::authz::board_access`] computes the ops
-/// from the caller's [`fleet_core::access::Access`] at every mint, and it is
+/// from the caller's [`probefleet_core::access::Access`] at every mint, and it is
 /// *ownership* that expands to the full set. Kept as the name for "all of
 /// them", and deliberately renamed so nothing reads it as a fallback somebody
 /// still falls back to.
@@ -196,10 +196,10 @@ fn hex32(bytes: &[u8; 32]) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use fleet_proto::ids::{BoardRef, LeaseId, OrgId};
+    use probefleet_proto::ids::{BoardRef, LeaseId, OrgId};
 
     /// RFC 8032 ed25519 test-vector seed. The node's verifier tests
-    /// (`fleet-agent/src/token.rs`) use the same seed, so a token signed here
+    /// (`probefleet-agent/src/token.rs`) use the same seed, so a token signed here
     /// verifies there: shared cross-crate test vector.
     const TEST_SEED: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
@@ -216,7 +216,7 @@ mod tests {
     ///
     /// `state.rs::node_id_for` namespaces node ids by org, so the node half is
     /// `"{org}/{name}"`. Built via that constructor rather than a literal, and
-    /// kept in step with `fleet-agent/src/token.rs`'s `board()` — the two are a
+    /// kept in step with `probefleet-agent/src/token.rs`'s `board()` — the two are a
     /// shared cross-crate vector, so a token signed here verifies there.
     fn test_board() -> BoardRef {
         let org = OrgId("acme".to_owned());

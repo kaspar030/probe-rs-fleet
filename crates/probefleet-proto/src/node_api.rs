@@ -5,7 +5,7 @@
 //! downward ([`CoordinatorCommand`]) over the node's single persistent
 //! `WebSocket` connection (revision 2, §3.5 — it was a bespoke mTLS stream
 //! before). This module defines only the shared serde payloads so the two ends
-//! cannot drift; the framing lives in `fleet-wire`.
+//! cannot drift; the framing lives in `probefleet-wire`.
 //!
 //! The opaque data plane (probe-rs frames) is *not* modeled here — it rides
 //! [`crate::DataFrame`] on a leased [`crate::ChannelId`].
@@ -57,7 +57,7 @@ pub enum BoardPresence {
 /// Carries the full leasable-board metadata declared in the node's
 /// `boards.toml` (chip / tags / exclusivity / power capability) in addition to
 /// the live presence, so the coordinator can reconstruct a
-/// [`fleet_proto::board::Board`] for its scheduler without a second message.
+/// [`probefleet_proto::board::Board`] for its scheduler without a second message.
 /// The board's owning [`NodeId`] is known from the authenticated connection
 /// (it is not repeated on the wire) and its lease state defaults to available.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

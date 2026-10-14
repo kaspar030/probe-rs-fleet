@@ -2,7 +2,7 @@
 //!
 //! The coordinator is the fleet's single publicly reachable, listening node
 //! (architecture §4.1). It owns inventory, scheduling/leases (delegated to the
-//! pure [`fleet_core::scheduler::Scheduler`]), capability-token auth, the opaque
+//! pure [`probefleet_core::scheduler::Scheduler`]), capability-token auth, the opaque
 //! data-plane RELAY, and the audit log. It never touches USB.
 //!
 //! ## Topology
@@ -13,8 +13,8 @@
 //! `Authorization: Bearer …` on the upgrade; there are no client certificates.
 //!
 //! * **Nodes** dial *out* and hold one persistent `WebSocket`. They send
-//!   [`fleet_proto::node_api::NodeReport`]s up; the coordinator sends
-//!   [`fleet_proto::node_api::CoordinatorCommand`]s back down the same
+//!   [`probefleet_proto::node_api::NodeReport`]s up; the coordinator sends
+//!   [`probefleet_proto::node_api::CoordinatorCommand`]s back down the same
 //!   connection. A node is identified by the `node` row its token hash matched.
 //! * **Sidecars and `ctl`** connect to request/extend/release leases and to open
 //!   relay channels ([`proto::SidecarToCoord`] / [`proto::CoordToSidecar`]).
@@ -30,9 +30,9 @@
 //! ## Data plane
 //!
 //! When a sidecar opens a channel, the coordinator validates the lease, mints a
-//! signed [`fleet_proto::token::CapabilityToken`] (ed25519; see [`auth`]),
-//! allocates a [`fleet_proto::ChannelId`], asks the owning node to open its
-//! probe-rs session, then relays opaque [`fleet_proto::DataFrame`]s between the
+//! signed [`probefleet_proto::token::CapabilityToken`] (ed25519; see [`auth`]),
+//! allocates a [`probefleet_proto::ChannelId`], asks the owning node to open its
+//! probe-rs session, then relays opaque [`probefleet_proto::DataFrame`]s between the
 //! two ends without ever parsing probe-rs traffic.
 //!
 //! ## Modules
@@ -81,7 +81,7 @@ pub use crate::error::{CoordinatorError, Result};
 pub use crate::state::{node_id_for, Db, OrgDb};
 pub use crate::subject::{FleetRole, Subject};
 
-use fleet_core::scheduler::Scheduler;
+use probefleet_core::scheduler::Scheduler;
 
 /// Build a fully-wired coordinator from its configuration.
 ///
@@ -198,9 +198,10 @@ async fn serve_tls(
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use hyper_util::service::TowerToHyperService;
 
-    let chain = fleet_tls::load_cert_chain(&tls.cert)?;
-    let key = fleet_tls::load_private_key(&tls.key)?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(fleet_tls::server_config(chain, key)?));
+    let chain = probefleet_tls::load_cert_chain(&tls.cert)?;
+    let key = probefleet_tls::load_private_key(&tls.key)?;
+    let acceptor =
+        tokio_rustls::TlsAcceptor::from(Arc::new(probefleet_tls::server_config(chain, key)?));
 
     loop {
         let (sock, peer) = match listener.accept().await {

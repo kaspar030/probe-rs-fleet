@@ -1,17 +1,17 @@
 //! [`WireTx`] / [`WireRx`] over `axum`'s `WebSocket`.
 //!
-//! The server-side counterpart of `fleet_wire::tungstenite`. It lives **here**,
-//! not in `fleet-wire`, so that `fleet-agent` and `fleet-sidecar` — libraries
+//! The server-side counterpart of `probefleet_wire::tungstenite`. It lives **here**,
+//! not in `probefleet-wire`, so that `probefleet-agent` and `probefleet-sidecar` — libraries
 //! that move probe bytes and dial outward — never link an HTTP server
 //! framework. That is a layering rule about dependency direction, not a binary
-//! size requirement: `fleet-bin` links the coordinator and therefore ships axum
+//! size requirement: `probefleet` links the coordinator and therefore ships axum
 //! onto the Pi regardless.
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt as _, StreamExt as _};
 
-use fleet_wire::{WireError, WireEvent, WireRx, WireTx};
+use probefleet_wire::{WireError, WireEvent, WireRx, WireTx};
 
 /// The send half of an axum `WebSocket`.
 pub struct AxumTx {

@@ -712,177 +712,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
-name = "fleet-agent"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "ed25519-dalek",
- "fleet-proto",
- "fleet-tls",
- "fleet-wire",
- "postcard",
- "postcard-rpc",
- "rand_core 0.6.4",
- "serde",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-gpiod",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "fleet-bin"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "clap",
- "clap_complete",
- "directories",
- "fleet-agent",
- "fleet-coordinator",
- "fleet-core",
- "fleet-proto",
- "fleet-sidecar",
- "fleet-tls",
- "fleet-wire",
- "forgs",
- "forgs-client",
- "forgs-http",
- "forgs-store",
- "jsonwebtoken",
- "rand_core 0.6.4",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "fleet-coordinator"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "base64",
- "ed25519-dalek",
- "fleet-agent",
- "fleet-core",
- "fleet-proto",
- "fleet-sidecar",
- "fleet-tls",
- "fleet-wire",
- "forgs",
- "forgs-http",
- "forgs-idp",
- "forgs-store",
- "futures-util",
- "hmac",
- "http",
- "http-body-util",
- "hyper",
- "hyper-util",
- "include_dir",
- "jsonwebtoken",
- "postcard",
- "rand_core 0.6.4",
- "rcgen",
- "rustls",
- "serde",
- "serde_json",
- "sha2",
- "sqlx",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tokio-tungstenite",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "fleet-core"
-version = "0.1.0"
-dependencies = [
- "fleet-proto",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fleet-proto"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "fleet-sidecar"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fleet-agent",
- "fleet-proto",
- "fleet-tls",
- "fleet-wire",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "fleet-tls"
-version = "0.1.0"
-dependencies = [
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-rustls",
- "tracing",
- "webpki-roots 1.0.9",
-]
-
-[[package]]
-name = "fleet-wire"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "fleet-proto",
- "fleet-tls",
- "futures-util",
- "http",
- "postcard",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2088,6 +1917,177 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
 dependencies = [
  "elliptic-curve",
+]
+
+[[package]]
+name = "probefleet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "clap",
+ "clap_complete",
+ "directories",
+ "forgs",
+ "forgs-client",
+ "forgs-http",
+ "forgs-store",
+ "jsonwebtoken",
+ "probefleet-agent",
+ "probefleet-coordinator",
+ "probefleet-core",
+ "probefleet-proto",
+ "probefleet-sidecar",
+ "probefleet-tls",
+ "probefleet-wire",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "probefleet-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ed25519-dalek",
+ "postcard",
+ "postcard-rpc",
+ "probefleet-proto",
+ "probefleet-tls",
+ "probefleet-wire",
+ "rand_core 0.6.4",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-gpiod",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "probefleet-coordinator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64",
+ "ed25519-dalek",
+ "forgs",
+ "forgs-http",
+ "forgs-idp",
+ "forgs-store",
+ "futures-util",
+ "hmac",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "include_dir",
+ "jsonwebtoken",
+ "postcard",
+ "probefleet-agent",
+ "probefleet-core",
+ "probefleet-proto",
+ "probefleet-sidecar",
+ "probefleet-tls",
+ "probefleet-wire",
+ "rand_core 0.6.4",
+ "rcgen",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "probefleet-core"
+version = "0.1.0"
+dependencies = [
+ "probefleet-proto",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "probefleet-proto"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "probefleet-sidecar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "probefleet-agent",
+ "probefleet-proto",
+ "probefleet-tls",
+ "probefleet-wire",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "probefleet-tls"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "probefleet-wire"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "http",
+ "postcard",
+ "probefleet-proto",
+ "probefleet-tls",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

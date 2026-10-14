@@ -13,7 +13,7 @@
 //!    `--gdb-connection-string`) the user points their gdb client at
 //!    (`target remote :1337`);
 //! 4. on `accept()`, byte-splice the accepted stream ↔ the relay gdb channel
-//!    verbatim (the symmetric pump to [`fleet_agent`-side `gdb::splice`]) — pure
+//!    verbatim (the symmetric pump to [`probefleet_agent`-side `gdb::splice`]) — pure
 //!    bytes, **no** gdbremote parsing.
 //!
 //! Single-client is fine for v1 (gdb is one client). The pump sets
@@ -25,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
-use fleet_proto::{ChannelId, DataFrame};
+use probefleet_proto::{ChannelId, DataFrame};
 
 /// Default local listen address for the user's gdb client, matching probe-rs's
 /// own default gdb stub address.

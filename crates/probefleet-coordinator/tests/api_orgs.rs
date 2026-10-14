@@ -15,7 +15,7 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
+use probefleet_coordinator::FleetRole;
 
 /// Call a route as a browser would: session cookie plus the CSRF header.
 async fn as_browser(
@@ -575,14 +575,14 @@ async fn orgs_with_hardware_or_grants_are_not_deleted() {
             "acme",
             "octo/repo",
             "tag=nrf52",
-            &[fleet_proto::token::AllowedOp::Attach],
+            &[probefleet_proto::token::AllowedOp::Attach],
             None,
         )
         .await;
     let (status, body) = delete_org(&fleet, &alice, "acme").await;
     assert_eq!((status, error_code(&body).as_str()), (409, "org_not_empty"));
 
-    let ns = fleet_coordinator::subject::ns_of(&org).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&org).unwrap();
     let scoped = fleet.db().forgs().scoped(ns);
     for g in scoped.list_grants().await.unwrap() {
         scoped.delete_grant(g.id).await.unwrap();

@@ -70,7 +70,7 @@ impl AppTokenLookup for NodeTokens {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::adopt::AdoptPolicy;
+    use probefleet_proto::adopt::AdoptPolicy;
 
     #[tokio::test]
     async fn node_lookup_bridges_to_the_node_row() {

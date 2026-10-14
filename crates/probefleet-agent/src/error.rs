@@ -1,6 +1,6 @@
 //! Agent-wide error type.
 
-use fleet_proto::TokenError;
+use probefleet_proto::TokenError;
 
 /// Result alias for agent operations.
 pub type Result<T> = std::result::Result<T, AgentError>;

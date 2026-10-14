@@ -409,11 +409,11 @@ impl RoleArg {
     }
 }
 
-impl From<RoleArg> for fleet_coordinator::FleetRole {
+impl From<RoleArg> for probefleet_coordinator::FleetRole {
     fn from(r: RoleArg) -> Self {
         match r {
-            RoleArg::Member => fleet_coordinator::FleetRole::Member,
-            RoleArg::Admin => fleet_coordinator::FleetRole::Admin,
+            RoleArg::Member => probefleet_coordinator::FleetRole::Member,
+            RoleArg::Admin => probefleet_coordinator::FleetRole::Admin,
         }
     }
 }
@@ -1101,11 +1101,11 @@ pub enum AdoptArg {
     Declared,
 }
 
-impl From<AdoptArg> for fleet_proto::AdoptPolicy {
+impl From<AdoptArg> for probefleet_proto::AdoptPolicy {
     fn from(a: AdoptArg) -> Self {
         match a {
-            AdoptArg::Auto => fleet_proto::AdoptPolicy::Auto,
-            AdoptArg::Declared => fleet_proto::AdoptPolicy::Declared,
+            AdoptArg::Auto => probefleet_proto::AdoptPolicy::Auto,
+            AdoptArg::Declared => probefleet_proto::AdoptPolicy::Declared,
         }
     }
 }

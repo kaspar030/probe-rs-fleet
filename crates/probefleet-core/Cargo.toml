@@ -1,5 +1,5 @@
 [package]
-name = "fleet-core"
+name = "probefleet-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 description = "Core domain types and shared logic for probe-rs-fleet."
 
 [dependencies]
-fleet-proto.workspace = true
+probefleet-proto.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

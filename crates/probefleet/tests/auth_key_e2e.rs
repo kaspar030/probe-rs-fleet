@@ -9,7 +9,7 @@
 //!
 //! Modelled on `share_e2e.rs`. As there, `login --token` stands in for the
 //! device flow (covered against a stub GitHub in
-//! `fleet-coordinator/tests/device_flow.rs`), and the test drives the role
+//! `probefleet-coordinator/tests/device_flow.rs`), and the test drives the role
 //! functions rather than a subprocess.
 //!
 //! **The session is minted fresh, far from expiry, deliberately.** On refresh
@@ -22,10 +22,10 @@
 mod common;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{
+use probefleet::cli::{
     AuthKeyCreateArgs, AuthKeyListArgs, AuthKeyRevokeCliArgs, LoginArgs, NodeUpFlags,
 };
-use fleet_coordinator::FleetRole;
+use probefleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [29u8; 32];
 
@@ -36,7 +36,7 @@ const SEED: [u8; 32] = [29u8; 32];
 /// the real XDG path.
 async fn login(fleet: &Fleet, config_dir: &std::path::Path, login_name: &str, role: FleetRole) {
     let token = fleet.session(login_name, role).await;
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token),
@@ -98,7 +98,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     let laptop = tmp.path().join("laptop");
     login(&fleet, &laptop, "alice", FleetRole::Member).await;
 
-    let created = fleet_bin::roles::auth_key::create(&create_args(&laptop, &["lab", "nrf52"]))
+    let created = probefleet::roles::auth_key::create(&create_args(&laptop, &["lab", "nrf52"]))
         .await
         .expect("auth-key create");
     assert!(created.key.starts_with("prfk1_"));
@@ -109,7 +109,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     // The Pi: a *different* config dir, with no login of its own — exactly the
     // headless machine the ladder's rungs 1 and 3 cannot serve.
     let pi = tmp.path().join("pi");
-    fleet_bin::roles::node_up::bootstrap(
+    probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(created.key.clone()),
@@ -130,14 +130,14 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     .await
     .expect("node up --auth-key with a user-minted key");
 
-    let node = fleet_bin::fleet_config::load(&pi.join("default.toml"))
+    let node = probefleet::fleet_config::load(&pi.join("default.toml"))
         .unwrap()
         .node
         .expect("[node] was written");
 
     // The credential works against the live coordinator: the exchange returned
     // a real token, not a plausible-looking string.
-    let (tx, rx) = fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    let (tx, rx) = probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: fleet.base_url.clone(),
         path: "/agent",
         bearer: node.node_token.clone(),
@@ -148,7 +148,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     drop((tx, rx));
 
     // The key's tags reached the node, and the node is in alice's org.
-    let node_id = fleet_proto::ids::NodeId(node.node_id.clone());
+    let node_id = probefleet_proto::ids::NodeId(node.node_id.clone());
     let (org, _) = fleet
         .coord
         .db()
@@ -159,7 +159,7 @@ async fn a_logged_in_user_mints_a_key_that_enrolls_a_headless_node() {
     assert_eq!(org, fleet.default_org().await);
 
     // ... and the listing now shows the key as consumed, attributed to alice.
-    let list = fleet_bin::roles::auth_key::list(&list_args(&laptop))
+    let list = probefleet::roles::auth_key::list(&list_args(&laptop))
         .await
         .expect("auth-key list");
     let row = list
@@ -183,18 +183,18 @@ async fn revoking_a_minted_key_stops_it_enrolling() {
     let laptop = tmp.path().join("laptop");
     login(&fleet, &laptop, "alice", FleetRole::Member).await;
 
-    let created = fleet_bin::roles::auth_key::create(&create_args(&laptop, &[]))
+    let created = probefleet::roles::auth_key::create(&create_args(&laptop, &[]))
         .await
         .expect("auth-key create");
 
     let revoked =
-        fleet_bin::roles::auth_key::revoke(&revoke_args(&laptop, &created.key_hash[..16]))
+        probefleet::roles::auth_key::revoke(&revoke_args(&laptop, &created.key_hash[..16]))
             .await
             .expect("auth-key revoke");
     assert_eq!(revoked.revoked, vec![created.key_hash.clone()]);
 
     let pi = tmp.path().join("pi");
-    let err = fleet_bin::roles::node_up::bootstrap(
+    let err = probefleet::roles::node_up::bootstrap(
         &NodeUpFlags {
             fleet_url: Some(fleet.base_url.clone()),
             auth_key: Some(created.key.clone()),
@@ -228,7 +228,7 @@ async fn creating_without_a_login_says_so() {
     let empty = tmp.path().join("no-login");
     std::fs::create_dir_all(&empty).unwrap();
 
-    let err = fleet_bin::roles::auth_key::create(&create_args(&empty, &[]))
+    let err = probefleet::roles::auth_key::create(&create_args(&empty, &[]))
         .await
         .expect_err("no fleet file");
     let rendered = format!("{err:#}");
@@ -248,7 +248,7 @@ async fn a_forever_key_is_refused_with_the_reason() {
     args.ttl = "0".to_owned();
     let rendered = format!(
         "{:#}",
-        fleet_bin::roles::auth_key::create(&args)
+        probefleet::roles::auth_key::create(&args)
             .await
             .expect_err("a never-expiring key is not mintable over the API")
     );
@@ -260,7 +260,7 @@ async fn a_forever_key_is_refused_with_the_reason() {
     args.ttl = "60d".to_owned();
     let rendered = format!(
         "{:#}",
-        fleet_bin::roles::auth_key::create(&args)
+        probefleet::roles::auth_key::create(&args)
             .await
             .expect_err("over the cap")
     );

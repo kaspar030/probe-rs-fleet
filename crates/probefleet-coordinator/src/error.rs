@@ -1,13 +1,13 @@
 //! Error type for the coordinator.
 
-use fleet_proto::ids::{LeaseId, NodeId};
+use probefleet_proto::ids::{LeaseId, NodeId};
 
 /// Errors produced by the coordinator's runtime and helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum CoordinatorError {
     /// A TLS-layer failure (config build or handshake).
     #[error("tls error: {0}")]
-    Tls(#[from] fleet_tls::TlsError),
+    Tls(#[from] probefleet_tls::TlsError),
 
     /// A transport-layer failure on a `WebSocket` connection.
     ///
@@ -15,7 +15,7 @@ pub enum CoordinatorError {
     /// be recognised (see [`CoordinatorError::as_wire`]) and logged as the
     /// normal end of a short-lived `ctl` session rather than as a fault.
     #[error("wire error: {0}")]
-    Wire(fleet_wire::WireError),
+    Wire(probefleet_wire::WireError),
 
     /// An HTTP-layer failure (listener, upgrade, or serving).
     /// A forgs storage failure (users, orgs, credentials, grants).
@@ -43,7 +43,7 @@ pub enum CoordinatorError {
 
     /// A capability-token signing/encoding failure.
     #[error("token error: {0}")]
-    Token(#[from] fleet_proto::token::TokenError),
+    Token(#[from] probefleet_proto::token::TokenError),
 
     /// A frame could not be encoded or decoded.
     #[error("protocol error: {0}")]
@@ -81,26 +81,28 @@ pub enum CoordinatorError {
 }
 
 impl CoordinatorError {
-    /// View this error as a [`fleet_wire::WireError`], for benign-close
+    /// View this error as a [`probefleet_wire::WireError`], for benign-close
     /// classification.
     ///
     /// `ctl` runs one request and exits, so a peer close is the expected end of
     /// such a connection. Without this, every `ctl list` would log a transport
     /// warning on the coordinator.
     #[must_use]
-    pub fn as_wire(&self) -> fleet_wire::WireError {
+    pub fn as_wire(&self) -> probefleet_wire::WireError {
         match self {
             CoordinatorError::Wire(w) => match w {
-                fleet_wire::WireError::Closed => fleet_wire::WireError::Closed,
-                fleet_wire::WireError::Protocol(m) => fleet_wire::WireError::Protocol(m.clone()),
-                fleet_wire::WireError::Io(io) => {
-                    fleet_wire::WireError::Io(std::io::Error::new(io.kind(), io.to_string()))
+                probefleet_wire::WireError::Closed => probefleet_wire::WireError::Closed,
+                probefleet_wire::WireError::Protocol(m) => {
+                    probefleet_wire::WireError::Protocol(m.clone())
+                }
+                probefleet_wire::WireError::Io(io) => {
+                    probefleet_wire::WireError::Io(std::io::Error::new(io.kind(), io.to_string()))
                 }
             },
             CoordinatorError::Io(io) => {
-                fleet_wire::WireError::Io(std::io::Error::new(io.kind(), io.to_string()))
+                probefleet_wire::WireError::Io(std::io::Error::new(io.kind(), io.to_string()))
             }
-            other => fleet_wire::WireError::Protocol(other.to_string()),
+            other => probefleet_wire::WireError::Protocol(other.to_string()),
         }
     }
 }

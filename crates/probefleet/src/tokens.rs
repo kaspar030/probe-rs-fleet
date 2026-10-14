@@ -4,7 +4,7 @@
 //! one app kind, the node token (`prfn1_…`). The format is built here from
 //! forgs directly rather than borrowed from the coordinator, so the client
 //! paths do not need the server crate to tell a session token from a node
-//! token. `fleet_coordinator::identity::token_format` builds the same format;
+//! token. `probefleet_coordinator::identity::token_format` builds the same format;
 //! a unit test pins the two together.
 
 use std::sync::OnceLock;
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn prefixes_match_the_coordinators_format() {
-        let theirs = fleet_coordinator::identity::token_format();
+        let theirs = probefleet_coordinator::identity::token_format();
         for kind in [
             TokenKind::Session,
             TokenKind::Refresh,
@@ -105,7 +105,7 @@ mod tests {
         }
         assert_eq!(
             format().prefix(node_kind()),
-            theirs.prefix(fleet_coordinator::identity::node_token_kind(&theirs))
+            theirs.prefix(probefleet_coordinator::identity::node_token_kind(&theirs))
         );
         assert!(mint_string(node_kind()).starts_with("prfn1_"));
     }

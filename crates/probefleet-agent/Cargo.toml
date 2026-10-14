@@ -1,5 +1,5 @@
 [package]
-name = "fleet-agent"
+name = "probefleet-agent"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,9 +20,9 @@ default = ["gpio"]
 gpio = ["dep:tokio-gpiod"]
 
 [dependencies]
-fleet-proto.workspace = true
-fleet-tls.workspace = true
-fleet-wire = { workspace = true, features = ["tungstenite"] }
+probefleet-proto.workspace = true
+probefleet-tls.workspace = true
+probefleet-wire = { workspace = true, features = ["tungstenite"] }
 
 postcard.workspace = true
 postcard-rpc.workspace = true
@@ -45,7 +45,7 @@ tokio-gpiod = { workspace = true, optional = true }
 rand_core.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
-fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+probefleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
 
 [lints]
 workspace = true

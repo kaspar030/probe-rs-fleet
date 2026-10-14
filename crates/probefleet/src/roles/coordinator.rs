@@ -24,10 +24,10 @@ pub async fn run(args: CoordinatorArgs) -> Result<()> {
     tracing::info!(listen = %cfg.listen_addr, "starting coordinator");
 
     // Race the coordinator's accept/sweep loop against a shutdown signal so
-    // SIGINT/SIGTERM tear it down cleanly. `fleet_coordinator::run` owns the
+    // SIGINT/SIGTERM tear it down cleanly. `probefleet_coordinator::run` owns the
     // serve + expiry-sweep lifecycle (task 1711).
     tokio::select! {
-        result = fleet_coordinator::run(cfg) => {
+        result = probefleet_coordinator::run(cfg) => {
             result.context("coordinator exited with an error")?;
             tracing::info!("coordinator stopped");
         }

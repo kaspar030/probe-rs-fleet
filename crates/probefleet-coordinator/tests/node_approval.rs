@@ -29,9 +29,11 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::auth_api::{NodeApprovalResponse, NodeRegisterStartResponse, NodeTokenResponse};
 use forgs::TokenKind;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::auth_api::{
+    NodeApprovalResponse, NodeRegisterStartResponse, NodeTokenResponse,
+};
 
 fn start_body(node_name: &str, tags: &[&str], adopt: Option<&str>) -> String {
     let mut body = serde_json::json!({
@@ -193,7 +195,7 @@ async fn a_member_approves_a_headless_machine_into_a_chosen_org() {
     let node_id = minted.node_id.clone();
     assert_eq!(
         node_id,
-        fleet_coordinator::node_id_for(&acme, "rpi-lab-3").0
+        probefleet_coordinator::node_id_for(&acme, "rpi-lab-3").0
     );
 
     // The credential is real: it authenticates a `/agent` upgrade.
@@ -889,7 +891,7 @@ async fn a_bogus_device_secret_is_one_uniform_rejection() {
     let session_token = fleet.seed_session("acme", "alice", FleetRole::Member).await;
     let format = fleet.auth().format();
     let node_token = format
-        .mint(fleet_coordinator::identity::node_token_kind(format))
+        .mint(probefleet_coordinator::identity::node_token_kind(format))
         .to_secret_string();
 
     for secret in ["garbage".to_owned(), session_token, node_token] {
@@ -947,7 +949,7 @@ async fn the_sweep_reclaims_spent_and_expired_registrations() {
         .await
         .unwrap();
 
-    fleet_coordinator::sweep::sweep_once(&fleet.coord).await;
+    probefleet_coordinator::sweep::sweep_once(&fleet.coord).await;
 
     assert_eq!(
         pending_rows(&fleet).await,

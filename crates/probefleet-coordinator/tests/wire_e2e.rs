@@ -15,19 +15,19 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use fleet_agent::{Agent, ProbeRsBackend, Session, SpliceIo};
-use fleet_coordinator::auth::Ed25519Signer;
-use fleet_coordinator::clock::SystemClock;
-use fleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
-use fleet_coordinator::core::Coordinator;
-use fleet_coordinator::state::Db;
-use fleet_coordinator::subject::Subject;
-use fleet_coordinator::FleetRole;
-use fleet_core::policy::Policy;
-use fleet_core::scheduler::{RequesterId, Scheduler};
-use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId};
-use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_agent::{Agent, ProbeRsBackend, Session, SpliceIo};
+use probefleet_coordinator::auth::Ed25519Signer;
+use probefleet_coordinator::clock::SystemClock;
+use probefleet_coordinator::config::{CoordinatorConfig, SigningKeySource};
+use probefleet_coordinator::core::Coordinator;
+use probefleet_coordinator::state::Db;
+use probefleet_coordinator::subject::Subject;
+use probefleet_coordinator::FleetRole;
+use probefleet_core::policy::Policy;
+use probefleet_core::scheduler::{RequesterId, Scheduler};
+use probefleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId};
+use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 const SEED: [u8; 32] = [7u8; 32];
 
@@ -75,8 +75,8 @@ impl Session for EchoSession {
     async fn kill(&self) -> Result<(), String> {
         Ok(())
     }
-    async fn wait(&self) -> fleet_agent::probers::SessionExit {
-        fleet_agent::probers::SessionExit::Killed
+    async fn wait(&self) -> probefleet_agent::probers::SessionExit {
+        probefleet_agent::probers::SessionExit::Killed
     }
 }
 
@@ -84,7 +84,7 @@ impl Session for EchoSession {
 impl ProbeRsBackend for EchoBackend {
     async fn open(
         &self,
-        board: &fleet_agent::config::BoardSpec,
+        board: &probefleet_agent::config::BoardSpec,
         _serve_token: &str,
     ) -> Result<Box<dyn Session>, String> {
         Ok(Box::new(EchoSession {
@@ -112,8 +112,8 @@ fn coordinator_config() -> CoordinatorConfig {
     }
 }
 
-fn agent_config(node: &NodeId, token_pubkey: &[u8; 32]) -> fleet_agent::config::AgentConfig {
-    fleet_agent::config::AgentConfig {
+fn agent_config(node: &NodeId, token_pubkey: &[u8; 32]) -> probefleet_agent::config::AgentConfig {
+    probefleet_agent::config::AgentConfig {
         node_id: node.0.clone(),
         fleet_url: "https://coordinator.example:7000".to_owned(),
         node_token: "prfn1_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
@@ -124,13 +124,13 @@ fn agent_config(node: &NodeId, token_pubkey: &[u8; 32]) -> fleet_agent::config::
         heartbeat_secs: 30,
         // Long enough that these transport tests never tick discovery.
         discovery_secs: 3_600,
-        adopt: fleet_proto::AdoptPolicy::Declared,
+        adopt: probefleet_proto::AdoptPolicy::Declared,
         erase_on_release: false,
     }
 }
 
-fn boards() -> fleet_agent::config::BoardsConfig {
-    fleet_agent::config::BoardsConfig::from_str(
+fn boards() -> probefleet_agent::config::BoardsConfig {
+    probefleet_agent::config::BoardsConfig::from_str(
         r#"
 [[board]]
 id = "nrf52840-dk-1"
@@ -150,7 +150,7 @@ kind = "none"
 /// same string, and in production that string comes from `node_id_for`. Built
 /// by calling it, so the fixture cannot drift from the shape production mints.
 fn node_id(org: &OrgId) -> NodeId {
-    fleet_coordinator::node_id_for(org, "node-a")
+    probefleet_coordinator::node_id_for(org, "node-a")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -164,7 +164,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     // The org, user and membership `coordinator user-token` provisions when
     // it mints a session: without the membership, the acting-org check denies
     // a perfectly valid token.
-    let now = fleet_coordinator::now_epoch_secs();
+    let now = probefleet_coordinator::now_epoch_secs();
     let org = db.ensure_org_named("default", now).await.unwrap();
     let (user, _) = db
         .forgs()
@@ -202,12 +202,12 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     );
     node.seed_inventory_from_boards().await;
 
-    let (coord_tx, coord_rx, agent_tx, agent_rx) = fleet_wire::mock::pair();
+    let (coord_tx, coord_rx, agent_tx, agent_rx) = probefleet_wire::mock::pair();
     {
         let coord = Arc::clone(&coord);
         let node_id = node_id.clone();
         tokio::spawn(async move {
-            let _ = fleet_coordinator::server::handle_agent_for_test(
+            let _ = probefleet_coordinator::server::handle_agent_for_test(
                 coord,
                 Box::new(coord_tx),
                 Box::new(coord_rx),
@@ -221,10 +221,10 @@ async fn sidecar_to_agent_data_plane_round_trip() {
         let mut config = agent_config(&node_id, &token_pubkey);
         tokio::spawn(async move {
             // A node that never persists its rotated token: these tests are
-            // about the wire, and the storage half is covered in fleet-bin.
-            let store: Arc<dyn fleet_agent::config::NodeTokenStore> =
-                Arc::new(fleet_agent::config::NullTokenStore);
-            let _ = fleet_agent::connection::serve_connection(
+            // about the wire, and the storage half is covered in probefleet.
+            let store: Arc<dyn probefleet_agent::config::NodeTokenStore> =
+                Arc::new(probefleet_agent::config::NullTokenStore);
+            let _ = probefleet_agent::connection::serve_connection(
                 &node,
                 &mut config,
                 &store,
@@ -256,12 +256,12 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     }
 
     // --- Sidecar relay client over duplex B ---
-    let (coord_tx, coord_rx, sc_tx, sc_rx) = fleet_wire::mock::pair();
+    let (coord_tx, coord_rx, sc_tx, sc_rx) = probefleet_wire::mock::pair();
     {
         let coord = Arc::clone(&coord);
         let dev = dev.clone();
         tokio::spawn(async move {
-            let _ = fleet_coordinator::server::handle_sidecar_for_test(
+            let _ = probefleet_coordinator::server::handle_sidecar_for_test(
                 coord,
                 Box::new(coord_tx),
                 Box::new(coord_rx),
@@ -270,9 +270,10 @@ async fn sidecar_to_agent_data_plane_round_trip() {
             .await;
         });
     }
-    let session = fleet_sidecar::transport::CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
-        .await
-        .unwrap();
+    let session =
+        probefleet_sidecar::transport::CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
+            .await
+            .unwrap();
 
     // Lease the board.
     let grant = session
@@ -291,7 +292,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
 
     // Open a data relay channel.
     let channel = session
-        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .open_channel(grant.lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap()
         .channel;
@@ -302,7 +303,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
     {
         // The splice borrows the session for the connection's lifetime.
         let session = &session;
-        let splice = fleet_sidecar::transport::splice_client(session, channel, client_peer);
+        let splice = probefleet_sidecar::transport::splice_client(session, channel, client_peer);
         let exchange = async {
             client.write_all(b"$AttachRequest#").await.unwrap();
             client.flush().await.unwrap();
@@ -330,7 +331,7 @@ async fn sidecar_to_agent_data_plane_round_trip() {
             let b = boards.iter().find(|b| b.board == board_id).unwrap();
             assert_eq!(
                 b.availability,
-                fleet_proto::admin::BoardAvailability::Leased
+                probefleet_proto::admin::BoardAvailability::Leased
             );
         }
         other => panic!("expected BoardList, got {other:?}"),

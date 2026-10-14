@@ -1,5 +1,5 @@
 [package]
-name = "fleet-coordinator"
+name = "probefleet-coordinator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,10 +15,10 @@ include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE", "build.rs", 
 description = "Coordinator role implementation for probe-rs-fleet."
 
 [dependencies]
-fleet-proto.workspace = true
-fleet-core.workspace = true
-fleet-tls.workspace = true
-fleet-wire.workspace = true
+probefleet-proto.workspace = true
+probefleet-core.workspace = true
+probefleet-tls.workspace = true
+probefleet-wire.workspace = true
 # Identity, sessions, API keys, the device flow and browser login are forgs'.
 # `oidc` + `client` on forgs-idp is what makes this the only crate that
 # verifies a JWT (architecture §6.7); the agent never links these.
@@ -32,9 +32,9 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 
 # HTTP/WebSocket server. This is the *only* crate in the workspace that depends
-# on axum/hyper's server half; fleet-agent and fleet-sidecar dial out with
-# tokio-tungstenite through fleet-wire. See
-# `crates/fleet-agent/tests/no_http_server_dep.rs`.
+# on axum/hyper's server half; probefleet-agent and probefleet-sidecar dial out with
+# tokio-tungstenite through probefleet-wire. See
+# `crates/probefleet-agent/tests/no_http_server_dep.rs`.
 axum.workspace = true
 hyper-util = { workspace = true, features = ["server", "server-auto", "http1", "tokio"] }
 tower.workspace = true
@@ -72,13 +72,13 @@ tracing.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-fleet-agent.workspace = true
-fleet-sidecar.workspace = true
-fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+probefleet-agent.workspace = true
+probefleet-sidecar.workspace = true
+probefleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
 tokio-tungstenite.workspace = true
 async-trait.workspace = true
-fleet-tls.workspace = true
-fleet-core.workspace = true
+probefleet-tls.workspace = true
+probefleet-core.workspace = true
 rcgen.workspace = true
 http.workspace = true
 hyper.workspace = true

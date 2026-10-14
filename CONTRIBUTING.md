@@ -56,10 +56,10 @@ looks exactly like a broken ignore file. An empty file or `/dev/null` is no
 control either: `--ignore-revs-file` *supplements* the configured file rather
 than replacing it. Use `--no-ignore-revs-file` (or `-c blame.ignoreRevsFile=`)
 as the control, and probe a file the reformat actually touched, e.g.
-`crates/fleet-core/src/scheduler.rs` (14 lines credited to the reformat with
+`crates/probefleet-core/src/scheduler.rs` (14 lines credited to the reformat with
 the ignore file, 392 with `--no-ignore-revs-file`) or
-`crates/fleet-coordinator/src/core.rs`. Do not probe
-`crates/fleet-proto/src/ids.rs:141` — the reformat never touched it, so it
+`crates/probefleet-coordinator/src/core.rs`. Do not probe
+`crates/probefleet-proto/src/ids.rs:141` — the reformat never touched it, so it
 blames the same commit either way and proves nothing.
 
 About 45 lines tree-wide stay credited to the reformat even when it is working.
@@ -85,15 +85,15 @@ regular crates.io dependency (`forgs`, `forgs-store`, `forgs-http`,
 
 Nothing has been published yet. Open points before the first release:
 
-- **Crate names.** `fleet-coordinator` is already taken on crates.io by an
-  unrelated project; the other `fleet-*` names were free when checked
-  (2026-10). The rename (e.g. `probe-rs-fleet-*`, with `fleet-bin` becoming
-  `probe-rs-fleet`) is still to be decided.
+- **Crate names.** The crates were renamed from `fleet-*` to `probefleet-*`
+  (`fleet-bin` became `probefleet`), because `fleet-coordinator` is taken on
+  crates.io. All eight `probefleet*` names were free when checked (2026-10).
+  The binary is still called `probe-rs-fleet`.
 - **Copyright holder** in `LICENSE-MIT` is to be confirmed.
 
 Every crate's metadata is inherited from `[workspace.package]`; the packaged
 files are an `include` allowlist per crate (sources, `LICENSE-*` — symlinks to
-the repo root — and, for `fleet-coordinator`, `build.rs`, `migrations/` and
+the repo root — and, for `probefleet-coordinator`, `build.rs`, `migrations/` and
 `web/`, which are embedded at compile time). Tests and fixtures are not shipped.
 
 **Versions.** Internal crates are listed in `[workspace.dependencies]` with
@@ -103,16 +103,16 @@ both `path` and `version`; bump those `version`s together with
 **Order.** A crate can only be published once the workspace crates it depends
 on (including dev-dependencies) are on crates.io:
 
-1. `fleet-proto`
-2. `fleet-core`
-3. `fleet-tls`
-4. `fleet-wire`
-5. `fleet-agent`, then `fleet-sidecar` (dev-depends on `fleet-agent`)
-6. `fleet-coordinator` (dev-depends on `fleet-agent` and `fleet-sidecar`)
-7. `fleet-bin`
+1. `probefleet-proto`
+2. `probefleet-core`
+3. `probefleet-tls`
+4. `probefleet-wire`
+5. `probefleet-agent`, then `probefleet-sidecar` (dev-depends on `probefleet-agent`)
+6. `probefleet-coordinator` (dev-depends on `probefleet-agent` and `probefleet-sidecar`)
+7. `probefleet`
 
 **Checking.** `cargo package --list -p <crate>` shows what would ship.
-`cargo package -p fleet-proto -p fleet-core …` (several `-p` at once) verifies
+`cargo package -p probefleet-proto -p probefleet-core …` (several `-p` at once) verifies
 crates that depend on unpublished siblings through a local overlay; a single
 `cargo publish --dry-run -p <crate>` fails on registry resolution until its
 workspace dependencies are actually published. Recent cargo (1.90+) can do the
@@ -128,5 +128,5 @@ cargo test --workspace
 ```
 
 CI gates formatting (`fmt.yml`) and builds the workspace plus runs the
-`fleet-coordinator` and `fleet-bin` tests (`ci.yml`). Clippy and the full
+`probefleet-coordinator` and `probefleet` tests (`ci.yml`). Clippy and the full
 `cargo test --workspace` are not gated; reviewers expect them to have been run.

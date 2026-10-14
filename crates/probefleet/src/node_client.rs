@@ -5,12 +5,12 @@
 //! through [`ForgsClient::post_json`], so a certificate pin covers these
 //! routes exactly as it covers `/auth/*` — one trust path.
 
-use fleet_proto::auth_api::{
+use forgs_client::{ClientError, ForgsClient, Secret};
+use probefleet_proto::auth_api::{
     NodeApprovalDecision, NodeApprovalRequest, NodeApprovalResponse, NodeEnrollRequest,
     NodeRegisterPollRequest, NodeRegisterStartRequest, NodeRegisterStartResponse,
     NodeTokenResponse, SelfRegisterRequest,
 };
-use forgs_client::{ClientError, ForgsClient, Secret};
 
 /// Build a client for the coordinator at `url`, pinned to `pin` if given.
 ///

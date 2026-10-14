@@ -1,4 +1,4 @@
-//! Integration tests for `fleet-tls`'s client trust configuration.
+//! Integration tests for `probefleet-tls`'s client trust configuration.
 //!
 //! Replaces the deleted `mtls.rs`. There are no client certificates any more, so
 //! what is left to prove is the *server* trust decision, which is the whole
@@ -16,7 +16,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use sha2::{Digest, Sha256};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use fleet_tls::{cert_fingerprint, client_trust_config, parse_fingerprint, server_config};
+use probefleet_tls::{cert_fingerprint, client_trust_config, parse_fingerprint, server_config};
 
 /// A minted self-signed cert plus its private key, in rustls DER form.
 struct Minted {
@@ -106,7 +106,7 @@ fn fingerprint_round_trips_through_its_hex_form() {
     let expected: [u8; 32] = Sha256::digest(leaf.cert_der.as_ref()).into();
     assert_eq!(parsed, expected);
 
-    assert_eq!(parsed, fleet_tls::cert_sha256(&leaf.cert_der));
+    assert_eq!(parsed, probefleet_tls::cert_sha256(&leaf.cert_der));
     assert!(parse_fingerprint("too-short").is_none());
     assert!(parse_fingerprint(&"z".repeat(64)).is_none());
 }

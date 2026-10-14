@@ -22,10 +22,10 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
-use fleet_core::scheduler::RequesterId;
-use fleet_proto::ids::{LeaseId, NodeId};
-use fleet_proto::node_api::CoordinatorCommand;
-use fleet_proto::{ChannelId, DataFrame};
+use probefleet_core::scheduler::RequesterId;
+use probefleet_proto::ids::{LeaseId, NodeId};
+use probefleet_proto::node_api::CoordinatorCommand;
+use probefleet_proto::{ChannelId, DataFrame};
 
 use crate::proto::CoordToSidecar;
 
@@ -124,7 +124,7 @@ pub type SidecarHandle = mpsc::Sender<CoordToSidecar>;
 /// also what lets [`Scheduler::remove_waiters`] drop exactly the right waiters
 /// when a socket closes.
 ///
-/// [`Scheduler::remove_waiters`]: fleet_core::scheduler::Scheduler::remove_waiters
+/// [`Scheduler::remove_waiters`]: probefleet_core::scheduler::Scheduler::remove_waiters
 #[derive(Debug, Clone, Default)]
 pub struct SidecarRegistry {
     inner: Arc<Mutex<HashMap<RequesterId, SidecarHandle>>>,
@@ -253,7 +253,7 @@ pub struct ChannelRoute {
     pub sidecar: SidecarHandle,
     /// Which plane this channel carries (data vs. gdb). The relay treats both
     /// identically; this is bookkeeping for diagnostics and teardown.
-    pub kind: fleet_proto::ChannelKind,
+    pub kind: probefleet_proto::ChannelKind,
 }
 
 /// Table of open relay channels, keyed by [`ChannelId`]. Also owns the monotonic
@@ -435,7 +435,7 @@ mod tests {
                     lease: LeaseId(1),
                     node: test_node_id(),
                     sidecar: tx,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
             )
             .await;
@@ -463,7 +463,7 @@ mod tests {
             lease: LeaseId(1),
             node: test_node_id(),
             sidecar,
-            kind: fleet_proto::ChannelKind::Data,
+            kind: probefleet_proto::ChannelKind::Data,
         };
         let ch_a = table.allocate().await;
         let ch_b = table.allocate().await;

@@ -1,21 +1,21 @@
 //! Coordinator configuration.
 //!
 //! This is the in-process configuration struct plus light validation. Loading
-//! it from a file (TOML) and wiring the CLI is the job of `fleet-bin`; here we
+//! it from a file (TOML) and wiring the CLI is the job of `probefleet`; here we
 //! only model the shape so the rest of the crate can depend on it.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fleet_core::policy::Policy;
+use probefleet_core::policy::Policy;
 
 use crate::error::{CoordinatorError, Result};
 
 /// Where the coordinator's ed25519 signing key comes from.
 #[derive(Debug, Clone)]
 pub enum SigningKeySource {
-    /// A raw 32-byte ed25519 seed (e.g. loaded from a key file by `fleet-bin`).
+    /// A raw 32-byte ed25519 seed (e.g. loaded from a key file by `probefleet`).
     Seed([u8; 32]),
 }
 
@@ -76,7 +76,7 @@ pub struct ProviderConfig {
     pub name: String,
     /// OAuth client id. Public.
     pub client_id: String,
-    /// OAuth client secret (`fleet-bin` resolves `client_secret_path`).
+    /// OAuth client secret (`probefleet` resolves `client_secret_path`).
     /// Required by every adapter: GitHub ignores PKCE, so the secret is what
     /// makes an intercepted code unspendable.
     pub client_secret: String,
@@ -272,7 +272,7 @@ pub struct CoordinatorConfig {
     pub default_org: String,
     /// Login providers (`[[auth.providers]]`).
     pub auth: AuthConfig,
-    /// The dedicated cookie/CSRF secret (≥ 32 bytes), loaded by `fleet-bin`
+    /// The dedicated cookie/CSRF secret (≥ 32 bytes), loaded by `probefleet`
     /// from `csrf_secret_path`. **Not** derived from the signing key.
     ///
     /// `None` is refused by [`crate::build`]; a coordinator constructed

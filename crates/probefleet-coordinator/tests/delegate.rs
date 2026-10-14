@@ -17,9 +17,9 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_proto::ids::BoardName;
-use fleet_proto::token::{AllowedOp, SignedToken};
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_proto::ids::BoardName;
+use probefleet_proto::token::{AllowedOp, SignedToken};
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -34,9 +34,9 @@ fn hex(bytes: &[u8]) -> String {
 async fn delegate(
     fleet: &TestCoordinator,
     bearer: &str,
-    select: fleet_proto::lease::Constraint,
+    select: probefleet_proto::lease::Constraint,
     ops: Vec<AllowedOp>,
-) -> fleet_proto::lease::LeaseGrant {
+) -> probefleet_proto::lease::LeaseGrant {
     let session = fleet.client_session(bearer).await;
     match session
         .request(SidecarToCoord::Delegate {
@@ -52,17 +52,17 @@ async fn delegate(
     }
 }
 
-fn by_board(name: &str) -> fleet_proto::lease::Constraint {
-    fleet_proto::lease::Constraint::Id(BoardName(name.to_owned()))
+fn by_board(name: &str) -> probefleet_proto::lease::Constraint {
+    probefleet_proto::lease::Constraint::Id(BoardName(name.to_owned()))
 }
 
 /// Open a `/delegate` session with a capability token.
 async fn delegated_session(
     fleet: &TestCoordinator,
     token: &[u8],
-) -> fleet_sidecar::transport::CoordSession {
+) -> probefleet_sidecar::transport::CoordSession {
     let (tx, rx) = fleet.dial("/delegate", &hex(token)).await.unwrap();
-    fleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
+    probefleet_sidecar::transport::CoordSession::start(Box::new(tx), Box::new(rx))
         .await
         .unwrap()
 }
@@ -103,7 +103,7 @@ async fn a_delegated_token_opens_a_channel_and_nothing_else_is_needed() {
     // The sandbox connects with nothing but that token.
     let sandbox = delegated_session(&fleet, &grant.token).await;
     let opened = sandbox
-        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .open_channel(grant.lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap();
 
@@ -156,10 +156,10 @@ async fn every_non_relay_verb_is_refused_on_the_delegated_route() {
     let refused: Vec<(&str, SidecarToCoord)> = vec![
         (
             "leasing another board",
-            SidecarToCoord::Lease(fleet_proto::lease::LeaseRequest {
+            SidecarToCoord::Lease(probefleet_proto::lease::LeaseRequest {
                 select: by_board("dk-3"),
                 duration_secs: 600,
-                priority: fleet_proto::lease::Priority::Interactive,
+                priority: probefleet_proto::lease::Priority::Interactive,
             }),
         ),
         ("enumerating the fleet", SidecarToCoord::ListBoards),
@@ -255,7 +255,7 @@ async fn a_token_cannot_open_a_channel_on_another_lease() {
     match sandbox
         .request(SidecarToCoord::OpenChannel {
             lease: second.lease,
-            kind: fleet_proto::ChannelKind::Data,
+            kind: probefleet_proto::ChannelKind::Data,
         })
         .await
         .unwrap()
@@ -315,8 +315,8 @@ async fn a_token_stops_working_the_moment_its_lease_is_released() {
 /// signature the caller can learn from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_credentials_are_refused_uniformly() {
-    use fleet_proto::ids::BoardRef;
-    use fleet_proto::token::{CapabilityToken, TokenSigner as _};
+    use probefleet_proto::ids::BoardRef;
+    use probefleet_proto::token::{CapabilityToken, TokenSigner as _};
 
     let fleet = TestCoordinator::start().await;
     let (session_token, org, _) = fleet.seed_user("alice").await;
@@ -326,15 +326,15 @@ async fn bad_credentials_are_refused_uniformly() {
     // a fixture that spells an unreachable shape teaches the next reader the
     // wrong one.
     let board = {
-        let node = fleet_coordinator::node_id_for(&org, "rpi-1");
+        let node = probefleet_coordinator::node_id_for(&org, "rpi-1");
         BoardRef::new(org, node, "dk-3")
     };
 
     // A well-formed token, signed by *another* coordinator's key.
-    let impostor = fleet_coordinator::auth::Ed25519Signer::from_seed(&[9u8; 32]);
+    let impostor = probefleet_coordinator::auth::Ed25519Signer::from_seed(&[9u8; 32]);
     let forged = impostor
         .sign(&CapabilityToken {
-            lease: fleet_proto::LeaseId(1),
+            lease: probefleet_proto::LeaseId(1),
             board: board.clone(),
             allowed_ops: vec![AllowedOp::Flash],
             expires: fleet.coord.now() + 3_600,
@@ -347,7 +347,7 @@ async fn bad_credentials_are_refused_uniformly() {
         .coord
         .signer()
         .sign(&CapabilityToken {
-            lease: fleet_proto::LeaseId(1),
+            lease: probefleet_proto::LeaseId(1),
             board,
             allowed_ops: vec![AllowedOp::Flash],
             expires: 1,
@@ -462,14 +462,14 @@ async fn a_delegation_cannot_exceed_the_delegators_own_access() {
     // The refused delegation left the board free, rather than parking a lease
     // on it that nobody can use.
     let sched = fleet.coord.scheduler().lock().await;
-    let dk4 = fleet_proto::ids::BoardRef::new(
+    let dk4 = probefleet_proto::ids::BoardRef::new(
         alice_org.clone(),
-        fleet_coordinator::node_id_for(&alice_org, "rpi-1"),
+        probefleet_coordinator::node_id_for(&alice_org, "rpi-1"),
         "dk-4",
     );
     assert_eq!(
         sched.board(&dk4).unwrap().state,
-        fleet_proto::board::BoardState::Idle,
+        probefleet_proto::board::BoardState::Idle,
         "a refused delegation must not strand the board"
     );
 }
@@ -500,11 +500,13 @@ async fn dropping_a_sidecar_connection_closes_its_channels() {
 
     let session = fleet.client_session(&alice_token).await;
     let lease = match session
-        .request(SidecarToCoord::Lease(fleet_proto::lease::LeaseRequest {
-            select: by_board("dk-3"),
-            duration_secs: 600,
-            priority: fleet_proto::lease::Priority::Interactive,
-        }))
+        .request(SidecarToCoord::Lease(
+            probefleet_proto::lease::LeaseRequest {
+                select: by_board("dk-3"),
+                duration_secs: 600,
+                priority: probefleet_proto::lease::Priority::Interactive,
+            },
+        ))
         .await
         .unwrap()
     {
@@ -512,7 +514,7 @@ async fn dropping_a_sidecar_connection_closes_its_channels() {
         other => panic!("expected a lease, got {other:?}"),
     };
     let opened = session
-        .open_channel(lease, fleet_proto::ChannelKind::Data)
+        .open_channel(lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap();
     let _ = node.expect_open_session().await;
@@ -558,7 +560,7 @@ async fn dropping_a_delegated_connection_closes_its_channels() {
     .await;
     let sandbox = delegated_session(&fleet, &grant.token).await;
     let opened = sandbox
-        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .open_channel(grant.lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap();
     let _ = node.expect_open_session().await;
@@ -600,12 +602,12 @@ async fn one_connection_dropping_leaves_another_connections_channel_alone() {
     let first = delegated_session(&fleet, &grant.token).await;
     let second = delegated_session(&fleet, &grant.token).await;
     let a = first
-        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .open_channel(grant.lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap();
     let _ = node.expect_open_session().await;
     let b = second
-        .open_channel(grant.lease, fleet_proto::ChannelKind::Data)
+        .open_channel(grant.lease, probefleet_proto::ChannelKind::Data)
         .await
         .unwrap();
     let _ = node.expect_open_session().await;

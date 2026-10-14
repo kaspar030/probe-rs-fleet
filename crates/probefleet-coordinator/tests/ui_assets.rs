@@ -165,7 +165,7 @@ async fn client_side_routes_all_render_the_shell() {
     let fleet = TestCoordinator::start().await;
 
     let (_, _, canonical) = fleet.http_full("GET", "/ui/", &[], None).await;
-    let pages = fleet_coordinator::assets::shell_pages();
+    let pages = probefleet_coordinator::assets::shell_pages();
     assert!(!pages.is_empty(), "there is at least one client-side page");
 
     for page in pages {
@@ -195,7 +195,7 @@ async fn client_side_routes_all_render_the_shell() {
 #[test]
 fn the_rust_and_javascript_page_lists_agree() {
     let source = String::from_utf8(
-        fleet_coordinator::assets::asset_bytes("router.mjs")
+        probefleet_coordinator::assets::asset_bytes("router.mjs")
             .expect("web/router.mjs is embedded")
             .to_vec(),
     )
@@ -215,7 +215,7 @@ fn the_rust_and_javascript_page_lists_agree() {
 
     assert_eq!(
         js,
-        fleet_coordinator::assets::shell_pages(),
+        probefleet_coordinator::assets::shell_pages(),
         "web/router.mjs's PAGES and src/assets.rs's PAGES have drifted; \
          the server would serve pages the client router does not know, or refuse \
          pages it does"
@@ -331,11 +331,11 @@ async fn the_ui_swallows_no_other_prefix() {
 
 /// Every embedded file as `(path, text)`.
 fn assets() -> Vec<(String, String)> {
-    fleet_coordinator::assets::asset_paths()
+    probefleet_coordinator::assets::asset_paths()
         .into_iter()
         .map(|path| {
-            let bytes =
-                fleet_coordinator::assets::asset_bytes(&path).expect("a listed path is embedded");
+            let bytes = probefleet_coordinator::assets::asset_bytes(&path)
+                .expect("a listed path is embedded");
             let text = String::from_utf8(bytes.to_vec())
                 .unwrap_or_else(|_| panic!("{path} is not UTF-8; the tree ships only text"));
             (path, text)

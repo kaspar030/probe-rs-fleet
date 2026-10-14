@@ -40,7 +40,7 @@ mod common;
 use std::sync::{Mutex, PoisonError};
 
 use common::{start_fleet, Fleet};
-use fleet_coordinator::FleetRole;
+use probefleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -56,7 +56,7 @@ async fn seed_expired_with_refresh(fleet: &Fleet, login: &str) -> (String, Strin
         .member(login, common::DEFAULT_ORG, FleetRole::Admin)
         .await;
     let now = fleet.coord.now();
-    let session = fleet_bin::tokens::mint(forgs::TokenKind::Session);
+    let session = probefleet::tokens::mint(forgs::TokenKind::Session);
     fleet
         .coord
         .db()
@@ -71,7 +71,7 @@ async fn seed_expired_with_refresh(fleet: &Fleet, login: &str) -> (String, Strin
 /// Does this token open `/client`? The honest liveness check: it goes through
 /// the coordinator's real authentication path.
 async fn token_works(fleet: &Fleet, token: &str) -> bool {
-    fleet_wire::client::dial(fleet_wire::client::DialOpts {
+    probefleet_wire::client::dial(probefleet_wire::client::DialOpts {
         url: fleet.base_url.clone(),
         path: "/client",
         bearer: token.to_owned(),
@@ -83,10 +83,10 @@ async fn token_works(fleet: &Fleet, token: &str) -> bool {
 
 /// Write a fleet file at the XDG path the renewal code will re-read and patch.
 fn write_fleet_file(base_url: &str, session: &str, refresh: Option<&str>, expires: Option<u64>) {
-    let path = fleet_bin::paths::fleet_config_path("default").unwrap();
-    fleet_bin::fleet_config::update(&path, |f| {
+    let path = probefleet::paths::fleet_config_path("default").unwrap();
+    probefleet::fleet_config::update(&path, |f| {
         base_url.clone_into(&mut f.url);
-        f.user = Some(fleet_bin::fleet_config::UserSection {
+        f.user = Some(probefleet::fleet_config::UserSection {
             session_token: session.to_owned(),
             username: Some("kaspar".to_owned()),
             user_id: None,
@@ -131,7 +131,7 @@ async fn the_sidecar_renews_an_expired_user_session_and_persists_it() {
         "the stored session must already be expired"
     );
 
-    let (url, token, _pin) = fleet_bin::roles::sidecar::resolve_client_config_for_test("default")
+    let (url, token, _pin) = probefleet::roles::sidecar::resolve_client_config_for_test("default")
         .await
         .expect("the shim must resolve a credential from the fleet file");
     assert_eq!(url, fleet.base_url);
@@ -142,8 +142,8 @@ async fn the_sidecar_renews_an_expired_user_session_and_persists_it() {
     );
 
     // Persisted, so the next `probe-rs` in the build reuses it.
-    let path = fleet_bin::paths::fleet_config_path("default").unwrap();
-    let user = fleet_bin::fleet_config::load(&path).unwrap().user.unwrap();
+    let path = probefleet::paths::fleet_config_path("default").unwrap();
+    let user = probefleet::fleet_config::load(&path).unwrap().user.unwrap();
     assert_eq!(user.session_token, token);
     assert!(user.expires.is_some_and(|e| e > now));
     assert_eq!(
@@ -189,7 +189,7 @@ async fn a_file_without_a_refresh_token_behaves_exactly_as_before() {
     );
 
     let started = std::time::Instant::now();
-    let (_url, token, _pin) = fleet_bin::roles::sidecar::resolve_client_config_for_test("default")
+    let (_url, token, _pin) = probefleet::roles::sidecar::resolve_client_config_for_test("default")
         .await
         .expect("a fleet file with a [user] table still resolves");
     // The stored token, warned about and handed on: a shim that refuses to
@@ -231,8 +231,8 @@ async fn logout_all_revokes_both_credentials_end_to_end() {
     write_fleet_file(&fleet.base_url, &session, Some(&refresh), Some(now + 3_600));
     assert!(token_works(&fleet, &session).await);
 
-    let path = fleet_bin::paths::fleet_config_path("default").unwrap();
-    fleet_bin::roles::logout::run(fleet_bin::cli::LogoutArgs {
+    let path = probefleet::paths::fleet_config_path("default").unwrap();
+    probefleet::roles::logout::run(probefleet::cli::LogoutArgs {
         all: true,
         fleet: "default".to_owned(),
         // The XDG path deliberately, so the verb and the renewal code agree on
@@ -252,7 +252,10 @@ async fn logout_all_revokes_both_credentials_end_to_end() {
         "the durable credential must be revoked, or logout means nothing"
     );
     assert!(
-        fleet_bin::fleet_config::load(&path).unwrap().user.is_none(),
+        probefleet::fleet_config::load(&path)
+            .unwrap()
+            .user
+            .is_none(),
         "[user] must be cleared locally too"
     );
 

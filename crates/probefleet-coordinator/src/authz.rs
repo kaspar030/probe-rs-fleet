@@ -25,9 +25,9 @@
 //! must be indistinguishable to the caller, or the error message becomes an
 //! org-enumeration oracle.
 
-use fleet_core::access::Access;
-use fleet_core::scheduler::Scheduler;
-use fleet_proto::ids::{LeaseId, OrgId, SubjectKey, SubjectKind};
+use probefleet_core::access::Access;
+use probefleet_core::scheduler::Scheduler;
+use probefleet_proto::ids::{LeaseId, OrgId, SubjectKey, SubjectKind};
 use tracing::warn;
 
 use crate::state::Db;
@@ -245,11 +245,11 @@ async fn holder_org_is(db: &Db, holder: &SubjectKey, org: &OrgId) -> bool {
 mod tests {
     use super::*;
     use crate::subject::testkit::{self, member};
-    use fleet_core::policy::Policy;
-    use fleet_proto::board::{Board, BoardState, PowerKind};
-    use fleet_proto::ids::{BoardName, BoardRef, NodeId};
-    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
-    use fleet_proto::token::AllowedOp;
+    use probefleet_core::policy::Policy;
+    use probefleet_proto::board::{Board, BoardState, PowerKind};
+    use probefleet_proto::ids::{BoardName, BoardRef, NodeId};
+    use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use probefleet_proto::token::AllowedOp;
     use FleetRole::{Admin, Member};
 
     fn node(org: &OrgId) -> NodeId {
@@ -291,7 +291,7 @@ mod tests {
         } else {
             Access {
                 member_of: holder.org().into_iter().cloned().collect(),
-                grants: vec![fleet_core::access::GrantScope {
+                grants: vec![probefleet_core::access::GrantScope {
                     id: "g1".to_owned(),
                     org: board_org.clone(),
                     selector: Constraint::Id(BoardName("b1".to_owned())),
@@ -300,9 +300,9 @@ mod tests {
                 }],
             }
         };
-        let fleet_core::scheduler::LeaseDecision::Granted(g) = s.request_lease(
+        let probefleet_core::scheduler::LeaseDecision::Granted(g) = s.request_lease(
             holder.key().clone(),
-            fleet_core::scheduler::RequesterId::DETACHED,
+            probefleet_core::scheduler::RequesterId::DETACHED,
             &access,
             lease_req("b1"),
             1000,

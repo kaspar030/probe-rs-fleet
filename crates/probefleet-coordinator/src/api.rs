@@ -78,7 +78,7 @@
 //!   minting and revoking enrollment credentials, by **calling**
 //!   [`forgs_http::keys::create`] / [`forgs_http::keys::revoke`] — the same
 //!   functions forgs' `/auth/keys` uses. See [`create_auth_key`].
-//! * `POST /api/v1/boards/power-cycle` — the one [`fleet_proto::token::AllowedOp`]
+//! * `POST /api/v1/boards/power-cycle` — the one [`probefleet_proto::token::AllowedOp`]
 //!   the *coordinator* enforces; see [`power_cycle`].
 //! * `DELETE /api/v1/leases/{lease_id}` — holder-or-admin lease release,
 //!   including a board org's admin reclaiming their own hardware from someone
@@ -138,14 +138,14 @@ use tracing::warn;
 use forgs::TokenKind;
 use forgs_http::{Caller, Carrier};
 
-use fleet_proto::admin::{
+use probefleet_proto::admin::{
     BoardAvailability, BoardSummary, GrantSummary, LeaseHolderSummary, LogLine,
 };
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::auth_api::NodeApprovalDecision;
-use fleet_proto::board::PowerKind;
-use fleet_proto::ids::{BoardName, BoardRef, LeaseId, SubjectKey};
-use fleet_proto::token::AllowedOp;
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::auth_api::NodeApprovalDecision;
+use probefleet_proto::board::PowerKind;
+use probefleet_proto::ids::{BoardName, BoardRef, LeaseId, SubjectKey};
+use probefleet_proto::token::AllowedOp;
 
 use crate::core::{Coordinator, NodeStatus, OpError, OrgAdminError, OrgCreateError};
 use crate::http::{parse_adopt, reject, valid_tags};
@@ -380,11 +380,11 @@ fn percent_decode(s: &str) -> String {
 // View structs
 // ---------------------------------------------------------------------------
 //
-// These live here, never in `fleet-proto`. The wire DTOs are shaped for
+// These live here, never in `probefleet-proto`. The wire DTOs are shaped for
 // postcard — newtype ids, a three-part `BoardRef`, externally-tagged enums —
 // and serializing them straight to JSON produces shapes like
 // `{"Uhubctl":{"hub":"1-1","port":2}}` that a hand-written frontend would have
-// to special-case. Giving `fleet-proto` a divergent field set to fix that would
+// to special-case. Giving `probefleet-proto` a divergent field set to fix that would
 // mean the browser and the CLI disagreed about what a board *is*, which is
 // precisely the drift `docs/web-ui.md` D2 exists to prevent.
 
@@ -1182,7 +1182,7 @@ async fn remove_org_member(
 /// node.
 ///
 /// [`NodeView`] is nonetheless kept **separate** from the wire's
-/// `fleet_proto::admin::NodeSummary`: this body is the web UI's contract (its
+/// `probefleet_proto::admin::NodeSummary`: this body is the web UI's contract (its
 /// `id` and `adopt` are already flattened to strings) and must be free to
 /// evolve on the browser's schedule rather than on `PROTOCOL_VERSION`'s. The
 /// two renderings happen to agree today; that is not a guarantee either way.
@@ -1354,7 +1354,7 @@ struct PendingDecision {
 ///
 /// The `inspect` response describes a machine the approver **cannot see**. RFC
 /// 8628 §5.4's mitigation is that they are told so before they decide, and the
-/// CLI prints it verbatim (`fleet-bin`'s `node approve`). The JSON API carries
+/// CLI prints it verbatim (`probefleet`'s `node approve`). The JSON API carries
 /// it in the `inspect` response body as a `warning` field, whose value is the
 /// constant [`APPROVAL_WARNING`]:
 ///
@@ -1425,7 +1425,7 @@ pub(crate) const APPROVAL_WARNING: &str =
 /// Attach [`APPROVAL_WARNING`] to a successful `inspect` response.
 ///
 /// Done by re-shaping the JSON rather than by widening
-/// `fleet_proto::auth_api::NodeApprovalResponse`: that type is the **wire** contract
+/// `probefleet_proto::auth_api::NodeApprovalResponse`: that type is the **wire** contract
 /// the CLI parses, and growing it for the browser's benefit would put a
 /// browser-shaped field in the shared crate — the drift `docs/web-ui.md` D2
 /// exists to prevent. A non-200, or a body that is not the object we expect, is
@@ -1494,7 +1494,7 @@ async fn leases(
 /// `BoardRef::answers_to` grammar) exactly as the wire verbs do.
 ///
 /// [`Coordinator::operator_power_cycle_core`] resolves it within the caller's
-/// [`fleet_core::access::Access`] through the tiered `resolve_board` — own org
+/// [`probefleet_core::access::Access`] through the tiered `resolve_board` — own org
 /// wins, then granted orgs — and re-checks [`AllowedOp::PowerCycle`] for a
 /// grantee. That second check is not redundant: resolution proves the caller may
 /// *see* the board, not that they may cut its power, and this is the one op the
@@ -1671,14 +1671,14 @@ struct GrantRequest {
 /// **Admin**-gated inside [`Coordinator::grant_create_core`], which also holds
 /// every rule this handler deliberately does not pre-empt:
 ///
-/// * the **selector** is parsed by `fleet_proto::lease::parse_constraint`
+/// * the **selector** is parsed by `probefleet_proto::lease::parse_constraint`
 ///   (where a bare term is a tag) and stored as `Constraint`'s `Display`, so a
 ///   grant's
 ///   meaning never depends on which surface wrote it. The UI sends the same
 ///   string a CLI would and must **not** build a structured selector of its
 ///   own. An empty expression is refused, which is what stops an empty tag set
 ///   — a match-everything — from reaching the table;
-/// * the **ops** go through `fleet_proto::token::normalize_ops`, so a
+/// * the **ops** go through `probefleet_proto::token::normalize_ops`, so a
 ///   data-plane op implies `attach` in the stored row;
 /// * the **expiry** is required, must be in the future, and is capped at
 ///   [`Coordinator::MAX_GRANT_TTL_SECS`];
@@ -2037,8 +2037,8 @@ mod tests {
     #[test]
     fn a_board_key_carries_both_shapes() {
         let board = BoardRef::new(
-            fleet_proto::ids::OrgId("01J0000000000000000000ORG1".to_owned()),
-            fleet_proto::ids::NodeId("01J0000000000000000000ORG1/rpi-1".to_owned()),
+            probefleet_proto::ids::OrgId("01J0000000000000000000ORG1".to_owned()),
+            probefleet_proto::ids::NodeId("01J0000000000000000000ORG1/rpi-1".to_owned()),
             "dk-3",
         );
         let view = BoardKeyView::from(&board);
@@ -2057,11 +2057,11 @@ mod tests {
     fn power_kinds_flatten_to_labels_without_the_wiring() {
         let json = serde_json::to_string(&BoardView::from(BoardSummary {
             board: BoardRef::new(
-                fleet_proto::ids::OrgId("o".to_owned()),
-                fleet_proto::ids::NodeId("o/n".to_owned()),
+                probefleet_proto::ids::OrgId("o".to_owned()),
+                probefleet_proto::ids::NodeId("o/n".to_owned()),
                 "b",
             ),
-            node: fleet_proto::ids::NodeId("o/n".to_owned()),
+            node: probefleet_proto::ids::NodeId("o/n".to_owned()),
             chip: "nRF52840_xxAA".to_owned(),
             model: None,
             tags: vec![],

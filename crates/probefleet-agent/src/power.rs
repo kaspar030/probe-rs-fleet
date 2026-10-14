@@ -9,7 +9,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use fleet_proto::PowerKind;
+use probefleet_proto::PowerKind;
 
 /// Errors from power-control operations.
 #[derive(Debug, thiserror::Error)]
@@ -183,7 +183,7 @@ impl Gpio {
             .map_err(|e| PowerError::Io(format!("opening {}: {e}", self.chip)))?;
         let opts = Options::output([self.line])
             .values([value])
-            .consumer("fleet-agent");
+            .consumer("probefleet-agent");
         let _lines = chip
             .request_lines(opts)
             .await

@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result};
 
-use fleet_proto::AdoptPolicy;
+use probefleet_proto::AdoptPolicy;
 
 use crate::cli::ShareArgs;
 use crate::fleet_config;
@@ -82,7 +82,7 @@ pub async fn run(args: ShareArgs) -> Result<()> {
     let response = crate::node_client::self_register(
         &client,
         &session,
-        &fleet_proto::auth_api::SelfRegisterRequest {
+        &probefleet_proto::auth_api::SelfRegisterRequest {
             node_name: node_name.clone(),
             tags: tag,
             adopt: Some(adopt.as_str().to_owned()),

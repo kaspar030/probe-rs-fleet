@@ -33,12 +33,12 @@ use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-use fleet_proto::ids::{NodeId, OrgId};
+use probefleet_proto::ids::{NodeId, OrgId};
 
 use crate::subject::Subject;
-use fleet_proto::node_api::NodeReport;
-use fleet_proto::PROTOCOL_VERSION;
-use fleet_wire::{WireError, WireEvent, WireRx, WireTx};
+use probefleet_proto::node_api::NodeReport;
+use probefleet_proto::PROTOCOL_VERSION;
+use probefleet_wire::{WireError, WireEvent, WireRx, WireTx};
 
 use crate::core::Coordinator;
 use crate::error::{CoordinatorError, Result};
@@ -97,7 +97,7 @@ impl NodeAuth {
 /// # Errors
 ///
 /// Returns a [`CoordinatorError`] when the connection ends. A benign peer close
-/// is reported as such (see [`fleet_wire::is_benign_close`]) so a node that
+/// is reported as such (see [`probefleet_wire::is_benign_close`]) so a node that
 /// simply went away is not logged as a fault.
 pub async fn handle_node(
     coord: Arc<Coordinator>,
@@ -130,7 +130,7 @@ pub async fn handle_node(
                         NodeMessage::Command(cmd) => CoordToNode::Command(cmd),
                         NodeMessage::Data(frame) => CoordToNode::Data(frame),
                     };
-                    if fleet_wire::send(&mut *tx, &envelope).await.is_err() {
+                    if probefleet_wire::send(&mut *tx, &envelope).await.is_err() {
                         break;
                     }
                 }
@@ -243,7 +243,7 @@ async fn node_read_loop(
                     WireEvent::Pong => {}
                     WireEvent::Closed => break Err(CoordinatorError::Wire(WireError::Closed)),
                     WireEvent::Binary(bytes) => {
-                        match fleet_wire::decode::<NodeToCoord>(&bytes)? {
+                        match probefleet_wire::decode::<NodeToCoord>(&bytes)? {
                             NodeToCoord::Report(report) => {
                                 if let Some(outcome) = handle_node_report(
                                     coord,
@@ -359,7 +359,7 @@ async fn push_rotation(
     let format = coord.auth().format();
     let token = format.mint(crate::identity::node_token_kind(format));
     let hash = token.hash();
-    let cmd = fleet_proto::node_api::CoordinatorCommand::RotateNodeToken {
+    let cmd = probefleet_proto::node_api::CoordinatorCommand::RotateNodeToken {
         token: token.to_secret_string(),
         rotation_id,
     };
@@ -516,7 +516,7 @@ pub async fn handle_delegate(
     coord: Arc<Coordinator>,
     tx: BoxTx,
     rx: BoxRx,
-    token: fleet_proto::token::CapabilityToken,
+    token: probefleet_proto::token::CapabilityToken,
 ) -> Result<()> {
     let (out_tx, ping_tx, writer_task) = spawn_sidecar_writer(tx);
 
@@ -542,7 +542,7 @@ pub async fn handle_delegate(
 /// The `/delegate` allowlist. Anything not named here is a flat error.
 async fn handle_delegate_message(
     coord: &Coordinator,
-    token: &fleet_proto::token::CapabilityToken,
+    token: &probefleet_proto::token::CapabilityToken,
     msg: SidecarToCoord,
     out_tx: &mpsc::Sender<CoordToSidecar>,
 ) -> Result<()> {
@@ -600,7 +600,7 @@ fn spawn_sidecar_writer(
             tokio::select! {
                 msg = out_rx.recv() => {
                     let Some(msg) = msg else { break };
-                    if fleet_wire::send(&mut *tx, &msg).await.is_err() {
+                    if probefleet_wire::send(&mut *tx, &msg).await.is_err() {
                         break;
                     }
                 }
@@ -637,7 +637,7 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     // Expect a Hello first.
-    let hello: SidecarToCoord = fleet_wire::recv(&mut *rx).await?;
+    let hello: SidecarToCoord = probefleet_wire::recv(&mut *rx).await?;
     match hello {
         SidecarToCoord::Hello { protocol_version } => {
             if protocol_version != PROTOCOL_VERSION {
@@ -680,7 +680,7 @@ where
                     WireEvent::Pong => {}
                     WireEvent::Closed => return Err(CoordinatorError::Wire(WireError::Closed)),
                     WireEvent::Binary(bytes) => {
-                        let msg: SidecarToCoord = fleet_wire::decode(&bytes)?;
+                        let msg: SidecarToCoord = probefleet_wire::decode(&bytes)?;
                         handle(msg).await?;
                     }
                 }
@@ -755,11 +755,11 @@ mod tests {
     use crate::clock::SystemClock;
     use crate::config::CoordinatorConfig;
     use crate::registry::{ChannelRoute, SidecarHandle};
-    use fleet_core::policy::Policy;
-    use fleet_core::scheduler::Scheduler;
-    use fleet_proto::ids::LeaseId;
-    use fleet_proto::node_api::{CoordinatorCommand, NodeReport};
-    use fleet_proto::DataFrame;
+    use probefleet_core::policy::Policy;
+    use probefleet_core::scheduler::Scheduler;
+    use probefleet_proto::ids::LeaseId;
+    use probefleet_proto::node_api::{CoordinatorCommand, NodeReport};
+    use probefleet_proto::DataFrame;
 
     const SEED: [u8; 32] = [5u8; 32];
 
@@ -816,12 +816,12 @@ mod tests {
                     lease: LeaseId(1),
                     node: node_id.clone(),
                     sidecar: route_tx,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
             )
             .await;
 
-        let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
+        let (server_tx, server_rx, mut peer_tx, _peer_rx) = probefleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
         let id = node_id.clone();
         let agent_task = tokio::spawn(async move {
@@ -831,7 +831,7 @@ mod tests {
         });
 
         // A control report (exercising the demux path) ...
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut peer_tx,
             &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )
@@ -842,7 +842,7 @@ mod tests {
             channel,
             bytes: vec![0xCA, 0xFE, 0xBA, 0xBE],
         };
-        fleet_wire::send(&mut peer_tx, &NodeToCoord::Data(payload.clone()))
+        probefleet_wire::send(&mut peer_tx, &NodeToCoord::Data(payload.clone()))
             .await
             .unwrap();
 
@@ -864,7 +864,7 @@ mod tests {
         let coord = coordinator().await;
         let node_id = test_node_id();
 
-        let (server_tx, server_rx, _peer_tx, mut peer_rx) = fleet_wire::mock::pair();
+        let (server_tx, server_rx, _peer_tx, mut peer_rx) = probefleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
         let id = node_id.clone();
         let agent_task = tokio::spawn(async move {
@@ -885,7 +885,10 @@ mod tests {
             .await
             .unwrap();
 
-        match fleet_wire::recv::<CoordToNode>(&mut peer_rx).await.unwrap() {
+        match probefleet_wire::recv::<CoordToNode>(&mut peer_rx)
+            .await
+            .unwrap()
+        {
             CoordToNode::Command(CoordinatorCommand::QueryState) => {}
             other => panic!("expected QueryState command, got {other:?}"),
         }
@@ -900,14 +903,14 @@ mod tests {
         let coord = coordinator().await;
         let node_id = test_node_id();
 
-        let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
+        let (server_tx, server_rx, mut peer_tx, _peer_rx) = probefleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
         let id = node_id.clone();
         let task = tokio::spawn(async move {
             handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id).await
         });
 
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut peer_tx,
             &NodeToCoord::Report(NodeReport::Register {
                 node: NodeId("someone-else".to_owned()),
@@ -933,14 +936,14 @@ mod tests {
         let coord = coordinator().await;
         let node_id = test_node_id();
 
-        let (server_tx, server_rx, mut peer_tx, _peer_rx) = fleet_wire::mock::pair();
+        let (server_tx, server_rx, mut peer_tx, _peer_rx) = probefleet_wire::mock::pair();
         let coord_clone = Arc::clone(&coord);
         let id = node_id.clone();
         let task = tokio::spawn(async move {
             handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id).await
         });
 
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut peer_tx,
             &NodeToCoord::Report(NodeReport::Register {
                 node: node_id.clone(),
@@ -949,7 +952,7 @@ mod tests {
         )
         .await
         .unwrap();
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut peer_tx,
             &NodeToCoord::Report(NodeReport::Heartbeat { uptime_secs: 1 }),
         )

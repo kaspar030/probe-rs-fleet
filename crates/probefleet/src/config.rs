@@ -1,17 +1,17 @@
 //! Shared configuration loading for fleet roles.
 //!
 //! The sibling crates each own their *runtime* config struct:
-//! [`fleet_coordinator::config::CoordinatorConfig`] and
-//! [`fleet_agent::config::AgentConfig`] / `BoardsConfig`. The agent's config
+//! [`probefleet_coordinator::config::CoordinatorConfig`] and
+//! [`probefleet_agent::config::AgentConfig`] / `BoardsConfig`. The agent's config
 //! already derives `serde::Deserialize`, so it is loaded directly via its own
 //! `from_path`. The coordinator's struct intentionally does *not* derive
 //! `Deserialize` (it carries non-serialisable runtime types), so this module
 //! owns the on-disk TOML shape and the conversion into the runtime struct —
-//! that mapping is precisely "the job of `fleet-bin`" called out in the
+//! that mapping is precisely "the job of `probefleet`" called out in the
 //! coordinator config docs.
 //!
 //! Client-side configuration is **not** here: since revision 2 it is one file
-//! per fleet, owned by [`crate::fleet_config`]. `fleet_agent::AgentConfig` is
+//! per fleet, owned by [`crate::fleet_config`]. `probefleet_agent::AgentConfig` is
 //! likewise no longer a file format — the agent role assembles it from the
 //! fleet file plus `node/node.toml`.
 
@@ -21,11 +21,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use fleet_coordinator::config::{
+use probefleet_coordinator::config::{
     AuthConfig, CoordinatorConfig, GithubActionsConfig, GithubEndpoints, ProviderConfig,
     ProviderKind, SigningKeySource, TlsConfig,
 };
-use fleet_core::policy::Policy;
+use probefleet_core::policy::Policy;
 
 /// Optional coordinator-terminated TLS, as a `[tls]` table.
 #[derive(Debug, Clone, Deserialize)]
@@ -166,11 +166,11 @@ struct GithubActionsToml {
 }
 
 fn default_gha_issuer() -> String {
-    fleet_coordinator::config::DEFAULT_GHA_ISSUER.to_owned()
+    probefleet_coordinator::config::DEFAULT_GHA_ISSUER.to_owned()
 }
 
 fn default_gha_jwks_url() -> String {
-    fleet_coordinator::config::DEFAULT_GHA_JWKS_URL.to_owned()
+    probefleet_coordinator::config::DEFAULT_GHA_JWKS_URL.to_owned()
 }
 
 fn default_jwks_refresh_secs() -> u64 {
@@ -293,7 +293,7 @@ fn default_node_token_rotate_secs() -> u64 {
 }
 
 fn default_org() -> String {
-    fleet_coordinator::config::DEFAULT_ORG_NAME.to_owned()
+    probefleet_coordinator::config::DEFAULT_ORG_NAME.to_owned()
 }
 
 fn default_pending_node_ttl_secs() -> u64 {

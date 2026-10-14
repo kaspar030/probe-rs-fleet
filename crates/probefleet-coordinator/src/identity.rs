@@ -26,9 +26,9 @@ use forgs_idp::{IdentityProvider, WorkloadIssuer};
 use forgs_store::{ConsumedApiKey, NewGrant, PendingDevice};
 use serde::{Deserialize, Serialize};
 
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::auth_api::NodeTokenResponse;
-use fleet_proto::token::AllowedOp;
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::auth_api::NodeTokenResponse;
+use probefleet_proto::token::AllowedOp;
 
 use crate::clock::SharedClock;
 use crate::config::{CoordinatorConfig, ProviderConfig, ProviderKind};
@@ -283,7 +283,7 @@ impl CiKeyPayload {
             .map(|t| format!("tag={t}"))
             .collect::<Vec<_>>()
             .join(" && ");
-        let selector = fleet_proto::lease::parse_constraint(&selector)
+        let selector = probefleet_proto::lease::parse_constraint(&selector)
             .ok()?
             .to_string();
         let ops = if self.ops.is_empty() {
@@ -297,7 +297,7 @@ impl CiKeyPayload {
             if parsed.len() != self.ops.len() {
                 return None;
             }
-            fleet_proto::token::normalize_ops(parsed)
+            probefleet_proto::token::normalize_ops(parsed)
         };
         Some((selector, ops))
     }
@@ -603,7 +603,7 @@ impl Coordinator {
     #[allow(clippy::too_many_arguments)]
     pub async fn register_node_and_mint(
         &self,
-        org: &fleet_proto::ids::OrgId,
+        org: &probefleet_proto::ids::OrgId,
         node_name: &str,
         tags: &[String],
         owner: Option<UserId>,

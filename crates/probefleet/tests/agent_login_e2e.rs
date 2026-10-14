@@ -18,7 +18,7 @@
 //! `auth_key_e2e.rs`'s header documents and deliberately stays outside of. The
 //! only honest way to exercise the refresh is to point XDG at a tempdir, which
 //! is process-global state, which is why every test here takes this file's own
-//! `ENV_LOCK`. That lock is per-binary: `fleet_bin::test_support::ENV_LOCK` is
+//! `ENV_LOCK`. That lock is per-binary: `probefleet::test_support::ENV_LOCK` is
 //! `pub(crate)`, so an integration test cannot reach it.
 //!
 //! The guard is held across `await` points on purpose: what it protects is the
@@ -31,8 +31,8 @@ mod common;
 use std::sync::Mutex;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{AgentLoginArgs, LoginArgs};
-use fleet_coordinator::FleetRole;
+use probefleet::cli::{AgentLoginArgs, LoginArgs};
+use probefleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -67,7 +67,7 @@ impl XdgHome {
         // role functions and `update_named` will reach for, and computing it
         // once is what makes the tests below assert against *that* file rather
         // than one they constructed themselves.
-        let fleet_file = fleet_bin::paths::fleet_config_path("default").unwrap();
+        let fleet_file = probefleet::paths::fleet_config_path("default").unwrap();
         Self {
             _dir: dir,
             fleet_file,
@@ -136,7 +136,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
     // `[user]` table must survive, since that is the read-modify-write rule the
     // whole file format rests on.
     let session = mint_user_token(&fleet, "alice").await;
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(session.clone()),
@@ -152,7 +152,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
     .expect("login --token");
 
     let key = mint_agent_key(&fleet, "desk-bot", false).await;
-    fleet_bin::roles::agent_login::run(
+    probefleet::roles::agent_login::run(
         agent_login_args(&fleet, &key, Some("desk-bot")),
         "default",
         None,
@@ -161,7 +161,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
     .expect("agent login");
 
     let path = xdg.fleet_file();
-    let file = fleet_bin::fleet_config::load(path).unwrap();
+    let file = probefleet::fleet_config::load(path).unwrap();
     let agent = file.agent.clone().expect("[agent] was written");
     assert!(
         agent.workload_token.starts_with("prfw1_"),
@@ -186,7 +186,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
 
     // The redemption synthesised the identity's grant, which is what makes the
     // sandbox's access ordinary and revocable.
-    let ns = fleet_coordinator::subject::ns_of(&fleet.default_org().await).unwrap();
+    let ns = probefleet_coordinator::subject::ns_of(&fleet.default_org().await).unwrap();
     let grants = fleet
         .coord
         .db()
@@ -206,13 +206,13 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
     //
     // Age the stored session past its expiry, exactly as an hour of wall clock
     // would, and ask for a usable token.
-    let stale = fleet_bin::fleet_config::update(path, |f| {
+    let stale = probefleet::fleet_config::update(path, |f| {
         f.agent.as_mut().unwrap().expires = 1;
     })
     .unwrap();
     let before = stale.agent.as_ref().unwrap().workload_token.clone();
 
-    let refreshed = fleet_bin::fleet_config::ensure_fresh_agent_session("default", &stale)
+    let refreshed = probefleet::fleet_config::ensure_fresh_agent_session("default", &stale)
         .await
         .expect("the stored auth key re-mints a session with no human involved");
     assert_ne!(
@@ -223,7 +223,7 @@ async fn an_agent_login_writes_a_session_that_renews_itself() {
 
     // ...and it was persisted, so the next process in the sandbox reuses it
     // instead of minting its own.
-    let after = fleet_bin::fleet_config::load(path).unwrap();
+    let after = probefleet::fleet_config::load(path).unwrap();
     let after_agent = after.agent.as_ref().unwrap();
     assert_eq!(after_agent.workload_token, refreshed);
     assert!(after_agent.expires > 1, "the new expiry was written too");
@@ -245,7 +245,7 @@ async fn a_peer_process_refresh_is_shared_rather_than_duplicated() {
     let fleet = start_fleet(SEED).await;
 
     let key = mint_agent_key(&fleet, "desk-bot", false).await;
-    fleet_bin::roles::agent_login::run(
+    probefleet::roles::agent_login::run(
         agent_login_args(&fleet, &key, Some("desk-bot")),
         "default",
         None,
@@ -255,17 +255,17 @@ async fn a_peer_process_refresh_is_shared_rather_than_duplicated() {
     let path = xdg.fleet_file();
 
     // Our snapshot: the session this process loaded, now expired.
-    let mut snapshot = fleet_bin::fleet_config::load(path).unwrap();
+    let mut snapshot = probefleet::fleet_config::load(path).unwrap();
     snapshot.agent.as_mut().unwrap().expires = 1;
 
     // Meanwhile a peer redeemed and wrote a fresh token to the shared file.
-    let peer = fleet_bin::fleet_config::ensure_fresh_agent_session("default", &snapshot)
+    let peer = probefleet::fleet_config::ensure_fresh_agent_session("default", &snapshot)
         .await
         .expect("the peer's refresh");
 
     // We now ask with our *stale* snapshot. The pre-redemption re-read must
     // hand back the peer's token rather than minting a third one.
-    let ours = fleet_bin::fleet_config::ensure_fresh_agent_session("default", &snapshot)
+    let ours = probefleet::fleet_config::ensure_fresh_agent_session("default", &snapshot)
         .await
         .expect("the peer's token is reused");
     assert_eq!(ours, peer, "concurrent processes share one session");
@@ -277,7 +277,7 @@ async fn a_peer_process_refresh_is_shared_rather_than_duplicated() {
     // (The coordinator-side count is deliberately not asserted: `Db` exposes no
     // way to count `workload_token` rows, and reaching into its pool to add one
     // would test the schema rather than this behaviour.)
-    let after = fleet_bin::fleet_config::load(path).unwrap();
+    let after = probefleet::fleet_config::load(path).unwrap();
     assert_eq!(after.agent.as_ref().unwrap().workload_token, peer);
 }
 
@@ -290,7 +290,7 @@ async fn a_single_use_key_is_refused_and_writes_nothing() {
     let fleet = start_fleet(SEED).await;
 
     let key = mint_agent_key(&fleet, "desk-bot", true).await;
-    let err = fleet_bin::roles::agent_login::run(
+    let err = probefleet::roles::agent_login::run(
         agent_login_args(&fleet, &key, Some("desk-bot")),
         "default",
         None,
@@ -307,7 +307,7 @@ async fn a_single_use_key_is_refused_and_writes_nothing() {
     // Nothing half-written: no `[agent]` table, and on a machine with no
     // previous login, no file at all.
     let path = xdg.fleet_file();
-    let agent = fleet_bin::fleet_config::load(path)
+    let agent = probefleet::fleet_config::load(path)
         .ok()
         .and_then(|f| f.agent);
     assert!(agent.is_none(), "a refused login writes no [agent] table");
@@ -321,7 +321,7 @@ async fn a_wrong_kind_of_credential_never_reaches_the_coordinator() {
     let fleet = start_fleet(SEED).await;
 
     let session = mint_user_token(&fleet, "alice").await;
-    let err = fleet_bin::roles::agent_login::run(
+    let err = probefleet::roles::agent_login::run(
         agent_login_args(&fleet, &session, None),
         "default",
         None,

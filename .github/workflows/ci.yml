@@ -16,7 +16,7 @@
 # Local equivalent:
 #
 #     cargo build --workspace --locked
-#     cargo test -p fleet-coordinator -p fleet-bin --locked
+#     cargo test -p probefleet-coordinator -p probefleet --locked
 #
 # See CONTRIBUTING.md.
 
@@ -40,4 +40,4 @@ jobs:
         run: cargo build --workspace --locked
 
       - name: Test
-        run: cargo test -p fleet-coordinator -p fleet-bin --locked
+        run: cargo test -p probefleet-coordinator -p probefleet --locked

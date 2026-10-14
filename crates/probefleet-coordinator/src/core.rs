@@ -1,7 +1,7 @@
 //! The transport-agnostic coordinator core.
 //!
 //! [`Coordinator`] ties together the shared state — the pure
-//! [`fleet_core::scheduler::Scheduler`] (behind a short-held mutex), the
+//! [`probefleet_core::scheduler::Scheduler`] (behind a short-held mutex), the
 //! [`Db`], the [`NodeRegistry`]/[`ChannelTable`], the ed25519 token
 //! [`Ed25519Signer`], and the clock — and implements the decision logic for
 //! every control-plane message *without* any socket I/O. The [`crate::server`]
@@ -28,15 +28,17 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use fleet_core::access::Access;
-use fleet_core::scheduler::{LeaseAuthError, LeaseDecision, Promotion, RequesterId, Scheduler};
-use fleet_proto::adopt::AdoptPolicy;
-use fleet_proto::board::{Board, BoardState};
-use fleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
+use probefleet_core::access::Access;
+use probefleet_core::scheduler::{
+    LeaseAuthError, LeaseDecision, Promotion, RequesterId, Scheduler,
+};
+use probefleet_proto::adopt::AdoptPolicy;
+use probefleet_proto::board::{Board, BoardState};
+use probefleet_proto::ids::{BoardName, BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
 
 use crate::subject::{FleetRole, Subject};
-use fleet_proto::lease::LeaseRequest;
-use fleet_proto::node_api::NodeReport;
+use probefleet_proto::lease::LeaseRequest;
+use probefleet_proto::node_api::NodeReport;
 
 use crate::auth::Ed25519Signer;
 use crate::authz::{self, AuthzError};
@@ -472,7 +474,7 @@ impl Coordinator {
     /// Reconcile a node inventory snapshot into the scheduler's board set and
     /// the `board` table.
     ///
-    /// A [`ProbeInventory`](fleet_proto::node_api::ProbeInventory) is a full
+    /// A [`ProbeInventory`](probefleet_proto::node_api::ProbeInventory) is a full
     /// snapshot, never a delta, so this is a **set** operation: what the report
     /// omits is retired from both stores.
     ///
@@ -527,9 +529,9 @@ impl Coordinator {
         org: &OrgId,
         node_id: &NodeId,
         adopt: AdoptPolicy,
-        inv: &fleet_proto::node_api::ProbeInventory,
+        inv: &probefleet_proto::node_api::ProbeInventory,
     ) -> ReconcileOutcome {
-        use fleet_proto::node_api::BoardPresence;
+        use probefleet_proto::node_api::BoardPresence;
         use std::collections::HashSet;
 
         let now = self.now_i64();
@@ -843,7 +845,7 @@ impl Coordinator {
     /// for a bare name with no way to disambiguate.
     ///
     /// The escape hatch is a **qualified name**, whose grammar lives on
-    /// [`fleet_proto::ids::BoardRef::answers_to`] so this resolver and
+    /// [`probefleet_proto::ids::BoardRef::answers_to`] so this resolver and
     /// `ctl release`'s board lookup cannot disagree: the board name is the last
     /// slash-separated segment, and any prefix is matched against the node's
     /// short name, its full (org-namespaced) id, or `org/node-id` — the last
@@ -874,7 +876,7 @@ impl Coordinator {
             }
         }
         let sched = self.scheduler.lock().await;
-        let candidates: Vec<&fleet_proto::board::Board> = sched
+        let candidates: Vec<&probefleet_proto::board::Board> = sched
             .boards()
             .filter(|b| {
                 b.id.answers_to_in(&name.0, org_paths.get(&b.id.org).map(String::as_str))
@@ -883,7 +885,7 @@ impl Coordinator {
             .collect();
 
         // Tier 1: the caller's own org. Tier 2: everything else they may reach.
-        let own: Vec<&fleet_proto::board::Board> = candidates
+        let own: Vec<&probefleet_proto::board::Board> = candidates
             .iter()
             .copied()
             .filter(|b| access.owns(b))
@@ -919,8 +921,8 @@ impl Coordinator {
     pub(crate) async fn list_boards_core(
         &self,
         subject: &Subject,
-    ) -> std::result::Result<Vec<fleet_proto::admin::BoardSummary>, OpError> {
-        use fleet_proto::admin::{BoardAvailability, BoardSummary};
+    ) -> std::result::Result<Vec<probefleet_proto::admin::BoardSummary>, OpError> {
+        use probefleet_proto::admin::{BoardAvailability, BoardSummary};
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
         if access.is_empty() {
@@ -1666,8 +1668,8 @@ impl Coordinator {
     pub(crate) async fn who_core(
         &self,
         subject: &Subject,
-    ) -> std::result::Result<Vec<fleet_proto::admin::LeaseHolderSummary>, OpError> {
-        use fleet_proto::admin::LeaseHolderSummary;
+    ) -> std::result::Result<Vec<probefleet_proto::admin::LeaseHolderSummary>, OpError> {
+        use probefleet_proto::admin::LeaseHolderSummary;
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
         if access.is_empty() {
@@ -1718,7 +1720,7 @@ impl Coordinator {
         &self,
         subject: &Subject,
         board: Option<&BoardName>,
-    ) -> std::result::Result<Vec<fleet_proto::admin::LogLine>, OpError> {
+    ) -> std::result::Result<Vec<probefleet_proto::admin::LogLine>, OpError> {
         let Some(org) = subject.org().cloned() else {
             return Err(OpError::Denied);
         };
@@ -1746,7 +1748,7 @@ impl Coordinator {
                     .recent_audit(200)
                     .await
                     .map_err(|e| OpError::Internal(e.into()))?;
-                lines.extend(rows.into_iter().map(|r| fleet_proto::admin::LogLine {
+                lines.extend(rows.into_iter().map(|r| probefleet_proto::admin::LogLine {
                     ts: i64::try_from(r.ts).unwrap_or(i64::MAX),
                     action: r.action,
                     board: None,
@@ -1805,7 +1807,7 @@ impl Coordinator {
         subject: &Subject,
         board: &BoardName,
     ) -> std::result::Result<BoardName, OpError> {
-        use fleet_proto::token::AllowedOp;
+        use probefleet_proto::token::AllowedOp;
 
         let now = self.now();
         let access = authz::board_access(&self.db, subject, now).await;
@@ -1850,7 +1852,7 @@ impl Coordinator {
             )));
         };
         if node
-            .send_command(fleet_proto::CoordinatorCommand::PowerCycle {
+            .send_command(probefleet_proto::CoordinatorCommand::PowerCycle {
                 board: board_ref.board_name(),
             })
             .await
@@ -1923,10 +1925,10 @@ impl Coordinator {
         subject: &Subject,
         grantee: &str,
         selector: &str,
-        ops: Vec<fleet_proto::token::AllowedOp>,
+        ops: Vec<probefleet_proto::token::AllowedOp>,
         expires: Option<u64>,
-    ) -> std::result::Result<fleet_proto::GrantSummary, OpError> {
-        use fleet_proto::lease::parse_constraint;
+    ) -> std::result::Result<probefleet_proto::GrantSummary, OpError> {
+        use probefleet_proto::lease::parse_constraint;
 
         let Some(org) = subject.org().cloned() else {
             return Err(OpError::Denied);
@@ -1948,7 +1950,7 @@ impl Coordinator {
             Err(e) => return Err(OpError::Invalid(format!("invalid selector: {e}"))),
         };
 
-        let ops = fleet_proto::token::normalize_ops(ops);
+        let ops = probefleet_proto::token::normalize_ops(ops);
         if ops.is_empty() {
             return Err(OpError::Invalid(
                 "a grant must confer at least one operation".to_owned(),
@@ -2013,7 +2015,7 @@ impl Coordinator {
 
         let org_name = self.db.org_name(&org).await.ok().flatten();
         let subject_display = self.subject_display(&key).await;
-        Ok(fleet_proto::GrantSummary {
+        Ok(probefleet_proto::GrantSummary {
             id,
             org,
             org_name,
@@ -2037,7 +2039,7 @@ impl Coordinator {
         subject: &Subject,
         grantee: &str,
         selector: &str,
-        ops: Vec<fleet_proto::token::AllowedOp>,
+        ops: Vec<probefleet_proto::token::AllowedOp>,
         expires: Option<u64>,
     ) -> Result<CoordToSidecar> {
         match self
@@ -2097,15 +2099,15 @@ impl Coordinator {
     }
 
     /// A forgs grant row as the wire summary.
-    async fn grant_summary(&self, row: forgs_store::GrantRow) -> fleet_proto::GrantSummary {
+    async fn grant_summary(&self, row: forgs_store::GrantRow) -> probefleet_proto::GrantSummary {
         let org = crate::subject::org_of(row.ns);
         let subject = SubjectKey::parse(&row.subject).unwrap_or_else(|| {
             // An unparseable stored subject is still listed (so it can be
             // revoked), rendered verbatim as an opaque user id.
-            SubjectKey::new(None, fleet_proto::ids::SubjectKind::User, &row.subject)
+            SubjectKey::new(None, probefleet_proto::ids::SubjectKind::User, &row.subject)
                 .unwrap_or_else(|| crate::subject::user_key(forgs::UserId::from_parts(0, 0)))
         });
-        fleet_proto::GrantSummary {
+        probefleet_proto::GrantSummary {
             id: row.id.to_string(),
             org_name: self.db.org_name(&org).await.ok().flatten(),
             org,
@@ -2133,7 +2135,7 @@ impl Coordinator {
     pub(crate) async fn grant_list_core(
         &self,
         subject: &Subject,
-    ) -> std::result::Result<Vec<fleet_proto::GrantSummary>, OpError> {
+    ) -> std::result::Result<Vec<probefleet_proto::GrantSummary>, OpError> {
         let Some(org) = subject.org().cloned() else {
             return Err(OpError::Denied);
         };
@@ -2185,7 +2187,7 @@ impl Coordinator {
     /// holds on a board it may no longer use, goes through the *whole* release
     /// path ([`Coordinator::tear_down_lease`]): channels down, lease closed and
     /// audited, any promoted waiter persisted. Queued requests are dropped too,
-    /// since a [`fleet_core::access::Access`] snapshot cannot notice a
+    /// since a [`probefleet_core::access::Access`] snapshot cannot notice a
     /// revocation.
     ///
     /// One honest limit: a capability token already minted stays
@@ -2379,7 +2381,7 @@ impl Coordinator {
     /// [`Coordinator::request_lease`] with the token attenuated further, to the
     /// intersection of what the caller may do and what they asked to hand over
     /// — you can never delegate more than you hold — **minus the queueing**: it
-    /// goes through [`fleet_core::scheduler::Scheduler::try_lease`], so a
+    /// goes through [`probefleet_core::scheduler::Scheduler::try_lease`], so a
     /// contended board is reported and no waiter is left behind (#452).
     ///
     /// # A CI workload may not delegate
@@ -2398,17 +2400,17 @@ impl Coordinator {
     async fn delegate(
         &self,
         subject: &Subject,
-        select: fleet_proto::lease::Constraint,
+        select: probefleet_proto::lease::Constraint,
         duration_secs: u64,
-        ops: Vec<fleet_proto::token::AllowedOp>,
+        ops: Vec<probefleet_proto::token::AllowedOp>,
     ) -> Result<CoordToSidecar> {
-        if subject.kind() == fleet_proto::ids::SubjectKind::Workload {
+        if subject.kind() == probefleet_proto::ids::SubjectKind::Workload {
             debug!(%subject, "refusing delegation by a CI workload");
             return Ok(CoordToSidecar::Error {
                 message: "a CI workload may not delegate its lease".to_owned(),
             });
         }
-        let ops = fleet_proto::token::normalize_ops(ops);
+        let ops = probefleet_proto::token::normalize_ops(ops);
         if ops.is_empty() {
             return Ok(CoordToSidecar::Error {
                 message: "a delegation must confer at least one operation".to_owned(),
@@ -2425,7 +2427,7 @@ impl Coordinator {
         let req = LeaseRequest {
             select,
             duration_secs,
-            priority: fleet_proto::lease::Priority::Interactive,
+            priority: probefleet_proto::lease::Priority::Interactive,
         };
         let decision = {
             let mut sched = self.scheduler.lock().await;
@@ -2453,7 +2455,7 @@ impl Coordinator {
         };
 
         // Never hand out more than the delegator holds.
-        let effective: Vec<fleet_proto::token::AllowedOp> = {
+        let effective: Vec<probefleet_proto::token::AllowedOp> = {
             let sched = self.scheduler.lock().await;
             match sched.board(&granted.board) {
                 Some(b) => {
@@ -2544,7 +2546,7 @@ impl Coordinator {
         // priority is a plain wire field: without this, a CI job could outbid a
         // human at a desk simply by setting it. This is not an edge case — the
         // sidecar sends `Priority::Interactive` unconditionally
-        // (`fleet-sidecar/src/lib.rs`), so the clamp fires on *every* CI lease.
+        // (`probefleet-sidecar/src/lib.rs`), so the clamp fires on *every* CI lease.
         //
         // `Policy::max_duration_ci` then applies to it, and extension inherits
         // the clamp for free: `Scheduler::extend_lease` re-derives the renewal
@@ -2553,14 +2555,14 @@ impl Coordinator {
         // capped under the clamped priority at grant time. So a workload stays
         // clamped on every renewal and there is deliberately no second guard in
         // `extend_lease` — please do not add one.
-        if subject.kind() == fleet_proto::ids::SubjectKind::Workload
-            && req.priority != fleet_proto::lease::Priority::Ci
+        if subject.kind() == probefleet_proto::ids::SubjectKind::Workload
+            && req.priority != probefleet_proto::lease::Priority::Ci
         {
             debug!(
                 %subject, requested = ?req.priority,
                 "clamping a workload's lease request to CI priority"
             );
-            req.priority = fleet_proto::lease::Priority::Ci;
+            req.priority = probefleet_proto::lease::Priority::Ci;
         }
         let select_display = req.select.to_string();
         let decision = {
@@ -2806,7 +2808,7 @@ impl Coordinator {
         &self,
         subject: &Subject,
         lease: LeaseId,
-        kind: fleet_proto::ChannelKind,
+        kind: probefleet_proto::ChannelKind,
         sidecar_tx: mpsc::Sender<CoordToSidecar>,
     ) -> Result<Option<CoordToSidecar>> {
         let (holder, board, node_id, expires) = {
@@ -2873,7 +2875,7 @@ impl Coordinator {
         // Mint a fresh capability token scoped to this lease/board, attenuated
         // to the holder's *current* effective ops. Reached only after the
         // ownership check above.
-        let token = fleet_proto::token::CapabilityToken {
+        let token = probefleet_proto::token::CapabilityToken {
             lease,
             board: board.clone(),
             allowed_ops: ops,
@@ -2927,7 +2929,7 @@ impl Coordinator {
     }
 
     /// Forward a sidecar data frame to the owning node.
-    async fn relay_from_sidecar(&self, frame: fleet_proto::DataFrame) {
+    async fn relay_from_sidecar(&self, frame: probefleet_proto::DataFrame) {
         let Some(route) = self.channels.get(frame.channel).await else {
             return;
         };
@@ -2955,8 +2957,8 @@ impl Coordinator {
     /// token, so there is no nullable-org audit problem on this path.
     pub(crate) async fn open_delegated_channel(
         &self,
-        token: &fleet_proto::token::CapabilityToken,
-        kind: fleet_proto::ChannelKind,
+        token: &probefleet_proto::token::CapabilityToken,
+        kind: probefleet_proto::ChannelKind,
         sidecar_tx: mpsc::Sender<CoordToSidecar>,
     ) -> Result<CoordToSidecar> {
         let refused = || CoordToSidecar::Error {
@@ -2993,7 +2995,7 @@ impl Coordinator {
         // Attenuate to the intersection: never more than the token says, and
         // never more than the delegator currently holds.
         let holder_access = authz::access_of(&self.db, &holder, now).await;
-        let ops: Vec<fleet_proto::token::AllowedOp> = {
+        let ops: Vec<probefleet_proto::token::AllowedOp> = {
             let sched = self.scheduler.lock().await;
             match sched.board(&board) {
                 Some(b) => {
@@ -3018,7 +3020,7 @@ impl Coordinator {
             });
         };
 
-        let fresh = fleet_proto::token::CapabilityToken {
+        let fresh = probefleet_proto::token::CapabilityToken {
             lease: token.lease,
             board: board.clone(),
             allowed_ops: ops,
@@ -3067,7 +3069,7 @@ impl Coordinator {
 
     /// Relay a data frame from a delegated connection, refusing any channel not
     /// belonging to the token's lease.
-    pub(crate) async fn relay_delegated(&self, lease: LeaseId, frame: fleet_proto::DataFrame) {
+    pub(crate) async fn relay_delegated(&self, lease: LeaseId, frame: probefleet_proto::DataFrame) {
         match self.channels.get(frame.channel).await {
             Some(route) if route.lease == lease => {}
             _ => return,
@@ -3080,7 +3082,7 @@ impl Coordinator {
     pub(crate) async fn close_delegated_channel(
         &self,
         lease: LeaseId,
-        channel: fleet_proto::ChannelId,
+        channel: probefleet_proto::ChannelId,
     ) {
         let Some(route) = self.channels.get(channel).await else {
             return;
@@ -3098,7 +3100,7 @@ impl Coordinator {
     ///
     /// Returns a [`crate::error::CoordinatorError`] if the sidecar's connection
     /// has closed.
-    pub async fn relay_from_agent(&self, frame: fleet_proto::DataFrame) -> Result<bool> {
+    pub async fn relay_from_agent(&self, frame: probefleet_proto::DataFrame) -> Result<bool> {
         relay::forward_to_sidecar(&self.channels, frame).await
     }
 
@@ -3132,7 +3134,7 @@ impl Coordinator {
     /// there is no cancel message on the wire, so a client whose bounded queue
     /// wait expires simply closes its connection and *this* method removes its
     /// waiter. That indirection is load-bearing — if this is ever refactored,
-    /// the wait-deadline path in `fleet-sidecar`'s `CoordSession::lease` loses
+    /// the wait-deadline path in `probefleet-sidecar`'s `CoordSession::lease` loses
     /// its cleanup with it.
     ///
     /// It also closes every relay channel this **connection** had open, which
@@ -3202,7 +3204,7 @@ impl Coordinator {
     async fn notify_promotion(
         &self,
         requester: RequesterId,
-        granted: &fleet_core::scheduler::GrantedLease,
+        granted: &probefleet_core::scheduler::GrantedLease,
     ) -> bool {
         let Some(handle) = self.sidecars.get(requester).await else {
             debug!(
@@ -3390,8 +3392,8 @@ pub type SharedCoordinator = Arc<Coordinator>;
 /// projection need not), and this is the one place the two are joined.
 /// `api.rs`'s `NodeView` is the parallel projection for the browser, kept
 /// separate on purpose — see [`Coordinator::list_nodes`].
-fn node_summary(status: NodeStatus) -> fleet_proto::admin::NodeSummary {
-    fleet_proto::admin::NodeSummary {
+fn node_summary(status: NodeStatus) -> probefleet_proto::admin::NodeSummary {
+    probefleet_proto::admin::NodeSummary {
         node: status.row.id,
         name: status.row.name,
         tags: status.row.tags,
@@ -3444,12 +3446,12 @@ mod tests {
     /// The name of the fixtures' main org.
     const DEFAULT_ORG_ID: &str = "default";
     use ed25519_dalek::{Verifier, VerifyingKey};
-    use fleet_core::policy::Policy;
-    use fleet_proto::board::PowerKind;
-    use fleet_proto::ids::{NodeId, SubjectKind};
-    use fleet_proto::lease::{Constraint, Priority};
-    use fleet_proto::node_api::BoardPresence;
-    use fleet_proto::token::SignedToken;
+    use probefleet_core::policy::Policy;
+    use probefleet_proto::board::PowerKind;
+    use probefleet_proto::ids::{NodeId, SubjectKind};
+    use probefleet_proto::lease::{Constraint, Priority};
+    use probefleet_proto::node_api::BoardPresence;
+    use probefleet_proto::token::SignedToken;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_SEED: [u8; 32] = [
@@ -3568,7 +3570,7 @@ mod tests {
         coord: &Coordinator,
         subject: &Subject,
         board: &str,
-    ) -> fleet_proto::lease::LeaseGrant {
+    ) -> probefleet_proto::lease::LeaseGrant {
         let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
         coord
             .handle_sidecar_message(
@@ -3631,7 +3633,7 @@ mod tests {
                 &alice,
                 SidecarToCoord::OpenChannel {
                     lease: grant.lease,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
                 &tx,
                 RequesterId::DETACHED,
@@ -3644,7 +3646,7 @@ mod tests {
         else {
             panic!("expected ChannelOpened");
         };
-        let NodeMessage::Command(fleet_proto::CoordinatorCommand::OpenSession {
+        let NodeMessage::Command(probefleet_proto::CoordinatorCommand::OpenSession {
             token: to_agent,
             ..
         }) = arx.recv().await.unwrap()
@@ -3867,7 +3869,7 @@ mod tests {
                 SidecarToCoord::Delegate {
                     select: Constraint::Id(BoardName("b1".to_owned())),
                     duration_secs: 600,
-                    ops: vec![fleet_proto::token::AllowedOp::Flash],
+                    ops: vec![probefleet_proto::token::AllowedOp::Flash],
                 },
                 &tx,
                 RequesterId::DETACHED,
@@ -4267,7 +4269,7 @@ mod tests {
                 &user(DEFAULT_ORG_ID, "bob"),
                 SidecarToCoord::OpenChannel {
                     lease: grant.lease,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
                 &tx,
                 RequesterId::DETACHED,
@@ -4291,7 +4293,7 @@ mod tests {
                 &alice,
                 SidecarToCoord::OpenChannel {
                     lease: grant.lease,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
                 &tx,
                 RequesterId::DETACHED,
@@ -4304,7 +4306,7 @@ mod tests {
         ));
         assert!(matches!(
             arx.recv().await.unwrap(),
-            NodeMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
+            NodeMessage::Command(probefleet_proto::CoordinatorCommand::OpenSession { .. })
         ));
     }
 
@@ -4329,7 +4331,7 @@ mod tests {
                 &user(DEFAULT_ORG_ID, "op"),
                 SidecarToCoord::OpenChannel {
                     lease: grant.lease,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
                 &tx,
                 RequesterId::DETACHED,
@@ -4342,7 +4344,7 @@ mod tests {
         ));
         assert!(matches!(
             arx.recv().await.unwrap(),
-            NodeMessage::Command(fleet_proto::CoordinatorCommand::OpenSession { .. })
+            NodeMessage::Command(probefleet_proto::CoordinatorCommand::OpenSession { .. })
         ));
     }
 
@@ -4539,7 +4541,7 @@ mod tests {
             SidecarToCoord::Release { lease: grant.lease },
             SidecarToCoord::OpenChannel {
                 lease: grant.lease,
-                kind: fleet_proto::ChannelKind::Data,
+                kind: probefleet_proto::ChannelKind::Data,
             },
         ] {
             coord
@@ -4850,7 +4852,7 @@ mod tests {
         ));
         assert!(matches!(
             arx.recv().await.unwrap(),
-            NodeMessage::Command(fleet_proto::CoordinatorCommand::PowerCycle { .. })
+            NodeMessage::Command(probefleet_proto::CoordinatorCommand::PowerCycle { .. })
         ));
     }
 
@@ -4861,7 +4863,7 @@ mod tests {
     /// otherwise hide.
     #[tokio::test]
     async fn inventory_populates_scheduler_db_and_list() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         // Fresh coordinator with NO pre-seeded boards.
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
@@ -4946,7 +4948,7 @@ mod tests {
                 );
                 assert_eq!(
                     boards[0].availability,
-                    fleet_proto::admin::BoardAvailability::Available
+                    probefleet_proto::admin::BoardAvailability::Available
                 );
             }
             other => panic!("expected BoardList, got {other:?}"),
@@ -4960,8 +4962,8 @@ mod tests {
         presence: BoardPresence,
         chip: &str,
         adopted: bool,
-    ) -> fleet_proto::BoardStatus {
-        fleet_proto::BoardStatus {
+    ) -> probefleet_proto::BoardStatus {
+        probefleet_proto::BoardStatus {
             board: BoardName(name.to_owned()),
             serial: serial.to_owned(),
             presence,
@@ -4981,7 +4983,7 @@ mod tests {
     /// injection the moment there are two. The report must now be dropped.
     #[tokio::test]
     async fn a_report_from_a_node_with_no_row_is_dropped_not_defaulted() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         // Deliberately NOT calling `ensure_node`: this node is unknown. Its
@@ -5024,7 +5026,7 @@ mod tests {
     /// leasable".
     #[tokio::test]
     async fn an_auto_node_adopts_boards_a_declared_node_would_not() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         for (policy, expect_scheduled) in
             [(AdoptPolicy::Auto, true), (AdoptPolicy::Declared, false)]
         {
@@ -5095,7 +5097,7 @@ mod tests {
     /// On a laptop, where probes are unplugged daily, this is the common case.
     #[tokio::test]
     async fn an_unplugged_adopted_board_leaves_the_scheduler() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         coord
@@ -5164,7 +5166,7 @@ mod tests {
     /// comes back; without the DB half the page count does.
     #[tokio::test]
     async fn a_renamed_board_leaves_no_stale_row() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let node = node_id(DEFAULT_ORG_ID, "node-a");
@@ -5221,7 +5223,7 @@ mod tests {
     /// re-reports every `discovery_secs`.
     #[tokio::test]
     async fn an_offline_board_is_retained_in_the_db_but_not_in_the_scheduler() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let node = node_id(DEFAULT_ORG_ID, "node-a");
@@ -5270,7 +5272,7 @@ mod tests {
     /// symptom this change exists to fix.
     #[tokio::test]
     async fn an_unplugged_adopted_board_leaves_the_db_too() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         coord
@@ -5330,7 +5332,7 @@ mod tests {
     /// policy was still `auto`.
     #[tokio::test]
     async fn a_policy_violating_adopted_board_gets_no_row() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let o = org(DEFAULT_ORG_ID);
@@ -5392,7 +5394,7 @@ mod tests {
     /// lease that is in active use.
     #[tokio::test]
     async fn a_leased_board_that_vanishes_from_a_report_is_not_deleted() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord =
             coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "alice", FleetRole::Member)]).await;
@@ -5452,7 +5454,7 @@ mod tests {
     /// entirely, are untouched.
     #[tokio::test]
     async fn an_empty_inventory_clears_only_that_nodes_rows() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(
             clock,
@@ -5553,7 +5555,7 @@ mod tests {
     /// scoped to `Online` rather than to `adopted`.
     #[tokio::test]
     async fn a_declared_node_still_honours_a_tombstone_for_a_previously_adopted_board() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         let o = org(DEFAULT_ORG_ID);
@@ -5626,7 +5628,7 @@ mod tests {
     /// unchanged behaviour, not a lockdown.
     #[tokio::test]
     async fn a_declared_board_is_scheduled_under_either_policy() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         for policy in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
             let clock = Arc::new(TestClock(AtomicU64::new(1000)));
             let coord =
@@ -5665,7 +5667,7 @@ mod tests {
     /// off for exactly the machines it exists for.
     #[tokio::test]
     async fn an_inventory_report_does_not_reset_the_adopt_policy() {
-        use fleet_proto::node_api::ProbeInventory;
+        use probefleet_proto::node_api::ProbeInventory;
         let clock = Arc::new(TestClock(AtomicU64::new(1000)));
         let coord = coordinator_with(clock, &[], &[(DEFAULT_ORG_ID, "op", FleetRole::Admin)]).await;
         coord
@@ -5711,11 +5713,11 @@ mod tests {
     fn shared_access(own_org: &str, granted_org: &str) -> Access {
         Access {
             member_of: vec![org(own_org)],
-            grants: vec![fleet_core::access::GrantScope {
+            grants: vec![probefleet_core::access::GrantScope {
                 id: "g1".to_owned(),
                 org: org(granted_org),
                 selector: Constraint::Tags(vec!["nrf52".to_owned()]),
-                ops: vec![fleet_proto::token::AllowedOp::Attach],
+                ops: vec![probefleet_proto::token::AllowedOp::Attach],
                 expires: None,
             }],
         }
@@ -5860,7 +5862,7 @@ mod tests {
     /// notice a revocation, so without this the grantee would be promoted onto
     /// the board it just lost access to.
     ///
-    /// Note the waiter is refreshed, not dropped — `fleet-core` pins the
+    /// Note the waiter is refreshed, not dropped — `probefleet-core` pins the
     /// difference (a request for the grantee's *own* org must survive); this
     /// asserts the coordinator actually pushes the new access in.
     #[tokio::test]
@@ -5888,7 +5890,7 @@ mod tests {
                 &forgs_store::NewGrant {
                     subject: bob.forgs_key().unwrap(),
                     selector: "tag=nrf52".to_owned(),
-                    ops: crate::state::join_ops(&[fleet_proto::token::AllowedOp::Attach]),
+                    ops: crate::state::join_ops(&[probefleet_proto::token::AllowedOp::Attach]),
                     expires: None,
                     created_by: Some(testkit::user_id("alice")),
                 },

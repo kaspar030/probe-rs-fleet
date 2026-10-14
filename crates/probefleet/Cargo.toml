@@ -1,5 +1,5 @@
 [package]
-name = "fleet-bin"
+name = "probefleet"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,18 +17,18 @@ name = "probe-rs-fleet"
 path = "src/main.rs"
 
 [dependencies]
-fleet-proto = { workspace = true }
-fleet-core = { workspace = true }
-fleet-tls = { workspace = true }
+probefleet-proto = { workspace = true }
+probefleet-core = { workspace = true }
+probefleet-tls = { workspace = true }
 forgs.workspace = true
 forgs-client.workspace = true
 # The shell-on-the-host admin verbs mint through forgs directly.
 forgs-store.workspace = true
 forgs-http.workspace = true
-fleet-wire = { workspace = true, features = ["tungstenite"] }
-fleet-agent = { workspace = true }
-fleet-coordinator = { workspace = true }
-fleet-sidecar = { workspace = true }
+probefleet-wire = { workspace = true, features = ["tungstenite"] }
+probefleet-agent = { workspace = true }
+probefleet-coordinator = { workspace = true }
+probefleet-sidecar = { workspace = true }
 
 clap = { workspace = true }
 clap_complete = { workspace = true }
@@ -45,13 +45,13 @@ rand_core = { workspace = true, features = ["getrandom"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# `node_board`'s tests need their own `ProbeLister` stub: fleet-agent's is
+# `node_board`'s tests need their own `ProbeLister` stub: probefleet-agent's is
 # `#[cfg(test)]`-private, so it cannot be borrowed across the crate boundary.
 async-trait = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-fleet-coordinator = { workspace = true }
-fleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
-fleet-core = { workspace = true }
+probefleet-coordinator = { workspace = true }
+probefleet-wire = { workspace = true, features = ["tungstenite", "test-util"] }
+probefleet-core = { workspace = true }
 axum = { workspace = true }
 # `ci_e2e.rs` stands up a stub GitHub Actions token service, which has to sign
 # a real RS256 JWT for the coordinator to verify.

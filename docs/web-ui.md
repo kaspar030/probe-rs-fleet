@@ -11,7 +11,7 @@ a future reader would otherwise undo something deliberate.
 Login, signup, cookies and CSRF are
 **forgs'** (`forgs-http`, merged into the coordinator's router under `/auth/*`;
 see `docs/architecture.md` §6). fleet's side lives in
-`crates/fleet-coordinator/src/identity.rs` (the `AuthContext`: cookie brand
+`crates/probefleet-coordinator/src/identity.rs` (the `AuthContext`: cookie brand
 `prfs`, CSRF header `x-fleet-csrf`, cookie prefix `/api/v1/`, post-login
 redirect `/ui/`), `src/api.rs` (the `/api/v1` handlers), `src/assets.rs` (the
 asset routes) and `web/` (the UI itself). Where this
@@ -43,7 +43,7 @@ ground in a browser:
 | enrollment | `share`, `node up`, `node approve <code>` |
 
 Besides `/ui` and `/api/v1`, the coordinator serves `GET /node/approve`
-(`crates/fleet-coordinator/src/http.rs`, `NODE_APPROVE_PAGE`): a static,
+(`crates/probefleet-coordinator/src/http.rs`, `NODE_APPROVE_PAGE`): a static,
 reflects-nothing page that tells you which command to run and links to
 `/ui/approve` (see [§3](#3-endpoint-table)). The UI lets
 users see their devices and agents, approve machines, hand out access and
@@ -142,7 +142,7 @@ It is not derived from the capability-signing seed, so rotating one secret
 does not silently rotate the other. It is
 **not** a per-process random: that would log every open tab out on every
 restart. (A coordinator built without one — tests only — does get a random
-key; `fleet-bin` refuses to start without the file.)
+key; `probefleet` refuses to start without the file.)
 
 **Bearer-from-JS was rejected.** `Authorization: Bearer` from JavaScript needs
 no CSRF machinery, which is its whole appeal — but a token readable by JS is a
@@ -181,12 +181,12 @@ implementation.
 > tempting to write "just this once" against `OrgDb` directly, the check has to
 > move into a `Coordinator` method that both surfaces call.
 
-Response bodies are the existing `fleet-proto::admin` DTOs — `BoardSummary`,
+Response bodies are the existing `probefleet-proto::admin` DTOs — `BoardSummary`,
 `LeaseHolderSummary`, `LogLine`, `GrantSummary` — serialized as JSON; they
 already derive `Serialize`. One wrinkle to check at implementation time: those
 types are shaped for postcard, and any that do not serialize to pleasant JSON
 (newtype ids, `BoardRef`'s three parts) get a thin view struct **in the
-coordinator**, never a divergent field set in `fleet-proto`.
+coordinator**, never a divergent field set in `probefleet-proto`.
 
 **The honest cost.** Today's operator methods on `Coordinator` are private, and
 several verbs the UI needs **have no wire verb at all**: node tags /
@@ -205,7 +205,7 @@ true).
 **Decided: hand-written HTML plus plain ES modules using `fetch`, embedded in
 the binary. No npm, no bundler, no TypeScript compile, no build step at all.**
 
-- Source lives in `crates/fleet-coordinator/web/` — not a `web/` at the repo
+- Source lives in `crates/probefleet-coordinator/web/` — not a `web/` at the repo
   root, not a `fleet-web` crate. The assets are part of the binary that serves
   them.
 - Embedded with `include_dir!`, served under `GET /ui/*`. The coordinator stays
@@ -219,7 +219,7 @@ the binary. No npm, no bundler, no TypeScript compile, no build step at all.**
   plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. No
   inline script, no CDN.
 
-**Four implementation decisions** (`crates/fleet-coordinator/src/assets.rs`
+**Four implementation decisions** (`crates/probefleet-coordinator/src/assets.rs`
 carries the same notes at the call site):
 
 1. **One tree hash, not per-file hashes.** Nothing hashes filenames at build
@@ -276,7 +276,7 @@ build` that needs node (breaks the cross-compilation story in
 workload-identity guide, not a build-pipeline document.)
 
 The frontend's unit tests
-(`crates/fleet-coordinator/web-tests/*.test.mjs`, node's built-in runner, zero
+(`crates/probefleet-coordinator/web-tests/*.test.mjs`, node's built-in runner, zero
 npm dependencies) want `node` on `PATH`. `tests/ui_js.rs` runs them when it is
 there and prints a loud skip when it is not, so neither `cargo build` nor `cargo
 test` requires a JavaScript toolchain — at the honest cost that on a machine
@@ -514,7 +514,7 @@ the org's hardware to somebody who is not in it at all.
 `selector` is the **canonical selector string** and is canonicalised
 server-side: `id=<name>` (one board), `board=<model>` (any board of that board
 type), `chip=<c>`, `tag=<t>`, and `a && b` conjunctions of tags, parsed by
-`fleet_proto::lease::parse_constraint` — where a bare word is always a tag —
+`probefleet_proto::lease::parse_constraint` — where a bare word is always a tag —
 and stored
 as `Constraint`'s `Display`. A grant's meaning must never depend on which
 surface wrote it, so the UI sends the same string a CLI would and does **not**
@@ -631,7 +631,7 @@ attacker-supplied text on an unauthenticated page.
 **Deny by default.** Every endpoint resolves to a `Subject` and is checked
 against the *target object's* org through the existing evaluator —
 `authz::require_role`, `authz::board_access`, `authz::require_lease_control`,
-`fleet_core::access::Access`. Nothing on this surface evaluates access itself.
+`probefleet_core::access::Access`. Nothing on this surface evaluates access itself.
 
 | Endpoint group | Rule | Where it already lives |
 |---|---|---|
@@ -756,22 +756,22 @@ not smuggled in with a UI.
 
 ## 6. Where it lives
 
-- **`crates/fleet-coordinator/src/api.rs`** — the `/api/v1/*` handlers. They
+- **`crates/probefleet-coordinator/src/api.rs`** — the `/api/v1/*` handlers. They
   authenticate through forgs' `authenticate_request` with the cookie carrier
   allowlisted for this prefix only, and call the same coordinator methods the
   CLI's routes do.
-- **`crates/fleet-coordinator/src/identity.rs`** — the forgs `AuthContext`
+- **`crates/probefleet-coordinator/src/identity.rs`** — the forgs `AuthContext`
   (cookie brand, CSRF header, cookie prefix, post-login redirect) and fleet's
   hooks.
-- **`crates/fleet-coordinator/src/http.rs`** — `/node/*`, including the
+- **`crates/probefleet-coordinator/src/http.rs`** — `/node/*`, including the
   informational `GET /node/approve`; the browser approves through
   `POST /api/v1/nodes/pending/{code}`, which calls the same
   `decide_pending_node` and shares its membership check.
-- **`crates/fleet-coordinator/src/authz.rs`** — the authorization rules. If an
+- **`crates/probefleet-coordinator/src/authz.rs`** — the authorization rules. If an
   endpoint seems to need a new rule, that is the signal to re-read §6.5 of the
   architecture, not to add one; node mutation (owner-or-admin) composes
   `node_owner` with `is_org_admin` at the call site.
-- **`crates/fleet-coordinator/web/`** — the asset tree (D3), served by
+- **`crates/probefleet-coordinator/web/`** — the asset tree (D3), served by
   `src/assets.rs`. A four-line `build.rs` emits `cargo:rerun-if-changed=web`
   (`include_dir!` rebuilds on a file's *contents* changing but not on one being
   added). The frontend's own tests live in `web-tests/`, **beside** `web/` and

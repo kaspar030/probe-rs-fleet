@@ -2,7 +2,7 @@
 //! node (architecture §4.1, §6).
 //!
 //! The same machinery carries **both** planes — the probe-rs `serve` data plane
-//! and the gdb tunnel — distinguished only by the [`fleet_proto::ChannelKind`]
+//! and the gdb tunnel — distinguished only by the [`probefleet_proto::ChannelKind`]
 //! recorded at open time (the coordinator relays the bytes identically either
 //! way). Channels are keyed purely by [`ChannelId`], so a single lease may hold
 //! several concurrent channels (e.g. a data channel and a gdb channel at once).
@@ -22,9 +22,9 @@
 //! transport-agnostic (they move frames between in-memory channels) so they can
 //! be exercised over `tokio::io::duplex` in tests without any TLS or sockets.
 
-use fleet_proto::ids::{BoardRef, LeaseId};
-use fleet_proto::node_api::CoordinatorCommand;
-use fleet_proto::{ChannelId, DataFrame};
+use probefleet_proto::ids::{BoardRef, LeaseId};
+use probefleet_proto::node_api::CoordinatorCommand;
+use probefleet_proto::{ChannelId, DataFrame};
 
 use crate::error::{CoordinatorError, Result};
 use crate::proto::CoordToSidecar;
@@ -40,7 +40,7 @@ pub struct OpenRequest {
     /// The target board, as the fleet-unique key the capability token is
     /// scoped to.
     pub board: BoardRef,
-    /// The signed capability token (wire framing: see `fleet_proto::token`).
+    /// The signed capability token (wire framing: see `probefleet_proto::token`).
     /// Per-channel, re-attenuated at every open; the node verifies it.
     pub token: Vec<u8>,
     /// The lease-scoped `probe-rs serve` user token (lowercase hex), which the
@@ -48,7 +48,7 @@ pub struct OpenRequest {
     /// [`crate::auth::serve_token`].
     pub serve_token: String,
     /// Which plane the channel carries (data vs. gdb tunnel).
-    pub kind: fleet_proto::ChannelKind,
+    pub kind: probefleet_proto::ChannelKind,
 }
 
 /// Open a relay channel: allocate an id, register the route, and command the
@@ -65,7 +65,7 @@ pub struct OpenRequest {
 pub async fn open_channel(
     table: &ChannelTable,
     node: &NodeHandle,
-    node_id: fleet_proto::ids::NodeId,
+    node_id: probefleet_proto::ids::NodeId,
     sidecar: SidecarHandle,
     request: OpenRequest,
 ) -> Result<ChannelId> {
@@ -175,7 +175,7 @@ pub async fn close_channel(
 mod tests {
     use super::*;
     use crate::registry::NodeMessage;
-    use fleet_proto::ids::{NodeId, OrgId};
+    use probefleet_proto::ids::{NodeId, OrgId};
     use tokio::sync::mpsc;
 
     /// The org this fixture's node and boards live in.
@@ -222,7 +222,7 @@ mod tests {
                 board: test_board_ref(),
                 token: vec![0xde, 0xad],
                 serve_token: "cafef00d".to_owned(),
-                kind: fleet_proto::ChannelKind::Data,
+                kind: probefleet_proto::ChannelKind::Data,
             },
         )
         .await
@@ -244,7 +244,7 @@ mod tests {
                 assert_eq!(token, vec![0xde, 0xad]);
                 assert_eq!(serve_token, "cafef00d");
                 assert_eq!(ch, channel);
-                assert_eq!(kind, fleet_proto::ChannelKind::Data);
+                assert_eq!(kind, probefleet_proto::ChannelKind::Data);
             }
             other => panic!("expected OpenSession, got {other:?}"),
         }
@@ -301,7 +301,7 @@ mod tests {
                 board: test_board_ref(),
                 token: vec![],
                 serve_token: String::new(),
-                kind: fleet_proto::ChannelKind::Data,
+                kind: probefleet_proto::ChannelKind::Data,
             },
         )
         .await
@@ -339,13 +339,15 @@ mod tests {
 
         // Node side: a wire pair whose far half stands in for the node.
         let (mut agent_wire_tx, _agent_wire_rx, _peer_tx, mut agent_remote) =
-            fleet_wire::mock::pair();
+            probefleet_wire::mock::pair();
         let (agent_tx, mut agent_msg_rx) = mpsc::channel::<NodeMessage>(16);
         // Writer task: drains NodeMessage -> writes DataFrame onto the wire.
         let writer = tokio::spawn(async move {
             while let Some(msg) = agent_msg_rx.recv().await {
                 if let NodeMessage::Data(frame) = msg {
-                    fleet_wire::send(&mut agent_wire_tx, &frame).await.unwrap();
+                    probefleet_wire::send(&mut agent_wire_tx, &frame)
+                        .await
+                        .unwrap();
                 }
             }
         });
@@ -359,7 +361,7 @@ mod tests {
                     lease: LeaseId(1),
                     node: test_node_id(),
                     sidecar: sidecar_tx,
-                    kind: fleet_proto::ChannelKind::Data,
+                    kind: probefleet_proto::ChannelKind::Data,
                 },
             )
             .await;
@@ -372,7 +374,7 @@ mod tests {
         assert!(forward_to_agent(&table, &node, payload.clone())
             .await
             .unwrap());
-        let received: DataFrame = fleet_wire::recv(&mut agent_remote).await.unwrap();
+        let received: DataFrame = probefleet_wire::recv(&mut agent_remote).await.unwrap();
         assert_eq!(received, payload);
 
         drop(node);

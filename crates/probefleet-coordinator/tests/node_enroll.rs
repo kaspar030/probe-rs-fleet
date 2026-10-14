@@ -19,10 +19,10 @@ mod common;
 
 use common::TestCoordinator;
 
-use fleet_coordinator::FleetRole;
-use fleet_proto::auth_api::NodeTokenResponse;
-use fleet_proto::ids::NodeId;
 use forgs::TokenKind;
+use probefleet_coordinator::FleetRole;
+use probefleet_proto::auth_api::NodeTokenResponse;
+use probefleet_proto::ids::NodeId;
 
 fn enroll_body(key: &str, node_name: &str) -> String {
     serde_json::json!({ "auth_key": key, "node_name": node_name }).to_string()
@@ -66,7 +66,7 @@ fn parse(body: &str) -> NodeTokenResponse {
     serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
 }
 
-async fn policy(fleet: &TestCoordinator, node: &NodeId) -> fleet_proto::AdoptPolicy {
+async fn policy(fleet: &TestCoordinator, node: &NodeId) -> probefleet_proto::AdoptPolicy {
     fleet
         .db()
         .node_org_and_policy(node)
@@ -125,7 +125,7 @@ async fn a_valid_node_key_mints_a_working_node_token() {
         row.owner_user_id.is_none(),
         "a key-enrolled node has no owner"
     );
-    assert_eq!(row.adopt, fleet_proto::AdoptPolicy::Declared);
+    assert_eq!(row.adopt, probefleet_proto::AdoptPolicy::Declared);
 
     // ... and the minted token authenticates a real upgrade. This is the step
     // that makes the exchange meaningful rather than decorative.
@@ -306,7 +306,7 @@ async fn a_session_self_registers_a_working_node_owned_by_the_caller() {
     let node = NodeId(resp.node_id);
     assert_eq!(
         fleet.db().node_org_and_policy(&node).await.unwrap(),
-        Some((acme, fleet_proto::AdoptPolicy::Auto)),
+        Some((acme, probefleet_proto::AdoptPolicy::Auto)),
         "a node created by `share` defaults to auto-adoption"
     );
     assert_eq!(
@@ -339,7 +339,7 @@ async fn an_explicit_adopt_policy_is_recorded() {
     let node = NodeId(parse(&body).node_id);
     assert_eq!(
         policy(&fleet, &node).await,
-        fleet_proto::AdoptPolicy::Declared
+        probefleet_proto::AdoptPolicy::Declared
     );
 }
 
@@ -377,7 +377,7 @@ async fn a_non_member_with_a_valid_session_is_refused() {
     // Nothing was created.
     assert!(fleet
         .db()
-        .org_of_node(&fleet_coordinator::node_id_for(&acme, "trespasser"))
+        .org_of_node(&probefleet_coordinator::node_id_for(&acme, "trespasser"))
         .await
         .unwrap()
         .is_none());
@@ -446,7 +446,7 @@ async fn re_sharing_the_same_machine_converges() {
     // stale one nobody can see.
     assert_eq!(
         policy(&fleet, &NodeId(second.node_id)).await,
-        fleet_proto::AdoptPolicy::Declared
+        probefleet_proto::AdoptPolicy::Declared
     );
 }
 
@@ -464,7 +464,7 @@ async fn a_key_enrolled_node_later_shared_converges_on_the_share_defaults() {
     let node = NodeId(enrolled.node_id);
     assert_eq!(
         policy(&fleet, &node).await,
-        fleet_proto::AdoptPolicy::Declared,
+        probefleet_proto::AdoptPolicy::Declared,
         "a key-enrolled node is a lab node by default"
     );
     assert!(fleet.db().node_owner(&node).await.unwrap().is_none());
@@ -472,7 +472,10 @@ async fn a_key_enrolled_node_later_shared_converges_on_the_share_defaults() {
     let (status, body) = self_register(&fleet, &session, "laptop", None, Some("acme")).await;
     assert_eq!(status, 200, "body: {body}");
 
-    assert_eq!(policy(&fleet, &node).await, fleet_proto::AdoptPolicy::Auto);
+    assert_eq!(
+        policy(&fleet, &node).await,
+        probefleet_proto::AdoptPolicy::Auto
+    );
     assert_eq!(
         fleet.db().node_owner(&node).await.unwrap(),
         Some(alice.to_string())

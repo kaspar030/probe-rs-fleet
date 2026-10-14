@@ -11,11 +11,11 @@
 mod common;
 
 use common::{start_fleet, Fleet};
-use fleet_bin::cli::{
+use probefleet::cli::{
     LoginArgs, OrgCliCreateArgs, OrgDeleteArgs, OrgMembersArgs, OrgRenameArgs, OrgSessionArgs,
     RoleArg,
 };
-use fleet_coordinator::FleetRole;
+use probefleet_coordinator::FleetRole;
 
 const SEED: [u8; 32] = [31u8; 32];
 
@@ -26,7 +26,7 @@ async fn login(fleet: &Fleet, config_dir: &std::path::Path, name: &str, org: Opt
         .await
         .unwrap()
         .token;
-    fleet_bin::roles::login::run(LoginArgs {
+    probefleet::roles::login::run(LoginArgs {
         fleet_url: Some(fleet.base_url.clone()),
         server_cert_sha256: None,
         token: Some(token),
@@ -63,7 +63,7 @@ fn create_args(config_dir: &std::path::Path, name: &str) -> OrgCliCreateArgs {
 }
 
 async fn roster(config_dir: &std::path::Path, org: &str) -> Vec<(String, String)> {
-    let list = fleet_bin::roles::org::members(&members_args(config_dir, Some(org)))
+    let list = probefleet::roles::org::members(&members_args(config_dir, Some(org)))
         .await
         .expect("org members");
     let mut out: Vec<_> = list
@@ -84,7 +84,7 @@ async fn a_logged_in_user_creates_an_org_and_manages_its_members() {
     login(&fleet, &alice, "alice", None).await;
     login(&fleet, &bob, "bob", None).await;
 
-    let created = fleet_bin::roles::org::create(&create_args(&alice, "acme"))
+    let created = probefleet::roles::org::create(&create_args(&alice, "acme"))
         .await
         .expect("org create");
     assert_eq!(created.name.as_deref(), Some("acme"));
@@ -92,7 +92,7 @@ async fn a_logged_in_user_creates_an_org_and_manages_its_members() {
     assert_eq!(fleet.org("acme").await.0, created.id);
 
     // `org list` shows it, as admin, beside the personal org.
-    let (orgs, acting) = fleet_bin::roles::org::list(&session(&alice))
+    let (orgs, acting) = probefleet::roles::org::list(&session(&alice))
         .await
         .expect("org list");
     assert!(
@@ -112,7 +112,7 @@ async fn a_logged_in_user_creates_an_org_and_manages_its_members() {
 
     // Add bob as a member (the default role).
     let alice_acme = members_args(&alice, Some("acme"));
-    let org = fleet_bin::roles::org::add_member(&alice_acme, "bob", RoleArg::Member)
+    let org = probefleet::roles::org::add_member(&alice_acme, "bob", RoleArg::Member)
         .await
         .expect("members add");
     assert_eq!(org, "acme");
@@ -126,24 +126,24 @@ async fn a_logged_in_user_creates_an_org_and_manages_its_members() {
 
     // bob, a mere member, is refused with an explanation.
     let bob_acme = members_args(&bob, Some("acme"));
-    let err = fleet_bin::roles::org::remove_member(&bob_acme, "alice")
+    let err = probefleet::roles::org::remove_member(&bob_acme, "alice")
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("not an admin"), "{err}");
 
     // The last admin cannot demote themselves …
-    let err = fleet_bin::roles::org::set_role(&alice_acme, "alice", RoleArg::Member)
+    let err = probefleet::roles::org::set_role(&alice_acme, "alice", RoleArg::Member)
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("no admin"), "{err}");
 
     // … but can once bob is an admin too.
-    fleet_bin::roles::org::set_role(&alice_acme, "bob", RoleArg::Admin)
+    probefleet::roles::org::set_role(&alice_acme, "bob", RoleArg::Admin)
         .await
         .expect("set-role admin");
-    fleet_bin::roles::org::set_role(&alice_acme, "alice", RoleArg::Member)
+    probefleet::roles::org::set_role(&alice_acme, "alice", RoleArg::Member)
         .await
         .expect("demote alice");
     assert_eq!(
@@ -155,7 +155,7 @@ async fn a_logged_in_user_creates_an_org_and_manages_its_members() {
     );
 
     // bob removes alice; she is no longer a member.
-    fleet_bin::roles::org::remove_member(&bob_acme, "alice")
+    probefleet::roles::org::remove_member(&bob_acme, "alice")
         .await
         .expect("members remove");
     assert_eq!(
@@ -172,7 +172,7 @@ async fn a_logged_in_user_creates_an_org_and_manages_its_members() {
             .unwrap(),
         None
     );
-    assert!(fleet_bin::roles::org::members(&alice_acme).await.is_err());
+    assert!(probefleet::roles::org::members(&alice_acme).await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -185,22 +185,22 @@ async fn names_collide_and_unknown_users_are_named() {
 
     // A username, and the default org, are taken.
     for taken in ["bob", common::DEFAULT_ORG] {
-        let err = fleet_bin::roles::org::create(&create_args(&alice, taken))
+        let err = probefleet::roles::org::create(&create_args(&alice, taken))
             .await
             .unwrap_err()
             .to_string();
         assert!(err.contains("existing org or user"), "{taken}: {err}");
     }
-    let err = fleet_bin::roles::org::create(&create_args(&alice, "Acme"))
+    let err = probefleet::roles::org::create(&create_args(&alice, "Acme"))
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("lowercase"), "{err}");
 
-    fleet_bin::roles::org::create(&create_args(&alice, "acme"))
+    probefleet::roles::org::create(&create_args(&alice, "acme"))
         .await
         .unwrap();
-    let err = fleet_bin::roles::org::add_member(
+    let err = probefleet::roles::org::add_member(
         &members_args(&alice, Some("acme")),
         "nobody",
         RoleArg::Member,
@@ -220,12 +220,12 @@ async fn members_defaults_to_the_fleet_files_org() {
     let tmp = tempfile::tempdir().unwrap();
     let carol = tmp.path().join("carol");
     login(&fleet, &carol, "carol", Some(common::DEFAULT_ORG)).await;
-    let list = fleet_bin::roles::org::members(&members_args(&carol, None))
+    let list = probefleet::roles::org::members(&members_args(&carol, None))
         .await
         .unwrap();
     assert_eq!(list.namespace, fleet.default_org().await.0);
     // A member of `default` but not its admin: no mutation.
-    assert!(fleet_bin::roles::org::add_member(
+    assert!(probefleet::roles::org::add_member(
         &members_args(&carol, None),
         "carol",
         RoleArg::Admin
@@ -269,18 +269,18 @@ async fn admins_rename_and_delete_team_orgs() {
     let alice = tmp.path().join("alice");
     let bob = tmp.path().join("bob");
     login(&fleet, &alice, "alice", None).await;
-    fleet_bin::roles::org::create(&create_args(&alice, "acme"))
+    probefleet::roles::org::create(&create_args(&alice, "acme"))
         .await
         .expect("org create");
     // Re-login acting in acme, so the fleet file's default follows.
     login(&fleet, &alice, "alice", Some("acme")).await;
     login(&fleet, &bob, "bob", None).await;
-    fleet_bin::roles::org::add_member(&members_args(&alice, Some("acme")), "bob", RoleArg::Member)
+    probefleet::roles::org::add_member(&members_args(&alice, Some("acme")), "bob", RoleArg::Member)
         .await
         .expect("members add");
 
     // A member may not rename.
-    let err = fleet_bin::roles::org::rename(&rename_args(&bob, Some("acme"), "acme2"))
+    let err = probefleet::roles::org::rename(&rename_args(&bob, Some("acme"), "acme2"))
         .await
         .unwrap_err()
         .to_string();
@@ -288,7 +288,7 @@ async fn admins_rename_and_delete_team_orgs() {
 
     // The admin renames the default org; the fleet file follows.
     assert_eq!(default_org(&alice).as_deref(), Some("acme"));
-    let (old, renamed) = fleet_bin::roles::org::rename(&rename_args(&alice, None, "acme2"))
+    let (old, renamed) = probefleet::roles::org::rename(&rename_args(&alice, None, "acme2"))
         .await
         .expect("org rename");
     assert_eq!(old, "acme");
@@ -297,7 +297,7 @@ async fn admins_rename_and_delete_team_orgs() {
     assert_eq!(fleet.org("acme2").await.0, renamed.id);
 
     // A personal org is refused, with why.
-    let err = fleet_bin::roles::org::delete(&delete_args(&alice, Some("alice")))
+    let err = probefleet::roles::org::delete(&delete_args(&alice, Some("alice")))
         .await
         .unwrap_err()
         .to_string();
@@ -312,13 +312,13 @@ async fn admins_rename_and_delete_team_orgs() {
             "rpi-1",
             &[],
             None,
-            fleet_proto::AdoptPolicy::Declared,
+            probefleet_proto::AdoptPolicy::Declared,
             "node.enroll",
             "test fixture",
         )
         .await
         .unwrap();
-    let err = fleet_bin::roles::org::delete(&delete_args(&alice, None))
+    let err = probefleet::roles::org::delete(&delete_args(&alice, None))
         .await
         .unwrap_err()
         .to_string();
@@ -332,7 +332,7 @@ async fn admins_rename_and_delete_team_orgs() {
         .unwrap());
 
     // Empty: deleted, and the fleet file's default cleared.
-    let name = fleet_bin::roles::org::delete(&delete_args(&alice, None))
+    let name = probefleet::roles::org::delete(&delete_args(&alice, None))
         .await
         .expect("org delete");
     assert_eq!(name, "acme2");

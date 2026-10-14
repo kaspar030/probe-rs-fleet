@@ -9,8 +9,8 @@
 //! frames — it is a pure byte pipe.
 //!
 //! The control plane and the data plane share one `WebSocket`, multiplexed by
-//! the [`fleet_wire`] envelopes. A single reader task demultiplexes coordinator
-//! replies (control) from relayed [`fleet_proto::DataFrame`]s (data), routing
+//! the [`probefleet_wire`] envelopes. A single reader task demultiplexes coordinator
+//! replies (control) from relayed [`probefleet_proto::DataFrame`]s (data), routing
 //! the latter to the active channel's splice.
 
 use std::path::Path;
@@ -20,10 +20,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex};
 
-use fleet_proto::lease::{LeaseGrant, LeaseRequest};
-use fleet_proto::{ChannelId, ChannelKind, DataFrame, PROTOCOL_VERSION};
-use fleet_wire::client::{dial, DialOpts};
-use fleet_wire::{CoordToSidecar, SidecarToCoord, WireEvent, WireRx, WireTx};
+use probefleet_proto::lease::{LeaseGrant, LeaseRequest};
+use probefleet_proto::{ChannelId, ChannelKind, DataFrame, PROTOCOL_VERSION};
+use probefleet_wire::client::{dial, DialOpts};
+use probefleet_wire::{CoordToSidecar, SidecarToCoord, WireEvent, WireRx, WireTx};
 
 use crate::selector::{DelegatedConfig, FleetConfig};
 
@@ -82,7 +82,7 @@ pub struct CoordSession {
     /// ack drain, an `open_channel`) would consume it and then mis-read the
     /// stream by one message. Load-dependent, intermittent, and very annoying
     /// to debug — hence a dedicated slot.
-    extend_rx: Mutex<mpsc::Receiver<(fleet_proto::LeaseId, u64)>>,
+    extend_rx: Mutex<mpsc::Receiver<(probefleet_proto::LeaseId, u64)>>,
     /// Set the active channel's data sink so the reader routes `Data` frames.
     data_sink: DataSink,
 }
@@ -93,7 +93,7 @@ impl CoordSession {
     /// The bearer token rides the `WebSocket` upgrade; there is no client
     /// certificate. Trust configuration (`WebPKI` roots, or the optional pinned
     /// server-cert hash) is shared with every other outbound connection in the
-    /// tree via `fleet_tls::client_trust_config`.
+    /// tree via `probefleet_tls::client_trust_config`.
     ///
     /// # Errors
     ///
@@ -150,7 +150,7 @@ impl CoordSession {
         tokio::spawn(async move {
             let mut tx = tx;
             while let Some(msg) = out_rx.recv().await {
-                if fleet_wire::send(&mut *tx, &msg).await.is_err() {
+                if probefleet_wire::send(&mut *tx, &msg).await.is_err() {
                     break;
                 }
             }
@@ -164,7 +164,7 @@ impl CoordSession {
             })
             .await
             .map_err(|_| TransportError::Connect("writer closed".to_owned()))?;
-        match fleet_wire::recv::<CoordToSidecar>(&mut *rx).await {
+        match probefleet_wire::recv::<CoordToSidecar>(&mut *rx).await {
             Ok(CoordToSidecar::Welcome { protocol_version }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(TransportError::Connect(format!(
@@ -182,7 +182,7 @@ impl CoordSession {
         }
 
         let (ctrl_tx, ctrl_rx) = mpsc::channel::<CoordToSidecar>(256);
-        let (extend_tx, extend_rx) = mpsc::channel::<(fleet_proto::LeaseId, u64)>(8);
+        let (extend_tx, extend_rx) = mpsc::channel::<(probefleet_proto::LeaseId, u64)>(8);
         let data_sink: DataSink = Arc::new(Mutex::new(None));
         let sink = Arc::clone(&data_sink);
         tokio::spawn(async move {
@@ -195,7 +195,7 @@ impl CoordSession {
                     WireEvent::Pong => continue,
                     WireEvent::Closed => break,
                 };
-                match fleet_wire::decode::<CoordToSidecar>(&bytes) {
+                match probefleet_wire::decode::<CoordToSidecar>(&bytes) {
                     Ok(CoordToSidecar::Data(frame)) => {
                         let route = {
                             let guard = sink.lock().await;
@@ -403,7 +403,7 @@ impl CoordSession {
     /// [`TransportError::Connect`] if the connection is gone,
     /// [`TransportError::Declined`] if no reply arrives in time,
     /// [`TransportError::Wire`] if the reply names a different lease.
-    pub async fn extend(&self, lease: fleet_proto::LeaseId) -> Result<u64, TransportError> {
+    pub async fn extend(&self, lease: probefleet_proto::LeaseId) -> Result<u64, TransportError> {
         self.send(SidecarToCoord::Extend { lease }).await?;
         let mut slot = self.extend_rx.lock().await;
         match tokio::time::timeout(std::time::Duration::from_secs(5), slot.recv()).await {
@@ -445,7 +445,7 @@ impl CoordSession {
     /// don't know" ([`Revalidation::Inconclusive`]) — the latter needs a
     /// best-effort `Release` first, or a fresh `Lease` under an `Id` selector
     /// would queue behind our own still-live hold.
-    pub async fn revalidate_lease(&self, lease: fleet_proto::LeaseId) -> Revalidation {
+    pub async fn revalidate_lease(&self, lease: probefleet_proto::LeaseId) -> Revalidation {
         if self.send(SidecarToCoord::Extend { lease }).await.is_err() {
             return Revalidation::Inconclusive("connection closed".to_owned());
         }
@@ -522,7 +522,7 @@ impl CoordSession {
     }
 
     /// Release a held lease (best-effort).
-    pub async fn release(&self, lease: fleet_proto::LeaseId) {
+    pub async fn release(&self, lease: probefleet_proto::LeaseId) {
         let _ = self.send(SidecarToCoord::Release { lease }).await;
         // Drain the Released ack if it arrives promptly; ignore failures.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), self.next_ctrl()).await;
@@ -564,7 +564,7 @@ impl CoordSession {
     /// Returns [`TransportError::Declined`] if the coordinator refuses.
     pub async fn open_channel(
         &self,
-        lease: fleet_proto::LeaseId,
+        lease: probefleet_proto::LeaseId,
         kind: ChannelKind,
     ) -> Result<OpenedChannel, TransportError> {
         self.send(SidecarToCoord::OpenChannel { lease, kind })
@@ -820,7 +820,9 @@ mod tests {
         let cfg = FleetConfig {
             coordinator: "https://c:1".to_owned(),
             token: "prfs1_t".to_owned(),
-            select: fleet_proto::lease::Constraint::Id(fleet_proto::ids::BoardName("b".to_owned())),
+            select: probefleet_proto::lease::Constraint::Id(probefleet_proto::ids::BoardName(
+                "b".to_owned(),
+            )),
             server_cert_sha256: Some("cd".repeat(32)),
             queue_wait_secs: 0,
         };
@@ -839,22 +841,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::too_many_lines)]
     async fn session_leases_opens_channel_and_splices() {
-        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
-        use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
-        use fleet_proto::LeaseId;
+        use probefleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
+        use probefleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
+        use probefleet_proto::LeaseId;
 
         // The coordinator answers with a fleet-unique board key; the request
         // side stays node-local.
         let board_ref = BoardRef::new(OrgId("default".to_owned()), NodeId("a".to_owned()), "b1");
 
-        let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
 
         // Coordinator peer task: Welcome -> Lease grant -> ChannelOpened ->
         // echo any Data frame back on the same channel.
         let board_ref_for_peer = board_ref.clone();
         let coord = tokio::spawn(async move {
             // Hello -> Welcome.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
@@ -863,7 +865,7 @@ mod tests {
                 }
                 other => panic!("expected Hello, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::Welcome {
                     protocol_version: PROTOCOL_VERSION,
@@ -873,14 +875,14 @@ mod tests {
             .unwrap();
 
             // Lease.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
                 SidecarToCoord::Lease(_) => {}
                 other => panic!("expected Lease, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
@@ -895,7 +897,7 @@ mod tests {
             .unwrap();
 
             // OpenChannel -> ChannelOpened(7).
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
@@ -905,7 +907,7 @@ mod tests {
                 }
                 other => panic!("expected OpenChannel, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::ChannelOpened {
                     channel: ChannelId(7),
@@ -917,20 +919,20 @@ mod tests {
             .unwrap();
 
             // Echo the next Data frame back (relay node stand-in).
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
                 SidecarToCoord::Data(frame) => {
                     assert_eq!(frame.channel, ChannelId(7));
-                    fleet_wire::send(&mut coord_tx, &CoordToSidecar::Data(frame))
+                    probefleet_wire::send(&mut coord_tx, &CoordToSidecar::Data(frame))
                         .await
                         .unwrap();
                 }
                 other => panic!("expected Data, got {other:?}"),
             }
             // Keep the connection open until the test drops it.
-            let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
+            let _ = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
         });
 
         let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))
@@ -992,24 +994,24 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extend_reply_does_not_steal_the_control_channel() {
-        use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
-        use fleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
-        use fleet_proto::LeaseId;
+        use probefleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId, SubjectKey, SubjectKind};
+        use probefleet_proto::lease::{Constraint, LeaseGrant, LeaseRequest, Priority};
+        use probefleet_proto::LeaseId;
 
-        let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let (sc_tx, sc_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
         let saw_release = Arc::new(Mutex::new(false));
         let saw_release_peer = Arc::clone(&saw_release);
 
         let coord = tokio::spawn(async move {
             // Hello -> Welcome.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
                 SidecarToCoord::Hello { .. } => {}
                 other => panic!("expected Hello, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::Welcome {
                     protocol_version: PROTOCOL_VERSION,
@@ -1019,7 +1021,7 @@ mod tests {
             .unwrap();
 
             // Lease -> grant.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
@@ -1030,7 +1032,7 @@ mod tests {
                 }
                 other => panic!("expected Lease, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::Lease(LeaseGrant {
                     lease: LeaseId(1),
@@ -1045,14 +1047,14 @@ mod tests {
             .unwrap();
 
             // Extend -> Extended.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
                 SidecarToCoord::Extend { lease } => assert_eq!(lease, LeaseId(1)),
                 other => panic!("expected Extend, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::Extended {
                     lease: LeaseId(1),
@@ -1063,7 +1065,7 @@ mod tests {
             .unwrap();
 
             // Release -> Released.
-            match fleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
@@ -1073,13 +1075,13 @@ mod tests {
                 }
                 other => panic!("expected Release, got {other:?}"),
             }
-            fleet_wire::send(
+            probefleet_wire::send(
                 &mut coord_tx,
                 &CoordToSidecar::Released { lease: LeaseId(1) },
             )
             .await
             .unwrap();
-            let _ = fleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
+            let _ = probefleet_wire::recv::<SidecarToCoord>(&mut coord_rx).await;
         });
 
         let session = CoordSession::start(Box::new(sc_tx), Box::new(sc_rx))

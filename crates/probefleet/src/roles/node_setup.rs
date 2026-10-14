@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use fleet_proto::auth_api::NodeTokenResponse;
-use fleet_proto::AdoptPolicy;
+use probefleet_proto::auth_api::NodeTokenResponse;
+use probefleet_proto::AdoptPolicy;
 
 use crate::fleet_config::{self, NodeSection};
 use crate::paths;
@@ -356,7 +356,7 @@ mod tests {
     /// run fails on a file this command wrote.
     #[test]
     fn the_scaffolds_are_valid_toml() {
-        fleet_agent::config::BoardsConfig::from_str(&starter_boards_toml()).unwrap();
+        probefleet_agent::config::BoardsConfig::from_str(&starter_boards_toml()).unwrap();
         for adopt in [AdoptPolicy::Auto, AdoptPolicy::Declared] {
             let settings: crate::roles::node_run::NodeSettings =
                 toml::from_str(&starter_node_toml(adopt)).unwrap();

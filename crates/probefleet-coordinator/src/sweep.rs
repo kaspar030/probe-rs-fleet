@@ -1,6 +1,6 @@
 //! Background lease-expiry sweep.
 //!
-//! Periodically asks the pure scheduler to [`expire`](fleet_core::scheduler::Scheduler::expire)
+//! Periodically asks the pure scheduler to [`expire`](probefleet_core::scheduler::Scheduler::expire)
 //! leases whose deadline has passed. For each freed lease the coordinator:
 //! closes any relay channels on the board, instructs the owning node to clean
 //! up (`ReleaseLease` → power-cycle, optional erase), persists the close, and
@@ -24,8 +24,8 @@ use std::time::Duration;
 use tokio::time::interval;
 use tracing::{debug, warn};
 
-use fleet_core::scheduler::ExpireResult;
-use fleet_proto::node_api::CoordinatorCommand;
+use probefleet_core::scheduler::ExpireResult;
+use probefleet_proto::node_api::CoordinatorCommand;
 
 use crate::core::Coordinator;
 use crate::relay;
@@ -126,11 +126,11 @@ mod tests {
     use crate::registry::{NodeHandle, NodeMessage};
     use crate::subject::testkit;
     use crate::subject::{FleetRole, Subject};
-    use fleet_core::policy::Policy;
-    use fleet_core::scheduler::{RequesterId, Scheduler};
-    use fleet_proto::board::{Board, BoardState, PowerKind};
-    use fleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId};
-    use fleet_proto::lease::{Constraint, LeaseRequest, Priority};
+    use probefleet_core::policy::Policy;
+    use probefleet_core::scheduler::{RequesterId, Scheduler};
+    use probefleet_proto::board::{Board, BoardState, PowerKind};
+    use probefleet_proto::ids::{BoardName, BoardRef, NodeId, OrgId};
+    use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::mpsc;
 

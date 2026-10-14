@@ -23,9 +23,9 @@ use std::sync::Arc;
 
 use common::TestCoordinator;
 
-use fleet_proto::node_api::NodeReport;
-use fleet_wire::client::{dial, DialOpts};
-use fleet_wire::NodeToCoord;
+use probefleet_proto::node_api::NodeReport;
+use probefleet_wire::client::{dial, DialOpts};
+use probefleet_wire::NodeToCoord;
 
 /// A TLS-terminating coordinator on a real socket, plus its cert's SHA-256.
 struct TlsFleet {
@@ -65,13 +65,13 @@ async fn start_tls_fleet() -> TlsFleet {
     let key = KeyPair::generate().unwrap();
     let cert = params.self_signed(&key).unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
-    let pin = fleet_tls::cert_sha256(&cert_der);
+    let pin = probefleet_tls::cert_sha256(&cert_der);
     let key_der = PrivateKeyDer::try_from(key.serialize_der()).unwrap();
 
-    let server_config = fleet_tls::server_config(vec![cert_der], key_der).unwrap();
+    let server_config = probefleet_tls::server_config(vec![cert_der], key_der).unwrap();
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
 
-    let router = fleet_coordinator::http::router(Arc::clone(&fleet.coord));
+    let router = probefleet_coordinator::http::router(Arc::clone(&fleet.coord));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -123,11 +123,11 @@ async fn a_pinning_client_completes_a_wss_websocket_upgrade() {
 
     // Prove it is a working WebSocket, not merely a completed handshake: this
     // is what catches a `serve_connection` that lacks `_with_upgrades`.
-    fleet_wire::send(
+    probefleet_wire::send(
         &mut tx,
         &NodeToCoord::Report(NodeReport::Register {
             node: node.clone(),
-            protocol_version: fleet_proto::PROTOCOL_VERSION,
+            protocol_version: probefleet_proto::PROTOCOL_VERSION,
         }),
     )
     .await

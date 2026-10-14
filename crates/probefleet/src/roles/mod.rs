@@ -3,10 +3,10 @@
 //! Each module owns the arg → config translation for one role and hands off to
 //! the owning sibling crate's entry point:
 //!
-//! - [`coordinator`] → [`fleet_coordinator::run`]
-//! - [`node_run`] → [`fleet_agent::connection::run`]
-//! - [`sidecar`] → [`fleet_sidecar::run`]
-//! - [`ctl`] → a caller of `fleet_sidecar::transport::CoordSession`, the one
+//! - [`coordinator`] → [`probefleet_coordinator::run`]
+//! - [`node_run`] → [`probefleet_agent::connection::run`]
+//! - [`sidecar`] → [`probefleet_sidecar::run`]
+//! - [`ctl`] → a caller of `probefleet_sidecar::transport::CoordSession`, the one
 //!   coordinator client the tree has
 //! - [`login`] → the coordinator's (forgs) device flow, any login provider
 //! - [`logout`] → revoke this machine's session and refresh token (`--all`:

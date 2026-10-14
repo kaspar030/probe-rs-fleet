@@ -9,7 +9,7 @@
 //! `redirect_uri` and no cookie session, so a page served by the coordinator
 //! cannot know who is looking at it. Approving therefore happens here, on a
 //! machine that already holds a `[user]` session — and the design keeps a real
-//! browser flow possible later (see `fleet_coordinator::http`'s module docs).
+//! browser flow possible later (see `probefleet_coordinator::http`'s module docs).
 //!
 //! # The phishing problem, which is the whole reason for the ceremony
 //!
@@ -42,8 +42,8 @@ use std::io::{IsTerminal as _, Write as _};
 
 use anyhow::{Context, Result};
 
-use fleet_proto::auth_api::{NodeApprovalDecision, NodeApprovalResponse};
 use forgs_client::ClientError;
+use probefleet_proto::auth_api::{NodeApprovalDecision, NodeApprovalResponse};
 
 use crate::cli::NodeApproveArgs;
 use crate::fleet_config::{self, FleetFile};

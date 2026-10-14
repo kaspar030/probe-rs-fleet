@@ -8,7 +8,7 @@
 //! multiplexed alongside.
 //!
 //! What ships here: the reconnect-with-backoff policy, the dial via
-//! `fleet_wire::client::dial` (which presents the node's bearer token on the
+//! `probefleet_wire::client::dial` (which presents the node's bearer token on the
 //! upgrade), ping/pong keepalive, node-token rotation, and the live control +
 //! data multiplex — register, inventory, heartbeat, command dispatch through the
 //! [`Agent`] handlers, and per-channel `DataFrame` splicing onto each session's
@@ -35,10 +35,10 @@ use crate::config::{AgentConfig, NodeTokenStore};
 use crate::error::{AgentError, Result};
 use crate::probers::ProbeRsBackend;
 
-use fleet_proto::node_api::NodeReport;
-use fleet_proto::{ChannelId, ChannelKind, CoordinatorCommand, DataFrame, PROTOCOL_VERSION};
-use fleet_wire::client::{dial, DialOpts};
-use fleet_wire::{CoordToNode, NodeToCoord, WireError, WireEvent, WireRx, WireTx};
+use probefleet_proto::node_api::NodeReport;
+use probefleet_proto::{ChannelId, ChannelKind, CoordinatorCommand, DataFrame, PROTOCOL_VERSION};
+use probefleet_wire::client::{dial, DialOpts};
+use probefleet_wire::{CoordToNode, NodeToCoord, WireError, WireEvent, WireRx, WireTx};
 
 /// How often the agent pings an otherwise idle connection.
 ///
@@ -162,7 +162,7 @@ fn should_fall_back(e: &AgentError, already_tried: bool) -> bool {
 /// The `config` is owned and mutable because a node token can be **rotated**
 /// mid-connection: the coordinator pushes a replacement, the agent writes it
 /// down through `store` and acks, and the next dial uses the new one. Where the
-/// token is written is `fleet-bin`'s business (see [`NodeTokenStore`]); this
+/// token is written is `probefleet`'s business (see [`NodeTokenStore`]); this
 /// crate only knows it must be durable before the ack.
 ///
 /// # Errors
@@ -312,7 +312,7 @@ where
             tokio::select! {
                 msg = out_rx.recv() => {
                     let Some(msg) = msg else { break };
-                    if fleet_wire::send(&mut *tx, &msg).await.is_err() {
+                    if probefleet_wire::send(&mut *tx, &msg).await.is_err() {
                         break;
                     }
                 }
@@ -328,7 +328,7 @@ where
 
     // 1. Register. The id is advisory — the coordinator authenticates us by our
     //    token and will close the connection if this contradicts it.
-    let node_id = fleet_proto::ids::NodeId(config.node_id.clone());
+    let node_id = probefleet_proto::ids::NodeId(config.node_id.clone());
     // Ghost-channel guard: the previous connection's splice tasks died with it
     // (dropping their sockets), but nothing told the agent. A surviving
     // `BoardSession` on the same lease is about to be *reused*, so its channel
@@ -374,7 +374,7 @@ where
                 last_seen = tokio::time::Instant::now();
                 match event {
                     Ok(WireEvent::Binary(bytes)) => {
-                        match fleet_wire::decode::<CoordToNode>(&bytes) {
+                        match probefleet_wire::decode::<CoordToNode>(&bytes) {
                             Ok(CoordToNode::Command(cmd)) => {
                                 handle_inbound_command(agent, config, store, &out_tx, &routes, cmd).await;
                             }
@@ -536,7 +536,7 @@ async fn handle_inbound_command<B: ProbeRsBackend + 'static>(
         // Surface the failure as a log report; the coordinator decides policy.
         let _ = out_tx
             .send(NodeToCoord::Report(NodeReport::Log {
-                level: fleet_proto::LogLevel::Error,
+                level: probefleet_proto::LogLevel::Error,
                 board: None,
                 message: format!("command failed: {e}"),
             }))
@@ -703,8 +703,8 @@ mod tests {
     use crate::agent::Agent;
     use crate::probers::{ProbeRsBackend, Session};
     use ed25519_dalek::{Signer, SigningKey};
-    use fleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
-    use fleet_proto::{ChannelId, LeaseId};
+    use probefleet_proto::token::{AllowedOp, CapabilityToken, SignedToken};
+    use probefleet_proto::{ChannelId, LeaseId};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -737,13 +737,13 @@ mod tests {
             heartbeat_secs: 1,
             // Long enough that a test which is not about discovery never ticks.
             discovery_secs: 3_600,
-            adopt: fleet_proto::AdoptPolicy::Declared,
+            adopt: probefleet_proto::AdoptPolicy::Declared,
             erase_on_release: false,
         }
     }
 
     /// An in-memory [`NodeTokenStore`], standing in for the fleet file that
-    /// `fleet-bin` supplies in production. It records what was written so a test
+    /// `probefleet` supplies in production. It records what was written so a test
     /// can assert the persist-before-ack ordering the real store exists for.
     #[derive(Debug, Default)]
     struct MemoryStore {
@@ -787,10 +787,10 @@ kind = "none"
     /// The fleet-unique key the coordinator mints for one of this node's
     /// boards; the token is scoped to it and the agent matches it verbatim.
     /// Its node half is the coordinator's org-namespaced id.
-    fn board_ref(name: &str) -> fleet_proto::BoardRef {
-        fleet_proto::BoardRef::new(
-            fleet_proto::OrgId("default".to_owned()),
-            fleet_proto::NodeId(NODE_ID.to_owned()),
+    fn board_ref(name: &str) -> probefleet_proto::BoardRef {
+        probefleet_proto::BoardRef::new(
+            probefleet_proto::OrgId("default".to_owned()),
+            probefleet_proto::NodeId(NODE_ID.to_owned()),
             name,
         )
     }
@@ -870,7 +870,7 @@ kind = "none"
 
         // The agent's dial-out connection speaks over one half of an in-memory
         // wire pair; the test plays the coordinator on the other.
-        let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
         let mut config = agent_config();
         let store: Arc<dyn NodeTokenStore> = Arc::new(MemoryStore::default());
         let agent_task = {
@@ -888,7 +888,7 @@ kind = "none"
         };
 
         // 1. Register.
-        match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
@@ -902,7 +902,7 @@ kind = "none"
             other => panic!("expected Register, got {other:?}"),
         }
         // 2. Inventory (one online board with full metadata).
-        match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
@@ -916,7 +916,7 @@ kind = "none"
 
         // 3. Command the agent to open a data session on channel 1.
         let token = signed_token(7, "b1", vec![AllowedOp::Attach], u64::MAX);
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut coord_tx,
             &CoordToNode::Command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(7),
@@ -941,7 +941,7 @@ kind = "none"
         let mut peer = peer;
 
         // 4. Data round-trip: coordinator -> agent -> serve socket.
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut coord_tx,
             &CoordToNode::Data(DataFrame {
                 channel: ChannelId(1),
@@ -959,7 +959,7 @@ kind = "none"
         peer.flush().await.unwrap();
         // Skip any interleaved Log reports; assert the data frame arrives.
         let data = loop {
-            match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+            match probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                 .await
                 .unwrap()
             {
@@ -991,9 +991,9 @@ kind = "none"
         // `adopt = auto` and a probe absent from `boards.toml`, so the tick has
         // something to find that the seed did not already know.
         let mut config = agent_config();
-        config.adopt = fleet_proto::AdoptPolicy::Auto;
+        config.adopt = probefleet_proto::AdoptPolicy::Auto;
         config.discovery_secs = 1;
-        let probe = fleet_proto::DiscoveredProbe {
+        let probe = probefleet_proto::DiscoveredProbe {
             serial: "ZZZ".to_owned(),
             vid: 0x1366,
             pid: 0x1015,
@@ -1007,7 +1007,7 @@ kind = "none"
         );
         agent.seed_inventory_from_boards().await;
 
-        let (agent_tx, agent_rx, _coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let (agent_tx, agent_rx, _coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
         let store: Arc<dyn NodeTokenStore> = Arc::new(MemoryStore::default());
         let task = {
             let agent = Arc::clone(&agent);
@@ -1025,10 +1025,10 @@ kind = "none"
         };
 
         // Register, then the seeded inventory (declared boards only).
-        let _register = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        let _register = probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        match probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap()
         {
@@ -1041,7 +1041,7 @@ kind = "none"
         // The first discovery tick finds the undeclared probe and reports it.
         let adopted = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+                match probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                     .await
                     .unwrap()
                 {
@@ -1062,7 +1062,7 @@ kind = "none"
         let quiet = tokio::time::timeout(Duration::from_secs(4), async {
             loop {
                 if let NodeToCoord::Report(NodeReport::Inventory(_)) =
-                    fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+                    probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                         .await
                         .unwrap()
                 {
@@ -1099,7 +1099,7 @@ kind = "none"
         agent.seed_inventory_from_boards().await;
         let before = agent.current_inventory().await;
 
-        let (agent_tx, agent_rx, _coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let (agent_tx, agent_rx, _coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
         let store: Arc<dyn NodeTokenStore> = Arc::new(MemoryStore::default());
         let task = {
             let agent = Arc::clone(&agent);
@@ -1116,10 +1116,10 @@ kind = "none"
             })
         };
 
-        let _register = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        let _register = probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        let _seed = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        let _seed = probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
 
@@ -1128,7 +1128,7 @@ kind = "none"
         tokio::time::sleep(Duration::from_millis(2_500)).await;
         let alive = tokio::time::timeout(
             Duration::from_secs(3),
-            fleet_wire::recv::<NodeToCoord>(&mut coord_rx),
+            probefleet_wire::recv::<NodeToCoord>(&mut coord_rx),
         )
         .await
         .expect("the connection must survive failed enumeration")
@@ -1163,7 +1163,7 @@ kind = "none"
         let agent = Arc::new(Agent::new(agent_config(), boards(), backend).unwrap());
         agent.seed_inventory_from_boards().await;
 
-        let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = fleet_wire::mock::pair();
+        let (agent_tx, agent_rx, mut coord_tx, mut coord_rx) = probefleet_wire::mock::pair();
         let task = {
             let agent = Arc::clone(&agent);
             let store = Arc::clone(&store);
@@ -1180,15 +1180,15 @@ kind = "none"
         };
 
         // Drain Register + Inventory.
-        let _ = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        let _ = probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
-        let _ = fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+        let _ = probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
             .await
             .unwrap();
 
         let new_token = "prfn1_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
-        fleet_wire::send(
+        probefleet_wire::send(
             &mut coord_tx,
             &CoordToNode::Command(CoordinatorCommand::RotateNodeToken {
                 token: new_token.to_owned(),
@@ -1201,7 +1201,7 @@ kind = "none"
         // The ack arrives ...
         let ack = loop {
             if let NodeToCoord::Report(NodeReport::TokenRotated { rotation_id }) =
-                fleet_wire::recv::<NodeToCoord>(&mut coord_rx)
+                probefleet_wire::recv::<NodeToCoord>(&mut coord_rx)
                     .await
                     .unwrap()
             {
@@ -1363,7 +1363,7 @@ kind = "none"
         ] {
             assert!(
                 matches!(
-                    classify_dial_error(&fleet_wire::WireError::Protocol(text.to_owned())),
+                    classify_dial_error(&probefleet_wire::WireError::Protocol(text.to_owned())),
                     AgentError::CredentialRejected(_)
                 ),
                 "`{text}` must classify as a credential rejection"
@@ -1372,7 +1372,7 @@ kind = "none"
 
         // ... and a genuine network failure must not.
         assert!(matches!(
-            classify_dial_error(&fleet_wire::WireError::Io(std::io::Error::new(
+            classify_dial_error(&probefleet_wire::WireError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 "connection refused"
             ))),

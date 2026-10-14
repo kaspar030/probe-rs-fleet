@@ -52,8 +52,8 @@
 use anyhow::{Context, Result};
 use std::process::ExitCode;
 
-use fleet_proto::token::AllowedOp;
-use fleet_wire::{CoordToSidecar, SidecarToCoord};
+use probefleet_proto::token::AllowedOp;
+use probefleet_wire::{CoordToSidecar, SidecarToCoord};
 
 use crate::cli::{GrantArgs, GrantCommand, GrantListArgs, GrantRevokeArgs};
 use crate::roles::ctl::{CtlClient, CtlConnection};
@@ -104,12 +104,12 @@ async fn create(args: GrantArgs) -> Result<ExitCode> {
     // round trip, and normalise it to the canonical form the coordinator
     // stores. Bare terms are tags: a grant describes a *set* of boards, and the
     // individual-board case is spelled `id=<name>`.
-    let selector = fleet_proto::lease::parse_constraint(&selector)
+    let selector = probefleet_proto::lease::parse_constraint(&selector)
         .map_err(|e| anyhow::anyhow!("invalid --select: {e}"))?
         .to_string();
 
     let requested = parse_ops_arg(&args.ops)?;
-    let ops = fleet_proto::token::normalize_ops(requested.clone());
+    let ops = probefleet_proto::token::normalize_ops(requested.clone());
     if !requested.contains(&AllowedOp::Attach) && ops.contains(&AllowedOp::Attach) {
         eprintln!(
             "note: flash/erase/reset run inside a data channel; added `attach`, \
@@ -231,7 +231,7 @@ async fn revoke_grant(args: GrantRevokeArgs) -> Result<ExitCode> {
 ///
 /// Returns an error naming the unrecognised label, or an empty set.
 pub fn parse_ops_arg(s: &str) -> Result<Vec<AllowedOp>> {
-    let ops = fleet_proto::token::parse_ops(s).map_err(|bad| {
+    let ops = probefleet_proto::token::parse_ops(s).map_err(|bad| {
         let known: Vec<&str> = AllowedOp::all().iter().map(|o| o.as_str()).collect();
         anyhow::anyhow!("unknown operation `{bad}`; known: {}", known.join(", "))
     })?;

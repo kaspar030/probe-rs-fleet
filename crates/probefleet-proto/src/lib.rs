@@ -58,7 +58,7 @@ pub struct ChannelId(pub u64);
 /// mismatches.
 ///
 /// A bump forces a **lockstep** upgrade of node + coordinator + sidecar + ctl.
-/// All four roles ship from the single `fleet-bin` binary, so that is cheap in
+/// All four roles ship from the single `probefleet` binary, so that is cheap in
 /// practice, but a half-upgraded fleet will refuse to connect (by design).
 ///
 /// * 2 → 3: [`DiscoveredProbe`] gained `inaccessible` (probe-rs 0.32 `probe-rs

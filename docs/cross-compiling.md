@@ -22,7 +22,7 @@ export CC_armv7_unknown_linux_musleabihf=armv7l-linux-musleabihf-gcc
 export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=armv7l-linux-musleabihf-gcc
 export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-Ctarget-feature=+crt-static"
 
-cargo build -p fleet-bin --release --target armv7-unknown-linux-musleabihf
+cargo build -p probefleet --release --target armv7-unknown-linux-musleabihf
 ```
 
 Produces a **statically linked** `probe-rs-fleet`. Copy it (and a
@@ -38,7 +38,7 @@ crypto library (BoringSSL-derived). Cross-compiling that C to `*-musl` with a
 
 We avoid this entirely by using the **pure-Rust `ring`** provider: `rustls`,
 `tokio-rustls`, and `rcgen` are configured with `default-features = false,
-features = ["ring", …]`, and `fleet-tls` installs
+features = ["ring", …]`, and `probefleet-tls` installs
 `rustls::crypto::ring::default_provider()`. With `ring`, **any** Rust cross
 toolchain builds the workspace — no clang, no sysroot CFLAGS dance. See commit
 `adbe632`.
@@ -110,7 +110,7 @@ Verified crates (all `default-features = false`, `ring` only):
 | Crate | Role |
 |---|---|
 | `axum` 0.8 (`http1,tokio,ws,json`) | the coordinator's router + WS upgrade |
-| `tokio-tungstenite` 0.29 (`connect,handshake,rustls-tls-webpki-roots`) | the dial-out client, via `fleet-wire` |
+| `tokio-tungstenite` 0.29 (`connect,handshake,rustls-tls-webpki-roots`) | the dial-out client, via `probefleet-wire` |
 | `hyper` 1 + `hyper-util` (`client-legacy`, `server-auto`) | the HTTP client (`forgs-client`: login, refresh, API keys, `/node/*`); the TLS-terminating server loop |
 | `hyper-rustls` 0.27 (`ring,tls12,webpki-tokio`) | HTTPS for that client |
 | `tokio-rustls` / `rustls` 0.23 (`ring`) | TLS |
@@ -125,13 +125,13 @@ export CC_armv7_unknown_linux_musleabihf=armv7l-linux-musleabihf-gcc
 export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER=armv7l-linux-musleabihf-gcc
 export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-Ctarget-feature=+crt-static"
 
-cargo build -p fleet-bin --release --target armv7-unknown-linux-musleabihf
+cargo build -p probefleet --release --target armv7-unknown-linux-musleabihf
 
 file target/armv7-unknown-linux-musleabihf/release/probe-rs-fleet
 #   ELF 32-bit LSB executable, ARM, EABI5 … statically linked
 
 # The regression check that matters. Expect NO output:
-cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf \
+cargo tree -p probefleet --target armv7-unknown-linux-musleabihf \
   --edges normal,build | grep -i aws-lc
 ```
 
@@ -145,22 +145,22 @@ rather than reaching for the clang escape hatch below.
 
 ### Keep two versions of tungstenite off the Pi
 
-`axum` depends on `tokio-tungstenite` internally, and `fleet-wire` depends on it
-directly for the dial-out client. `fleet-bin` links both the coordinator and the
+`axum` depends on `tokio-tungstenite` internally, and `probefleet-wire` depends on it
+directly for the dial-out client. `probefleet` links both the coordinator and the
 agent, so a version mismatch ships **two** copies of tungstenite (and its
 `sha1`/`rand`/`data-encoding` tail) on every node. The workspace therefore pins
 `tokio-tungstenite` to the major `axum` uses; bump the two together and re-run:
 
 ```sh
-cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf --edges normal \
+cargo tree -p probefleet --target armv7-unknown-linux-musleabihf --edges normal \
   | grep -oE 'tungstenite v[0-9.]+' | sort -u    # expect exactly one line
 ```
 
 ### Layering: no HTTP *server* framework in the agent
 
-`axum`'s adapter for the wire traits lives in `fleet-coordinator`
-(`src/ws_axum.rs`), not in `fleet-wire`, so `fleet-agent` and `fleet-sidecar`
-link only the client half. `crates/fleet-agent/tests/no_http_server_dep.rs`
+`axum`'s adapter for the wire traits lives in `probefleet-coordinator`
+(`src/ws_axum.rs`), not in `probefleet-wire`, so `probefleet-agent` and `probefleet-sidecar`
+link only the client half. `crates/probefleet-agent/tests/no_http_server_dep.rs`
 enforces this.
 
 **The same test fences identity.** Identity lives in the forgs workspace
@@ -169,25 +169,25 @@ crates.io dependency), and its crates are split exactly along this line:
 
 | crate | linked by | what it pulls |
 |---|---|---|
-| `forgs` (pure core, no IO) | `fleet-coordinator`, `fleet-bin` | serde, sha2, ulid |
-| `forgs-store` | `fleet-coordinator` only | sqlx (SQLite) |
-| `forgs-http` | `fleet-coordinator` only | axum |
-| `forgs-idp` (`client`, `oidc`) | `fleet-coordinator` only | hyper client, `jsonwebtoken` |
-| `forgs-client` | `fleet-bin` only (CLI login, keys, `/node/*` calls) | hyper client + rustls/ring; **no** axum, no sqlx |
+| `forgs` (pure core, no IO) | `probefleet-coordinator`, `probefleet` | serde, sha2, ulid |
+| `forgs-store` | `probefleet-coordinator` only | sqlx (SQLite) |
+| `forgs-http` | `probefleet-coordinator` only | axum |
+| `forgs-idp` (`client`, `oidc`) | `probefleet-coordinator` only | hyper client, `jsonwebtoken` |
+| `forgs-client` | `probefleet` only (CLI login, keys, `/node/*` calls) | hyper client + rustls/ring; **no** axum, no sqlx |
 
-`fleet-agent`, `fleet-sidecar`, `fleet-proto`, `fleet-core` and `fleet-wire`
+`probefleet-agent`, `probefleet-sidecar`, `probefleet-proto`, `probefleet-core` and `probefleet-wire`
 link **no forgs crate at all**: they only ever *present* a bearer token and
-stay prefix-agnostic, and fleet-proto carries its own serde mirror of the
+stay prefix-agnostic, and probefleet-proto carries its own serde mirror of the
 subject key. The test forbids `axum`, `hyper`, `forgs-store`, `forgs-http` and
-`sqlx` in `fleet-agent`'s graph, and `forgs-http`, `forgs-store`, `axum` and
-`sqlx` in `fleet-sidecar`'s. forgs keeps the same pure-Rust, `ring`,
+`sqlx` in `probefleet-agent`'s graph, and `forgs-http`, `forgs-store`, `axum` and
+`sqlx` in `probefleet-sidecar`'s. forgs keeps the same pure-Rust, `ring`,
 `default-features = false` discipline as this workspace, so none of it changes
 the musl build; the `aws-lc` check above covers it.
 
 To be accurate about what that buys: it is **not** what keeps the Pi build
-working — `fleet-bin` links the coordinator, so axum ships on the Pi regardless.
+working — `probefleet` links the coordinator, so axum ships on the Pi regardless.
 It is a layering rule. A library that discovers probes and dials outward should
-not need a server framework to compile, and the moment `fleet-agent` can reach
+not need a server framework to compile, and the moment `probefleet-agent` can reach
 for `axum::extract::ws::WebSocket` the `WireTx`/`WireRx` seam stops being load
 bearing and the next transport change has to be made twice.
 
@@ -196,16 +196,16 @@ bearing and the next transport change has to be made twice.
 Architecture §6.7 added GitHub Actions workload-identity verification, which
 means **`jsonwebtoken`** and its signature-algorithm tail: `rsa`,
 `num-bigint-dig`, `p256`, `p384`, `ed25519-dalek`. It sits behind `forgs-idp`'s
-off-by-default `oidc` feature, enabled by exactly one crate — `fleet-coordinator`,
+off-by-default `oidc` feature, enabled by exactly one crate — `probefleet-coordinator`,
 the only one that verifies a token.
 
 Be accurate about what that gate buys, because the obvious reading is wrong:
 
-- **It does not keep the tail off the Pi.** `fleet-bin` links the coordinator,
+- **It does not keep the tail off the Pi.** `probefleet` links the coordinator,
   so `jsonwebtoken` is in the shipped binary's graph on every target, exactly as
-  `axum` is. `cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf -i
+  `axum` is. `cargo tree -p probefleet --target armv7-unknown-linux-musleabihf -i
   jsonwebtoken` prints it.
-- **What it does buy** is that `fleet-agent` and `fleet-sidecar` link none of it
+- **What it does buy** is that `probefleet-agent` and `probefleet-sidecar` link none of it
   — the same layering rule as the section above, for the same reason. A library
   that discovers probes has no business compiling an RSA implementation, and a
   crate that only ever *presents* a bearer token should not gain the ability to

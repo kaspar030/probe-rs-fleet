@@ -22,10 +22,10 @@
 //! matching no longer carrying an org argument of its own, this comparison *is*
 //! the tenancy boundary.
 
-use fleet_proto::board::Board;
-use fleet_proto::ids::OrgId;
-use fleet_proto::lease::Constraint;
-use fleet_proto::token::AllowedOp;
+use probefleet_proto::board::Board;
+use probefleet_proto::ids::OrgId;
+use probefleet_proto::lease::Constraint;
+use probefleet_proto::token::AllowedOp;
 
 /// One live grant, as the evaluator sees it.
 ///
@@ -52,7 +52,7 @@ impl GrantScope {
     /// Whether the grant is still live at `now`.
     ///
     /// Exclusive at the boundary, matching
-    /// [`fleet_proto::token::CapabilityToken::is_valid_at`]: `now == expires`
+    /// [`probefleet_proto::token::CapabilityToken::is_valid_at`]: `now == expires`
     /// is expired.
     #[must_use]
     pub fn is_live_at(&self, now: u64) -> bool {
@@ -180,8 +180,8 @@ pub fn selector_matches(board: &Board, constraint: &Constraint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fleet_proto::board::{BoardState, PowerKind};
-    use fleet_proto::ids::{BoardName, BoardRef, NodeId};
+    use probefleet_proto::board::{BoardState, PowerKind};
+    use probefleet_proto::ids::{BoardName, BoardRef, NodeId};
 
     fn org(name: &str) -> OrgId {
         OrgId(name.to_owned())
