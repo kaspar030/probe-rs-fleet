@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use std::process::ExitCode;
 
-use probefleet_proto::admin::{BoardSummary, NodeSummary};
+use probefleet_proto::admin::{BoardSummary, LeaseHolderSummary, NodeSummary};
 use probefleet_proto::ids::BoardName;
 use probefleet_proto::lease::{Constraint, LeaseRequest, Priority};
 use probefleet_proto::token::AllowedOp;
@@ -466,13 +466,7 @@ impl CtlClient {
                 if holders.is_empty() {
                     println!("no active leases");
                 } else {
-                    println!("{:<8} {:<32} {:<24} EXPIRES", "LEASE", "BOARD", "HOLDER");
-                    for h in holders {
-                        println!(
-                            "{:<8} {:<32} {:<24} {}",
-                            h.lease.0, h.board, h.holder, h.expires
-                        );
-                    }
+                    print!("{}", render_lease_table(&holders));
                 }
                 Ok(())
             }
@@ -509,60 +503,123 @@ impl CtlClient {
     }
 }
 
+/// Strip the `<org>/` prefix a [`probefleet_proto::ids::NodeId`] carries.
+///
+/// Node ids are namespaced by org (`<org id>/beast`), so printing them raw
+/// repeats an opaque ULID on every row. The org is shown once, in its own
+/// column, when a table spans more than one.
+fn strip_org<'a>(org: &probefleet_proto::ids::OrgId, s: &'a str) -> &'a str {
+    s.strip_prefix(org.0.as_str())
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(s)
+}
+
+/// `<node>/<name>` for a board, without the org prefix.
+fn short_board(board: &probefleet_proto::ids::BoardRef) -> String {
+    format!("{}/{}", strip_org(&board.org, &board.node.0), board.name)
+}
+
 /// Render the `ctl list` board table.
 ///
 /// Split out of the RPC so the layout is unit-testable without a coordinator.
 ///
-/// TAGS sits **before** HOLDER because HOLDER is the one frequently-empty,
-/// variable-width column and is already last; padding TAGS to a fixed width
-/// keeps HOLDER aligned. `exclusive` and `power` stay out of the table — they
-/// would push it past any terminal — and are carried by `--json`, which is
-/// exactly why `--json` exists.
+/// BOARD is `<node>/<name>` and AGENT is `<node>`: the org ULID prefix of the
+/// stable key is dropped, and an ORG column (the org's path, falling back to
+/// its id) appears only when the listing spans more than one org — which
+/// happens when a grant shares another org's boards. HOLDER is the holder's
+/// username when the coordinator resolved one, else its stable key.
+/// `--json` keeps the full stable keys. `exclusive` and `power` stay out of
+/// the table — they would push it past any terminal — and are carried by
+/// `--json`, which is exactly why `--json` exists.
 fn render_board_table(boards: &[BoardSummary]) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    // BOARD is the fleet key "<org>/<node>/<name>", so it is wider than
-    // revision 1's bare id. MODEL is what `board=<model>` matches; `-` means
-    // the board declared none (every adopted board), so no `board=` selector
-    // can reach it.
-    let _ = writeln!(
-        out,
-        "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} {:<10} HOLDER",
-        "BOARD", "AGENT", "MODEL", "CHIP", "STATE", "TAGS", "SERIAL"
-    );
-    for b in boards {
-        let state = format!("{:?}", b.availability);
-        // Render the holder as its stable key ("<org>/<kind>:<id>").
-        let holder = b
-            .holder
-            .as_ref()
-            .map_or_else(String::new, ToString::to_string);
-        let model = b.model.as_deref().unwrap_or("-");
-        // Port names `ctl serial <board> --port` accepts; `-` for none.
-        let serial = if b.serial_ports.is_empty() {
-            "-".to_owned()
-        } else {
-            b.serial_ports
-                .iter()
-                .map(|p| p.name.as_str())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let _ = writeln!(
-            out,
-            "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} {:<10} {}",
-            b.board,
-            b.node.0,
-            model,
-            b.chip,
-            state,
-            crate::render::tags_cell(&b.tags),
-            serial,
-            holder
-        );
+    let multi_org = boards
+        .iter()
+        .map(|b| &b.board.org)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1;
+    // MODEL is what `board=<model>` matches; `-` means the board declared
+    // none (every adopted board), so no `board=` selector can reach it.
+    let mut header = vec![
+        "BOARD", "AGENT", "MODEL", "CHIP", "STATE", "TAGS", "SERIAL", "HOLDER",
+    ];
+    if multi_org {
+        header.insert(0, "ORG");
     }
-    out
+    let rows: Vec<Vec<String>> = boards
+        .iter()
+        .map(|b| {
+            let holder = b.holder_display.clone().unwrap_or_else(|| {
+                b.holder
+                    .as_ref()
+                    .map_or_else(String::new, ToString::to_string)
+            });
+            // Port names `ctl serial <board> --port` accepts; `-` for none.
+            let serial = if b.serial_ports.is_empty() {
+                "-".to_owned()
+            } else {
+                b.serial_ports
+                    .iter()
+                    .map(|p| p.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let mut row = vec![
+                short_board(&b.board),
+                strip_org(&b.board.org, &b.node.0).to_owned(),
+                b.model.as_deref().unwrap_or("-").to_owned(),
+                b.chip.clone(),
+                format!("{:?}", b.availability),
+                crate::render::tags_cell(&b.tags),
+                serial,
+                holder,
+            ];
+            if multi_org {
+                row.insert(
+                    0,
+                    b.org_name.clone().unwrap_or_else(|| b.board.org.0.clone()),
+                );
+            }
+            row
+        })
+        .collect();
+    crate::render::table(&header, &rows)
+}
+
+/// Render the `ctl who` lease table.
+///
+/// Same treatment as [`render_board_table`]: BOARD without the org prefix, an
+/// ORG column (the org id — the lease row carries no org path) only when the
+/// leases span more than one org, and HOLDER as a username when resolved.
+fn render_lease_table(holders: &[LeaseHolderSummary]) -> String {
+    let multi_org = holders
+        .iter()
+        .map(|h| &h.board.org)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1;
+    let mut header = vec!["LEASE", "BOARD", "HOLDER", "EXPIRES"];
+    if multi_org {
+        header.insert(1, "ORG");
+    }
+    let rows: Vec<Vec<String>> = holders
+        .iter()
+        .map(|h| {
+            let mut row = vec![
+                h.lease.0.to_string(),
+                short_board(&h.board),
+                h.holder_display
+                    .clone()
+                    .unwrap_or_else(|| h.holder.to_string()),
+                h.expires.to_string(),
+            ];
+            if multi_org {
+                row.insert(1, h.board.org.0.clone());
+            }
+            row
+        })
+        .collect();
+    crate::render::table(&header, &rows)
 }
 
 /// Render the `ctl nodes` machine table.
@@ -572,31 +629,24 @@ fn render_board_table(boards: &[BoardSummary]) -> String {
 /// populated value is numeric. BOARDS is an empty cell for a machine that has
 /// reported no probes, which is exactly the row `ctl list` cannot show.
 fn render_node_table(nodes: &[NodeSummary]) -> String {
-    use std::fmt::Write as _;
-
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{:<24} {:<24} {:<10} {:<8} {:<12} BOARDS",
-        "NAME", "TAGS", "ADOPT", "ONLINE", "LAST-SEEN"
-    );
-    for n in nodes {
-        let online = if n.online { "yes" } else { "no" };
-        let last_seen = n
-            .last_seen
-            .map_or_else(|| "never".to_owned(), |ts| ts.to_string());
-        let _ = writeln!(
-            out,
-            "{:<24} {:<24} {:<10} {:<8} {:<12} {}",
-            n.name,
-            crate::render::tags_cell(&n.tags),
-            n.adopt.as_str(),
-            online,
-            last_seen,
-            n.boards.join(",")
-        );
-    }
-    out
+    let rows: Vec<Vec<String>> = nodes
+        .iter()
+        .map(|n| {
+            vec![
+                n.name.clone(),
+                crate::render::tags_cell(&n.tags),
+                n.adopt.as_str().to_owned(),
+                if n.online { "yes" } else { "no" }.to_owned(),
+                n.last_seen
+                    .map_or_else(|| "never".to_owned(), |ts| ts.to_string()),
+                n.boards.join(","),
+            ]
+        })
+        .collect();
+    crate::render::table(
+        &["NAME", "TAGS", "ADOPT", "ONLINE", "LAST-SEEN", "BOARDS"],
+        &rows,
+    )
 }
 
 /// Run a `ctl` command, returning the process exit code.
@@ -895,6 +945,8 @@ mod tests {
                 interface: Some(1),
                 default_baud: 115_200,
             }],
+            org_name: Some("acme".to_owned()),
+            holder_display: Some("kaspar".to_owned()),
         }
     }
 
@@ -938,6 +990,95 @@ mod tests {
             !untagged.contains("none"),
             "an untagged board must not render a placeholder: {untagged}"
         );
+    }
+
+    const ORG: &str = "01J9Z3Q4ABCDEFGHJKMNPQRSTV";
+
+    /// The org ULID is not repeated on every row of a single-org listing:
+    /// BOARD is `<node>/<name>`, AGENT is `<node>`, and there is no ORG column.
+    #[test]
+    fn board_table_drops_the_org_prefix_for_a_single_org() {
+        let out = render_board_table(&[sample_board("dk-1", &[])]);
+        assert!(!out.contains(ORG), "{out}");
+        assert!(!out.lines().next().unwrap().contains("ORG"), "{out}");
+        let row = out.lines().nth(1).unwrap();
+        assert!(row.starts_with("beast/dk-1  beast  "), "{row}");
+    }
+
+    /// HOLDER is the username when resolved, else the stable key.
+    #[test]
+    fn board_table_holder_prefers_the_username() {
+        let out = render_board_table(&[sample_board("dk-1", &[])]);
+        assert!(out.lines().nth(1).unwrap().ends_with("kaspar"), "{out}");
+
+        let mut b = sample_board("dk-1", &[]);
+        b.holder_display = None;
+        let out = render_board_table(&[b]);
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap()
+                .ends_with("user:01J9Z3Q4ABCDEFGHJKMNPQRSTW"),
+            "{out}"
+        );
+    }
+
+    /// A listing spanning two orgs (a grant shares another org's boards) gets
+    /// an ORG column: the org path, else the org id.
+    #[test]
+    fn board_table_adds_an_org_column_across_orgs() {
+        use probefleet_proto::ids::{BoardRef, NodeId, OrgId};
+        let mut other = sample_board("dk-9", &[]);
+        let org2 = "01J9Z3Q4ABCDEFGHJKMNPQRSTX";
+        other.board = BoardRef::new(
+            OrgId(org2.to_owned()),
+            NodeId(format!("{org2}/lab")),
+            "dk-9",
+        );
+        other.node = NodeId(format!("{org2}/lab"));
+        other.org_name = None;
+        let out = render_board_table(&[sample_board("dk-1", &[]), other]);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].starts_with("ORG "), "{out}");
+        assert!(lines[1].starts_with("acme "), "{out}");
+        assert!(lines[1].contains("beast/dk-1"), "{out}");
+        assert!(lines[2].starts_with(org2), "{out}");
+        assert!(lines[2].contains(" lab/dk-9 "), "{out}");
+    }
+
+    /// Widths follow the content: a long board name pushes AGENT right on
+    /// every row, header included, so the columns stay aligned.
+    #[test]
+    fn board_table_columns_stay_aligned_with_a_long_name() {
+        let out = render_board_table(&[
+            sample_board("a-really-quite-long-board-name-that-overflows", &[]),
+            sample_board("dk-2", &[]),
+        ]);
+        let lines: Vec<&str> = out.lines().collect();
+        let col = lines[0].find("AGENT").unwrap();
+        for l in &lines[1..] {
+            assert_eq!(&l[col..col + 5], "beast", "{out}");
+        }
+    }
+
+    #[test]
+    fn lease_table_drops_the_org_prefix_and_shows_the_username() {
+        let b = sample_board("dk-1", &[]);
+        let h = LeaseHolderSummary {
+            lease: probefleet_proto::LeaseId(7),
+            board: b.board,
+            holder: b.holder.unwrap(),
+            expires: 123,
+            holder_display: Some("kaspar".to_owned()),
+        };
+        let out = render_lease_table(std::slice::from_ref(&h));
+        assert!(!out.contains(ORG), "{out}");
+        assert_eq!(out.lines().nth(1), Some("7      beast/dk-1  kaspar  123"));
+
+        let mut h = h;
+        h.holder_display = None;
+        let out = render_lease_table(&[h]);
+        assert!(out.contains("user:01J9Z3Q4ABCDEFGHJKMNPQRSTW"), "{out}");
     }
 
     /// The node table shows what `ctl list` cannot: tags, adopt policy, live

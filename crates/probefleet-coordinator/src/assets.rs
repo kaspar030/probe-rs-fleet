@@ -204,7 +204,9 @@ fn redirect_to_root() -> Response {
 fn org_segment_ok(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= 64
-        && segment.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && !crate::state::RESERVED_NAMES
             .iter()
             .any(|reserved| reserved.eq_ignore_ascii_case(segment))
@@ -458,7 +460,13 @@ mod tests {
     /// (any case) and anything with a dot, slash or odd byte do not.
     #[test]
     fn org_segments_are_screened_by_syntax_and_reserved_names() {
-        for ok in ["alice", "acme-labs", "a", "01J0000000000000000000ORG2", &"a".repeat(64)] {
+        for ok in [
+            "alice",
+            "acme-labs",
+            "a",
+            "01J0000000000000000000ORG2",
+            &"a".repeat(64),
+        ] {
             assert!(org_segment_ok(ok), "{ok} must be accepted");
         }
         for reserved in crate::state::RESERVED_NAMES {
@@ -468,7 +476,18 @@ mod tests {
                 "{reserved} is reserved in any case"
             );
         }
-        for bad in ["", "..", ".", "a.b", "a/b", "a b", "a_b", "\u{e9}", "a\0", &"a".repeat(65)] {
+        for bad in [
+            "",
+            "..",
+            ".",
+            "a.b",
+            "a/b",
+            "a b",
+            "a_b",
+            "\u{e9}",
+            "a\0",
+            &"a".repeat(65),
+        ] {
             assert!(!org_segment_ok(bad), "{bad:?} must be refused");
         }
     }

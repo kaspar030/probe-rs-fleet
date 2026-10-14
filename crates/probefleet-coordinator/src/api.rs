@@ -2083,6 +2083,8 @@ mod tests {
                 interface: Some(1),
                 default_baud: 115_200,
             }],
+            org_name: None,
+            holder_display: None,
         }))
         .unwrap();
         assert!(json.contains(r#""serial_ports":["if1"]"#), "{json}");

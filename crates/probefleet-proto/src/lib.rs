@@ -151,4 +151,10 @@ pub struct ChannelId(pub u64);
 ///   so every inventory report and board list re-encodes. The serial control
 ///   messages themselves ride *inside* relayed `DataFrame`s and add no
 ///   envelope variant.
-pub const PROTOCOL_VERSION: u32 = 13;
+/// * 13 → 14: readable `ctl list` / `ctl who`. [`admin::BoardSummary`] gained
+///   `org_name` (the board's org path) and `holder_display` (the holder's
+///   username), and [`admin::LeaseHolderSummary`] gained `holder_display`.
+///   All are display only — `org` / `holder` stay the identities. postcard is
+///   positional, so every `BoardList` and lease table re-encodes. No stored
+///   data is affected.
+pub const PROTOCOL_VERSION: u32 = 14;

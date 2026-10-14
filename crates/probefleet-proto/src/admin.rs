@@ -63,6 +63,12 @@ pub struct BoardSummary {
     pub expires: Option<u64>,
     /// USB serial ports the lease holder can open with `ctl serial`.
     pub serial_ports: Vec<SerialPortInfo>,
+    /// The board's org path (display name), if the coordinator resolved one.
+    /// Display only: `board.org` is the identity.
+    pub org_name: Option<String>,
+    /// A human rendering of `holder` (a user's username rather than
+    /// `user:<ulid>`), if the coordinator resolved one. Display only.
+    pub holder_display: Option<String>,
 }
 
 /// One row of the `ctl nodes` machine inventory.
@@ -117,6 +123,9 @@ pub struct LeaseHolderSummary {
     pub holder: SubjectKey,
     /// Expiry as epoch seconds.
     pub expires: u64,
+    /// A human rendering of `holder` (a user's username rather than
+    /// `user:<ulid>`), if the coordinator resolved one. Display only.
+    pub holder_display: Option<String>,
 }
 
 /// One audit/log line returned by `ctl logs`.

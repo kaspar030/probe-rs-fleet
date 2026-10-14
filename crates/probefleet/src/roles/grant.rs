@@ -176,27 +176,36 @@ async fn list_grants(args: GrantListArgs) -> Result<ExitCode> {
             if grants.is_empty() {
                 println!("this org has shared no boards");
             } else {
-                println!(
-                    "{:<34} {:<24} {:<28} {:<22} EXPIRES",
-                    "ID", "SUBJECT", "SELECTOR", "OPS"
-                );
-                for g in grants {
-                    println!(
-                        "{:<34} {:<24} {:<28} {:<22} {}",
-                        g.id,
-                        g.subject,
-                        g.selector,
-                        render_ops(&g.ops),
-                        g.expires
-                            .map_or_else(|| "never".to_owned(), |e| e.to_string())
-                    );
-                }
+                print!("{}", render_grant_table(&grants));
             }
             Ok(ExitCode::SUCCESS)
         }
         CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
         other => anyhow::bail!("unexpected reply: {other:?}"),
     }
+}
+
+/// Render the `grant list` table.
+///
+/// SUBJECT is the grantee's username when the coordinator resolved one, else
+/// its stable key. No ORG column: the list is always the caller's own org.
+fn render_grant_table(grants: &[probefleet_proto::admin::GrantSummary]) -> String {
+    let rows: Vec<Vec<String>> = grants
+        .iter()
+        .map(|g| {
+            vec![
+                g.id.clone(),
+                g.subject_display
+                    .clone()
+                    .unwrap_or_else(|| g.subject.to_string()),
+                g.selector.clone(),
+                render_ops(&g.ops),
+                g.expires
+                    .map_or_else(|| "never".to_owned(), |e| e.to_string()),
+            ]
+        })
+        .collect();
+    crate::render::table(&["ID", "SUBJECT", "SELECTOR", "OPS", "EXPIRES"], &rows)
 }
 
 /// `grant revoke <id>`.
@@ -309,5 +318,29 @@ mod tests {
             "flash,power-cycle"
         );
         assert_eq!(render_ops(&[]), "");
+    }
+
+    /// SUBJECT shows the username when resolved, else the stable key.
+    #[test]
+    fn grant_table_subject_prefers_the_username() {
+        use probefleet_proto::ids::{OrgId, SubjectKey, SubjectKind};
+        let mut g = probefleet_proto::admin::GrantSummary {
+            id: "ab".repeat(16),
+            org: OrgId("01J9Z3Q4ABCDEFGHJKMNPQRSTV".to_owned()),
+            org_name: Some("acme".to_owned()),
+            subject: SubjectKey::new(None, SubjectKind::User, "01J9Z3Q4ABCDEFGHJKMNPQRSTW")
+                .unwrap(),
+            subject_display: Some("kaspar".to_owned()),
+            selector: "nrf52".to_owned(),
+            ops: vec![AllowedOp::Flash],
+            expires: None,
+            created_by: None,
+            created_at: 0,
+        };
+        let out = render_grant_table(std::slice::from_ref(&g));
+        assert!(out.lines().nth(1).unwrap().contains("  kaspar  "), "{out}");
+        g.subject_display = None;
+        let out = render_grant_table(&[g]);
+        assert!(out.contains("user:01J9Z3Q4ABCDEFGHJKMNPQRSTW"), "{out}");
     }
 }

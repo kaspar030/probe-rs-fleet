@@ -18,9 +18,79 @@ pub(crate) fn tags_cell(tags: &[String]) -> String {
     tags.join(",")
 }
 
+/// Lay out a table whose column widths follow the content.
+///
+/// Each column is as wide as its widest cell (header included, counted in
+/// `char`s), columns are separated by two spaces, the last column is never
+/// padded, and trailing whitespace is trimmed so an empty last cell leaves
+/// none behind. Every line, header included, ends in `\n`.
+///
+/// Fixed widths were the original layout, and they broke as soon as a value
+/// outgrew its slot (a fleet board key is ~70 characters): every column after
+/// it shifted right on that row only.
+pub(crate) fn table(header: &[&str], rows: &[Vec<String>]) -> String {
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            let w = cell.chars().count();
+            match widths.get_mut(i) {
+                Some(slot) => *slot = (*slot).max(w),
+                None => widths.push(w),
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut line = |cells: &mut dyn Iterator<Item = &str>| {
+        let mut l = String::new();
+        for (i, cell) in cells.enumerate() {
+            if i > 0 {
+                l.push_str("  ");
+            }
+            l.push_str(cell);
+            let pad = widths[i].saturating_sub(cell.chars().count());
+            l.extend(std::iter::repeat_n(' ', pad));
+        }
+        out.push_str(l.trim_end());
+        out.push('\n');
+    };
+    line(&mut header.iter().copied());
+    for row in rows {
+        line(&mut row.iter().map(String::as_str));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn columns_are_as_wide_as_their_widest_cell() {
+        let out = table(
+            &["A", "B", "C"],
+            &[
+                vec![
+                    "a-very-long-cell".to_owned(),
+                    "x".to_owned(),
+                    "1".to_owned(),
+                ],
+                vec!["s".to_owned(), "yy".to_owned(), "2".to_owned()],
+            ],
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "A                 B   C");
+        assert_eq!(lines[1], "a-very-long-cell  x   1");
+        assert_eq!(lines[2], "s                 yy  2");
+    }
+
+    #[test]
+    fn no_trailing_whitespace_for_an_empty_last_cell() {
+        let out = table(&["A", "HOLDER"], &[vec!["a".to_owned(), String::new()]]);
+        for l in out.lines() {
+            assert_eq!(l, l.trim_end(), "{out:?}");
+        }
+        assert_eq!(out.lines().nth(1), Some("a"));
+    }
 
     fn owned(tags: &[&str]) -> Vec<String> {
         tags.iter().map(|t| (*t).to_owned()).collect()

@@ -333,7 +333,12 @@ async fn org_page_urls_leak_no_org_existence() {
     // The session API: `org: null` for every org bob cannot act in, by path
     // or id, and byte-identical answers.
     let mut sessions = Vec::new();
-    for org in ["acme", "no-such-org", acme.0.as_str(), "01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
+    for org in [
+        "acme",
+        "no-such-org",
+        acme.0.as_str(),
+        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    ] {
         let path = format!("/api/v1/session?org={org}");
         let (status, body) = as_browser(&fleet, "GET", &path, &bob, None).await;
         assert_eq!(status, 200, "{path}: {body}");

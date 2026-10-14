@@ -930,7 +930,7 @@ impl Coordinator {
             return Err(OpError::Denied);
         }
         let sched = self.scheduler.lock().await;
-        let boards = sched
+        let mut boards = sched
             .boards()
             .filter(|b| access.may_use(b, now))
             .map(|b| {
@@ -958,9 +958,33 @@ impl Coordinator {
                     lease,
                     expires,
                     serial_ports: b.serial_ports.clone(),
+                    org_name: None,
+                    holder_display: None,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // The display lookups hit the database, so never under the scheduler
+        // lock. They are best-effort (a miss renders the raw key), which keeps
+        // this core infallible past the access check.
+        drop(sched);
+        let mut org_names: std::collections::HashMap<OrgId, Option<String>> =
+            std::collections::HashMap::new();
+        let mut displays: std::collections::HashMap<SubjectKey, Option<String>> =
+            std::collections::HashMap::new();
+        for b in &mut boards {
+            if !org_names.contains_key(&b.board.org) {
+                let name = self.db.org_name(&b.board.org).await.ok().flatten();
+                org_names.insert(b.board.org.clone(), name);
+            }
+            b.org_name.clone_from(&org_names[&b.board.org]);
+            if let Some(holder) = &b.holder {
+                if !displays.contains_key(holder) {
+                    let d = self.subject_display(holder).await;
+                    displays.insert(holder.clone(), d);
+                }
+                b.holder_display.clone_from(&displays[holder]);
+            }
+        }
         Ok(boards)
     }
 
@@ -969,7 +993,8 @@ impl Coordinator {
     async fn list_boards(&self, subject: &Subject) -> CoordToSidecar {
         match self.list_boards_core(subject).await {
             Ok(boards) => CoordToSidecar::BoardList(boards),
-            // Only `Denied` is reachable here — the core does no fallible I/O.
+            // Only `Denied` is reachable here — the core's only I/O past the
+            // access check is best-effort display lookups that cannot fail it.
             // The remaining variants still have to go somewhere: this reply
             // has no error channel of its own (the signature predates the
             // core split and `handle_sidecar_message`'s call site must not
@@ -1678,7 +1703,7 @@ impl Coordinator {
             return Err(OpError::Denied);
         }
         let sched = self.scheduler.lock().await;
-        let holders = sched
+        let mut holders = sched
             .boards()
             .filter(|b| access.may_use(b, now))
             .filter_map(|b| match &b.state {
@@ -1687,10 +1712,22 @@ impl Coordinator {
                     board: b.id.clone(),
                     holder: by.clone(),
                     expires: *expires,
+                    holder_display: None,
                 }),
                 _ => None,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        // Best-effort display lookups, outside the scheduler lock.
+        drop(sched);
+        let mut displays: std::collections::HashMap<SubjectKey, Option<String>> =
+            std::collections::HashMap::new();
+        for h in &mut holders {
+            if !displays.contains_key(&h.holder) {
+                let d = self.subject_display(&h.holder).await;
+                displays.insert(h.holder.clone(), d);
+            }
+            h.holder_display.clone_from(&displays[&h.holder]);
+        }
         Ok(holders)
     }
 
@@ -4533,8 +4570,30 @@ mod tests {
             .await
             .unwrap();
         match rx.recv().await.unwrap() {
-            CoordToSidecar::LeaseTable(rows) => assert_eq!(rows.len(), 1),
+            CoordToSidecar::LeaseTable(rows) => {
+                assert_eq!(rows.len(), 1);
+                // The display name rides along; the key stays the identity.
+                assert_eq!(rows[0].holder_display.as_deref(), Some("alice"));
+            }
             other => panic!("expected LeaseTable, got {other:?}"),
+        }
+        // `ctl list` for org A names the org and the holder readably.
+        coord
+            .handle_sidecar_message(
+                &alice_a,
+                SidecarToCoord::ListBoards,
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::BoardList(boards) => {
+                assert_eq!(boards.len(), 1);
+                assert_eq!(boards[0].org_name.as_deref(), Some("org-a"));
+                assert_eq!(boards[0].holder_display.as_deref(), Some("alice"));
+            }
+            other => panic!("expected BoardList, got {other:?}"),
         }
 
         // Lease verbs on the other org's lease are indistinguishable from
