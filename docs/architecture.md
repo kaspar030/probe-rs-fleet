@@ -856,7 +856,7 @@ and there is an authorization layer over every board. Every generic piece of
 that — users, orgs, memberships, sessions, refresh tokens, API keys, workload
 tokens, grants, the device flow, browser login, cookies and CSRF — lives in
 **forgs** ([github.com/kaspar030/forgs](https://github.com/kaspar030/forgs),
-`docs/design.md` there), a git dependency of this workspace. fleet keeps only
+`docs/design.md` there), a crates.io dependency of this workspace. fleet keeps only
 what is about hardware: nodes, boards, leases, capability tokens, the board
 selector and op vocabulary, and the two hooks through which forgs asks fleet a
 question.
@@ -2190,7 +2190,7 @@ probe-rs-fleet/
 
 `fleet-core` stays pure so the scheduler is testable without sockets or USB.
 There is no `fleet-auth` any more: identity lives in the **forgs**
-workspace (github.com/kaspar030/forgs, a pinned git dependency;
+workspace (github.com/kaspar030/forgs, a crates.io dependency;
 `forgs` pure core, `forgs-store`, `forgs-http`, `forgs-idp`,
 `forgs-client`). `fleet-coordinator` links the server half; `fleet-bin` links
 `forgs` + `forgs-client`; `fleet-agent`, `fleet-sidecar`, `fleet-proto`,

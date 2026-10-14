@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+# Package contents for crates.io: sources plus the assets embedded at compile
+# time (web UI, migrations) — no tests, fixtures or scratch dirs.
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE", "build.rs", "migrations/**", "web/**"]
 description = "Coordinator role implementation for probe-rs-fleet."
 
 [dependencies]

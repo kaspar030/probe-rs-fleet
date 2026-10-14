@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 description = "Core domain types and shared logic for probe-rs-fleet."
 
 [dependencies]

@@ -70,16 +70,54 @@ reformat is correct. Expected residue, not a failure.
 ## The forgs dependency
 
 Identity and auth come from [forgs](https://github.com/kaspar030/forgs), a
-git dependency pinned by `rev` in the root `Cargo.toml` (all five `forgs*`
-crates share one rev). A plain clone builds as-is; no sibling checkout is
-needed.
+regular crates.io dependency (`forgs`, `forgs-store`, `forgs-http`,
+`forgs-idp`, `forgs-client`, all at the same version in the root
+`Cargo.toml`). A plain clone builds as-is; no sibling checkout is needed.
 
-- **Bumping forgs:** change the `rev` on all five entries, then
+- **Bumping forgs:** change the `version` on all five entries, then
   `cargo build --workspace` to refresh `Cargo.lock`.
 - **Co-developing forgs and fleet:** check forgs out next to this repo
-  (`../forgs`) and uncomment the `[patch."https://github.com/kaspar030/forgs"]`
-  block at the end of the root `Cargo.toml`. Do not commit it uncommented;
-  push the forgs change and bump the rev instead.
+  (`../forgs`) and uncomment the `[patch.crates-io]` block at the end of the
+  root `Cargo.toml` (or put the same table in `.cargo/config.toml`). Do not
+  commit it uncommented; publish the forgs change and bump the version instead.
+
+## Publishing to crates.io
+
+Nothing has been published yet. Open points before the first release:
+
+- **Crate names.** `fleet-coordinator` is already taken on crates.io by an
+  unrelated project; the other `fleet-*` names were free when checked
+  (2026-10). The rename (e.g. `probe-rs-fleet-*`, with `fleet-bin` becoming
+  `probe-rs-fleet`) is still to be decided.
+- **Copyright holder** in `LICENSE-MIT` is to be confirmed.
+
+Every crate's metadata is inherited from `[workspace.package]`; the packaged
+files are an `include` allowlist per crate (sources, `LICENSE-*` — symlinks to
+the repo root — and, for `fleet-coordinator`, `build.rs`, `migrations/` and
+`web/`, which are embedded at compile time). Tests and fixtures are not shipped.
+
+**Versions.** Internal crates are listed in `[workspace.dependencies]` with
+both `path` and `version`; bump those `version`s together with
+`workspace.package.version`.
+
+**Order.** A crate can only be published once the workspace crates it depends
+on (including dev-dependencies) are on crates.io:
+
+1. `fleet-proto`
+2. `fleet-core`
+3. `fleet-tls`
+4. `fleet-wire`
+5. `fleet-agent`, then `fleet-sidecar` (dev-depends on `fleet-agent`)
+6. `fleet-coordinator` (dev-depends on `fleet-agent` and `fleet-sidecar`)
+7. `fleet-bin`
+
+**Checking.** `cargo package --list -p <crate>` shows what would ship.
+`cargo package -p fleet-proto -p fleet-core …` (several `-p` at once) verifies
+crates that depend on unpublished siblings through a local overlay; a single
+`cargo publish --dry-run -p <crate>` fails on registry resolution until its
+workspace dependencies are actually published. Recent cargo (1.90+) can do the
+whole thing with `cargo publish --workspace`, which publishes in dependency
+order.
 
 ## Before you open a PR
 

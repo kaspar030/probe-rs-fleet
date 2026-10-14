@@ -24,25 +24,29 @@ edition = "2021"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ariel-os/probe-rs-fleet"
+authors = ["Kaspar Schleiser <kaspar@schleiser.de>"]
+keywords = ["probe-rs", "embedded", "hil", "testing", "fleet"]
+categories = ["embedded", "development-tools::testing", "hardware-support"]
 
 [workspace.dependencies]
-# internal
-fleet-proto = { path = "crates/fleet-proto" }
-fleet-core = { path = "crates/fleet-core" }
-fleet-tls = { path = "crates/fleet-tls" }
+# internal. The `version` here must be bumped together with
+# `workspace.package.version` (crates.io requires it next to `path`).
+fleet-proto = { version = "0.1.0", path = "crates/fleet-proto" }
+fleet-core = { version = "0.1.0", path = "crates/fleet-core" }
+fleet-tls = { version = "0.1.0", path = "crates/fleet-tls" }
+fleet-wire = { version = "0.1.0", path = "crates/fleet-wire" }
+fleet-agent = { version = "0.1.0", path = "crates/fleet-agent" }
+fleet-coordinator = { version = "0.1.0", path = "crates/fleet-coordinator" }
+fleet-sidecar = { version = "0.1.0", path = "crates/fleet-sidecar" }
 
-# identity / auth (forgs). Pulled from GitHub, pinned by rev; to bump, change
-# the rev on all five. For local co-development against a sibling forgs
-# checkout, see the commented-out [patch] block at the end of this file.
-forgs = { git = "https://github.com/kaspar030/forgs", rev = "c1f7c8294810347ce417d60797972ed0c2431b04" }
-forgs-store = { git = "https://github.com/kaspar030/forgs", rev = "c1f7c8294810347ce417d60797972ed0c2431b04" }
-forgs-http = { git = "https://github.com/kaspar030/forgs", rev = "c1f7c8294810347ce417d60797972ed0c2431b04" }
-forgs-idp = { git = "https://github.com/kaspar030/forgs", rev = "c1f7c8294810347ce417d60797972ed0c2431b04" }
-forgs-client = { git = "https://github.com/kaspar030/forgs", rev = "c1f7c8294810347ce417d60797972ed0c2431b04" }
-fleet-wire = { path = "crates/fleet-wire" }
-fleet-agent = { path = "crates/fleet-agent" }
-fleet-coordinator = { path = "crates/fleet-coordinator" }
-fleet-sidecar = { path = "crates/fleet-sidecar" }
+# identity / auth (forgs), from crates.io. Bump all five together. For local
+# co-development against a sibling forgs checkout, see the commented-out
+# [patch.crates-io] block at the end of this file.
+forgs = "0.1.0"
+forgs-store = "0.1.0"
+forgs-http = "0.1.0"
+forgs-idp = "0.1.0"
+forgs-client = "0.1.0"
 
 # rpc / wire
 postcard-rpc = { version = "0.12", features = ["use-std"] }
@@ -157,10 +161,10 @@ tempfile = "3"
 
 # Local co-development against a sibling forgs checkout (`../forgs`): uncomment
 # this block (do not commit it uncommented). Equivalent without editing this
-# file: a `[patch]` table in `.cargo/config.toml`, or per command
-#   --config 'patch."https://github.com/kaspar030/forgs".forgs.path="../forgs/crates/forgs"'
+# file: a `[patch.crates-io]` table in `.cargo/config.toml`, or per command
+#   --config 'patch.crates-io.forgs.path="../forgs/crates/forgs"'
 # (repeat for each crate).
-# [patch."https://github.com/kaspar030/forgs"]
+# [patch.crates-io]
 # forgs = { path = "../forgs/crates/forgs" }
 # forgs-store = { path = "../forgs/crates/forgs-store" }
 # forgs-http = { path = "../forgs/crates/forgs-http" }

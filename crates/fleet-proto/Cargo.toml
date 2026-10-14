@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = false
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
 description = "Shared wire types and RPC service definitions for probe-rs-fleet (no I/O)."
 
 [dependencies]

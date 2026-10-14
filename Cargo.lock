@@ -908,7 +908,8 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "forgs"
 version = "0.1.0"
-source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97ffd9f0facfe2820a029e55f6cea25858152ea6ebccfd93bf2d0a117d2a7376"
 dependencies = [
  "async-trait",
  "base64",
@@ -923,7 +924,8 @@ dependencies = [
 [[package]]
 name = "forgs-client"
 version = "0.1.0"
-source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550d5f93cca15e030326a6432ddb78ba6df0aa3d0d6983c68c6c6c8b410c884c"
 dependencies = [
  "forgs",
  "http",
@@ -943,7 +945,8 @@ dependencies = [
 [[package]]
 name = "forgs-http"
 version = "0.1.0"
-source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb4da74c8abe550124ba4ae94f2c2ad3c53a2af44b75f9c608990fca243c3163"
 dependencies = [
  "async-trait",
  "axum",
@@ -965,7 +968,8 @@ dependencies = [
 [[package]]
 name = "forgs-idp"
 version = "0.1.0"
-source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6d0628b08b8d39c2ae60029dbd699863f6210d343db278a0a23c76893692d2e"
 dependencies = [
  "async-trait",
  "base64",
@@ -990,7 +994,8 @@ dependencies = [
 [[package]]
 name = "forgs-store"
 version = "0.1.0"
-source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f8a46cb7a37f3f79acf9bc8d8d093778f87a949b50d2cf8cd16cfa4207426ee"
 dependencies = [
  "async-trait",
  "forgs",

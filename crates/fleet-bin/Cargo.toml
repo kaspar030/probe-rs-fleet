@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities", "embedded", "development-tools::testing"]
+readme = "../../README.md"
+include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE", "README.md"]
 description = "Single multi-role binary for probe-rs-fleet (coordinator, agent, sidecar, ctl)."
 
 [[bin]]

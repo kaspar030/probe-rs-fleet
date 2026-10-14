@@ -164,8 +164,8 @@ link only the client half. `crates/fleet-agent/tests/no_http_server_dep.rs`
 enforces this.
 
 **The same test fences identity.** Identity lives in the forgs workspace
-([github.com/kaspar030/forgs](https://github.com/kaspar030/forgs), a pinned
-git dependency), and its crates are split exactly along this line:
+([github.com/kaspar030/forgs](https://github.com/kaspar030/forgs), a
+crates.io dependency), and its crates are split exactly along this line:
 
 | crate | linked by | what it pulls |
 |---|---|---|
