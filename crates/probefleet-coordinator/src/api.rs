@@ -1957,7 +1957,7 @@ struct AuthKeyCreateRequest {
     /// For a `ci` key: the ops its synthesised grant confers.
     #[serde(default)]
     ops: Vec<String>,
-    /// For a `ci` key: a stable identity name (`--as` on the CLI).
+    /// For a `ci` key: a stable identity name (`--name` on the CLI).
     ///
     /// A name alongside `purpose: "node"`, or one outside `[a-z0-9._-]`, is a
     /// `400` — the validation is [`forgs_http::keys::create`]'s, as

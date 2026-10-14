@@ -292,7 +292,7 @@ coordinator_token_pubkey = "…"   # verifies per-lease capability tokens
 
 [agent]                # present once `agent login` has run (§6.7)
 auth_key = "…"         # prfk1_…, the DURABLE credential, re-redeemed on demand
-name = "desk-bot"      # the `--as` identity; display only, not verified
+name = "desk-bot"      # the `--name` identity; display only, not verified
 workload_token = "…"   # the current short-lived session
 expires = 1788999999   # required here, so staleness is knowable offline
 ```
@@ -1052,7 +1052,7 @@ The decisions that are load-bearing:
   | node | `<org id>/node:<node id>` | node token (fleet's app kind) |
   | workload | `gha/workload:<owner>/<repo>` | GitHub Actions OIDC (§6.7) |
   | workload | `<org id>/workload:key:<hash8>` | unnamed `ci` API key |
-  | workload | `<org id>/workload:agent:<name>` | `ci` key minted `--as <name>` |
+  | workload | `<org id>/workload:agent:<name>` | `ci` key minted `--name <name>` |
 
   The coordinator attaches the acting org to it (`subject::Subject`) and
   converts forgs ↔ wire keys by render + parse; a key that does not survive
@@ -1885,7 +1885,7 @@ burning a single-use key, and a `ci` key cannot enroll a node.
 Redeeming a `ci` key (`POST /auth/token`, `grant_type: api_key`) does **not**
 widen `board_access`. forgs consumes the key and derives the subject
 `<org>/workload:key:<hash8>` (or `<org>/workload:agent:<name>` for a key minted
-`--as <name>` — see below); fleet's `on_workload_redeemed` hook then upserts
+`--name <name>` — see below); fleet's `on_workload_redeemed` hook then upserts
 an *ordinary grant* — the same kind of row `grant --repo` writes, evaluated by
 the same code and revocable by the same verb — whose selector and ops come from
 the key's payload; forgs then mints the workload token. The grant's id is
@@ -1918,10 +1918,11 @@ old — produces a **new subject and a new grant row**: the audit trail forks, t
 per-subject concurrency cap resets, and the old grant lingers. A long-running
 agent or CI runner has no persistent identity at all.
 
-`auth-key create --purpose ci --as <name>` gives it one. The name is stored in
+`auth-key create --purpose ci --name <name>` gives it one. (`--as` is still accepted as a
+deprecated alias.) The name is stored in
 `forgs_api_key.subject_name` (NULL, not `''`, means "no name"), and redemption
 then builds the subject `<org>/workload:agent:<name>` and a grant id derived
-from `(org, subject)`. Because the upsert is keyed on the grant id, a re-minted key with the same `--as`
+from `(org, subject)`. Because the upsert is keyed on the grant id, a re-minted key with the same `--name`
 re-upserts the **same row**: same audit history, same concurrency budget, same
 revocation handle. Nothing downstream changes — `board_access`, `Access`, the
 scheduler and the audit log are all subject-key-generic, and `SubjectKey::parse`
@@ -1952,7 +1953,7 @@ what its redemption synthesises. Such a grant has an ordinary random id and is
 id — it is the one grant that survives.
 
 **The trade, which is the whole point and a security-relevant surprise if
-unstated: two live keys sharing an `--as` are one identity, and the grant
+unstated: two live keys sharing an `--name` are one identity, and the grant
 belongs to the identity, not to the key.** Revoking one of them tears down that
 shared grant and every live lease held under the name — including another key's
 runner, mid-job. It does not end the identity: a surviving key with the same
@@ -1989,7 +1990,7 @@ with lives `workload_token_ttl_secs` (default 1h) and, per the subsection above,
 `ci login` hourly — a cron job or retry wrapper reimplemented per sandbox, which
 does not even propagate between the concurrent processes sharing the machine.
 
-`probefleet agent login --fleet-url <url> --auth-key prfk1_… [--as <name>]`
+`probefleet agent login --fleet-url <url> --auth-key prfk1_… [--name <name>]`
 closes that. It stores the durable key in the fleet file's `[agent]` table
 (§4.1), and `ctl` and the `probe-rs` shim re-**redeem** it whenever the stored
 token is within 60s of expiry.

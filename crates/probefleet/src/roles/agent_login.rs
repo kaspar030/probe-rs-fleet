@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! probefleet agent login --fleet-url https://fleet.example \
-//!     --auth-key prfk1_… --as desk-bot
+//!     --auth-key prfk1_… --name desk-bot
 //! ```
 //!
 //! # Who this is for, and what it grants
@@ -11,7 +11,7 @@
 //! A long-running sandbox — a dev container, a shared build box, an agent's
 //! workspace — with **concurrent processes** that all want to reach the fleet.
 //! Such a machine can already hold a persistent *identity*
-//! (`auth-key create --purpose agent --as <name>`), but not a persistent
+//! (`auth-key create --purpose agent --name <name>`), but not a persistent
 //! *session*: the `prfw1_` workload token it authenticates with lives about an
 //! hour and nothing renews it. Without this verb every sandbox threads its own
 //! hourly `eval "$(probefleet ci login …)"` — a cron job or retry wrapper
@@ -92,7 +92,7 @@ enum Confirmation {
 /// # Errors
 ///
 /// Returns an error if no coordinator URL is known, the key is not an auth key
-/// or the pin/`--as` is malformed (all checked before any request), the
+/// or the pin/`--name` is malformed (all checked before any request), the
 /// redemption is refused, the key turns out to be single-use, or the fleet file
 /// cannot be written.
 pub async fn run(args: AgentLoginArgs, fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
@@ -139,7 +139,7 @@ pub async fn run(args: AgentLoginArgs, fleet: &str, config_dir: Option<PathBuf>)
     anyhow::ensure!(
         crate::tokens::is_api_key(&auth_key),
         "--auth-key must be an auth key (`prfk1_…`); mint one with \
-         `probefleet auth-key create --purpose agent --as <name> --multi-use --tag <tag>`"
+         `probefleet auth-key create --purpose agent --name <name> --multi-use --tag <tag>`"
     );
     // Never repaired, only refused: a repaired name is a *different* identity,
     // and this one is only a display value here anyway.
@@ -213,7 +213,7 @@ const SINGLE_USE: &str = "that auth key is single-use, so it cannot back a persi
                           the second hour.\nNote the key has now been spent \u{2014} confirming \
                           this costs a redemption, and a single-use key has only one.\nNothing was \
                           written. Mint a replacement with:\n  probefleet auth-key create \
-                          --purpose agent --as <name> --multi-use --tag <tag>";
+                          --purpose agent --name <name> --multi-use --tag <tag>";
 
 /// The lines the summary prints, as data.
 ///
@@ -443,13 +443,13 @@ mod tests {
             .expect_err("bad pin");
         assert!(format!("{err:#}").contains("64 hex"), "got: {err:#}");
 
-        // An `--as` that is not a usable identity name.
+        // An `--name` that is not a usable identity name.
         let mut a = args(&key);
         a.subject_name = Some("Not/A Name".to_owned());
         let err = run(a, "default", Some(tmp.path().to_path_buf()))
             .await
-            .expect_err("bad --as");
-        assert!(format!("{err:#}").contains("--as"), "got: {err:#}");
+            .expect_err("bad --name");
+        assert!(format!("{err:#}").contains("--name"), "got: {err:#}");
 
         assert!(
             !tmp.path().join("default.toml").exists(),

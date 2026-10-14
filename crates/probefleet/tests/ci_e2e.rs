@@ -524,7 +524,7 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
     assert_eq!(grants[0].selector, "tag=nrf52");
 }
 
-/// The same fallback with a **named** key (`auth-key create --as builder`):
+/// The same fallback with a **named** key (`auth-key create --name builder`):
 /// `ci login` is unchanged, but the subject the runner speaks as is the
 /// identity rather than the credential — so re-minting the key would keep it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

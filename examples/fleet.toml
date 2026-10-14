@@ -186,7 +186,7 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # a shared build box, an agent's workspace.
 #
 # Such a machine can hold a persistent *identity* without this table (mint the
-# key with `auth-key create --purpose agent --as <name>`), but not a persistent
+# key with `auth-key create --purpose agent --name <name>`), but not a persistent
 # *session*: the workload token it authenticates with lives about an hour and
 # nothing renews it. Without this table every sandbox threads its own hourly
 #   eval "$(probefleet ci login …)"
@@ -194,7 +194,7 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # propagate between the concurrent processes sharing the machine.
 #
 # Written by:
-#   probefleet agent login --fleet-url <url> --auth-key prfk1_… --as <name>
+#   probefleet agent login --fleet-url <url> --auth-key prfk1_… --name <name>
 #
 # THE KEY MUST BE `--multi-use`. A single-use key breaks on the second PROCESS,
 # not merely the second hour, so `agent login` refuses one — it detects this by
@@ -211,7 +211,7 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # `previous_workload_token` field to mirror [node]'s.
 auth_key = "prfk1_…"
 
-# The `--as` identity the key speaks as. DISPLAY ONLY, and not verified: the
+# The `--name` identity the key speaks as. DISPLAY ONLY, and not verified: the
 # redemption response does not echo the subject name, so this is what the
 # operator typed, not what the coordinator resolved.
 name = "desk-bot"

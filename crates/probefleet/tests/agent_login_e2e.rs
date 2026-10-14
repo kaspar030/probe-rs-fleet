@@ -1,7 +1,7 @@
 //! `probefleet agent login` end to end, through the CLI's own code paths.
 //!
 //! The story this task exists for: a persistent sandbox with concurrent users
-//! is handed a `--purpose agent --as <name> --multi-use` key once, and from
+//! is handed a `--purpose agent --name <name> --multi-use` key once, and from
 //! then on holds a **self-renewing** fleet session — no cron job, no hourly
 //! `eval "$(probefleet ci login …)"`, and no per-process wrapper.
 //!
@@ -100,7 +100,7 @@ async fn mint_user_token(fleet: &Fleet, login: &str) -> String {
     fleet.session(login, FleetRole::Member).await
 }
 
-/// Mint an `--purpose agent --as <name>` auth key directly in the coordinator's
+/// Mint an `--purpose agent --name <name>` auth key directly in the coordinator's
 /// database, as `auth-key create` does over the API.
 async fn mint_agent_key(fleet: &Fleet, name: &str, single_use: bool) -> String {
     fleet

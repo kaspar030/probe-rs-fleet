@@ -185,7 +185,7 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
         Some(raw) => {
             anyhow::ensure!(
                 purpose == PURPOSE_CI,
-                "`--as` names the identity a `--purpose ci` (or `agent`) key speaks as; \
+                "`--name` names the identity a `--purpose ci` (or `agent`) key speaks as; \
                  a node key enrolls a machine and confers no subject for a name to attach to"
             );
             Some(normalise_identity_name(raw)?)
@@ -871,7 +871,7 @@ mod tests {
         assert!(err.contains("bogus"), "the refusal must name the op: {err}");
     }
 
-    /// `--as` stores the **normalised** name, so a rotation typed with
+    /// `--name` stores the **normalised** name, so a rotation typed with
     /// different capitalisation months later is the same identity.
     #[tokio::test]
     async fn an_identity_name_is_stored_normalised() {
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(keys[0].subject_name.as_deref(), Some("builder"));
     }
 
-    /// A node key confers no subject, so `--as` on one is refused.
+    /// A node key confers no subject, so `--name` on one is refused.
     #[tokio::test]
     async fn an_identity_name_on_a_node_key_is_refused() {
         let args = AuthKeyArgs {

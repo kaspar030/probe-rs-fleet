@@ -336,7 +336,7 @@ shape.
 Give it a name instead:
 
 ```sh
-probefleet auth-key create --purpose agent --as builder \
+probefleet auth-key create --purpose agent --name builder \
     --tag nrf52 \
     --ops flash,attach \
     --ttl 30d
@@ -350,8 +350,8 @@ from `(org, <org>/workload:agent:builder)` rather than from the hash. The rotati
 and the identity never moves:
 
 ```sh
-# 1. Mint the replacement with the SAME --as.
-probefleet auth-key create --purpose agent --as builder \
+# 1. Mint the replacement with the SAME --name.
+probefleet auth-key create --purpose agent --name builder \
     --tag nrf52 --ops flash,attach --ttl 30d
 
 # 2. Deploy the new secret to the runner and restart it.
@@ -372,7 +372,7 @@ for a `gha/workload:owner/repo` repo subject. It is scoped to your org: two orgs
 may each have a `builder`.
 
 **The trade, and it is the important paragraph on this page.** Two live keys
-sharing an `--as` are **one identity, and the grant belongs to the identity, not
+sharing an `--name` are **one identity, and the grant belongs to the identity, not
 to the key**. So step 3 above is not a no-op on the identity and it is not a
 clean revocation either:
 
@@ -403,7 +403,7 @@ key over once instead:
 
 ```sh
 probefleet agent login --fleet-url https://fleet.example \
-    --auth-key "$PROBEFLEET_AUTH_KEY" --as builder
+    --auth-key "$PROBEFLEET_AUTH_KEY" --name builder
 ```
 
 That stores the key in `~/.config/probefleet/fleets/<name>.toml` (0600), and

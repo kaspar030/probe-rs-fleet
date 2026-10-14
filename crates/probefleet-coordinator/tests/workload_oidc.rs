@@ -1352,12 +1352,12 @@ async fn the_api_refuses_to_mint_a_tagless_ci_key() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Named identities (`auth-key create --as <name>`), architecture §6.7
+// 8. Named identities (`auth-key create --name <name>`), architecture §6.7
 // ---------------------------------------------------------------------------
 
 /// The headline: **rotating a named key does not move the identity.**
 ///
-/// Mint key A `--as builder`, redeem it, lease a board. Mint key B with the
+/// Mint key A `--name builder`, redeem it, lease a board. Mint key B with the
 /// same name and a different secret, redeem that. Both redemptions must produce
 /// the *same* subject and re-upsert the *same* grant row — which is what keeps
 /// the audit trail, the per-subject concurrency budget and the revocation
@@ -1408,7 +1408,7 @@ async fn a_named_keys_identity_survives_rotating_the_key() {
     .await
     .unwrap();
 
-    // The rotation: a *different secret*, the same `--as` — and then the same
+    // The rotation: a *different secret*, the same `--name` — and then the same
     // name spelled differently, which normalises to the same identity.
     for name in ["builder", "BUILDER"] {
         let key = fleet
@@ -1442,7 +1442,7 @@ async fn a_named_keys_identity_survives_rotating_the_key() {
 
 /// The accepted trade, asserted so it cannot be "fixed" by accident.
 ///
-/// Two live keys sharing an `--as` are **one identity**, and the grant belongs
+/// Two live keys sharing an `--name` are **one identity**, and the grant belongs
 /// to the identity, not to the key. So revoking key A tears down the shared
 /// grant and key B's runner's live lease — a disruption, not a revocation:
 /// key B redeeming again re-creates the grant with the same id and subject.

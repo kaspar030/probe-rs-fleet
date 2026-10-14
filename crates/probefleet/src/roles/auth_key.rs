@@ -50,14 +50,14 @@ use crate::roles::node_setup;
 /// before anything is stored, so the database holds exactly two purposes, the
 /// coordinator's `meta.purpose != AUTH_KEY_PURPOSE_CI` check is untouched, and
 /// no listing or migration has to learn a third value. It exists because
-/// "ci key" says *per job* about a credential minted `--as <name>`, which is a
+/// "ci key" says *per job* about a credential minted `--name <name>`, which is a
 /// persistent identity.
 ///
 /// Deliberately **CLI-only**: it is not a wire value, so a browser posting
 /// `"purpose":"agent"` to `/api/v1/auth-keys` gets a `400`.
 pub(crate) const PURPOSE_AGENT_ALIAS: &str = "agent";
 
-/// Validate an `--as <name>` locally, naming the rule when it fails.
+/// Validate an `--name <name>` locally, naming the rule when it fails.
 ///
 /// The coordinator validates it too (with the same function), but a `400`
 /// cannot say *which* rule was broken, and this one is easy to break by
@@ -72,7 +72,7 @@ pub(crate) const PURPOSE_AGENT_ALIAS: &str = "agent";
 pub(crate) fn normalise_identity_name(raw: &str) -> Result<String> {
     forgs::subject::normalise_service_name(raw).with_context(|| {
         format!(
-            "`--as {raw}` is not a usable identity name: use 1-{} characters from \
+            "`--name {raw}` is not a usable identity name: use 1-{} characters from \
              [a-z0-9._-], starting with a letter or digit. No `:` and no `/`, so a \
              name can never be mistaken for the unnamed `key:<hash>` form or for a \
              `gha/workload:owner/repo` repo subject",
@@ -95,15 +95,15 @@ pub(crate) fn normalise_identity_name(raw: &str) -> Result<String> {
 pub(crate) fn identity_epilogue(org: &str, name: &str) -> String {
     format!(
         "This key speaks as `{org}/workload:agent:{name}` \u{2014} an identity, not a\n\
-         credential. Minting another key with the same `--as` rotates the secret\n\
+         credential. Minting another key with the same `--name` rotates the secret\n\
          without changing the identity: the same grant row, the same audit trail,\n\
          the same concurrency budget.\n\
          \n\
-         The trade that makes that work: TWO LIVE KEYS SHARING AN `--as` ARE ONE\n\
+         The trade that makes that work: TWO LIVE KEYS SHARING AN `--name` ARE ONE\n\
          IDENTITY, AND THE GRANT BELONGS TO THE IDENTITY, NOT TO THE KEY. Revoking\n\
          one of them tears down that shared grant and every live lease held under\n\
          the name \u{2014} including another key's runner, mid-job. It does not end the\n\
-         identity: a surviving key with the same `--as` re-creates the grant on its\n\
+         identity: a surviving key with the same `--name` re-creates the grant on its\n\
          next redemption, and workload tokens already minted stay valid until they\n\
          expire. So revoking one key of a shared identity is a DISRUPTION, NOT A\n\
          REVOCATION.\n\
@@ -145,7 +145,7 @@ pub async fn run(args: AuthKeyCliArgs) -> Result<()> {
 ///
 /// See [`run`]. A TTL of zero (or `never`) is refused locally, with the reason,
 /// rather than bouncing the user off a `400`. So are a `--purpose node` key
-/// carrying `--as`, and an `--as` name that breaks the charset rule.
+/// carrying `--name`, and an `--name` name that breaks the charset rule.
 pub async fn create(args: &AuthKeyCreateArgs) -> Result<ApiKeyCreated> {
     let ttl = parse_ttl(&args.ttl)?;
     // `--purpose agent` is a spelling of `ci`, normalised at this boundary so
@@ -172,7 +172,7 @@ pub async fn create(args: &AuthKeyCreateArgs) -> Result<ApiKeyCreated> {
         Some(raw) => {
             anyhow::ensure!(
                 purpose == "ci",
-                "`--as` names the identity a `--purpose ci` (or `agent`) key speaks as; \
+                "`--name` names the identity a `--purpose ci` (or `agent`) key speaks as; \
                  a node key enrolls a machine and confers no subject for a name to attach to"
             );
             Some(normalise_identity_name(raw)?)
@@ -226,7 +226,7 @@ pub async fn create(args: &AuthKeyCreateArgs) -> Result<ApiKeyCreated> {
     // on the rotation. The response echoes what was stored, so compare.
     if subject_name.is_some() && created.subject_name != subject_name {
         anyhow::bail!(
-            "this coordinator does not support `--as`: it minted an UNNAMED key \
+            "this coordinator does not support `--name`: it minted an UNNAMED key \
              (it echoed identity {:?}, not {:?}). That key works, but its subject and \
              grant are derived from the key hash, so rotating it forks the identity. \
              Revoke it (`probefleet auth-key revoke {}`) and upgrade the coordinator.",
@@ -347,7 +347,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         "invalid_request" => {
             "the request was refused: a hash prefix must be at least 8 hex \
              characters, an auth key minted this way must expire (TTL \
-             between 1 second and 30 days), and `--as` is only valid on a \
+             between 1 second and 30 days), and `--name` is only valid on a \
              `--purpose ci`/`agent` key, over [a-z0-9._-] starting with a \
              letter or digit"
         }
@@ -578,7 +578,7 @@ mod tests {
         }
     }
 
-    /// A bad `--as` names the rule locally, rather than bouncing the operator
+    /// A bad `--name` names the rule locally, rather than bouncing the operator
     /// off a coarse `400` that cannot say which rule was broken.
     #[test]
     fn an_invalid_identity_name_names_the_rule() {

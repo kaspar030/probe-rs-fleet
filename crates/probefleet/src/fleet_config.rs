@@ -21,7 +21,7 @@
 //!
 //! [agent]               # written by `probefleet agent login`
 //! auth_key = "prfk1_…"         # the durable credential
-//! name = "desk-bot"            # the --as identity, display only
+//! name = "desk-bot"            # the --name identity, display only
 //! workload_token = "prfw1_…"   # the current short-lived session
 //! expires = 1788999999         # epoch seconds
 //! ```
@@ -169,7 +169,7 @@ pub struct NodeSection {
 /// expiry.
 ///
 /// This is the *persistent sandbox* case: a long-running, possibly multi-user
-/// machine that holds an identity (`auth-key create --purpose agent --as
+/// machine that holds an identity (`auth-key create --purpose agent --name
 /// <name>`) rather than a human session. The durable credential lives here so
 /// that no cron job or hourly `eval "$(probefleet ci login …)"` wrapper has
 /// to be reimplemented per sandbox.
@@ -191,7 +191,7 @@ pub struct AgentSection {
     /// `agent login`: the premise is a sandbox the operator owns and is content
     /// to let hold a persistent identity in its filesystem reach.
     pub auth_key: String,
-    /// The `--as` identity name the key speaks as. Display only.
+    /// The `--name` identity name the key speaks as. Display only.
     ///
     /// **Not verified**: the redemption response does not echo the subject
     /// name, so this is what the operator typed, not what the coordinator

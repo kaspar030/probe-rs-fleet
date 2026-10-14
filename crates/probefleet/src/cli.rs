@@ -318,7 +318,7 @@ pub struct AuthKeyArgs {
     ///
     /// `agent` is a **spelling of `ci`**, not a third credential: it stores
     /// `ci` and behaves identically. It exists so the vocabulary stops saying
-    /// "per job" about a key minted `--as <name>`, which is a persistent
+    /// "per job" about a key minted `--name <name>`, which is a persistent
     /// identity. A listing shows `ci` for such a key, because it is one.
     #[arg(long, default_value = "node", value_parser = ["node", "ci", "agent"])]
     pub purpose: String,
@@ -340,7 +340,8 @@ pub struct AuthKeyArgs {
     /// including another key's runner, mid-job — and a surviving key with the
     /// same name re-creates the grant on its next redemption. See the epilogue
     /// the mint prints, and architecture §6.7.
-    #[arg(long = "as", value_name = "NAME")]
+    // `--as` is kept as a hidden, deprecated alias.
+    #[arg(long = "name", alias = "as", value_name = "NAME")]
     pub subject_name: Option<String>,
     /// For `--purpose ci`: the operations the key's grant confers,
     /// comma-separated. Defaults to `flash,attach,reset,erase`.
@@ -561,7 +562,7 @@ pub struct AuthKeyCreateArgs {
     ///
     /// `agent` is a **spelling of `ci`**, not a third credential: it stores
     /// `ci` and behaves identically. It exists so the vocabulary stops saying
-    /// "per job" about a key minted `--as <name>`, which is a persistent
+    /// "per job" about a key minted `--name <name>`, which is a persistent
     /// identity. `auth-key list` shows `ci` for such a key, because it is one.
     #[arg(long, default_value = "node", value_parser = ["node", "ci", "agent"])]
     pub purpose: String,
@@ -583,7 +584,8 @@ pub struct AuthKeyCreateArgs {
     /// including another key's runner, mid-job — and a surviving key with the
     /// same name re-creates the grant on its next redemption. See the epilogue
     /// the mint prints, and architecture §6.7.
-    #[arg(long = "as", value_name = "NAME")]
+    // `--as` is kept as a hidden, deprecated alias.
+    #[arg(long = "name", alias = "as", value_name = "NAME")]
     pub subject_name: Option<String>,
     /// For `--purpose ci`: the operations the key's grant confers,
     /// comma-separated. Defaults to `flash,attach,reset,erase`.
@@ -1219,12 +1221,13 @@ pub struct AgentLoginArgs {
     /// strongest credential the fleet file can hold.
     #[arg(long, env = "PROBEFLEET_AUTH_KEY")]
     pub auth_key: String,
-    /// The identity name the key was minted with (`auth-key create --as`).
+    /// The identity name the key was minted with (`auth-key create --name`).
     ///
     /// **Display only**: the redemption response does not echo the subject
     /// name, so this is recorded, not verified. Getting it wrong changes what
     /// the summary prints and nothing else.
-    #[arg(long = "as", value_name = "NAME")]
+    // `--as` is kept as a hidden, deprecated alias.
+    #[arg(long = "name", alias = "as", value_name = "NAME")]
     pub subject_name: Option<String>,
 }
 
@@ -2569,7 +2572,7 @@ mod tests {
             "https://fleet.example",
             "--auth-key",
             "prfk1_abc",
-            "--as",
+            "--name",
             "desk-bot",
             "--server-cert-sha256",
             &"ab".repeat(32),
@@ -3343,8 +3346,9 @@ mod tests {
         );
     }
 
-    /// `--as` is spelled `as` on the command line and `subject_name` in Rust
-    /// (`as` is a keyword), and `--purpose agent` parses — it is the third
+    /// `--name` maps to the `subject_name` field (the wire name; `--as` is kept
+    /// as a hidden, deprecated alias), and `--purpose agent` parses — it is the third
+
     /// accepted *spelling*, normalised to `ci` before anything is stored.
     #[test]
     fn auth_key_create_parses_an_identity_name_and_the_agent_purpose() {
@@ -3356,7 +3360,7 @@ mod tests {
             "agent",
             "--tag",
             "nrf52",
-            "--as",
+            "--name",
             "builder",
         ]));
         match cli.command {
@@ -3393,7 +3397,7 @@ mod tests {
             "agent",
             "--tag",
             "desk",
-            "--as",
+            "--name",
             "builder",
             "--ttl",
             "0",
@@ -3416,6 +3420,75 @@ mod tests {
                 other => panic!("expected auth-key, got {other:?}"),
             },
             other => panic!("expected coordinator, got {other:?}"),
+        }
+    }
+
+    /// The old `--as` spelling still parses to the same field on all three
+    /// commands, but `--help` teaches only `--name`.
+    #[test]
+    fn subject_name_accepts_the_deprecated_as_alias() {
+        let cli = Cli::parse_from(os(&["probefleet", "auth-key", "create", "--as", "builder"]));
+        match cli.command {
+            Command::AuthKey(a) => match a.command {
+                AuthKeyCommand::Create(c) => {
+                    assert_eq!(c.subject_name.as_deref(), Some("builder"))
+                }
+                other => panic!("expected create, got {other:?}"),
+            },
+            other => panic!("expected auth-key, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&[
+            "probefleet",
+            "coordinator",
+            "auth-key",
+            "--as",
+            "builder",
+        ]));
+        match cli.command {
+            Command::Coordinator(a) => match a.command {
+                Some(CoordinatorCommand::AuthKey(k)) => {
+                    assert_eq!(k.subject_name.as_deref(), Some("builder"))
+                }
+                other => panic!("expected auth-key, got {other:?}"),
+            },
+            other => panic!("expected coordinator, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(os(&[
+            "probefleet",
+            "agent",
+            "login",
+            "--auth-key",
+            "prfk1_abc",
+            "--as",
+            "builder",
+        ]));
+        match cli.command {
+            Command::Agent(a) => match a.command {
+                Some(AgentCommand::Login(l)) => {
+                    assert_eq!(l.subject_name.as_deref(), Some("builder"))
+                }
+                other => panic!("expected agent login, got {other:?}"),
+            },
+            other => panic!("expected agent, got {other:?}"),
+        }
+
+        for path in [
+            ["auth-key", "create"],
+            ["coordinator", "auth-key"],
+            ["agent", "login"],
+        ] {
+            let mut cmd = Cli::command();
+            let help = cmd
+                .find_subcommand_mut(path[0])
+                .expect("group")
+                .find_subcommand_mut(path[1])
+                .expect("verb")
+                .render_long_help()
+                .to_string();
+            assert!(help.contains("--name"), "{path:?} help: {help}");
+            assert!(!help.contains("--as"), "{path:?} help: {help}");
         }
     }
 
