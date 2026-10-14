@@ -94,6 +94,17 @@ kind = "uhubctl"
 hub  = "1-1"
 port = 2
 
+# Serial passthrough (`probefleet ctl serial <board>`). USB serial ports that
+# share the probe's USB device (J-Link VCOM, ST-Link VCP, DAPLink CDC-ACM) are
+# discovered automatically and named `if<N>`; set `uart_discover = false` to
+# turn that off. Add a UART on a separate adapter explicitly — prefer a stable
+# /dev/serial/by-id path, ttyUSB numbers move:
+#
+# [[board.uart]]
+# name = "console"                 # optional, default "uart<i>"
+# path = "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A1B2C3-if00-port0"
+# baud = 115200                    # optional default baud
+
 # A second board, GPIO-powered, exclusive by default:
 #
 # [[board]]

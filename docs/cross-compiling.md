@@ -94,6 +94,12 @@ proxies). The result is a static `probe-rs` that runs on the Pi.
   rule matching the probe's `idVendor` (e.g. `1366` for SEGGER J-Link) granting
   group/world access. (A proper packaged install should ship this.)
 - The agent needs `probe-rs` on its `PATH` (e.g. install to `/usr/local/bin`).
+- **Serial passthrough.** The agent opens board UARTs with the `serialport`
+  crate built with `default-features = false`: no libudev, so the musl build
+  stays pure Rust (its `nix` dependency is pure Rust too). Ports are found by
+  walking `/sys/class/tty`, which needs no udev either. The agent user needs
+  read/write access to `/dev/ttyACM*` / `/dev/ttyUSB*` (on Alpine: the
+  `dialout` group, or an mdev rule like the probe one above).
 
 ## The WebSocket stack
 

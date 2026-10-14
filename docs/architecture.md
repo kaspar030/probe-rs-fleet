@@ -84,7 +84,9 @@ connection:
 ```
 
 The coordinator forwards opaque bytes on a leased channel; it never decodes
-probe-rs traffic. The sidecar exposes a local TCP endpoint (advertised to the
+probe-rs traffic. The same relay carries two more channel kinds: a gdb tunnel
+(`ChannelKind::Gdb`) and a board's USB serial port (`ChannelKind::Serial`,
+§4.2 "Serial passthrough"). The sidecar exposes a local TCP endpoint (advertised to the
 genuine client as `PROBE_RS_REMOTE_HOST=ws://127.0.0.1:<port>`) and byte-splices
 its accepted connection onto the relay — the same bytes flow through verbatim.
 
@@ -511,6 +513,59 @@ Decided agent model:
   tunnel) is an optional follow-up. *(Post-0.32 master has since made `probe-rs
   gdb` attach through the RPC client, so this tunnel can likely be retired once
   0.33 ships — unreleased, so nothing changes yet; tracked as issue #298.)*
+
+#### Serial passthrough (`ChannelKind::Serial`)
+
+Most probes expose a USB CDC-ACM / USB-serial interface next to the debug
+interface (ST-Link VCP, J-Link VCOM, DAPLink, ESP USB-JTAG-serial, FTDI). The
+node passes it through to the lease holder as a **third relay channel kind**,
+riding the same relay, lease authorization, per-channel capability token and
+close-on-release / close-on-disconnect machinery as the data and gdb planes —
+the coordinator gained no serial-specific logic beyond copying the port list
+into its board inventory.
+
+* **Discovery.** The node walks `/sys/class/tty/*/device` up to the first
+  ancestor carrying `idVendor`/`idProduct` and associates a tty with a board
+  when that USB device's serial number matches the probe serial (case-
+  insensitively, or as the hex of the sysfs bytes — probe-rs hex-encodes some
+  ST-Link serials) and, when known, its vid/pid. Ports are named `if<N>` by
+  USB interface number. `[[board.uart]]` (§8) adds explicitly configured ports
+  (a separate FTDI adapter) and `uart_discover = false` turns the automatic
+  match off. The resulting `SerialPortInfo`s ride `BoardStatus.serial_ports`,
+  so a tty appearing or vanishing is an inventory change reported like any
+  other; `ctl list` and the web UI show the names.
+* **No client paths.** The client names a *port*, never a device path; the
+  node re-resolves names against a fresh tty listing at channel open
+  (ttyACM numbers move on re-enumeration), so a leaseholder cannot make the
+  node open an arbitrary `/dev` node.
+* **In-band framing.** Each `DataFrame` on a serial channel carries exactly
+  one postcard `SerialRequest` (client → node: `Open`, `Data`, `Configure`,
+  `SetDtr`, `SetRts`, `Break`) or `SerialEvent` (`Opened`, `Data`, `Error`,
+  `Closed`). WebSocket messages are delimited and the relay forwards frames
+  1:1, so boundaries survive and the coordinator stays byte-opaque — no new
+  envelope variant, no `/delegate` allowlist change.
+* **Gating and lifecycle.** Opening requires `AllowedOp::Attach` (a UART is no
+  more privileged than attaching). The node opens the tty exclusively
+  (`serialport`, `TIOCEXCL` + `flock`) only once the client's `Open` arrives,
+  one channel per port, and closes it — dropping buffered input — on
+  `KillSession`, lease release, power cycle, fault, or a dropped coordinator
+  connection. Serial coexists with a running `probe-rs serve`/gdb session on
+  the same board: flash and watch the UART is the point.
+* **Client.** `probefleet ctl serial <board>` (the board must be leased by the
+  caller — e.g. the sidecar's cached lease) attaches the terminal in raw mode
+  (escape `Ctrl-]`: `q` quit, `r` reset pulse, `d`/`t` toggle DTR/RTS, `b`
+  break), or just pipes when stdin is not a tty (CI: `ctl serial b > uart.log
+  < /dev/null`). `--pty [--link PATH]` instead exposes a pseudo-terminal
+  symlinked at `$XDG_RUNTIME_DIR/probefleet/serial/<board>[-<port>]`, so
+  picocom/tio/minicom/pyserial work unmodified. Baud, stop bits and flow
+  control a tool sets on the pty are detected by polling the slave's termios
+  and forwarded as `Configure`. Limitations: Linux ptys have no modem lines
+  (DTR/RTS stay on the escape commands) and force CS8/no parity (data bits and
+  parity come from the command line). FIFOs were rejected (unidirectional, no
+  termios); kernel-level emulation (tty0tty, CUSE, usbip) needs root.
+* **Deferred** (same channel, no wire change): an RFC 2217 server for
+  DTR/RTS-capable remote clients (esptool, pyserial `rfc2217://`), and sidecar
+  auto-attach (tee the UART while `probe-rs run` executes).
 
 A node also owns **USB power** behind a `PowerControl` trait: `uhubctl` (per-hub
 port), GPIO relay, or `none`. Used for post-lease cleanup and fault recovery,
@@ -1413,7 +1468,7 @@ enforces `--ops`" would be false for half the labels:
 
 | op | enforced where |
 |---|---|
-| `attach` | agent, at data-channel open |
+| `attach` | agent, at data-channel and serial-channel open |
 | `gdb` | agent, at gdb-channel open |
 | `power-cycle` | coordinator, in the power-cycle handler |
 | `flash`, `erase`, `reset` | **not enforced** — in-band probe-rs RPC inside the data channel, which the fleet relays without parsing |
@@ -2131,6 +2186,14 @@ exclusive = true
 kind = "uhubctl"                  # | "gpio" | "none"
 hub  = "1-1"
 port = 2
+
+# Optional: serial ports beyond (or instead of) the auto-discovered ones that
+# share the probe's USB device (§4.2 "Serial passthrough").
+# uart_discover = false            # default true
+[[board.uart]]
+name = "console"                  # optional, default "uart<i>"
+path = "/dev/serial/by-id/usb-FTDI_FT232R_A1B2C3-if00-port0"
+baud = 115200                     # optional default baud
 ```
 
 The node reconciles discovered probes against this file. **Whether an

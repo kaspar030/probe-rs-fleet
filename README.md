@@ -32,6 +32,8 @@ probefleet node up
 # On any logged-in machine:
 probefleet ctl list
 probefleet ctl lease id=<board>
+probefleet ctl serial <board>              # its USB UART on this terminal
+probefleet ctl serial <board> --pty        # …or as a local pty for picocom/tio
 ```
 
 `examples/coordinator.toml` documents the login provider setup and every
