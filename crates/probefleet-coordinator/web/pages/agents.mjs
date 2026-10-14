@@ -8,6 +8,12 @@
 // that 400s would be the worst of both answers, so the page says in one line
 // what the v1 answer is — delete and re-enroll.
 //
+// Moving (admins only) re-homes the node and every board it hosts in another
+// org the user belongs to. The node keeps its token and reconnects by itself;
+// grants in this org stop covering its boards, and leased boards refuse the
+// move unless "revoke active leases" is ticked. Moving a single board is not
+// possible: a board belongs to its machine.
+//
 // Revoking is a revocation, not a tidy-up, and the confirm says the cascade out
 // loud: the node's token dies, its live leases are released, and its
 // control-plane connection is closed.
@@ -21,7 +27,7 @@
 // `GET /api/v1/nodes` with per-board presence.
 
 import { h, tags, ago, when, errorBox } from '../dom.mjs';
-import { isAdmin, userId } from '../session.mjs';
+import { isAdmin, userId, memberships, orgLabel } from '../session.mjs';
 
 const ADOPT = ['auto', 'declared'];
 
@@ -31,8 +37,14 @@ function mayEdit(node, session) {
   return Boolean(node.owner) && node.owner === userId(session);
 }
 
+/** The orgs a node in the acting org could be moved to: every other membership. */
+export function moveTargets(session) {
+  const current = session && session.org ? session.org.id : null;
+  return memberships(session).filter((m) => m.id !== current);
+}
+
 export function render(state) {
-  const { nodes, session, editing, error } = state;
+  const { nodes, session, editing, moving, error } = state;
   const children = [
     h('h1', {}, 'Agents'),
     h(
@@ -57,6 +69,7 @@ export function render(state) {
   const rows = [];
   for (const node of nodes) {
     const editable = mayEdit(node, session);
+    const movable = isAdmin(session) && moveTargets(session).length > 0;
     rows.push(
       h(
         'tr',
@@ -80,8 +93,11 @@ export function render(state) {
           editable
             ? [
                 h('button', { on: { click: () => state.onEdit(node.name) } }, 'Edit'),
+                movable
+                  ? h('button', { on: { click: () => state.onMoveOpen(node.name) } }, 'Move…')
+                  : null,
                 h('button', { class: 'danger', on: { click: () => state.onRevoke(node) } }, 'Revoke'),
-              ]
+              ].filter(Boolean)
             : h('span', { class: 'hint' }, '—'),
         ),
       ),
@@ -121,6 +137,46 @@ export function render(state) {
         ),
       );
     }
+    if (moving === node.name && isAdmin(session)) {
+      rows.push(
+        h(
+          'tr',
+          {},
+          h(
+            'td',
+            { colspan: 8 },
+            h(
+              'form',
+              { class: 'panel', on: { submit: (e) => { e.preventDefault(); return state.onMove(node, e.target); } } },
+              h(
+                'label',
+                {},
+                h('span', { class: 'label' }, 'Move to org'),
+                h(
+                  'select',
+                  { name: 'to_org' },
+                  moveTargets(session).map((m) =>
+                    h('option', { value: m.id }, m.personal ? `${orgLabel(m)} (personal)` : orgLabel(m))),
+                ),
+              ),
+              h('label', {}, h('input', { type: 'checkbox', name: 'force' }), ' Revoke active leases on its boards'),
+              h(
+                'p',
+                { class: 'hint' },
+                'All of its boards move with it. Grants in this org stop covering them. ' +
+                  'The machine keeps its token and reconnects by itself. You must be a member of the target org.',
+              ),
+              h(
+                'div',
+                { class: 'row' },
+                h('button', { class: 'primary', type: 'submit' }, 'Move'),
+                h('button', { type: 'button', on: { click: () => state.onMoveOpen(null) } }, 'Cancel'),
+              ),
+            ),
+          ),
+        ),
+      );
+    }
   }
 
   children.push(
@@ -151,7 +207,9 @@ export function render(state) {
 
 export async function load(ctx) {
   const { api, session } = ctx;
-  const state = { nodes: [], session, editing: ctx.editing || null, error: null };
+  const state = {
+    nodes: [], session, editing: ctx.editing || null, moving: ctx.moving || null, error: null,
+  };
   state.nodes = await api.get('/api/v1/nodes');
 
   state.onEdit = (name) => {
@@ -168,6 +226,44 @@ export async function load(ctx) {
     try {
       await api.patch(`/api/v1/nodes/${encodeURIComponent(name)}`, body);
       ctx.editing = null;
+    } catch (err) {
+      window.alert(api.describe(err));
+    }
+    await ctx.reload();
+  };
+
+  state.onMoveOpen = (name) => {
+    ctx.moving = name;
+    return ctx.reload();
+  };
+
+  state.onMove = async (node, form) => {
+    const to = form.elements.to_org.value;
+    const force = Boolean(form.elements.force && form.elements.force.checked);
+    const target = moveTargets(session).find((m) => m.id === to);
+    const message =
+      `Move ${node.name} to ${target ? orgLabel(target) : to}?\n\n` +
+      'All of its boards move with it and leave this org; grants here stop covering them. ' +
+      (force
+        ? 'Active leases on its boards are revoked. '
+        : 'The move is refused if any of its boards is leased. ') +
+      'The machine reconnects by itself with its existing token.';
+    if (!window.confirm(message)) return;
+    try {
+      const out = await api.post(`/api/v1/nodes/${encodeURIComponent(node.name)}/move`, { to_org: to, force });
+      ctx.moving = null;
+      const lines = [`Moved ${out.node.name} to ${orgLabel(out.to_org)}.`];
+      if (out.revoked_leases) lines.push(`${out.revoked_leases} lease(s) revoked.`);
+      const who = (g) => g.subject_display || (g.subject && g.subject.key) || '?';
+      if (out.grants_lost && out.grants_lost.length) {
+        lines.push('', 'Grants here that no longer cover its boards:');
+        for (const g of out.grants_lost) lines.push(`  ${who(g)}: ${g.selector}`);
+      }
+      if (out.grants_gained && out.grants_gained.length) {
+        lines.push('', `Grants in ${orgLabel(out.to_org)} that now cover them:`);
+        for (const g of out.grants_gained) lines.push(`  ${who(g)}: ${g.selector}`);
+      }
+      window.alert(lines.join('\n'));
     } catch (err) {
       window.alert(api.describe(err));
     }

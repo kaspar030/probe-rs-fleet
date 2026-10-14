@@ -169,6 +169,51 @@ pub(crate) enum OrgAdminError {
     Internal(crate::error::CoordinatorError),
 }
 
+/// Why [`Coordinator::move_node_core`] refused.
+///
+/// Distinct codes, unlike [`OpError`]: the caller is already an admin of
+/// the source org and a member of the target before any of the specific
+/// answers is given, so they reveal nothing the caller could not see.
+#[derive(Debug)]
+pub(crate) enum NodeMoveError {
+    /// Not an admin of the source org, or not a member of the target (or
+    /// the target does not exist — the same answer): 403 `forbidden`.
+    Denied,
+    /// The source org has no such node: 404 `not_found`.
+    NotFound,
+    /// Source and target are the same org: 400 `invalid_request`.
+    SameOrg,
+    /// The target org already has a node by that name: 409
+    /// `node_name_taken`.
+    NameTaken,
+    /// This many of the node's boards are leased and `force` was not given:
+    /// 409 `node_leased`.
+    Leased(u32),
+    /// A coordinator fault: 500.
+    Internal(crate::error::CoordinatorError),
+}
+
+/// What [`Coordinator::move_node_core`] did.
+#[derive(Debug)]
+pub(crate) struct NodeMoveOutcome {
+    /// The source org.
+    pub from: OrgId,
+    /// The target org.
+    pub to: OrgId,
+    /// The node's id before the move.
+    pub old_id: NodeId,
+    /// The moved node, as now stored in the target org.
+    pub node: NodeStatus,
+    /// Leases revoked by the move (with `force`, or by the post-commit
+    /// sweep).
+    pub revoked_leases: u32,
+    /// Source-org grants that covered one of the node's live boards and no
+    /// longer do. Unmodified: selectors never name an org or node.
+    pub grants_lost: Vec<probefleet_proto::GrantSummary>,
+    /// Target-org grants that now cover one of the node's boards.
+    pub grants_gained: Vec<probefleet_proto::GrantSummary>,
+}
+
 impl OpError {
     /// Render this failure the way today's sidecar wire renders it.
     ///
@@ -1545,65 +1590,17 @@ impl Coordinator {
             .await?;
         let node_id = row.id.clone();
 
-        // (1) + (2), interleaved on purpose: live leases go down through the
-        // whole shared release path, then the boards leave the scheduler — and
-        // the *last* teardown check and the `remove_board` calls happen under a
-        // single lock.
-        //
-        // Looped, and that is not defensive coding. Two distinct routes produce
-        // the same failure — an open `leases` row against a board the scheduler
-        // no longer has, which nothing will ever close and whose holder
-        // believes it has a lease:
-        //
-        // * `tear_down_lease` promotes a queued waiter onto the board it just
-        //   freed **and persists the promotion**, so a single pass can leave a
-        //   brand-new lease behind; and
-        // * a lease request arriving between the check and `remove_board` is
-        //   granted and persisted in that window.
-        //
-        // The second is why the exit is not "loop until empty, then take the
-        // lock again": the guard has to be re-tested and acted on without ever
-        // releasing the lock in between. Each iteration consumes at least one
-        // waiter or grant, and `tear_down_lease` needs the lock itself, so the
-        // teardown cannot happen inside the scope that removes the boards.
-        let board_refs: Vec<BoardRef> = loop {
-            let held: Vec<(LeaseId, BoardRef, SubjectKey)> = {
-                let mut sched = self.scheduler.lock().await;
-                let held: Vec<_> = sched
-                    .boards()
-                    .filter(|b| b.node == node_id)
-                    .filter_map(|b| match &b.state {
-                        BoardState::Leased { lease, by, .. } => {
-                            Some((*lease, b.id.clone(), by.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                if held.is_empty() {
-                    // Nothing leased *and* still holding the lock: remove the
-                    // boards now, before anything can be granted on them.
-                    let refs: Vec<BoardRef> = sched
-                        .boards()
-                        .filter(|b| b.node == node_id)
-                        .map(|b| b.id.clone())
-                        .collect();
-                    for board_ref in &refs {
-                        sched.remove_board(board_ref);
-                    }
-                    break refs;
-                }
-                held
-            };
-            for (lease, board_ref, holder) in held {
-                warn!(
-                    %board_ref, ?lease, node = %node_id,
-                    "releasing a lease on a node being deleted"
-                );
-                self.tear_down_lease(lease, &holder, "node deleted", "lease.revoke", subject)
-                    .await
-                    .map_err(OpError::Internal)?;
-            }
-        };
+        // (1) + (2): see `drain_node_boards`.
+        let (removed, _) = self
+            .drain_node_boards(
+                &node_id,
+                subject,
+                "node deleted",
+                "releasing a lease on a node being deleted",
+            )
+            .await
+            .map_err(OpError::Internal)?;
+        let board_refs: Vec<BoardRef> = removed.into_iter().map(|b| b.id).collect();
 
         // (3) The rows, board-first, in one transaction.
         let deleted = self
@@ -1631,6 +1628,356 @@ impl Coordinator {
         .await
         .map_err(OpError::Internal)?;
         Ok(node_id)
+    }
+
+    /// Move a node — and with it every board it hosts — from the caller's
+    /// acting org to `to_org_raw` (an org path or id).
+    ///
+    /// # Authorization
+    ///
+    /// **Admin of the source org** (a move takes hardware out of it; a
+    /// non-admin member gets a `node.move.denied` audit row) **and member of
+    /// the target** (the same bar as approving a node into an org,
+    /// [`crate::identity::APPROVE_ROLE`]). An unknown target and one the
+    /// caller is not a member of give the same [`NodeMoveError::Denied`], so
+    /// this is no oracle for which orgs exist.
+    ///
+    /// # What happens
+    ///
+    /// 1. leased boards refuse the move unless `force`; with `force` their
+    ///    leases are revoked (`"node moved"`), and the boards leave the
+    ///    scheduler ([`Coordinator::drain_node_boards`]);
+    /// 2. the node and board rows are re-keyed in one transaction
+    ///    ([`Db::move_node`]). The token hash stays on the row, so the agent's
+    ///    existing token authenticates the moved node;
+    /// 3. the live connection is closed: it captured the old org and id. The
+    ///    agent reconnects by itself, re-reports its inventory, and the boards
+    ///    re-enter the scheduler under the new org. Its stored node id stays
+    ///    the old one until its next `node up`, which
+    ///    [`crate::server`]'s `Register` check tolerates;
+    /// 4. a final drain under the old id sweeps anything a report slipped in
+    ///    before the commit — unconditionally, since those keys no longer
+    ///    exist;
+    /// 5. `node.move.out` / `node.move.in` audit rows in both orgs.
+    ///
+    /// Grants are not touched (selectors name neither org nor node); the
+    /// outcome lists which source-org grants stop covering the boards and
+    /// which target-org grants start to, computed over the boards that were
+    /// live in the scheduler (an offline node's lists are empty).
+    ///
+    /// # Errors
+    ///
+    /// See [`NodeMoveError`].
+    pub(crate) async fn move_node_core(
+        &self,
+        subject: &Subject,
+        name: &str,
+        to_org_raw: &str,
+        force: bool,
+    ) -> std::result::Result<NodeMoveOutcome, NodeMoveError> {
+        let (from, to, row) = self.authorize_node_move(subject, name, to_org_raw).await?;
+        let old_id = row.id.clone();
+
+        if !force {
+            let sched = self.scheduler.lock().await;
+            let leased = sched
+                .boards()
+                .filter(|b| b.node == old_id && matches!(b.state, BoardState::Leased { .. }))
+                .count();
+            if leased > 0 {
+                return Err(NodeMoveError::Leased(
+                    u32::try_from(leased).unwrap_or(u32::MAX),
+                ));
+            }
+        }
+        let (removed, mut revoked) = self
+            .drain_node_boards(
+                &old_id,
+                subject,
+                "node moved",
+                "releasing a lease on a node being moved",
+            )
+            .await
+            .map_err(NodeMoveError::Internal)?;
+
+        let new_id = match self.db.move_node(&from, &row.name, &to).await {
+            Ok(crate::state::NodeMove::Moved(id)) => id,
+            other => {
+                // The boards already left the scheduler; drop the connection so
+                // the node reconnects and re-reports them where it still is.
+                self.nodes.remove_and_close(&old_id).await;
+                return Err(match other {
+                    Ok(crate::state::NodeMove::NameTaken) => NodeMoveError::NameTaken,
+                    Ok(_) => NodeMoveError::NotFound,
+                    Err(e) => NodeMoveError::Internal(e),
+                });
+            }
+        };
+        self.nodes.remove_and_close(&old_id).await;
+        let (_, swept) = self
+            .drain_node_boards(
+                &old_id,
+                subject,
+                "node moved",
+                "releasing a lease on a node being moved",
+            )
+            .await
+            .map_err(NodeMoveError::Internal)?;
+        revoked += swept;
+
+        let (grants_lost, grants_gained) =
+            self.move_grant_effects(&from, &to, &new_id, &removed).await;
+
+        let from_name = self.org_label(&from).await;
+        let to_name = self.org_label(&to).await;
+
+        let actor = subject.key().to_string();
+        self.audit(
+            &from,
+            "node.move.out",
+            Some(&actor),
+            Some(&old_id.0),
+            None,
+            None,
+            Some(&format!(
+                "to {to_name} as {new_id}; {} boards; {revoked} leases revoked",
+                removed.len()
+            )),
+        )
+        .await
+        .map_err(NodeMoveError::Internal)?;
+        self.audit(
+            &to,
+            "node.move.in",
+            Some(&actor),
+            Some(&new_id.0),
+            None,
+            None,
+            Some(&format!("from {from_name} (was {old_id})")),
+        )
+        .await
+        .map_err(NodeMoveError::Internal)?;
+
+        let new_row = self
+            .db
+            .scoped(to.clone())
+            .node_by_name(&row.name)
+            .await
+            .map_err(NodeMoveError::Internal)?
+            .ok_or(NodeMoveError::NotFound)?;
+        let online = self.nodes.get(&new_row.id).await.is_some();
+        Ok(NodeMoveOutcome {
+            from,
+            to,
+            old_id,
+            node: NodeStatus {
+                row: new_row,
+                online,
+            },
+            revoked_leases: revoked,
+            grants_lost,
+            grants_gained,
+        })
+    }
+
+    /// The checks of [`Coordinator::move_node_core`], in order: admin of the
+    /// source (a member gets a `node.move.denied` row), the node exists,
+    /// member of the target, not the same org, name free in the target.
+    /// Returns the source, the target and the node row.
+    async fn authorize_node_move(
+        &self,
+        subject: &Subject,
+        name: &str,
+        to_org_raw: &str,
+    ) -> std::result::Result<(OrgId, OrgId, crate::state::NodeRow), NodeMoveError> {
+        let Some(from) = subject.org().cloned() else {
+            return Err(NodeMoveError::Denied);
+        };
+        let Some(user) = subject.user_id() else {
+            return Err(NodeMoveError::Denied);
+        };
+        match self.db.role_of(&from, user).await {
+            Ok(Some(FleetRole::Admin)) => {}
+            Ok(Some(_)) => {
+                self.audit(
+                    &from,
+                    "node.move.denied",
+                    Some(&subject.key().to_string()),
+                    None,
+                    None,
+                    None,
+                    Some(&format!("{name}: not an org admin")),
+                )
+                .await
+                .map_err(NodeMoveError::Internal)?;
+                return Err(NodeMoveError::Denied);
+            }
+            Ok(None) => return Err(NodeMoveError::Denied),
+            Err(e) => return Err(NodeMoveError::Internal(e)),
+        }
+        let row = self
+            .db
+            .scoped(from.clone())
+            .node_by_name(name)
+            .await
+            .map_err(NodeMoveError::Internal)?
+            .ok_or(NodeMoveError::NotFound)?;
+
+        let to = self
+            .db
+            .resolve_org(to_org_raw)
+            .await
+            .map_err(NodeMoveError::Internal)?
+            .ok_or(NodeMoveError::Denied)?;
+        match self.db.role_of(&to, user).await {
+            Ok(Some(role)) if role >= crate::identity::APPROVE_ROLE => {}
+            Ok(_) => return Err(NodeMoveError::Denied),
+            Err(e) => return Err(NodeMoveError::Internal(e)),
+        }
+        if to == from {
+            return Err(NodeMoveError::SameOrg);
+        }
+        if self
+            .db
+            .node_id_in_org_by_name(&to, &row.name)
+            .await
+            .map_err(NodeMoveError::Internal)?
+            .is_some()
+        {
+            return Err(NodeMoveError::NameTaken);
+        }
+        Ok((from, to, row))
+    }
+
+    /// An org's display name, else its id (for audit details).
+    async fn org_label(&self, org: &OrgId) -> String {
+        self.db
+            .org_name(org)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| org.0.clone())
+    }
+
+    /// The grants a move takes `boards` out of (source org) and into
+    /// (target org, the boards re-keyed under `new_id`). Best effort: a
+    /// grant store failure yields empty lists rather than failing a move
+    /// that has already committed.
+    async fn move_grant_effects(
+        &self,
+        from: &OrgId,
+        to: &OrgId,
+        new_id: &NodeId,
+        boards: &[Board],
+    ) -> (
+        Vec<probefleet_proto::GrantSummary>,
+        Vec<probefleet_proto::GrantSummary>,
+    ) {
+        let now = self.now();
+        let rekeyed: Vec<Board> = boards
+            .iter()
+            .map(|b| Board {
+                id: BoardRef::new(to.clone(), new_id.clone(), b.id.name.clone()),
+                node: new_id.clone(),
+                ..b.clone()
+            })
+            .collect();
+        let mut lost = Vec::new();
+        let mut gained = Vec::new();
+        for (org, set, out) in [(from, boards, &mut lost), (to, &rekeyed[..], &mut gained)] {
+            let Some(ns) = crate::subject::ns_of(org) else {
+                continue;
+            };
+            let Ok(rows) = self.db.forgs().scoped(ns).list_grants().await else {
+                continue;
+            };
+            for row in rows {
+                let covers = crate::state::grant_scope(&row)
+                    .is_some_and(|g| g.is_live_at(now) && set.iter().any(|b| g.covers(b)));
+                if covers {
+                    out.push(self.grant_summary(row).await);
+                }
+            }
+        }
+        (lost, gained)
+    }
+
+    /// Revoke every live lease on `node_id`'s boards and remove the boards
+    /// from the scheduler, returning the removed boards and the number of
+    /// leases revoked.
+    ///
+    /// Shared by [`Coordinator::delete_node_core`] and
+    /// [`Coordinator::move_node_core`]; the caller supplies the lease close
+    /// reason (and a log line) so each keeps its own history.
+    async fn drain_node_boards(
+        &self,
+        node_id: &NodeId,
+        subject: &Subject,
+        close_reason: &str,
+        log_msg: &str,
+    ) -> Result<(Vec<Board>, u32)> {
+        let mut revoked = 0u32;
+        // (1) + (2), interleaved on purpose: live leases go down through the
+        // whole shared release path, then the boards leave the scheduler — and
+        // the *last* teardown check and the `remove_board` calls happen under a
+        // single lock.
+        //
+        // Looped, and that is not defensive coding. Two distinct routes produce
+        // the same failure — an open `leases` row against a board the scheduler
+        // no longer has, which nothing will ever close and whose holder
+        // believes it has a lease:
+        //
+        // * `tear_down_lease` promotes a queued waiter onto the board it just
+        //   freed **and persists the promotion**, so a single pass can leave a
+        //   brand-new lease behind; and
+        // * a lease request arriving between the check and `remove_board` is
+        //   granted and persisted in that window.
+        //
+        // The second is why the exit is not "loop until empty, then take the
+        // lock again": the guard has to be re-tested and acted on without ever
+        // releasing the lock in between. Each iteration consumes at least one
+        // waiter or grant, and `tear_down_lease` needs the lock itself, so the
+        // teardown cannot happen inside the scope that removes the boards.
+        let boards: Vec<Board> = loop {
+            let held: Vec<(LeaseId, BoardRef, SubjectKey)> = {
+                let mut sched = self.scheduler.lock().await;
+                let held: Vec<_> = sched
+                    .boards()
+                    .filter(|b| b.node == *node_id)
+                    .filter_map(|b| match &b.state {
+                        BoardState::Leased { lease, by, .. } => {
+                            Some((*lease, b.id.clone(), by.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if held.is_empty() {
+                    // Nothing leased *and* still holding the lock: remove the
+                    // boards now, before anything can be granted on them.
+                    let refs: Vec<BoardRef> = sched
+                        .boards()
+                        .filter(|b| b.node == *node_id)
+                        .map(|b| b.id.clone())
+                        .collect();
+                    let removed: Vec<Board> = refs
+                        .iter()
+                        .filter_map(|board_ref| sched.remove_board(board_ref))
+                        .collect();
+                    break removed;
+                }
+                held
+            };
+            for (lease, board_ref, holder) in held {
+                warn!(%board_ref, ?lease, node = %node_id, "{log_msg}");
+                if self
+                    .tear_down_lease(lease, &holder, close_reason, "lease.revoke", subject)
+                    .await?
+                {
+                    revoked += 1;
+                }
+            }
+        };
+        Ok((boards, revoked))
     }
 
     /// The owner-or-admin check shared by the two node-mutation cores.
@@ -6036,5 +6383,230 @@ mod tests {
             promoted.is_none(),
             "a revoked grantee must not be promoted onto the board it lost"
         );
+    }
+
+    // -- node move ---------------------------------------------------------
+
+    /// org-a hosts `node-a` with boards `dk-1`/`dk-2` (scheduled and
+    /// recorded). alice: admin of org-a, member of org-b. bob: member of
+    /// org-a. carol: admin of org-a only. org-c exists with no alice.
+    async fn move_fixture() -> Coordinator {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let boards = [
+            board("org-a", "dk-1", "node-a"),
+            board("org-a", "dk-2", "node-a"),
+        ];
+        let coord = coordinator_with(
+            clock,
+            &boards,
+            &[
+                ("org-a", "alice", FleetRole::Admin),
+                ("org-b", "alice", FleetRole::Member),
+                ("org-a", "bob", FleetRole::Member),
+                ("org-a", "carol", FleetRole::Admin),
+                ("org-c", "carol", FleetRole::Member),
+            ],
+        )
+        .await;
+        for b in &boards {
+            coord
+                .db()
+                .scoped(org("org-a"))
+                .record_board(b, BoardPresence::Online, 1000)
+                .await
+                .unwrap();
+        }
+        coord
+    }
+
+    async fn audit_actions(coord: &Coordinator, org_name: &str) -> Vec<String> {
+        coord
+            .db()
+            .scoped(org(org_name))
+            .recent_audit(None, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.action)
+            .collect()
+    }
+
+    async fn add_grant(
+        coord: &Coordinator,
+        org_name: &str,
+        grantee: &Subject,
+        selector: &str,
+    ) -> String {
+        coord
+            .db()
+            .forgs()
+            .scoped(crate::subject::ns_of(&org(org_name)).unwrap())
+            .insert_grant(
+                &forgs_store::NewGrant {
+                    subject: grantee.forgs_key().unwrap(),
+                    selector: selector.to_owned(),
+                    ops: crate::state::join_ops(&[probefleet_proto::token::AllowedOp::Attach]),
+                    expires: None,
+                    created_by: None,
+                },
+                1000,
+            )
+            .await
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn moving_a_node_rekeys_it_and_its_boards() {
+        let coord = move_fixture().await;
+        let alice = user("org-a", "alice");
+        let outsider = user("org-c", "carol");
+        let lost = add_grant(&coord, "org-a", &outsider, "tag=nrf52").await;
+        let _unrelated = add_grant(&coord, "org-a", &outsider, "chip=other").await;
+        let gained = add_grant(&coord, "org-b", &outsider, "id=dk-1").await;
+
+        let out = coord
+            .move_node_core(&alice, "node-a", "org-b", false)
+            .await
+            .unwrap();
+        assert_eq!(out.from, org("org-a"));
+        assert_eq!(out.to, org("org-b"));
+        assert_eq!(out.old_id, node_id("org-a", "node-a"));
+        assert_eq!(out.node.row.id, node_id("org-b", "node-a"));
+        assert_eq!(out.node.row.boards, ["dk-1", "dk-2"]);
+        assert_eq!(out.revoked_leases, 0);
+        let ids = |g: &[probefleet_proto::GrantSummary]| {
+            g.iter().map(|g| g.id.clone()).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&out.grants_lost), [lost]);
+        assert_eq!(ids(&out.grants_gained), [gained]);
+
+        assert!(coord
+            .db()
+            .scoped(org("org-a"))
+            .list_nodes()
+            .await
+            .unwrap()
+            .is_empty());
+        let in_b = coord.db().scoped(org("org-b")).list_nodes().await.unwrap();
+        assert_eq!(in_b.len(), 1);
+        assert_eq!(in_b[0].boards, ["dk-1", "dk-2"]);
+        // The old keys left the scheduler; the agent's re-report re-adds them.
+        assert!(coord.scheduler.lock().await.boards().next().is_none());
+        assert!(audit_actions(&coord, "org-a")
+            .await
+            .contains(&"node.move.out".to_owned()));
+        assert!(audit_actions(&coord, "org-b")
+            .await
+            .contains(&"node.move.in".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_of_the_source_may_not_move_a_node() {
+        let coord = move_fixture().await;
+        let bob = user("org-a", "bob");
+        assert!(matches!(
+            coord.move_node_core(&bob, "node-a", "org-b", false).await,
+            Err(NodeMoveError::Denied)
+        ));
+        assert!(audit_actions(&coord, "org-a")
+            .await
+            .contains(&"node.move.denied".to_owned()));
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org("org-a"))
+                .list_nodes()
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        // A non-member of the source is denied too.
+        let stranger = user("org-b", "alice");
+        let stranger = Subject::user(stranger.user_id().unwrap(), org("org-c"));
+        assert!(matches!(
+            coord
+                .move_node_core(&stranger, "node-a", "org-b", false)
+                .await,
+            Err(NodeMoveError::Denied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_target_the_caller_is_not_in_looks_like_no_target() {
+        let coord = move_fixture().await;
+        let alice = user("org-a", "alice");
+        assert!(matches!(
+            coord.move_node_core(&alice, "node-a", "org-c", false).await,
+            Err(NodeMoveError::Denied)
+        ));
+        assert!(matches!(
+            coord
+                .move_node_core(&alice, "node-a", "no-such-org", false)
+                .await,
+            Err(NodeMoveError::Denied)
+        ));
+        assert!(matches!(
+            coord.move_node_core(&alice, "node-a", "org-a", false).await,
+            Err(NodeMoveError::SameOrg)
+        ));
+        assert!(matches!(
+            coord.move_node_core(&alice, "ghost", "org-b", false).await,
+            Err(NodeMoveError::NotFound)
+        ));
+        // Nothing moved, nothing drained.
+        assert_eq!(coord.scheduler.lock().await.boards().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_name_taken_in_the_target_is_refused() {
+        let coord = move_fixture().await;
+        coord
+            .db()
+            .scoped(org("org-b"))
+            .ensure_node(&node_id("org-b", "node-a"), 1000)
+            .await
+            .unwrap();
+        let alice = user("org-a", "alice");
+        assert!(matches!(
+            coord.move_node_core(&alice, "node-a", "org-b", false).await,
+            Err(NodeMoveError::NameTaken)
+        ));
+        assert_eq!(coord.scheduler.lock().await.boards().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_leased_node_moves_only_with_force() {
+        let coord = move_fixture().await;
+        let alice = user("org-a", "alice");
+        let bob = user("org-a", "bob");
+        let grant = grant_lease(&coord, &bob, "dk-1").await;
+
+        assert!(matches!(
+            coord.move_node_core(&alice, "node-a", "org-b", false).await,
+            Err(NodeMoveError::Leased(1))
+        ));
+        assert_eq!(coord.scheduler.lock().await.boards().count(), 2);
+
+        let out = coord
+            .move_node_core(&alice, "node-a", "org-b", true)
+            .await
+            .unwrap();
+        assert_eq!(out.revoked_leases, 1);
+        assert!(coord.scheduler.lock().await.boards().next().is_none());
+        assert_eq!(
+            coord
+                .db()
+                .scoped(org("org-a"))
+                .open_lease_count()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(audit_actions(&coord, "org-a")
+            .await
+            .contains(&"lease.revoke".to_owned()));
+        let _ = grant;
     }
 }

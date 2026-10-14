@@ -260,7 +260,7 @@ pub async fn delete(args: &OrgDeleteArgs) -> Result<String> {
 }
 
 /// `route?org=<org>`, percent-encoding the org.
-fn org_route(route: &str, org: &str) -> String {
+pub(crate) fn org_route(route: &str, org: &str) -> String {
     use std::fmt::Write as _;
     let mut encoded = String::with_capacity(org.len());
     for b in org.bytes() {

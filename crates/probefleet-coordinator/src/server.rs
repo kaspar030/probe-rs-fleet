@@ -311,6 +311,28 @@ async fn handle_node_report(
     report: NodeReport,
 ) -> Result<Option<CoordinatorError>> {
     match report {
+        NodeReport::Register {
+            ref node,
+            protocol_version,
+        } if *node != auth.node && is_pre_move_id(node, &auth.node) => {
+            // The node was moved to another org (`Coordinator::move_node_core`):
+            // its token survived the move, but the fleet file still holds the
+            // old `<old org>/<name>` id. Same node-local name, different org
+            // prefix is exactly what a move produces, and the routing id is the
+            // token's anyway. Not audited: it would fire on every reconnect
+            // until the agent's next `node up`.
+            debug!(%node_id, claimed = %node.0, "node reports pre-move id");
+            coord
+                .handle_node_report(
+                    node_id,
+                    NodeReport::Register {
+                        node: auth.node.clone(),
+                        protocol_version,
+                    },
+                )
+                .await?;
+            Ok(None)
+        }
         NodeReport::Register { ref node, .. } if *node != auth.node => {
             // Under bearer auth the self-declared id is attacker-controlled
             // text. Routing already uses the token-derived id, so ignoring the
@@ -346,6 +368,18 @@ async fn handle_node_report(
             coord.handle_node_report(node_id, other).await?;
             Ok(None)
         }
+    }
+}
+
+/// Whether `claimed` is what a node moved to another org would still send:
+/// the same node-local name (after the first `/`) as `actual`, under a
+/// different, non-empty org prefix.
+fn is_pre_move_id(claimed: &NodeId, actual: &NodeId) -> bool {
+    match (claimed.0.split_once('/'), actual.0.split_once('/')) {
+        (Some((c_org, c_name)), Some((a_org, a_name))) => {
+            !c_org.is_empty() && c_org != a_org && c_name == a_name && !c_name.is_empty()
+        }
+        _ => false,
     }
 }
 
@@ -963,5 +997,88 @@ mod tests {
         tokio::time::sleep(TEST_SETTLE).await;
         assert!(coord.nodes().get(&node_id).await.is_some());
         task.abort();
+    }
+
+    /// A node moved to another org reconnects with its surviving token but
+    /// still announces its pre-move `<old org>/<name>` id: accepted.
+    #[tokio::test]
+    async fn register_with_a_pre_move_id_is_accepted() {
+        let coord = coordinator().await;
+        let node_id = test_node_id();
+        let old_id = crate::state::node_id_for(
+            &crate::subject::org_of(forgs::NsNodeId::from_parts(1, 2)),
+            "node-a",
+        );
+        assert_ne!(old_id, node_id);
+
+        let (server_tx, server_rx, mut peer_tx, _peer_rx) = probefleet_wire::mock::pair();
+        let coord_clone = Arc::clone(&coord);
+        let id = node_id.clone();
+        let task = tokio::spawn(async move {
+            handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id).await
+        });
+
+        probefleet_wire::send(
+            &mut peer_tx,
+            &NodeToCoord::Report(NodeReport::Register {
+                node: old_id,
+                protocol_version: PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(TEST_SETTLE).await;
+        assert!(coord.nodes().get(&node_id).await.is_some());
+        assert!(!task.is_finished());
+        task.abort();
+    }
+
+    /// The leniency is only for a different org with the *same* name: another
+    /// org's other node is still refused, and still audited.
+    #[tokio::test]
+    async fn register_with_another_orgs_other_node_is_refused_and_audited() {
+        let coord = coordinator().await;
+        // A real org, so the audit row's foreign key holds.
+        let org = coord.db().ensure_org_named("lab", 0).await.unwrap();
+        let node_id = crate::state::node_id_for(&org, "node-a");
+        let foreign = crate::state::node_id_for(
+            &crate::subject::org_of(forgs::NsNodeId::from_parts(1, 2)),
+            "node-b",
+        );
+
+        let (server_tx, server_rx, mut peer_tx, _peer_rx) = probefleet_wire::mock::pair();
+        let coord_clone = Arc::clone(&coord);
+        let id = node_id.clone();
+        let task = tokio::spawn(async move {
+            handle_agent_for_test(coord_clone, Box::new(server_tx), Box::new(server_rx), id).await
+        });
+        probefleet_wire::send(
+            &mut peer_tx,
+            &NodeToCoord::Report(NodeReport::Register {
+                node: foreign,
+                protocol_version: PROTOCOL_VERSION,
+            }),
+        )
+        .await
+        .unwrap();
+        let err = task.await.unwrap().unwrap_err();
+        assert!(matches!(err, CoordinatorError::Protocol(ref m) if m.contains("node-b")));
+        let audit = coord.db().scoped(org).recent_audit(None, 50).await.unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|e| e.action == "node.register.id_mismatch"),
+            "mismatch must still be audited: {audit:?}"
+        );
+    }
+
+    #[test]
+    fn pre_move_id_shape() {
+        let id = |s: &str| NodeId(s.to_owned());
+        assert!(is_pre_move_id(&id("A/rpi"), &id("B/rpi")));
+        assert!(!is_pre_move_id(&id("B/rpi"), &id("B/rpi")));
+        assert!(!is_pre_move_id(&id("A/other"), &id("B/rpi")));
+        assert!(!is_pre_move_id(&id("rpi"), &id("B/rpi")));
+        assert!(!is_pre_move_id(&id("/rpi"), &id("B/rpi")));
     }
 }

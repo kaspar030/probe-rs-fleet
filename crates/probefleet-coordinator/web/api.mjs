@@ -91,6 +91,10 @@ export function describe(err) {
       return 'Your personal org follows your username; it cannot be renamed or deleted.';
     case 'org_not_empty':
       return 'The org still has hardware or sharing: remove its nodes, release its leases and revoke its grants first.';
+    case 'node_name_taken':
+      return 'The target org already has a node with that name.';
+    case 'node_leased':
+      return 'Some of its boards are leased: release them, or tick "revoke active leases".';
     case 'org_limit_reached':
       return 'You have reached the limit on how many orgs you may create.';
     case 'server_error':

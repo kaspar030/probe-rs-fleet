@@ -807,6 +807,40 @@ pub enum NodeCommand {
     Up(NodeUpArgs),
     /// Run the node with the `[node]` credential this machine already has.
     Run(NodeRunArgs),
+    /// Move a node, with all its boards, to another org.
+    ///
+    /// You must be an admin of the node's org and a member of the target.
+    /// The machine keeps its token and reconnects by itself.
+    Move(NodeMoveArgs),
+}
+
+/// Arguments for `probefleet node move`.
+#[derive(Debug, Args)]
+pub struct NodeMoveArgs {
+    /// The node's name (or its full `<org>/<name>` id, whose org is then the
+    /// source unless `--org` is given).
+    pub name: String,
+    /// The org to move it to (path or id).
+    #[arg(long)]
+    pub to_org: String,
+    /// The org it is in now (path or id). Defaults to the fleet file's
+    /// `[user].org`, else your personal org.
+    #[arg(long)]
+    pub org: Option<String>,
+    /// Revoke active leases on its boards instead of refusing the move.
+    #[arg(long)]
+    pub force: bool,
+    /// Skip the confirmation prompt. Required when stdin is not a terminal.
+    #[arg(long)]
+    pub yes: bool,
+    /// The fleet whose `[user]` session authorises the move.
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
+        add = crate::completion::fleet_candidates())]
+    pub fleet: String,
+    /// Override the config directory (default: XDG config dir). Test and
+    /// packaging support.
+    #[arg(long, hide = true, value_hint = clap::ValueHint::DirPath)]
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 /// Arguments for `probefleet node up`.
@@ -1809,6 +1843,10 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
                     }
                     NodeCommand::Run(run) => {
                         roles::node_run::run(&run.fleet, run.config_dir).await?;
+                        Ok(ExitCode::SUCCESS)
+                    }
+                    NodeCommand::Move(mv) => {
+                        roles::node_move::run(&mv).await?;
                         Ok(ExitCode::SUCCESS)
                     }
                 },
@@ -3420,12 +3458,45 @@ mod tests {
                     }
                     NodeBoardCommand::List(other) => panic!("expected add, got {other:?}"),
                 },
-                NodeCommand::Approve(_) | NodeCommand::Up(_) | NodeCommand::Run(_) => {
+                NodeCommand::Approve(_)
+                | NodeCommand::Up(_)
+                | NodeCommand::Run(_)
+                | NodeCommand::Move(_) => {
                     panic!("expected board")
                 }
             },
             other => panic!("expected node, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_node_move() {
+        let cli = Cli::parse_from(os(&[
+            "probefleet",
+            "node",
+            "move",
+            "rpi-1",
+            "--to-org",
+            "beta",
+            "--org",
+            "acme",
+            "--force",
+            "--yes",
+        ]));
+        match cli.command {
+            Command::Node(n) => match n.command {
+                NodeCommand::Move(m) => {
+                    assert_eq!(m.name, "rpi-1");
+                    assert_eq!(m.to_org, "beta");
+                    assert_eq!(m.org.as_deref(), Some("acme"));
+                    assert!(m.force && m.yes);
+                }
+                other => panic!("expected move, got {other:?}"),
+            },
+            other => panic!("expected node, got {other:?}"),
+        }
+        // --to-org is required.
+        assert!(Cli::try_parse_from(os(&["probefleet", "node", "move", "rpi-1"])).is_err());
     }
 
     /// Bare `node board add` must parse: with a terminal it prompts for
@@ -3460,7 +3531,10 @@ mod tests {
                         NodeBoardCommand::Add(a) => assert_eq!(a.interactive_choice(), expected),
                         NodeBoardCommand::List(other) => panic!("expected add, got {other:?}"),
                     },
-                    NodeCommand::Approve(_) | NodeCommand::Up(_) | NodeCommand::Run(_) => {
+                    NodeCommand::Approve(_)
+                    | NodeCommand::Up(_)
+                    | NodeCommand::Run(_)
+                    | NodeCommand::Move(_) => {
                         panic!("expected board")
                     }
                 },

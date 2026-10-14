@@ -164,6 +164,23 @@ test('agents offers tags and adopt, never a rename', () => {
   assert.match(textOf(tree), /Renaming is not supported/);
 });
 
+test('agents offers Move… to admins only, targeting other orgs', () => {
+  const node = {
+    id: `${ORG}/rpi-1`, name: 'rpi-1', tags: [], adopt: 'declared',
+    owner: MEMBER.user_id, last_seen: 1700000000, created_at: 1600000000, online: true, boards: [],
+  };
+  assert.ok(labels(agents.render({ nodes: [node], session: ADMIN })).includes('Move…'));
+  assert.ok(!labels(agents.render({ nodes: [node], session: MEMBER })).includes('Move…'));
+  const tree = agents.render({ nodes: [node], session: ADMIN, moving: 'rpi-1' });
+  const options = findAll(tree, (n) => n.tag === 'option').map((n) => n.attrs.value);
+  assert.deepEqual(options, [TEAM], 'the current org is not a target');
+  assert.ok(find(tree, (n) => n.tag === 'input' && n.attrs.name === 'force'));
+  assert.match(textOf(tree), /boards move with it/);
+  // A member never gets the panel, even if asked.
+  const memberTree = agents.render({ nodes: [node], session: MEMBER, moving: 'rpi-1' });
+  assert.equal(find(memberTree, (n) => n.tag === 'select' && n.attrs.name === 'to_org'), null);
+});
+
 // Agents counts *declared* boards (the `board` table) and Devices lists the
 // *leasable* ones (the scheduler), so the two legitimately differ by boards
 // whose probe is unplugged. The page has to say so, or the disagreement reads

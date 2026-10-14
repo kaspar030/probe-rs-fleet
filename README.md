@@ -39,7 +39,8 @@ probefleet ctl serial <board> --pty        # …or as a local pty for picocom/ti
 `examples/coordinator.toml` documents the login provider setup and every
 other coordinator key. `node up` registers the machine with your login and
 then runs it; headless lab nodes can instead be approved from another machine
-(`node approve`) or enrolled with an auth key (`auth-key create`). Linking the
+(`node approve`) or enrolled with an auth key (`auth-key create`). A node,
+with its boards, moves to another org with `node move <name> --to-org <org>`. Linking the
 binary as `probe-rs` on your `PATH` makes plain `probe-rs` commands use the
 fleet.
 

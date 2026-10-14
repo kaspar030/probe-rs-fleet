@@ -671,6 +671,68 @@ impl Db {
         Ok(row.map(|(id,)| id))
     }
 
+    /// Move the node named `name` from org `from` to org `to`, re-keying its
+    /// `node` row and every `board` row in one transaction. Returns the new
+    /// node id, [`NodeMove::NotFound`] if `from` has no such node, or
+    /// [`NodeMove::NameTaken`] if `to` already has one by that name (a
+    /// concurrent enroll the caller's pre-check could not see).
+    ///
+    /// A [`Db`] method rather than an [`OrgDb`] one **on purpose**: it is the
+    /// one write that deliberately spans two orgs, and an `OrgDb` is bound to
+    /// exactly one. The caller
+    /// ([`crate::core::Coordinator::move_node_core`]) authorizes against both.
+    ///
+    /// The node id embeds the org (`node_id_for`), so the primary key itself
+    /// changes. `board.node_id` is an enforced foreign key with no `ON
+    /// UPDATE` action, so the check is deferred to commit
+    /// (`PRAGMA defer_foreign_keys`, on the transaction's own connection),
+    /// by which time both tables agree again. The token hash stays on the
+    /// row, so the node's existing token authenticates the moved node.
+    ///
+    /// Closed `leases` and `audit_log` rows are left alone: history stays
+    /// with the org it happened in.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn move_node(&self, from: &OrgId, name: &str, to: &OrgId) -> Result<NodeMove> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("PRAGMA defer_foreign_keys = ON")
+            .execute(&mut *tx)
+            .await?;
+        let Some((old,)): Option<(String,)> =
+            sqlx::query_as("SELECT id FROM node WHERE ns_node_id = ?1 AND name = ?2")
+                .bind(from.0.as_str())
+                .bind(name)
+                .fetch_optional(&mut *tx)
+                .await?
+        else {
+            return Ok(NodeMove::NotFound);
+        };
+        let new = node_id_for(to, name);
+        let updated = sqlx::query("UPDATE node SET id = ?1, ns_node_id = ?2 WHERE id = ?3")
+            .bind(new.0.as_str())
+            .bind(to.0.as_str())
+            .bind(old.as_str())
+            .execute(&mut *tx)
+            .await;
+        match updated {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                return Ok(NodeMove::NameTaken);
+            }
+            Err(e) => return Err(e.into()),
+        }
+        sqlx::query("UPDATE board SET node_id = ?1, ns_node_id = ?2 WHERE node_id = ?3")
+            .bind(new.0.as_str())
+            .bind(to.0.as_str())
+            .bind(old.as_str())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(NodeMove::Moved(new))
+    }
+
     /// The org a node belongs to, if the node is known.
     ///
     /// # Errors
@@ -739,6 +801,17 @@ impl Db {
             }
         }
     }
+}
+
+/// The outcome of [`Db::move_node`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeMove {
+    /// Moved; the node's new id.
+    Moved(NodeId),
+    /// The source org has no node by that name.
+    NotFound,
+    /// The target org already has a node by that name.
+    NameTaken,
 }
 
 /// Turn a forgs grant row into fleet's evaluable [`GrantScope`], or `None` if
@@ -1885,6 +1958,73 @@ mod tests {
         assert!(!s.delete_node("b-node").await.unwrap());
         assert_eq!(s.board_count().await.unwrap(), 0);
         assert_eq!(db.node_by_token_hash("h").await.unwrap(), None);
+    }
+
+    /// A move re-keys the node and its boards in one transaction, keeps the
+    /// token, leaves the foreign keys consistent, and refuses a taken name.
+    #[tokio::test]
+    async fn move_node_rekeys_node_and_boards() {
+        let db = testkit::db().await;
+        let a = seeded(&db, "acme", "other-a").await;
+        let b = seeded(&db, "beta", "taken").await;
+        db.register_node(&a, "rpi", "h", &[], 1000).await.unwrap();
+        db.register_node(&a, "taken", "h2", &[], 1000)
+            .await
+            .unwrap();
+        for name in ["dk-1", "dk-2"] {
+            db.scoped(a.clone())
+                .record_board(&board_in(&a, "rpi", name), BoardPresence::Online, 1000)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.move_node(&a, "ghost", &b).await.unwrap(),
+            NodeMove::NotFound
+        );
+        assert_eq!(
+            db.move_node(&a, "taken", &b).await.unwrap(),
+            NodeMove::NameTaken
+        );
+        // The refused move rolled back.
+        assert!(db
+            .scoped(a.clone())
+            .node_by_name("taken")
+            .await
+            .unwrap()
+            .is_some());
+
+        let new = node_id_for(&b, "rpi");
+        assert_eq!(
+            db.move_node(&a, "rpi", &b).await.unwrap(),
+            NodeMove::Moved(new.clone())
+        );
+        assert!(db
+            .scoped(a.clone())
+            .node_by_name("rpi")
+            .await
+            .unwrap()
+            .is_none());
+        let moved = db.scoped(b.clone()).list_nodes().await.unwrap();
+        let rpi = moved.iter().find(|n| n.name == "rpi").unwrap();
+        assert_eq!(rpi.id, new);
+        assert_eq!(rpi.boards, ["dk-1", "dk-2"]);
+        assert!(db
+            .scoped(a.clone())
+            .list_nodes()
+            .await
+            .unwrap()
+            .iter()
+            .all(|n| n.name != "rpi"));
+        // The token survives and now authenticates the moved node.
+        let (id, org, _) = db.node_by_token_hash("h").await.unwrap().unwrap();
+        assert_eq!((id, org), (new, b));
+        let violations = sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(violations, 0, "foreign keys hold after the move");
     }
 
     #[tokio::test]

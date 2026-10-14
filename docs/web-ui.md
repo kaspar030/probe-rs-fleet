@@ -488,6 +488,7 @@ leave the org unmanageable), `400 invalid_request` (malformed body or role).
 | `GET /api/v1/nodes` | — | `[{"id","name","tags","adopt","owner","last_seen","online","boards"}]` | **new** `Coordinator::list_nodes` → **new** `OrgDb::list_nodes` (+ `NodeRegistry` for `online`) | member |
 | `PATCH /api/v1/nodes/{name}` | `{"tags"?,"adopt"?}` | the updated node row | `Coordinator::update_node_core` → `OrgDb::update_node` | node owner, or admin |
 | `DELETE /api/v1/nodes/{name}` | — | `204` | `Coordinator::delete_node_core` → lease teardown + scheduler removal + `OrgDb::delete_node` + close the live connection | node owner, or admin |
+| `POST /api/v1/nodes/{name}/move` | `{"to_org":"<path or id>","force":false}` | `{"node","old_id","from_org","to_org","revoked_leases","grants_lost","grants_gained"}` | `Coordinator::move_node_core` → lease drain + `Db::move_node` (one transaction) + close the live connection | admin of the source **and** member of the target |
 | `POST /api/v1/nodes/pending/{code}` | `{"decision":"inspect"\|"approve"\|"deny","replace":false}` | `NodeApprovalResponse` + a `warning` field | `http::decide_pending_node` (**unchanged**) | member |
 
 `boards` in a node row is the **declared** set, not the leasable one: the names
@@ -498,6 +499,15 @@ pruned on its next report. `GET /api/v1/boards` reads the *scheduler* instead �
 what can be leased right now — so the Agents count is legitimately ≥ the Devices
 list, differing exactly by the declared-but-offline boards. The field carries no
 per-board presence; adding it would widen this payload for a display nicety.
+
+**Moving a node.** `POST /api/v1/nodes/{name}/move` re-homes a node and every
+board it hosts in another org. Refusals: `403 forbidden` (not an admin of the
+source; not a member of the target, or no such target — the same answer),
+`404 not_found`, `400 invalid_request` (same org), `409 node_name_taken`, and
+`409 node_leased` (with a `leased` count) unless `force`. The Agents page
+offers it as **Move…** to admins, with a picker of the user's other
+memberships and a confirmation. Moving a single board is not supported: a
+board belongs to its machine. See architecture §6.1 for what survives a move.
 
 There is deliberately **no** `GET /api/v1/nodes/pending`, for the reason §4
 records:

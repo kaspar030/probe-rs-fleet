@@ -230,6 +230,7 @@ async fn every_action_the_ui_performs_needs_the_csrf_header() {
         ("DELETE", "/api/v1/leases/1", "{}"),
         ("PATCH", "/api/v1/nodes/rpi-1", r#"{"tags":[]}"#),
         ("DELETE", "/api/v1/nodes/rpi-1", "{}"),
+        ("POST", "/api/v1/nodes/rpi-1/move", r#"{"to_org":"x"}"#),
         (
             "POST",
             "/api/v1/nodes/pending/ABCD-1234",

@@ -20,6 +20,7 @@
 //!   self-renewing session instead of an hourly `ci login` wrapper
 //! - [`completions`] → print how to switch shell completion on
 //! - [`node_approve`] → approve a headless machine that printed a short code
+//! - [`node_move`] → move a node and its boards to another org
 //! - [`node_board`] → declare a board (discover probes, append to
 //!   `boards.toml`) instead of hand-editing it
 //! - [`node_up`] → the §4.2 credential ladder, then [`node_run`]
@@ -45,6 +46,7 @@ pub mod login;
 pub mod logout;
 pub mod node_approve;
 pub mod node_board;
+pub mod node_move;
 pub mod node_run;
 pub mod node_setup;
 pub mod node_up;

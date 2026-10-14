@@ -12,8 +12,8 @@ mod common;
 
 use common::{start_fleet, Fleet};
 use probefleet::cli::{
-    LoginArgs, OrgCliCreateArgs, OrgDeleteArgs, OrgMembersArgs, OrgRenameArgs, OrgSessionArgs,
-    RoleArg,
+    LoginArgs, NodeMoveArgs, OrgCliCreateArgs, OrgDeleteArgs, OrgMembersArgs, OrgRenameArgs,
+    OrgSessionArgs, RoleArg,
 };
 use probefleet_coordinator::FleetRole;
 
@@ -344,4 +344,112 @@ async fn admins_rename_and_delete_team_orgs() {
         .unwrap()
         .is_none());
     assert_eq!(default_org(&alice), None);
+}
+
+fn move_args(
+    config_dir: &std::path::Path,
+    name: &str,
+    org: Option<&str>,
+    to: &str,
+) -> NodeMoveArgs {
+    NodeMoveArgs {
+        name: name.to_owned(),
+        to_org: to.to_owned(),
+        org: org.map(ToOwned::to_owned),
+        force: false,
+        yes: true,
+        fleet: "default".to_owned(),
+        config_dir: Some(config_dir.to_path_buf()),
+    }
+}
+
+/// `node move`: an admin of the source who is a member of the target moves a
+/// node; its boards go with it. A non-admin of the source, and a target the
+/// caller is not in, are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admin_moves_a_node_and_its_boards_to_another_org() {
+    use probefleet_proto::board::{Board, BoardState, PowerKind};
+    use probefleet_proto::ids::BoardRef;
+
+    let fleet = start_fleet(SEED).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let alice = tmp.path().join("alice");
+    let bob = tmp.path().join("bob");
+    for name in ["org-a", "org-b", "org-c"] {
+        fleet.create_org(name).await;
+    }
+    fleet.member("alice", "org-a", FleetRole::Admin).await;
+    fleet.member("alice", "org-b", FleetRole::Member).await;
+    fleet.member("bob", "org-a", FleetRole::Member).await;
+    fleet.member("bob", "org-b", FleetRole::Admin).await;
+    login(&fleet, &alice, "alice", Some("org-a")).await;
+    login(&fleet, &bob, "bob", Some("org-a")).await;
+
+    let a = fleet.org("org-a").await;
+    let b = fleet.org("org-b").await;
+    let reg = fleet
+        .coord
+        .register_node_and_mint(
+            &a,
+            "rpi-1",
+            &[],
+            None,
+            probefleet_proto::AdoptPolicy::Declared,
+            "node.enroll",
+            "test fixture",
+        )
+        .await
+        .unwrap();
+    let node = probefleet_proto::ids::NodeId(reg.node_id);
+    for name in ["dk-1", "dk-2"] {
+        fleet
+            .coord
+            .db()
+            .scoped(a.clone())
+            .record_board(
+                &Board {
+                    id: BoardRef::new(a.clone(), node.clone(), name),
+                    node: node.clone(),
+                    chip: "nRF52840_xxAA".to_owned(),
+                    model: None,
+                    tags: Vec::new(),
+                    exclusive: true,
+                    power: PowerKind::None,
+                    state: BoardState::Idle,
+                    serial_ports: Vec::new(),
+                },
+                probefleet_proto::node_api::BoardPresence::Online,
+                1,
+            )
+            .await
+            .unwrap();
+    }
+
+    // bob is only a member of the source.
+    let err = probefleet::roles::node_move::move_node(&move_args(&bob, "rpi-1", None, "org-b"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must be an admin"), "{err}");
+    // alice is not in org-c.
+    let err = probefleet::roles::node_move::move_node(&move_args(&alice, "rpi-1", None, "org-c"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("must be an admin"), "{err}");
+
+    let moved = probefleet::roles::node_move::move_node(&move_args(&alice, "rpi-1", None, "org-b"))
+        .await
+        .expect("node move");
+    assert_eq!(moved.node.id, format!("{}/rpi-1", b.0));
+    assert_eq!(moved.from_org.name.as_deref(), Some("org-a"));
+    assert_eq!(moved.to_org.name.as_deref(), Some("org-b"));
+    assert_eq!(moved.node.boards, ["dk-1", "dk-2"]);
+
+    let in_a = fleet.coord.db().scoped(a).list_nodes().await.unwrap();
+    assert!(in_a.is_empty(), "{in_a:?}");
+    let in_b = fleet.coord.db().scoped(b).list_nodes().await.unwrap();
+    assert_eq!(in_b.len(), 1);
+    assert_eq!(in_b[0].name, "rpi-1");
+    assert_eq!(in_b[0].boards, ["dk-1", "dk-2"]);
 }

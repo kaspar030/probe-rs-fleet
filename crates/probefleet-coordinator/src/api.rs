@@ -61,6 +61,8 @@
 //!   see [`update_node`].
 //! * `DELETE /api/v1/nodes/{name}` — a revocation, cascading through the live
 //!   leases, the scheduler and the node's connection; see [`delete_node`].
+//! * `POST /api/v1/nodes/{name}/move` — move a node and its boards to another
+//!   org the caller is a member of (admin of the source); see [`move_node`].
 //! * `POST /api/v1/nodes/pending/{code}` — inspect / approve / deny a pending
 //!   node registration, cashing in `docs/architecture.md` §4.2's promise that a
 //!   cookie-authenticated handler would call the *same*
@@ -147,7 +149,9 @@ use probefleet_proto::board::PowerKind;
 use probefleet_proto::ids::{BoardName, BoardRef, LeaseId, SubjectKey};
 use probefleet_proto::token::AllowedOp;
 
-use crate::core::{Coordinator, NodeStatus, OpError, OrgAdminError, OrgCreateError};
+use crate::core::{
+    Coordinator, NodeMoveError, NodeMoveOutcome, NodeStatus, OpError, OrgAdminError, OrgCreateError,
+};
 use crate::http::{parse_adopt, reject, valid_tags};
 use crate::identity::{CiKeyPayload, NodeKeyPayload, PURPOSE_CI, PURPOSE_NODE};
 use crate::subject::{FleetRole, Subject};
@@ -174,6 +178,7 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
             "/api/v1/nodes/{name}",
             axum::routing::patch(update_node).delete(delete_node),
         )
+        .route("/api/v1/nodes/{name}/move", post(move_node))
         .route("/api/v1/nodes/pending/{code}", post(decide_pending))
         .route("/api/v1/boards", get(boards))
         .route("/api/v1/boards/power-cycle", post(power_cycle))
@@ -1324,6 +1329,138 @@ async fn delete_node(
     match coord.delete_node_core(&subject, &name).await {
         Ok(_id) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => op_error(&e),
+    }
+}
+
+/// The body of `POST /api/v1/nodes/{name}/move`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NodeMoveRequest {
+    /// The target org: a path (its name) or namespace id.
+    to_org: String,
+    /// Revoke live leases on the node's boards instead of refusing.
+    #[serde(default)]
+    force: bool,
+}
+
+/// An org as named in a move response.
+#[derive(Debug, Serialize)]
+struct OrgRefView {
+    id: String,
+    name: Option<String>,
+}
+
+/// A grant a move affected: the usual view plus a display name for its
+/// subject, so a warning can say *who* lost access.
+#[derive(Debug, Serialize)]
+struct MovedGrantView {
+    #[serde(flatten)]
+    grant: GrantView,
+    subject_display: Option<String>,
+}
+
+impl From<GrantSummary> for MovedGrantView {
+    fn from(g: GrantSummary) -> Self {
+        let subject_display = g.subject_display.clone();
+        Self {
+            grant: GrantView::from(g),
+            subject_display,
+        }
+    }
+}
+
+/// The response of `POST /api/v1/nodes/{name}/move`.
+#[derive(Debug, Serialize)]
+struct NodeMoveView {
+    node: NodeView,
+    old_id: String,
+    from_org: OrgRefView,
+    to_org: OrgRefView,
+    revoked_leases: u32,
+    grants_lost: Vec<MovedGrantView>,
+    grants_gained: Vec<MovedGrantView>,
+}
+
+/// Render a [`NodeMoveError`].
+fn node_move_error(e: &NodeMoveError) -> Response {
+    match e {
+        NodeMoveError::Denied => reject(StatusCode::FORBIDDEN, "forbidden"),
+        NodeMoveError::NotFound => reject(StatusCode::NOT_FOUND, "not_found"),
+        NodeMoveError::SameOrg => reject(StatusCode::BAD_REQUEST, "invalid_request"),
+        NodeMoveError::NameTaken => reject(StatusCode::CONFLICT, "node_name_taken"),
+        NodeMoveError::Leased(n) => (
+            StatusCode::CONFLICT,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({
+                "error": "node_leased",
+                "leased": n,
+            })),
+        )
+            .into_response(),
+        NodeMoveError::Internal(err) => {
+            warn!(error = %err, "a node move failed");
+            reject(StatusCode::INTERNAL_SERVER_ERROR, "server_error")
+        }
+    }
+}
+
+/// `POST /api/v1/nodes/{name}/move` — move a node, with all its boards, from
+/// the acting org to `to_org`.
+///
+/// Admin of the source, member of the target; an unknown target is the same
+/// `403` as a foreign one. Leased boards refuse the move (`409 node_leased`,
+/// with a `leased` count) unless `force`. The node's token survives, so the
+/// agent reconnects on its own. See [`Coordinator::move_node_core`].
+async fn move_node(
+    State(coord): State<Arc<Coordinator>>,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: axum::body::Bytes,
+) -> Response {
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let Ok(request) = serde_json::from_slice::<NodeMoveRequest>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    match coord
+        .move_node_core(&subject, &name, &request.to_org, request.force)
+        .await
+    {
+        Ok(NodeMoveOutcome {
+            from,
+            to,
+            old_id,
+            node,
+            revoked_leases,
+            grants_lost,
+            grants_gained,
+        }) => {
+            let from_name = coord.db().org_name(&from).await.ok().flatten();
+            let to_name = coord.db().org_name(&to).await.ok().flatten();
+            Json(NodeMoveView {
+                node: NodeView::from(node),
+                old_id: old_id.0,
+                from_org: OrgRefView {
+                    id: from.0,
+                    name: from_name,
+                },
+                to_org: OrgRefView {
+                    id: to.0,
+                    name: to_name,
+                },
+                revoked_leases,
+                grants_lost: grants_lost.into_iter().map(Into::into).collect(),
+                grants_gained: grants_gained.into_iter().map(Into::into).collect(),
+            })
+            .into_response()
+        }
+        Err(e) => node_move_error(&e),
     }
 }
 

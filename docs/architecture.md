@@ -1027,6 +1027,21 @@ The decisions that are load-bearing:
 - **Boards are keyed `(org, node, name)`**, and a node id is already
   org-namespaced (`state.rs::node_id_for` → `"<org id>/<name>"`), so the same
   machine name in two tenants is two nodes.
+- **Moving a node to another org** (`probefleet node move`, the Agents
+  page's *Move…*; `Coordinator::move_node_core`) therefore changes the node's
+  id. Admin of the source and member of the target are required. Leased
+  boards refuse the move unless forced (then the leases are revoked). The
+  node and board rows are re-keyed in one transaction (`Db::move_node`, FK
+  checks deferred to commit); closed leases and audit rows stay with the
+  source org. The **token survives** — it is looked up by hash, and the hash
+  stays on the row — so the agent need not re-enroll; its live connection is
+  closed, it reconnects, and its re-reported inventory lands in the new org.
+  Its fleet file still holds the old id until its next `node up`, so
+  `Register` accepts a claimed id with the same node-local name under a
+  different org prefix (logged at debug, not audited). Grants are untouched:
+  selectors name neither org nor node, so source-org grants simply stop
+  covering the boards and target-org grants may start to; the move reports
+  both lists. A single board cannot be moved.
 - **Subjects.** forgs builds a `forgs::Subject` from a credential;
   `probefleet-proto::ids::SubjectKey` is its wire mirror and renders identically,
   `[<ns>/]<kind>:<id>`:
