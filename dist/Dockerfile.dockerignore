@@ -1,0 +1,6 @@
+# BuildKit/podman pick this up for builds using dist/Dockerfile.
+target
+tmp
+.git
+.tau
+dist/.env

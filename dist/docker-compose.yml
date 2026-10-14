@@ -1,0 +1,34 @@
+# probefleet coordinator, deployed behind an HTTPS reverse proxy.
+#
+#   cp .env.example .env    # then edit
+#   docker compose up -d --build
+#
+# The proxy must terminate TLS and forward everything (including WebSocket
+# upgrades on /agent and /client) to the published port. See README.md here.
+
+services:
+  coordinator:
+    build:
+      context: ..
+      dockerfile: dist/Dockerfile
+    image: ${PROBEFLEET_IMAGE:-probefleet:latest}
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      # Bound to loopback by default: only the reverse proxy on this host
+      # should reach it. Set PROBEFLEET_BIND=0.0.0.0 if the proxy is elsewhere.
+      - "${PROBEFLEET_BIND:-127.0.0.1}:${PROBEFLEET_PORT:-7000}:7000"
+    volumes:
+      - probefleet-data:/data
+      # Optional extra TOML (see PROBEFLEET_EXTRA_CONFIG in .env.example).
+      # - ./extra.toml:/etc/probefleet/extra.toml:ro
+    # If your proxy runs in Docker, attach to its network instead of (or in
+    # addition to) publishing a port:
+    # networks: [proxy]
+
+volumes:
+  probefleet-data:
+
+# networks:
+#   proxy:
+#     external: true
