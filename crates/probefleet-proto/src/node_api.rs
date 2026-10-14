@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::board::PowerKind;
 use crate::ids::{BoardName, BoardRef, LeaseId, NodeId};
+use crate::serial::SerialPortInfo;
 use crate::ChannelId;
 
 /// A probe physically discovered on a node host (via `probe-rs` enumeration).
@@ -98,6 +99,10 @@ pub struct BoardStatus {
     /// exactly what an operator wondering why `--select 'chip=…'` or
     /// `--select 'board=…'` does not match needs to see.
     pub adopted: bool,
+    /// USB serial ports associated with the board (auto-discovered by USB
+    /// topology, plus any `[[board.uart]]` overrides), openable by the lease
+    /// holder over a [`ChannelKind::Serial`] channel.
+    pub serial_ports: Vec<SerialPortInfo>,
 }
 
 /// A full inventory snapshot: which declared boards are present, plus any
@@ -149,6 +154,10 @@ pub enum PowerAction {
 ///   stub. `probe-rs gdb` is not remote-capable in 0.32, so the node runs it
 ///   locally and tunnels its raw gdbremote TCP as a second opaque channel
 ///   (architecture §4.2 gap note, §10 Q3).
+/// * [`ChannelKind::Serial`] — one of the board's USB serial ports. Each
+///   `DataFrame` carries one postcard-encoded
+///   [`crate::serial::SerialRequest`] / [`crate::serial::SerialEvent`], so
+///   line settings and DTR/RTS travel in-band.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ChannelKind {
     /// Opaque probe-rs `serve` postcard-rpc data plane (the default).
@@ -156,6 +165,8 @@ pub enum ChannelKind {
     Data,
     /// Raw gdbremote TCP from a board-local `probe-rs gdb` stub.
     Gdb,
+    /// A board USB serial port (framed [`crate::serial`] messages).
+    Serial,
 }
 
 /// Messages a node sends *up* to the coordinator.
@@ -348,6 +359,12 @@ mod tests {
                 exclusive: true,
                 power: PowerKind::None,
                 adopted: false,
+                serial_ports: vec![SerialPortInfo {
+                    name: "if1".to_owned(),
+                    device: "ttyACM0".to_owned(),
+                    interface: Some(1),
+                    default_baud: 115_200,
+                }],
             }],
             unknown: vec![
                 DiscoveredProbe {

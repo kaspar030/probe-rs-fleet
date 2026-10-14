@@ -34,7 +34,7 @@ use crate::ids::{BoardRef, LeaseId};
 ///
 /// | op | enforced where |
 /// |---|---|
-/// | [`AllowedOp::Attach`] | agent, at data-channel open (`ChannelKind::Data`) |
+/// | [`AllowedOp::Attach`] | agent, at data-channel and serial-channel open (`ChannelKind::Data`, `ChannelKind::Serial`) |
 /// | [`AllowedOp::Gdb`] | agent, at gdb-channel open (`ChannelKind::Gdb`) |
 /// | [`AllowedOp::PowerCycle`] | coordinator, in the operator power-cycle handler |
 /// | [`AllowedOp::Flash`], [`AllowedOp::Erase`], [`AllowedOp::Reset`] | **not enforced** |

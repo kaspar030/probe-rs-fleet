@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{BoardRef, LeaseId, NodeId, SubjectKey};
+use crate::serial::SerialPortInfo;
 
 /// A leasable board, as known to the coordinator (reconciled from a node's
 /// `boards.toml` plus live probe discovery).
@@ -25,6 +26,8 @@ pub struct Board {
     /// How the node can cut/restore USB power to this board.
     pub power: PowerKind,
     pub state: BoardState,
+    /// USB serial ports the node associates with the board.
+    pub serial_ports: Vec<SerialPortInfo>,
 }
 
 /// USB power-control capability for a board, as wired on the node.

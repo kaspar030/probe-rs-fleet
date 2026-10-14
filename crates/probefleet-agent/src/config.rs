@@ -142,6 +142,33 @@ pub struct BoardSpec {
     /// USB power-control wiring.
     #[serde(default = "default_power")]
     pub power: PowerSpec,
+    /// Explicitly configured serial ports (`[[board.uart]]`), for boards whose
+    /// UART is a separate adapter or whose tty USB discovery cannot associate.
+    ///
+    /// The key is `uart` because `serial` already names the probe serial.
+    #[serde(default)]
+    pub uart: Vec<UartSpec>,
+    /// Whether to auto-discover serial ports that share the probe's USB
+    /// device (CDC-ACM VCOM, FTDI channels, ...). Default `true`.
+    #[serde(default = "default_uart_discover")]
+    pub uart_discover: bool,
+}
+
+fn default_uart_discover() -> bool {
+    true
+}
+
+/// One explicitly configured serial port of a board (`[[board.uart]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UartSpec {
+    /// The name clients open it by; defaults to `uart<i>` (its index).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// The device path, ideally a stable `/dev/serial/by-id/...` link.
+    pub path: PathBuf,
+    /// Default baud rate (115200 when omitted).
+    #[serde(default)]
+    pub baud: Option<u32>,
 }
 
 impl BoardSpec {
@@ -223,6 +250,34 @@ impl BoardsConfig {
                     "duplicate board id {:?}",
                     board.id
                 )));
+            }
+            let mut uart_names: HashSet<String> = HashSet::new();
+            for (i, uart) in board.uart.iter().enumerate() {
+                if uart.path.as_os_str().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "board {:?} declares a uart with an empty path",
+                        board.id
+                    )));
+                }
+                if uart.name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "board {:?} declares a uart with an empty name (omit the key instead)",
+                        board.id
+                    )));
+                }
+                if uart.baud == Some(0) {
+                    return Err(ConfigError::Invalid(format!(
+                        "board {:?} declares a uart with baud 0",
+                        board.id
+                    )));
+                }
+                let name = uart.name.clone().unwrap_or_else(|| format!("uart{i}"));
+                if !uart_names.insert(name.clone()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "board {:?} declares uart name {name:?} twice",
+                        board.id
+                    )));
+                }
             }
             if !seen_serials.insert(&board.serial) {
                 return Err(ConfigError::Invalid(format!(
@@ -759,5 +814,47 @@ chip = "c1"
         assert!(cfg.fall_back_to_previous_token());
         assert_eq!(cfg.node_token, "prfn1_old");
         assert_eq!(cfg.previous_node_token.as_deref(), Some(current.as_str()));
+    }
+
+    #[test]
+    fn uart_entries_parse_and_validate() {
+        let cfg = BoardsConfig::from_str(
+            r#"
+[[board]]
+id = "b"
+serial = "S"
+chip = "c"
+uart_discover = false
+[[board.uart]]
+name = "console"
+path = "/dev/serial/by-id/usb-FTDI-if00-port0"
+baud = 9600
+[[board.uart]]
+path = "/dev/ttyUSB1"
+"#,
+        )
+        .unwrap();
+        let b = &cfg.boards[0];
+        assert!(!b.uart_discover);
+        assert_eq!(b.uart.len(), 2);
+        assert_eq!(b.uart[0].baud, Some(9600));
+        assert_eq!(b.uart[1].name, None);
+        // Defaults: discovery on, no explicit ports.
+        let cfg = BoardsConfig::from_str("[[board]]\nid = \"b\"\nserial = \"S\"\nchip = \"c\"\n").unwrap();
+        assert!(cfg.boards[0].uart_discover && cfg.boards[0].uart.is_empty());
+    }
+
+    #[test]
+    fn bad_uart_entries_are_rejected() {
+        for bad in [
+            "[[board.uart]]\npath = \"\"\n",
+            "[[board.uart]]\nname = \"\"\npath = \"/dev/x\"\n",
+            "[[board.uart]]\npath = \"/dev/x\"\nbaud = 0\n",
+            "[[board.uart]]\nname = \"a\"\npath = \"/dev/x\"\n[[board.uart]]\nname = \"a\"\npath = \"/dev/y\"\n",
+            "[[board.uart]]\npath = \"/dev/x\"\n[[board.uart]]\nname = \"uart0\"\npath = \"/dev/y\"\n",
+        ] {
+            let text = format!("[[board]]\nid = \"b\"\nserial = \"S\"\nchip = \"c\"\n{bad}");
+            assert!(BoardsConfig::from_str(&text).is_err(), "{bad}");
+        }
     }
 }

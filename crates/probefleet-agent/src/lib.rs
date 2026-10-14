@@ -28,6 +28,7 @@ pub mod error;
 pub mod gdb;
 pub mod power;
 pub mod probers;
+pub mod serial;
 pub mod token;
 
 pub use agent::Agent;

@@ -17,6 +17,7 @@ pub mod board;
 pub mod ids;
 pub mod lease;
 pub mod node_api;
+pub mod serial;
 pub mod token;
 
 pub use admin::{
@@ -30,6 +31,7 @@ pub use node_api::{
     BoardPresence, BoardStatus, ChannelKind, CoordinatorCommand, DiscoveredProbe, LogLevel,
     NodeReport, PowerAction, ProbeInventory,
 };
+pub use serial::SerialPortInfo;
 pub use token::{
     normalize_ops, parse_ops, AllowedOp, CapabilityToken, SignedToken, TokenError, TokenSigner,
     TokenVerifier, SIGNATURE_LEN,
@@ -142,4 +144,11 @@ pub struct ChannelId(pub u64);
 ///   fields. postcard is positional, so every envelope carrying a holder
 ///   re-encodes, and every stored org id / subject from a v11 coordinator is
 ///   meaningless to a v12 one (its database starts fresh).
-pub const PROTOCOL_VERSION: u32 = 12;
+/// * 12 → 13: board USB-serial passthrough ([`serial`]). [`ChannelKind`]
+///   gained `Serial` (appended, so `Data`/`Gdb` keep their discriminants),
+///   and [`node_api::BoardStatus`], [`board::Board`] and
+///   [`admin::BoardSummary`] gained `serial_ports`. postcard is positional,
+///   so every inventory report and board list re-encodes. The serial control
+///   messages themselves ride *inside* relayed `DataFrame`s and add no
+///   envelope variant.
+pub const PROTOCOL_VERSION: u32 = 13;

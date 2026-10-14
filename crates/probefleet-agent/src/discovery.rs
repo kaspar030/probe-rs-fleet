@@ -100,6 +100,8 @@ pub fn reconcile(boards: &BoardsConfig, discovered: &[DiscoveredProbe]) -> Probe
             exclusive: board.exclusive,
             power: board.power.to_power_kind(),
             adopted: false,
+            // Stamped by the agent's discovery pass, which owns the tty lister.
+            serial_ports: Vec::new(),
         });
     }
 
@@ -171,6 +173,8 @@ pub fn adopted_board_spec(probe: &DiscoveredProbe) -> Option<BoardSpec> {
         tags: inferred_tags(probe),
         exclusive: true,
         power: PowerSpec::None,
+        uart: Vec::new(),
+        uart_discover: true,
     })
 }
 
@@ -245,6 +249,7 @@ pub fn adopted_board_status(spec: &BoardSpec, presence: BoardPresence) -> BoardS
         exclusive: spec.exclusive,
         power: spec.power.to_power_kind(),
         adopted: true,
+        serial_ports: Vec::new(),
     }
 }
 

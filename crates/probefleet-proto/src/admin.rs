@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::adopt::AdoptPolicy;
 use crate::board::PowerKind;
 use crate::ids::{BoardRef, LeaseId, NodeId, OrgId, SubjectKey};
+use crate::serial::SerialPortInfo;
 use crate::token::AllowedOp;
 
 /// A coarse, operator-facing lifecycle label for a board in `ctl list`.
@@ -60,6 +61,8 @@ pub struct BoardSummary {
     pub lease: Option<LeaseId>,
     /// If leased, the expiry (epoch seconds).
     pub expires: Option<u64>,
+    /// USB serial ports the lease holder can open with `ctl serial`.
+    pub serial_ports: Vec<SerialPortInfo>,
 }
 
 /// One row of the `ctl nodes` machine inventory.

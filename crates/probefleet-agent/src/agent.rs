@@ -30,6 +30,9 @@ use crate::error::{AgentError, Result};
 use crate::gdb::{GdbConnection, GdbStub, ProcessGdbStub};
 use crate::power::{self, PowerControl};
 use crate::probers::{ProbeRsBackend, Session};
+use crate::serial::{
+    BusyPorts, SerialChannelCtx, SerialLister, SerialOpener, SerialportOpener, SysfsSerialLister,
+};
 use crate::token::Ed25519Verifier;
 
 /// One `probe-rs serve` process and every relay channel spliced onto it.
@@ -67,6 +70,19 @@ struct GdbSession {
     lease: LeaseId,
     board: BoardName,
     connection: GdbConnection,
+}
+
+/// An open serial-passthrough channel (architecture §4.2, "Serial
+/// passthrough"). The port itself is opened by the channel pump
+/// ([`crate::serial::run_channel`]) once the client's `Open` frame names it;
+/// this entry is what ties the channel to its lease/board lifecycle.
+struct SerialSession {
+    lease: LeaseId,
+    board: BoardName,
+    /// Dropping or setting this stops the pump, which closes the fd.
+    stop: tokio::sync::watch::Sender<bool>,
+    /// Handed to the connection layer's splice exactly once.
+    ctx: Option<SerialChannelCtx>,
 }
 
 /// Factory that builds a power controller from a board's declared power kind.
@@ -110,6 +126,14 @@ pub struct Agent<B: ProbeRsBackend> {
     /// into `sessions`: a gdb stub is per-channel by nature (each carries one
     /// client connection), so it has no process to share.
     gdb_sessions: Mutex<HashMap<ChannelId, GdbSession>>,
+    /// Open serial-passthrough channels, keyed by channel.
+    serial_sessions: Mutex<HashMap<ChannelId, SerialSession>>,
+    /// Enumerates USB ttys for serial-port discovery.
+    serial_lister: Arc<dyn SerialLister>,
+    /// Opens serial devices (injectable for tests).
+    serial_opener: Arc<dyn SerialOpener>,
+    /// Device paths currently open on a serial channel.
+    serial_busy: BusyPorts,
     /// Reports the agent wants to emit upward (drained by the connection loop).
     outbox: Mutex<Vec<NodeReport>>,
     /// Builds power controllers (injectable for tests).
@@ -143,6 +167,8 @@ fn declared_board_status(b: &BoardSpec) -> probefleet_proto::BoardStatus {
         exclusive: b.exclusive,
         power: b.power.to_power_kind(),
         adopted: false,
+        // Stamped from a tty listing by `Agent::stamp_serial_ports`.
+        serial_ports: Vec::new(),
     }
 }
 
@@ -171,6 +197,10 @@ impl<B: ProbeRsBackend> Agent<B> {
             }),
             sessions: Mutex::new(HashMap::new()),
             gdb_sessions: Mutex::new(HashMap::new()),
+            serial_sessions: Mutex::new(HashMap::new()),
+            serial_lister: Arc::new(SysfsSerialLister::default()),
+            serial_opener: Arc::new(SerialportOpener),
+            serial_busy: BusyPorts::default(),
             outbox: Mutex::new(Vec::new()),
             power_factory: Box::new(|k| power::from_power_kind(k)),
             now_fn: wall_clock_secs,
@@ -201,6 +231,58 @@ impl<B: ProbeRsBackend> Agent<B> {
     pub fn with_lister(mut self, lister: Arc<dyn ProbeLister>) -> Self {
         self.lister = lister;
         self
+    }
+
+    /// Override the USB-tty enumerator used for serial-port discovery (tests).
+    #[must_use]
+    pub fn with_serial_lister(mut self, lister: Arc<dyn SerialLister>) -> Self {
+        self.serial_lister = lister;
+        self
+    }
+
+    /// Override how serial devices are opened (tests stand a pty pair in).
+    #[must_use]
+    pub fn with_serial_opener(mut self, opener: Arc<dyn SerialOpener>) -> Self {
+        self.serial_opener = opener;
+        self
+    }
+
+    /// The serial ports of `spec`, resolved against a fresh tty listing.
+    ///
+    /// `vid_pid` narrows the auto-discovered match when the probe's USB ids
+    /// are known; the stored spec's ids are used when non-zero.
+    fn serial_ports_for(
+        spec: &BoardSpec,
+        vid_pid: Option<(u16, u16)>,
+        ttys: &[crate::serial::UsbTty],
+    ) -> Vec<crate::serial::ResolvedPort> {
+        let vid_pid = vid_pid.or((spec.vid != 0 || spec.pid != 0).then_some((spec.vid, spec.pid)));
+        crate::serial::resolve_ports(spec, vid_pid, ttys)
+    }
+
+    /// Stamp `serial_ports` onto every online board of `inventory`.
+    fn stamp_serial_ports(
+        &self,
+        inventory: &mut ProbeInventory,
+        adopted: &HashMap<BoardName, BoardSpec>,
+        discovered: &[probefleet_proto::DiscoveredProbe],
+    ) {
+        let ttys = self.serial_lister.list();
+        for status in &mut inventory.boards {
+            if status.presence != probefleet_proto::BoardPresence::Online {
+                continue;
+            }
+            let spec = self.boards.board(&status.board).or_else(|| adopted.get(&status.board));
+            let Some(spec) = spec else { continue };
+            let vid_pid = discovered
+                .iter()
+                .find(|p| p.serial == spec.serial)
+                .map(|p| (p.vid, p.pid));
+            status.serial_ports = Self::serial_ports_for(spec, vid_pid, &ttys)
+                .into_iter()
+                .map(|p| p.info)
+                .collect();
+        }
     }
 
     /// Run one probe-discovery pass and, if anything changed, install the
@@ -234,6 +316,9 @@ impl<B: ProbeRsBackend> Agent<B> {
         let mut inventory = discovery::reconcile(&self.boards, &discovered);
         let previous = self.adopted.lock().await.clone();
         let adopted = discovery::adopt_unknown(&mut inventory, self.config.adopt, &previous);
+        // Serial ports ride the same on-change report: a tty appearing or
+        // vanishing changes the inventory.
+        self.stamp_serial_ports(&mut inventory, &adopted, &discovered);
         if *self.inventory.lock().await == inventory {
             return None;
         }
@@ -284,10 +369,12 @@ impl<B: ProbeRsBackend> Agent<B> {
             .iter()
             .map(declared_board_status)
             .collect();
-        *self.inventory.lock().await = ProbeInventory {
+        let mut inventory = ProbeInventory {
             boards,
             unknown: Vec::new(),
         };
+        self.stamp_serial_ports(&mut inventory, &HashMap::new(), &[]);
+        *self.inventory.lock().await = inventory;
     }
 
     /// Drain queued upward reports.
@@ -390,9 +477,10 @@ impl<B: ProbeRsBackend> Agent<B> {
 
         // Verify the capability token locally before doing anything else. The
         // required capability depends on the channel kind: a gdb tunnel needs
-        // `Gdb`, the data plane needs `Attach`.
+        // `Gdb`; the data plane and a serial console need `Attach` (a UART is
+        // no more privileged than attaching to the target).
         let required = match kind {
-            ChannelKind::Data => AllowedOp::Attach,
+            ChannelKind::Data | ChannelKind::Serial => AllowedOp::Attach,
             ChannelKind::Gdb => AllowedOp::Gdb,
         };
         let now = (self.now_fn)();
@@ -404,7 +492,83 @@ impl<B: ProbeRsBackend> Agent<B> {
                     .await
             }
             ChannelKind::Gdb => self.open_gdb_session(lease, &local, channel, &spec).await,
+            ChannelKind::Serial => self.open_serial_session(lease, &local, channel, &spec).await,
         }
+    }
+
+    /// Register a serial-passthrough channel.
+    ///
+    /// Ports are resolved **now**, against a fresh tty listing rather than the
+    /// last inventory: ttyACM numbers move after a re-enumeration or a power
+    /// cycle. The device itself is opened by the pump when the client's
+    /// `Open` frame names a port. Coexists with any `serve`/gdb session on
+    /// the same board — flash-and-watch-the-UART is the point.
+    async fn open_serial_session(
+        &self,
+        lease: LeaseId,
+        board: &BoardName,
+        channel: ChannelId,
+        spec: &BoardSpec,
+    ) -> Result<()> {
+        let ttys = self.serial_lister.list();
+        let ports = Self::serial_ports_for(spec, None, &ttys);
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let names: Vec<String> = ports.iter().map(|p| p.info.name.clone()).collect();
+        self.serial_sessions.lock().await.insert(
+            channel,
+            SerialSession {
+                lease,
+                board: board.clone(),
+                stop,
+                ctx: Some(SerialChannelCtx {
+                    ports,
+                    opener: Arc::clone(&self.serial_opener),
+                    busy: Arc::clone(&self.serial_busy),
+                    stop: stop_rx,
+                }),
+            },
+        );
+        self.emit(NodeReport::Log {
+            level: probefleet_proto::LogLevel::Info,
+            board: Some(board.clone()),
+            message: format!(
+                "opened serial channel {} for lease {} (ports: {})",
+                channel.0,
+                lease.0,
+                if names.is_empty() { "none".to_owned() } else { names.join(", ") }
+            ),
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Take the pump context of an open serial channel (once).
+    pub async fn take_serial_ctx(&self, channel: ChannelId) -> Option<SerialChannelCtx> {
+        self.serial_sessions
+            .lock()
+            .await
+            .get_mut(&channel)
+            .and_then(|s| s.ctx.take())
+    }
+
+    /// Forget a serial channel whose pump ended on its own. Returns whether
+    /// it was still registered — i.e. whether the caller must report
+    /// `SessionClosed` (an agent-initiated stop already did).
+    pub async fn finish_serial(&self, channel: ChannelId) -> bool {
+        self.serial_sessions.lock().await.remove(&channel).is_some()
+    }
+
+    /// Stop every serial channel without reporting (the control connection
+    /// is gone, so the coordinator has dropped them already).
+    pub async fn close_serial_channels(&self) {
+        for (_, s) in self.serial_sessions.lock().await.drain() {
+            let _ = s.stop.send(true);
+        }
+    }
+
+    /// Number of open serial channels (tests).
+    pub async fn serial_session_count(&self) -> usize {
+        self.serial_sessions.lock().await.len()
     }
 
     /// Open a data-plane channel, reusing this board's `probe-rs serve` process
@@ -620,6 +784,19 @@ impl<B: ProbeRsBackend> Agent<B> {
         for channel in self.gdb_channels_for_board(board).await {
             self.on_kill_session(channel).await?;
         }
+        // Serial too: a power cycle re-enumerates the USB device, so the tty
+        // fd would go stale exactly like a probe handle.
+        let serial: Vec<ChannelId> = self
+            .serial_sessions
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, s)| &s.board == board)
+            .map(|(c, _)| *c)
+            .collect();
+        for channel in serial {
+            self.on_kill_session(channel).await?;
+        }
         let mut sessions = self.sessions.lock().await;
         Self::kill_board_session_locked(&mut sessions, board, &self.outbox).await?;
         Ok(())
@@ -712,6 +889,16 @@ impl<B: ProbeRsBackend> Agent<B> {
             })
             .await;
         }
+        let serial = self.serial_sessions.lock().await.remove(&channel);
+        if let Some(session) = serial {
+            // Stops the pump, which closes the fd and drops buffered input.
+            let _ = session.stop.send(true);
+            self.emit(NodeReport::SessionClosed {
+                channel,
+                exit_code: None,
+            })
+            .await;
+        }
         // A gdb tunnel may share the same channel-id space; tear it down too.
         let gdb = self.gdb_sessions.lock().await.remove(&channel);
         if let Some(session) = gdb {
@@ -746,6 +933,9 @@ impl<B: ProbeRsBackend> Agent<B> {
         for entry in self.sessions.lock().await.values_mut() {
             entry.channels.clear();
         }
+        // Serial channels are not lease-lived processes: the port is held
+        // only while a channel is, so a dead connection closes them.
+        self.close_serial_channels().await;
     }
 
     /// Release a lease: close its channels, then kill the board's `serve` and
@@ -848,6 +1038,14 @@ impl<B: ProbeRsBackend> Agent<B> {
             .collect();
         channels.extend(
             self.gdb_sessions
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, s)| s.lease == lease)
+                .map(|(c, _)| *c),
+        );
+        channels.extend(
+            self.serial_sessions
                 .lock()
                 .await
                 .iter()
@@ -1907,6 +2105,8 @@ port = 2
                 tags: vec!["auto".to_owned()],
                 exclusive: true,
                 power: crate::config::PowerSpec::None,
+                uart: Vec::new(),
+                uart_discover: true,
             },
         );
         agent.set_adopted(poisoned).await;
@@ -1957,5 +2157,105 @@ port = 2
             "the first pass changed it"
         );
         assert!(agent.discovery_pass().await.is_none(), "nothing changed");
+    }
+
+    // ---- serial passthrough ---------------------------------------------
+
+    fn serial_tty() -> crate::serial::UsbTty {
+        crate::serial::UsbTty {
+            tty: "ttyACM0".to_owned(),
+            path: std::path::PathBuf::from("/dev/ttyACM0"),
+            vid: 0x1366,
+            pid: 0x1015,
+            usb_serial: Some("S1".to_owned()),
+            usb_device_path: std::path::PathBuf::from("/sys/devices/x"),
+            interface: Some(2),
+        }
+    }
+
+    fn serial_agent() -> Agent<MockBackend> {
+        let lister = crate::serial::StaticSerialLister::default();
+        lister.0.lock().unwrap().push(serial_tty());
+        make_agent(Arc::new(MockBackend::new())).with_serial_lister(Arc::new(lister))
+    }
+
+    async fn open_serial(agent: &Agent<MockBackend>, lease: u64, channel: u64, ops: Vec<AllowedOp>) -> Result<()> {
+        agent
+            .handle_command(CoordinatorCommand::OpenSession {
+                lease: LeaseId(lease),
+                board: board_ref("b1"),
+                token: signed_token(lease, "b1", ops, 2_000),
+                serve_token: SERVE_TOKEN.to_owned(),
+                channel: ChannelId(channel),
+                kind: ChannelKind::Serial,
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn serial_ports_are_stamped_onto_the_inventory() {
+        let agent = serial_agent();
+        agent.seed_inventory_from_boards().await;
+        let inv = agent.current_inventory().await;
+        let ports = &inv.boards[0].serial_ports;
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports[0].name, "if2");
+        assert_eq!(ports[0].device, "ttyACM0");
+    }
+
+    #[tokio::test]
+    async fn serial_channel_needs_attach() {
+        let agent = serial_agent();
+        let err = open_serial(&agent, 7, 1, vec![AllowedOp::Gdb]).await.unwrap_err();
+        assert!(matches!(err, AgentError::Token(_)));
+        assert_eq!(agent.serial_session_count().await, 0);
+        open_serial(&agent, 7, 1, vec![AllowedOp::Attach]).await.unwrap();
+        assert_eq!(agent.serial_session_count().await, 1);
+        // The serial channel spawns no `probe-rs serve`.
+        assert_eq!(agent.serve_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn release_kill_and_power_cycle_stop_serial_channels() {
+        let agent = serial_agent();
+        open_serial(&agent, 7, 1, vec![AllowedOp::Attach]).await.unwrap();
+        let mut ctx = agent.take_serial_ctx(ChannelId(1)).await.unwrap();
+        assert!(agent.take_serial_ctx(ChannelId(1)).await.is_none(), "taken once");
+        agent
+            .handle_command(CoordinatorCommand::ReleaseLease {
+                lease: LeaseId(7),
+                board: BoardName("b1".into()),
+                erase: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(agent.serial_session_count().await, 0);
+        // The pump's stop signal fired (or its sender is gone).
+        assert!(*ctx.stop.borrow_and_update() || ctx.stop.has_changed().is_err());
+        assert!(agent
+            .take_reports()
+            .await
+            .iter()
+            .any(|r| matches!(r, NodeReport::SessionClosed { channel, .. } if *channel == ChannelId(1))));
+        // An agent stop means the pump must not report again.
+        assert!(!agent.finish_serial(ChannelId(1)).await);
+
+        open_serial(&agent, 8, 2, vec![AllowedOp::Attach]).await.unwrap();
+        agent
+            .handle_command(CoordinatorCommand::KillSession { channel: ChannelId(2) })
+            .await
+            .unwrap();
+        assert_eq!(agent.serial_session_count().await, 0);
+
+        open_serial(&agent, 8, 3, vec![AllowedOp::Attach]).await.unwrap();
+        agent
+            .handle_command(CoordinatorCommand::PowerCycle { board: BoardName("b1".into()) })
+            .await
+            .unwrap();
+        assert_eq!(agent.serial_session_count().await, 0);
+
+        open_serial(&agent, 8, 4, vec![AllowedOp::Attach]).await.unwrap();
+        agent.clear_data_channels().await;
+        assert_eq!(agent.serial_session_count().await, 0, "a dropped connection closes serial");
     }
 }

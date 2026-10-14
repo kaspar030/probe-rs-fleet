@@ -429,6 +429,9 @@ where
     };
 
     writer_task.abort();
+    // The coordinator drops this connection's channels with it; a serial
+    // port must not stay open behind them.
+    agent.close_serial_channels().await;
     result
 }
 
@@ -605,6 +608,27 @@ async fn spawn_splice<B: ProbeRsBackend + 'static>(
     let out_tx = out_tx.clone();
     let routes = Arc::clone(routes);
     let io: Option<Box<dyn crate::probers::SpliceIo>> = match kind {
+        ChannelKind::Serial => {
+            let Some(ctx) = agent.take_serial_ctx(channel).await else {
+                routes.lock().await.remove(&channel);
+                return;
+            };
+            let agent = Arc::clone(agent);
+            tokio::spawn(async move {
+                let end =
+                    crate::serial::run_channel(channel, ctx, out_tx.clone(), to_session_rx).await;
+                routes.lock().await.remove(&channel);
+                // An agent-initiated stop already reported the close; one
+                // that ended on its own (client gone, device unplugged,
+                // refused open) must tell the coordinator.
+                if matches!(end, crate::serial::ChannelEnd::Ended(_))
+                    && agent.finish_serial(channel).await
+                {
+                    let _ = out_tx.send(crate::serial::session_closed(channel)).await;
+                }
+            });
+            return;
+        }
         ChannelKind::Data => agent.take_data_io(channel).await,
         ChannelKind::Gdb => agent
             .take_gdb_io(channel)
