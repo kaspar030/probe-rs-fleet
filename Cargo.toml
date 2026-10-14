@@ -154,7 +154,7 @@ tokio-gpiod = "0.3"
 # unix syscalls (advisory file locking + uid checks for the sidecar's lease
 # store). Already in the lock file via `tempfile`; `default-features = false`
 # keeps it to the same pure-Rust shape the rest of the tree insists on.
-rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "pty", "termios"] }
+rustix = { version = "1", default-features = false, features = ["fs", "process", "std", "pty", "termios", "stdio"] }
 
 # Board USB-serial passthrough (agent). `default-features = false` drops
 # libudev (C), keeping the armv7-musl cross build pure Rust; port discovery is

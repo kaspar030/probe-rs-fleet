@@ -462,6 +462,8 @@ struct BoardView {
     holder: Option<SubjectView>,
     lease: Option<u64>,
     expires: Option<u64>,
+    /// Names of the board's USB serial ports (`ctl serial <board> --port`).
+    serial_ports: Vec<String>,
 }
 
 impl From<BoardSummary> for BoardView {
@@ -487,6 +489,7 @@ impl From<BoardSummary> for BoardView {
             holder: b.holder.as_ref().map(SubjectView::from),
             lease: b.lease.map(|l| l.0),
             expires: b.expires,
+            serial_ports: b.serial_ports.into_iter().map(|p| p.name).collect(),
         }
     }
 }
@@ -2074,8 +2077,16 @@ mod tests {
             holder: None,
             lease: None,
             expires: None,
+            serial_ports: vec![probefleet_proto::SerialPortInfo {
+                name: "if1".to_owned(),
+                device: "ttyACM0".to_owned(),
+                interface: Some(1),
+                default_baud: 115_200,
+            }],
         }))
         .unwrap();
+        assert!(json.contains(r#""serial_ports":["if1"]"#), "{json}");
+        assert!(!json.contains("ttyACM0"), "device names stay node-side: {json}");
         assert!(json.contains(r#""power":"uhubctl""#), "{json}");
         assert!(!json.contains("1-1"), "{json}");
         assert!(json.contains(r#""availability":"available""#), "{json}");

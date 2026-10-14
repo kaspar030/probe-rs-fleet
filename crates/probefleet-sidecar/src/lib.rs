@@ -73,6 +73,8 @@ pub mod lease_store;
 pub mod local;
 pub mod proxy;
 pub mod selector;
+#[cfg(unix)]
+pub mod serial;
 pub mod signal;
 pub mod transport;
 

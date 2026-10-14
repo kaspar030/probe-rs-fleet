@@ -497,6 +497,7 @@ impl TestCoordinator {
             exclusive: true,
             power: PowerKind::None,
             state: BoardState::Idle,
+            serial_ports: Vec::new(),
         };
         self.db()
             .scoped(org.clone())

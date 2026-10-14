@@ -1350,6 +1350,37 @@ pub struct CtlArgs {
     pub command: CtlCommand,
 }
 
+/// `ctl serial --parity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SerialParity {
+    /// No parity.
+    None,
+    /// Odd parity.
+    Odd,
+    /// Even parity.
+    Even,
+}
+
+/// `ctl serial --flow`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SerialFlow {
+    /// No flow control.
+    None,
+    /// XON/XOFF.
+    Software,
+    /// RTS/CTS.
+    Hardware,
+}
+
+/// An on/off switch (`--dtr on`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnOff {
+    /// Asserted.
+    On,
+    /// Deasserted.
+    Off,
+}
+
 /// `ctl` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum CtlCommand {
@@ -1408,6 +1439,51 @@ pub enum CtlCommand {
         /// `ctl list`) to reach one shared with you.
         #[arg(add = crate::completion::board_id_candidates())]
         board: String,
+    },
+    /// Attach to a leased board's USB serial port (UART passthrough).
+    ///
+    /// The board must already be leased by you (`ctl lease id=<board>`, or a
+    /// cached lease from any `probe-rs` invocation); serial runs alongside a
+    /// probe-rs session on the same board. Without `--pty` the terminal is
+    /// attached (escape: `Ctrl-]` then `q` quit, `r` reset pulse, `d`/`t`
+    /// toggle DTR/RTS, `b` break). With `--pty` a local pseudo-terminal is
+    /// exposed for picocom/tio/minicom/pyserial; baud changes the tool makes
+    /// are forwarded, DTR/RTS stay on the escape commands.
+    Serial {
+        /// The leased board.
+        #[arg(add = crate::completion::board_id_candidates())]
+        board: String,
+        /// Port name as shown by `ctl list` (default: the board's first).
+        #[arg(long)]
+        port: Option<String>,
+        /// Baud rate.
+        #[arg(long, default_value_t = 115_200)]
+        baud: u32,
+        /// Data bits (5-8).
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(5..=8))]
+        data_bits: u8,
+        /// Parity.
+        #[arg(long, value_enum, default_value_t = SerialParity::None)]
+        parity: SerialParity,
+        /// Stop bits (1 or 2).
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+        stop_bits: u8,
+        /// Flow control.
+        #[arg(long, value_enum, default_value_t = SerialFlow::None)]
+        flow: SerialFlow,
+        /// Expose a local pseudo-terminal instead of attaching stdio.
+        #[arg(long)]
+        pty: bool,
+        /// Where to symlink the pty (default:
+        /// `$XDG_RUNTIME_DIR/probefleet/serial/<board>[-<port>]`).
+        #[arg(long, requires = "pty")]
+        link: Option<std::path::PathBuf>,
+        /// Initial DTR level.
+        #[arg(long, value_enum)]
+        dtr: Option<OnOff>,
+        /// Initial RTS level.
+        #[arg(long, value_enum)]
+        rts: Option<OnOff>,
     },
     /// Show who holds which boards.
     Who,
@@ -2993,6 +3069,28 @@ mod tests {
             },
             other => panic!("expected ctl, got {other:?}"),
         }
+
+        let cli = Cli::parse_from(os(&[
+            "probefleet", "ctl", "serial", "b1", "--baud", "9600", "--parity", "even", "--pty",
+            "--link", "/tmp/x", "--dtr", "off",
+        ]));
+        match cli.command {
+            Command::Ctl(a) => match a.command {
+                CtlCommand::Serial { board, baud, parity, pty, link, dtr, .. } => {
+                    assert_eq!(board, "b1");
+                    assert_eq!(baud, 9600);
+                    assert_eq!(parity, SerialParity::Even);
+                    assert!(pty);
+                    assert_eq!(link.as_deref(), Some(std::path::Path::new("/tmp/x")));
+                    assert_eq!(dtr, Some(OnOff::Off));
+                }
+                other => panic!("expected serial, got {other:?}"),
+            },
+            other => panic!("expected ctl, got {other:?}"),
+        }
+        // --link without --pty is refused; data bits are range-checked.
+        assert!(Cli::try_parse_from(os(&["probefleet", "ctl", "serial", "b1", "--link", "/x"])).is_err());
+        assert!(Cli::try_parse_from(os(&["probefleet", "ctl", "serial", "b1", "--data-bits", "9"])).is_err());
 
         let cli = Cli::parse_from(os(&["probefleet", "ctl", "power-cycle", "b1"]));
         match cli.command {

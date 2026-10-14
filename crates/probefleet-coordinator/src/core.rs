@@ -604,6 +604,7 @@ impl Coordinator {
                     exclusive: status.exclusive,
                     power: status.power.clone(),
                     state: BoardState::Idle,
+                    serial_ports: status.serial_ports.clone(),
                 };
                 if status.presence == BoardPresence::Online {
                     online += 1;
@@ -956,6 +957,7 @@ impl Coordinator {
                     holder,
                     lease,
                     expires,
+                    serial_ports: b.serial_ports.clone(),
                 }
             })
             .collect();
@@ -3513,6 +3515,7 @@ mod tests {
             exclusive: true,
             power: PowerKind::None,
             state: BoardState::Idle,
+            serial_ports: Vec::new(),
         }
     }
 
@@ -4973,6 +4976,7 @@ mod tests {
             exclusive: true,
             power: PowerKind::None,
             adopted,
+            serial_ports: Vec::new(),
         }
     }
 

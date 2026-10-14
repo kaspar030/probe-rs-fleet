@@ -266,6 +266,7 @@ mod tests {
             exclusive: true,
             power: PowerKind::None,
             state: BoardState::Idle,
+            serial_ports: Vec::new(),
         }
     }
 

@@ -176,6 +176,7 @@ mod tests {
             exclusive: true,
             power: PowerKind::None,
             state: BoardState::Idle,
+            serial_ports: Vec::new(),
         });
         db.scoped(org.clone())
             .ensure_node(&node, 1000)

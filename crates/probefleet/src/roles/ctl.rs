@@ -335,6 +335,45 @@ impl CtlClient {
         }
     }
 
+    /// `ctl serial <board> …` — attach to a leased board's USB serial port.
+    ///
+    /// Resolves the lease the way `release` does (the board list), then opens
+    /// a serial channel on it. The coordinator refuses the open unless the
+    /// caller controls that lease, so a board leased by somebody else fails
+    /// there, not here.
+    #[cfg(unix)]
+    async fn serial(
+        &self,
+        board: &BoardName,
+        opts: probefleet_sidecar::serial::SerialOptions,
+    ) -> Result<ExitCode> {
+        let session = self.connect_session().await?;
+        let found = match session.request(SidecarToCoord::ListBoards).await? {
+            CoordToSidecar::BoardList(boards) => {
+                boards.into_iter().find(|b| b.board.answers_to(&board.0))
+            }
+            CoordToSidecar::Error { message } => anyhow::bail!("coordinator error: {message}"),
+            other => anyhow::bail!("unexpected reply: {other:?}"),
+        };
+        let Some(found) = found else {
+            anyhow::bail!("no board {board} is visible to you (see `ctl list`)");
+        };
+        let Some(lease) = found.lease else {
+            anyhow::bail!(
+                "board {board} is not leased; lease it first (`probefleet ctl lease id={}`, \
+                 or any probe-rs invocation that caches its lease)",
+                found.board.name
+            );
+        };
+        if found.serial_ports.is_empty() {
+            eprintln!("warning: the node reports no serial ports for {board}; trying anyway");
+        }
+        let code = probefleet_sidecar::serial::run(&session, lease, &found.board.to_string(), opts)
+            .await
+            .map_err(|e| anyhow::anyhow!("serial: {e}"))?;
+        Ok(ExitCode::from(u8::try_from(code).unwrap_or(1)))
+    }
+
     /// `ctl delegate --select … --ops … --ttl …`.
     ///
     /// Prints **only** the capability token and the two environment variables a
@@ -489,8 +528,8 @@ fn render_board_table(boards: &[BoardSummary]) -> String {
     // can reach it.
     let _ = writeln!(
         out,
-        "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} HOLDER",
-        "BOARD", "AGENT", "MODEL", "CHIP", "STATE", "TAGS"
+        "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} {:<10} HOLDER",
+        "BOARD", "AGENT", "MODEL", "CHIP", "STATE", "TAGS", "SERIAL"
     );
     for b in boards {
         let state = format!("{:?}", b.availability);
@@ -500,15 +539,26 @@ fn render_board_table(boards: &[BoardSummary]) -> String {
             .as_ref()
             .map_or_else(String::new, ToString::to_string);
         let model = b.model.as_deref().unwrap_or("-");
+        // Port names `ctl serial <board> --port` accepts; `-` for none.
+        let serial = if b.serial_ports.is_empty() {
+            "-".to_owned()
+        } else {
+            b.serial_ports
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let _ = writeln!(
             out,
-            "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} {}",
+            "{:<32} {:<16} {:<14} {:<16} {:<12} {:<20} {:<10} {}",
             b.board,
             b.node.0,
             model,
             b.chip,
             state,
             crate::render::tags_cell(&b.tags),
+            serial,
             holder
         );
     }
@@ -577,6 +627,66 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
         CtlCommand::Release { board } => client.release(&BoardName(board)).await?,
         CtlCommand::PowerCycle { board } => client.power_cycle(&BoardName(board)).await?,
         CtlCommand::Who => client.who().await?,
+        CtlCommand::Serial {
+            board,
+            port,
+            baud,
+            data_bits,
+            parity,
+            stop_bits,
+            flow,
+            pty,
+            link,
+            dtr,
+            rts,
+        } => {
+            #[cfg(unix)]
+            {
+                use crate::cli::{OnOff, SerialFlow, SerialParity};
+                use probefleet_proto::serial::{DataBits, FlowControl, LineSettings, Parity, StopBits};
+                use probefleet_sidecar::serial::{default_link, LocalMode, SerialOptions};
+                let settings = LineSettings {
+                    baud,
+                    data_bits: match data_bits {
+                        5 => DataBits::Five,
+                        6 => DataBits::Six,
+                        7 => DataBits::Seven,
+                        _ => DataBits::Eight,
+                    },
+                    parity: match parity {
+                        SerialParity::None => Parity::None,
+                        SerialParity::Odd => Parity::Odd,
+                        SerialParity::Even => Parity::Even,
+                    },
+                    stop_bits: if stop_bits == 2 { StopBits::Two } else { StopBits::One },
+                    flow: match flow {
+                        SerialFlow::None => FlowControl::None,
+                        SerialFlow::Software => FlowControl::Software,
+                        SerialFlow::Hardware => FlowControl::Hardware,
+                    },
+                };
+                let mode = if pty {
+                    LocalMode::Pty {
+                        link: link.unwrap_or_else(|| default_link(&board, port.as_deref())),
+                    }
+                } else {
+                    LocalMode::Stdio
+                };
+                let opts = SerialOptions {
+                    port,
+                    settings,
+                    dtr: dtr.map(|v| v == OnOff::On),
+                    rts: rts.map(|v| v == OnOff::On),
+                    mode,
+                };
+                return client.serial(&BoardName(board), opts).await;
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (board, port, baud, data_bits, parity, stop_bits, flow, pty, link, dtr, rts);
+                anyhow::bail!("`ctl serial` is supported on Unix hosts only");
+            }
+        }
         CtlCommand::Logs { board, follow } => {
             client.logs(board.map(BoardName).as_ref(), follow).await?;
         }
@@ -771,6 +881,12 @@ mod tests {
             holder: SubjectKey::new(None, SubjectKind::User, "01J9Z3Q4ABCDEFGHJKMNPQRSTW"),
             lease: Some(probefleet_proto::LeaseId(7)),
             expires: Some(123),
+            serial_ports: vec![probefleet_proto::SerialPortInfo {
+                name: "if1".to_owned(),
+                device: "ttyACM0".to_owned(),
+                interface: Some(1),
+                default_baud: 115_200,
+            }],
         }
     }
 
@@ -805,6 +921,7 @@ mod tests {
             "the header must name the column: {out}"
         );
         assert!(out.contains("nrf52,desk"), "{out}");
+        assert!(out.contains("SERIAL") && out.contains("if1"), "{out}");
         let untagged = out
             .lines()
             .find(|l| l.contains("dk-2"))

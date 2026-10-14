@@ -598,6 +598,35 @@ impl CoordSession {
     async fn send_data(&self, frame: DataFrame) -> Result<(), TransportError> {
         self.send(SidecarToCoord::Data(frame)).await
     }
+
+    /// Route `channel`'s relayed frames to the returned receiver (replacing
+    /// any prior sink). For framed channels (serial) whose caller wants the
+    /// frames themselves rather than a byte splice.
+    pub async fn attach_data(&self, channel: ChannelId) -> mpsc::Receiver<DataFrame> {
+        let (tx, rx) = mpsc::channel::<DataFrame>(256);
+        self.set_data_sink(channel, tx).await;
+        rx
+    }
+
+    /// Send one data frame to the owning node.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Connect`] if the connection is gone.
+    pub async fn send_frame(&self, frame: DataFrame) -> Result<(), TransportError> {
+        self.send_data(frame).await
+    }
+
+    /// Await the next control message (e.g. `ChannelClosed`). Only for a
+    /// caller that owns the session while a channel is open — it consumes
+    /// whatever arrives.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::Connect`] once the connection is gone.
+    pub async fn next_control(&self) -> Result<CoordToSidecar, TransportError> {
+        self.next_ctrl().await
+    }
 }
 
 /// Splice a local client stream onto an opened relay `channel`: copy bytes
