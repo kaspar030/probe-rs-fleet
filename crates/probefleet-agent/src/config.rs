@@ -840,7 +840,8 @@ path = "/dev/ttyUSB1"
         assert_eq!(b.uart[0].baud, Some(9600));
         assert_eq!(b.uart[1].name, None);
         // Defaults: discovery on, no explicit ports.
-        let cfg = BoardsConfig::from_str("[[board]]\nid = \"b\"\nserial = \"S\"\nchip = \"c\"\n").unwrap();
+        let cfg = BoardsConfig::from_str("[[board]]\nid = \"b\"\nserial = \"S\"\nchip = \"c\"\n")
+            .unwrap();
         assert!(cfg.boards[0].uart_discover && cfg.boards[0].uart.is_empty());
     }
 

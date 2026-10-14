@@ -3071,12 +3071,31 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probefleet", "ctl", "serial", "b1", "--baud", "9600", "--parity", "even", "--pty",
-            "--link", "/tmp/x", "--dtr", "off",
+            "probefleet",
+            "ctl",
+            "serial",
+            "b1",
+            "--baud",
+            "9600",
+            "--parity",
+            "even",
+            "--pty",
+            "--link",
+            "/tmp/x",
+            "--dtr",
+            "off",
         ]));
         match cli.command {
             Command::Ctl(a) => match a.command {
-                CtlCommand::Serial { board, baud, parity, pty, link, dtr, .. } => {
+                CtlCommand::Serial {
+                    board,
+                    baud,
+                    parity,
+                    pty,
+                    link,
+                    dtr,
+                    ..
+                } => {
                     assert_eq!(board, "b1");
                     assert_eq!(baud, 9600);
                     assert_eq!(parity, SerialParity::Even);
@@ -3089,8 +3108,19 @@ mod tests {
             other => panic!("expected ctl, got {other:?}"),
         }
         // --link without --pty is refused; data bits are range-checked.
-        assert!(Cli::try_parse_from(os(&["probefleet", "ctl", "serial", "b1", "--link", "/x"])).is_err());
-        assert!(Cli::try_parse_from(os(&["probefleet", "ctl", "serial", "b1", "--data-bits", "9"])).is_err());
+        assert!(
+            Cli::try_parse_from(os(&["probefleet", "ctl", "serial", "b1", "--link", "/x"]))
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(os(&[
+            "probefleet",
+            "ctl",
+            "serial",
+            "b1",
+            "--data-bits",
+            "9"
+        ]))
+        .is_err());
 
         let cli = Cli::parse_from(os(&["probefleet", "ctl", "power-cycle", "b1"]));
         match cli.command {

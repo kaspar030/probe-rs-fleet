@@ -110,9 +110,10 @@ impl SysfsSerialLister {
     }
 
     fn resolve_one(&self, tty: &str, by_id: &[(PathBuf, String)]) -> Option<UsbTty> {
-        let device = std::fs::canonicalize(self.sys_root.join("class/tty").join(tty).join("device"))
-            .ok()?;
-        let sys_root = std::fs::canonicalize(&self.sys_root).unwrap_or_else(|_| self.sys_root.clone());
+        let device =
+            std::fs::canonicalize(self.sys_root.join("class/tty").join(tty).join("device")).ok()?;
+        let sys_root =
+            std::fs::canonicalize(&self.sys_root).unwrap_or_else(|_| self.sys_root.clone());
         let mut interface = None;
         let mut dir: &Path = &device;
         loop {
@@ -124,7 +125,9 @@ impl SysfsSerialLister {
                     interface = u8::from_str_radix(&n, 16).ok();
                 }
             }
-            if let (Some(vid), Some(pid)) = (read_attr(dir, "idVendor"), read_attr(dir, "idProduct")) {
+            if let (Some(vid), Some(pid)) =
+                (read_attr(dir, "idVendor"), read_attr(dir, "idProduct"))
+            {
                 let path = by_id
                     .iter()
                     .find(|(_, t)| t == tty)
@@ -247,10 +250,10 @@ pub fn resolve_ports(
         .map(|(i, u)| ResolvedPort {
             info: SerialPortInfo {
                 name: u.name.clone().unwrap_or_else(|| format!("uart{i}")),
-                device: u
-                    .path
-                    .file_name()
-                    .map_or_else(|| u.path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+                device: u.path.file_name().map_or_else(
+                    || u.path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                ),
                 interface: None,
                 default_baud: u.baud.unwrap_or(DEFAULT_BAUD),
             },
@@ -266,7 +269,10 @@ pub fn resolve_ports(
         .collect();
     found.sort_by(|a, b| (a.interface, &a.tty).cmp(&(b.interface, &b.tty)));
     for t in found {
-        if ports.iter().any(|p| p.path == t.path || p.path == Path::new("/dev").join(&t.tty)) {
+        if ports
+            .iter()
+            .any(|p| p.path == t.path || p.path == Path::new("/dev").join(&t.tty))
+        {
             continue;
         }
         let mut name = t
@@ -333,7 +339,8 @@ pub fn apply_settings(
     port: &mut dyn serialport::SerialPort,
     s: &LineSettings,
 ) -> Result<(), String> {
-    port.set_baud_rate(s.baud).map_err(|e| format!("baud {}: {e}", s.baud))?;
+    port.set_baud_rate(s.baud)
+        .map_err(|e| format!("baud {}: {e}", s.baud))?;
     port.set_data_bits(match s.data_bits {
         DataBits::Five => serialport::DataBits::Five,
         DataBits::Six => serialport::DataBits::Six,
@@ -401,7 +408,11 @@ pub enum ChannelEnd {
     Ended(String),
 }
 
-async fn send_event(out_tx: &mpsc::Sender<NodeToCoord>, channel: ChannelId, ev: &SerialEvent) -> bool {
+async fn send_event(
+    out_tx: &mpsc::Sender<NodeToCoord>,
+    channel: ChannelId,
+    ev: &SerialEvent,
+) -> bool {
     out_tx
         .send(NodeToCoord::Data(DataFrame {
             channel,
@@ -472,10 +483,20 @@ pub async fn run_channel(
         match wire::decode::<SerialRequest>(&frame.bytes) {
             Ok(SerialRequest::Open { port, settings }) => break (port, settings),
             Ok(_) => {
-                send_event(&out_tx, channel, &SerialEvent::Error("port not open yet".to_owned())).await;
+                send_event(
+                    &out_tx,
+                    channel,
+                    &SerialEvent::Error("port not open yet".to_owned()),
+                )
+                .await;
             }
             Err(e) => {
-                send_event(&out_tx, channel, &SerialEvent::Error(format!("malformed request: {e}"))).await;
+                send_event(
+                    &out_tx,
+                    channel,
+                    &SerialEvent::Error(format!("malformed request: {e}")),
+                )
+                .await;
             }
         }
     };
@@ -493,12 +514,18 @@ pub async fn run_channel(
         let names: Vec<&str> = ports.iter().map(|p| p.info.name.as_str()).collect();
         let reason = match &port_name {
             None => "this board has no serial ports".to_owned(),
-            Some(n) => format!("no serial port {n:?} on this board (have: {})", names.join(", ")),
+            Some(n) => format!(
+                "no serial port {n:?} on this board (have: {})",
+                names.join(", ")
+            ),
         };
         return close(reason).await;
     };
 
-    let claimed = busy.lock().expect("busy lock").insert(resolved.path.clone());
+    let claimed = busy
+        .lock()
+        .expect("busy lock")
+        .insert(resolved.path.clone());
     if !claimed {
         return close(format!(
             "serial port {} is already open on another channel",
@@ -659,7 +686,9 @@ pub fn session_closed(channel: ChannelId) -> NodeToCoord {
 /// An opener that hands out pre-opened ports by path (tests, including the
 /// coordinator's end-to-end tests, which stand a pty pair in for the tty).
 #[derive(Default)]
-pub struct MapOpener(pub StdMutex<std::collections::HashMap<PathBuf, Box<dyn serialport::SerialPort>>>);
+pub struct MapOpener(
+    pub StdMutex<std::collections::HashMap<PathBuf, Box<dyn serialport::SerialPort>>>,
+);
 
 impl MapOpener {
     /// Register `port` to be handed out (once) for `path`.
@@ -668,7 +697,10 @@ impl MapOpener {
     ///
     /// If the internal lock was poisoned.
     pub fn insert(&self, path: impl Into<PathBuf>, port: Box<dyn serialport::SerialPort>) {
-        self.0.lock().expect("opener lock").insert(path.into(), port);
+        self.0
+            .lock()
+            .expect("opener lock")
+            .insert(path.into(), port);
     }
 }
 
@@ -773,7 +805,13 @@ mod tests {
         std::fs::create_dir_all(&platform).unwrap();
         f.tty("ttyS0", &platform);
         // A by-id link for the FTDI port.
-        symlink("../../ttyUSB0", f.dir.path().join("dev/serial/by-id/usb-FTDI_FT1234-if00-port0")).unwrap();
+        symlink(
+            "../../ttyUSB0",
+            f.dir
+                .path()
+                .join("dev/serial/by-id/usb-FTDI_FT1234-if00-port0"),
+        )
+        .unwrap();
 
         let ttys = f.lister().list();
         assert_eq!(ttys.len(), 2, "{ttys:?}");
@@ -785,7 +823,9 @@ mod tests {
         assert_eq!((usb.vid, usb.pid, usb.interface), (0x0403, 0x6010, Some(0)));
         assert_eq!(
             usb.path,
-            f.dir.path().join("dev/serial/by-id/usb-FTDI_FT1234-if00-port0")
+            f.dir
+                .path()
+                .join("dev/serial/by-id/usb-FTDI_FT1234-if00-port0")
         );
 
         let ports = resolve_ports(&spec("001050257890"), Some((0x1366, 0x1015)), &ttys);
@@ -816,7 +856,11 @@ mod tests {
         assert!(tty_matches_probe("066DFF", None, &t));
         assert!(!tty_matches_probe("066DFF", Some((0x1366, 0x1015)), &t));
         assert!(!tty_matches_probe("other", None, &t));
-        assert!(!tty_matches_probe("", None, &tty("x", 0, 0, Some(""), None)));
+        assert!(!tty_matches_probe(
+            "",
+            None,
+            &tty("x", 0, 0, Some(""), None)
+        ));
         assert!(!tty_matches_probe("abc", None, &tty("x", 0, 0, None, None)));
     }
 
@@ -854,13 +898,18 @@ mod tests {
         assert_eq!(ports[1].info.default_baud, DEFAULT_BAUD);
 
         s.uart_discover = false;
-        let names: Vec<String> = resolve_ports(&s, None, &ttys).into_iter().map(|p| p.info.name).collect();
+        let names: Vec<String> = resolve_ports(&s, None, &ttys)
+            .into_iter()
+            .map(|p| p.info.name)
+            .collect();
         assert_eq!(names, ["console", "uart1"]);
     }
 
     // ---- the channel pump, against a pty pair --------------------------
 
-    fn pty_ctx(ports: Vec<ResolvedPort>) -> (SerialChannelCtx, serialport::TTYPort, watch::Sender<bool>) {
+    fn pty_ctx(
+        ports: Vec<ResolvedPort>,
+    ) -> (SerialChannelCtx, serialport::TTYPort, watch::Sender<bool>) {
         let (master, slave) = serialport::TTYPort::pair().unwrap();
         let opener = MapOpener::default();
         opener.insert("/dev/ttyTEST", Box::new(slave));
@@ -921,7 +970,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(matches!(next_event(&mut out_rx).await, SerialEvent::Opened { ref port, .. } if port == "if1"));
+        assert!(
+            matches!(next_event(&mut out_rx).await, SerialEvent::Opened { ref port, .. } if port == "if1")
+        );
 
         // device → client
         master.write_all(b"hello").unwrap();
@@ -935,7 +986,10 @@ mod tests {
         assert_eq!(got, b"hello");
 
         // client → device
-        in_tx.send(req(&SerialRequest::Data(b"world".to_vec()))).await.unwrap();
+        in_tx
+            .send(req(&SerialRequest::Data(b"world".to_vec())))
+            .await
+            .unwrap();
         let mut buf = [0u8; 5];
         // Hand the master back: dropping it would hang up the slave.
         let master = tokio::task::spawn_blocking(move || {
@@ -957,16 +1011,25 @@ mod tests {
             .unwrap();
         in_tx.send(req(&SerialRequest::SetDtr(true))).await.unwrap();
         let ev = next_event(&mut out_rx).await;
-        assert!(matches!(ev, SerialEvent::Error(ref e) if e.contains("DTR")), "{ev:?}");
+        assert!(
+            matches!(ev, SerialEvent::Error(ref e) if e.contains("DTR")),
+            "{ev:?}"
+        );
         // Configure was applied before the DTR request was handled; on Linux
         // a pty master's termios reads the slave's.
         #[cfg(target_os = "linux")]
         assert_eq!(master.baud_rate().unwrap(), 9600);
 
         stop_tx.send(true).unwrap();
-        let end = tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(end, ChannelEnd::Stopped);
-        assert!(matches!(next_event(&mut out_rx).await, SerialEvent::Closed(_)));
+        assert!(matches!(
+            next_event(&mut out_rx).await,
+            SerialEvent::Closed(_)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -982,11 +1045,16 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(matches!(next_event(&mut out_rx).await, SerialEvent::Closed(ref r) if r.contains("nope")));
+        assert!(
+            matches!(next_event(&mut out_rx).await, SerialEvent::Closed(ref r) if r.contains("nope"))
+        );
         assert!(matches!(task.await.unwrap(), ChannelEnd::Ended(_)));
 
         let (ctx, _master, _stop) = pty_ctx(vec![test_port()]);
-        ctx.busy.lock().unwrap().insert(PathBuf::from("/dev/ttyTEST"));
+        ctx.busy
+            .lock()
+            .unwrap()
+            .insert(PathBuf::from("/dev/ttyTEST"));
         let (out_tx, mut out_rx) = mpsc::channel(64);
         let (in_tx, in_rx) = mpsc::channel(64);
         let task = tokio::spawn(run_channel(ChannelId(1), ctx, out_tx, in_rx));
@@ -997,7 +1065,9 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(matches!(next_event(&mut out_rx).await, SerialEvent::Closed(ref r) if r.contains("already open")));
+        assert!(
+            matches!(next_event(&mut out_rx).await, SerialEvent::Closed(ref r) if r.contains("already open"))
+        );
         assert!(matches!(task.await.unwrap(), ChannelEnd::Ended(_)));
     }
 
@@ -1008,7 +1078,10 @@ mod tests {
         let (in_tx, in_rx) = mpsc::channel(64);
         let task = tokio::spawn(run_channel(ChannelId(1), ctx, out_tx, in_rx));
         in_tx.send(req(&SerialRequest::SetRts(true))).await.unwrap();
-        assert!(matches!(next_event(&mut out_rx).await, SerialEvent::Error(_)));
+        assert!(matches!(
+            next_event(&mut out_rx).await,
+            SerialEvent::Error(_)
+        ));
         drop(in_tx);
         assert!(matches!(task.await.unwrap(), ChannelEnd::Ended(_)));
     }

@@ -28,14 +28,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use probefleet_proto::serial::{
-    self as wire, DataBits, FlowControl, LineSettings, Parity, SerialEvent, SerialRequest,
-    StopBits,
+    self as wire, DataBits, FlowControl, LineSettings, Parity, SerialEvent, SerialRequest, StopBits,
 };
 use probefleet_proto::{ChannelId, ChannelKind, DataFrame, LeaseId};
 use probefleet_wire::CoordToSidecar;
 use rustix::termios::{self, ControlModes, InputModes, OptionalActions, Termios};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::transport::{CoordSession, TransportError};
 
@@ -202,8 +201,10 @@ pub fn apply_to_termios(t: &mut Termios, s: &LineSettings) -> std::io::Result<()
     c.set(ControlModes::CSTOPB, s.stop_bits == StopBits::Two);
     c.set(ControlModes::CRTSCTS, s.flow == FlowControl::Hardware);
     t.control_modes = c;
-    t.input_modes
-        .set(InputModes::IXON | InputModes::IXOFF, s.flow == FlowControl::Software);
+    t.input_modes.set(
+        InputModes::IXON | InputModes::IXOFF,
+        s.flow == FlowControl::Software,
+    );
     Ok(())
 }
 
@@ -303,7 +304,8 @@ impl Pty {
     /// A write failure on the master.
     pub async fn write(&self, mut bytes: &[u8]) -> std::io::Result<()> {
         while !bytes.is_empty() {
-            let ready = tokio::time::timeout(Duration::from_millis(200), self.master.writable()).await;
+            let ready =
+                tokio::time::timeout(Duration::from_millis(200), self.master.writable()).await;
             let Ok(guard) = ready else {
                 termios::tcflush(&self.slave, termios::QueueSelector::IFlush)?;
                 return Ok(());
@@ -358,7 +360,13 @@ pub fn make_link(link: &Path, target: &Path) -> std::io::Result<()> {
 pub fn default_link(board: &str, port: Option<&str>) -> PathBuf {
     let sanitize = |s: &str| -> String {
         s.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect()
     };
     let base = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
@@ -373,7 +381,11 @@ pub fn default_link(board: &str, port: Option<&str>) -> PathBuf {
     base.join("serial").join(name)
 }
 
-async fn send(session: &CoordSession, channel: ChannelId, req: &SerialRequest) -> Result<(), TransportError> {
+async fn send(
+    session: &CoordSession,
+    channel: ChannelId,
+    req: &SerialRequest,
+) -> Result<(), TransportError> {
     session
         .send_frame(DataFrame {
             channel,
@@ -412,12 +424,18 @@ async fn apply_action(
         Action::ToggleDtr => {
             lines.dtr = !lines.dtr;
             send(session, channel, &SerialRequest::SetDtr(lines.dtr)).await?;
-            eprint!("\r\n[probefleet: DTR {}]\r\n", if lines.dtr { "on" } else { "off" });
+            eprint!(
+                "\r\n[probefleet: DTR {}]\r\n",
+                if lines.dtr { "on" } else { "off" }
+            );
         }
         Action::ToggleRts => {
             lines.rts = !lines.rts;
             send(session, channel, &SerialRequest::SetRts(lines.rts)).await?;
-            eprint!("\r\n[probefleet: RTS {}]\r\n", if lines.rts { "on" } else { "off" });
+            eprint!(
+                "\r\n[probefleet: RTS {}]\r\n",
+                if lines.rts { "on" } else { "off" }
+            );
         }
         Action::Break => send(session, channel, &SerialRequest::Break { millis: 250 }).await?,
         Action::Help => eprint!("\r\n[probefleet: {HELP}]\r\n"),
@@ -431,6 +449,10 @@ async fn apply_action(
 /// # Errors
 ///
 /// A refused channel, a refused `Open`, or local I/O setup failures.
+///
+/// # Panics
+///
+/// Never: the `expect`s are guarded by `select!` preconditions.
 #[allow(clippy::too_many_lines)]
 pub async fn run(
     session: &CoordSession,
@@ -483,7 +505,11 @@ pub async fn run(
         LocalMode::Pty { link } => {
             let pty = Pty::open(&settings).map_err(io)?;
             make_link(link, &pty.slave_path).map_err(io)?;
-            println!("{} -> {} ({board_label} port {port}, {settings})", link.display(), pty.slave_path.display());
+            println!(
+                "{} -> {} ({board_label} port {port}, {settings})",
+                link.display(),
+                pty.slave_path.display()
+            );
             (Some(pty), Some(LinkGuard(link.clone())))
         }
     };
@@ -492,7 +518,11 @@ pub async fn run(
         eprintln!("[probefleet: {HELP}]");
     }
     // Raw mode only after the banners, and only for a real terminal.
-    let _raw = if stdin_tty { Some(RawGuard::stdin().map_err(io)?) } else { None };
+    let raw = if stdin_tty {
+        Some(RawGuard::stdin().map_err(io)?)
+    } else {
+        None
+    };
 
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -579,7 +609,7 @@ pub async fn run(
             }
         }
     };
-    drop(_raw);
+    drop(raw);
     if channel_open {
         session.close_channel_acked(channel).await;
     }
@@ -596,14 +626,21 @@ mod tests {
         assert_eq!(p.feed(b"ab"), vec![Action::Send(b"ab".to_vec())]);
         assert_eq!(
             p.feed(&[b'x', ESCAPE, b'r', b'y']),
-            vec![Action::Send(b"x".to_vec()), Action::Reset, Action::Send(b"y".to_vec())]
+            vec![
+                Action::Send(b"x".to_vec()),
+                Action::Reset,
+                Action::Send(b"y".to_vec())
+            ]
         );
         // An escape split across reads.
         assert_eq!(p.feed(&[ESCAPE]), vec![]);
         assert_eq!(p.feed(b"q"), vec![Action::Quit]);
         // A doubled escape sends a literal one.
         assert_eq!(p.feed(&[ESCAPE, ESCAPE]), vec![Action::Send(vec![ESCAPE])]);
-        assert_eq!(p.feed(&[ESCAPE, b'd', ESCAPE, b't', ESCAPE, b'b']), vec![Action::ToggleDtr, Action::ToggleRts, Action::Break]);
+        assert_eq!(
+            p.feed(&[ESCAPE, b'd', ESCAPE, b't', ESCAPE, b'b']),
+            vec![Action::ToggleDtr, Action::ToggleRts, Action::Break]
+        );
         assert_eq!(p.feed(&[ESCAPE, b'?']), vec![Action::Help]);
     }
 
@@ -660,11 +697,18 @@ mod tests {
         };
         apply_to_termios(&mut t, &want).unwrap();
         termios::tcsetattr(&tool, OptionalActions::Now, &t).unwrap();
-        assert_eq!(pty.settings().unwrap(), want, "the poller sees the tool's settings");
+        assert_eq!(
+            pty.settings().unwrap(),
+            want,
+            "the poller sees the tool's settings"
+        );
 
         rustix::io::write(&tool, b"ping").unwrap();
         let mut buf = [0u8; 16];
-        let n = tokio::time::timeout(Duration::from_secs(5), pty.read(&mut buf)).await.unwrap().unwrap();
+        let n = tokio::time::timeout(Duration::from_secs(5), pty.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(&buf[..n], b"ping");
 
         pty.write(b"pong").await.unwrap();

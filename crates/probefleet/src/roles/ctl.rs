@@ -643,7 +643,9 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
             #[cfg(unix)]
             {
                 use crate::cli::{OnOff, SerialFlow, SerialParity};
-                use probefleet_proto::serial::{DataBits, FlowControl, LineSettings, Parity, StopBits};
+                use probefleet_proto::serial::{
+                    DataBits, FlowControl, LineSettings, Parity, StopBits,
+                };
                 use probefleet_sidecar::serial::{default_link, LocalMode, SerialOptions};
                 let settings = LineSettings {
                     baud,
@@ -658,7 +660,11 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
                         SerialParity::Odd => Parity::Odd,
                         SerialParity::Even => Parity::Even,
                     },
-                    stop_bits: if stop_bits == 2 { StopBits::Two } else { StopBits::One },
+                    stop_bits: if stop_bits == 2 {
+                        StopBits::Two
+                    } else {
+                        StopBits::One
+                    },
                     flow: match flow {
                         SerialFlow::None => FlowControl::None,
                         SerialFlow::Software => FlowControl::Software,
@@ -683,7 +689,9 @@ pub async fn run(args: CtlArgs) -> Result<ExitCode> {
             }
             #[cfg(not(unix))]
             {
-                let _ = (board, port, baud, data_bits, parity, stop_bits, flow, pty, link, dtr, rts);
+                let _ = (
+                    board, port, baud, data_bits, parity, stop_bits, flow, pty, link, dtr, rts,
+                );
                 anyhow::bail!("`ctl serial` is supported on Unix hosts only");
             }
         }

@@ -2045,6 +2045,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serialport",
  "sha2",
  "sqlx",
  "subtle",

@@ -272,7 +272,10 @@ impl<B: ProbeRsBackend> Agent<B> {
             if status.presence != probefleet_proto::BoardPresence::Online {
                 continue;
             }
-            let spec = self.boards.board(&status.board).or_else(|| adopted.get(&status.board));
+            let spec = self
+                .boards
+                .board(&status.board)
+                .or_else(|| adopted.get(&status.board));
             let Some(spec) = spec else { continue };
             let vid_pid = discovered
                 .iter()
@@ -492,7 +495,10 @@ impl<B: ProbeRsBackend> Agent<B> {
                     .await
             }
             ChannelKind::Gdb => self.open_gdb_session(lease, &local, channel, &spec).await,
-            ChannelKind::Serial => self.open_serial_session(lease, &local, channel, &spec).await,
+            ChannelKind::Serial => {
+                self.open_serial_session(lease, &local, channel, &spec)
+                    .await
+            }
         }
     }
 
@@ -535,7 +541,11 @@ impl<B: ProbeRsBackend> Agent<B> {
                 "opened serial channel {} for lease {} (ports: {})",
                 channel.0,
                 lease.0,
-                if names.is_empty() { "none".to_owned() } else { names.join(", ") }
+                if names.is_empty() {
+                    "none".to_owned()
+                } else {
+                    names.join(", ")
+                }
             ),
         })
         .await;
@@ -2179,7 +2189,12 @@ port = 2
         make_agent(Arc::new(MockBackend::new())).with_serial_lister(Arc::new(lister))
     }
 
-    async fn open_serial(agent: &Agent<MockBackend>, lease: u64, channel: u64, ops: Vec<AllowedOp>) -> Result<()> {
+    async fn open_serial(
+        agent: &Agent<MockBackend>,
+        lease: u64,
+        channel: u64,
+        ops: Vec<AllowedOp>,
+    ) -> Result<()> {
         agent
             .handle_command(CoordinatorCommand::OpenSession {
                 lease: LeaseId(lease),
@@ -2206,10 +2221,14 @@ port = 2
     #[tokio::test]
     async fn serial_channel_needs_attach() {
         let agent = serial_agent();
-        let err = open_serial(&agent, 7, 1, vec![AllowedOp::Gdb]).await.unwrap_err();
+        let err = open_serial(&agent, 7, 1, vec![AllowedOp::Gdb])
+            .await
+            .unwrap_err();
         assert!(matches!(err, AgentError::Token(_)));
         assert_eq!(agent.serial_session_count().await, 0);
-        open_serial(&agent, 7, 1, vec![AllowedOp::Attach]).await.unwrap();
+        open_serial(&agent, 7, 1, vec![AllowedOp::Attach])
+            .await
+            .unwrap();
         assert_eq!(agent.serial_session_count().await, 1);
         // The serial channel spawns no `probe-rs serve`.
         assert_eq!(agent.serve_count().await, 0);
@@ -2218,9 +2237,14 @@ port = 2
     #[tokio::test]
     async fn release_kill_and_power_cycle_stop_serial_channels() {
         let agent = serial_agent();
-        open_serial(&agent, 7, 1, vec![AllowedOp::Attach]).await.unwrap();
+        open_serial(&agent, 7, 1, vec![AllowedOp::Attach])
+            .await
+            .unwrap();
         let mut ctx = agent.take_serial_ctx(ChannelId(1)).await.unwrap();
-        assert!(agent.take_serial_ctx(ChannelId(1)).await.is_none(), "taken once");
+        assert!(
+            agent.take_serial_ctx(ChannelId(1)).await.is_none(),
+            "taken once"
+        );
         agent
             .handle_command(CoordinatorCommand::ReleaseLease {
                 lease: LeaseId(7),
@@ -2232,30 +2256,42 @@ port = 2
         assert_eq!(agent.serial_session_count().await, 0);
         // The pump's stop signal fired (or its sender is gone).
         assert!(*ctx.stop.borrow_and_update() || ctx.stop.has_changed().is_err());
-        assert!(agent
-            .take_reports()
-            .await
-            .iter()
-            .any(|r| matches!(r, NodeReport::SessionClosed { channel, .. } if *channel == ChannelId(1))));
+        assert!(agent.take_reports().await.iter().any(
+            |r| matches!(r, NodeReport::SessionClosed { channel, .. } if *channel == ChannelId(1))
+        ));
         // An agent stop means the pump must not report again.
         assert!(!agent.finish_serial(ChannelId(1)).await);
 
-        open_serial(&agent, 8, 2, vec![AllowedOp::Attach]).await.unwrap();
+        open_serial(&agent, 8, 2, vec![AllowedOp::Attach])
+            .await
+            .unwrap();
         agent
-            .handle_command(CoordinatorCommand::KillSession { channel: ChannelId(2) })
+            .handle_command(CoordinatorCommand::KillSession {
+                channel: ChannelId(2),
+            })
             .await
             .unwrap();
         assert_eq!(agent.serial_session_count().await, 0);
 
-        open_serial(&agent, 8, 3, vec![AllowedOp::Attach]).await.unwrap();
+        open_serial(&agent, 8, 3, vec![AllowedOp::Attach])
+            .await
+            .unwrap();
         agent
-            .handle_command(CoordinatorCommand::PowerCycle { board: BoardName("b1".into()) })
+            .handle_command(CoordinatorCommand::PowerCycle {
+                board: BoardName("b1".into()),
+            })
             .await
             .unwrap();
         assert_eq!(agent.serial_session_count().await, 0);
 
-        open_serial(&agent, 8, 4, vec![AllowedOp::Attach]).await.unwrap();
+        open_serial(&agent, 8, 4, vec![AllowedOp::Attach])
+            .await
+            .unwrap();
         agent.clear_data_channels().await;
-        assert_eq!(agent.serial_session_count().await, 0, "a dropped connection closes serial");
+        assert_eq!(
+            agent.serial_session_count().await,
+            0,
+            "a dropped connection closes serial"
+        );
     }
 }

@@ -2086,7 +2086,10 @@ mod tests {
         }))
         .unwrap();
         assert!(json.contains(r#""serial_ports":["if1"]"#), "{json}");
-        assert!(!json.contains("ttyACM0"), "device names stay node-side: {json}");
+        assert!(
+            !json.contains("ttyACM0"),
+            "device names stay node-side: {json}"
+        );
         assert!(json.contains(r#""power":"uhubctl""#), "{json}");
         assert!(!json.contains("1-1"), "{json}");
         assert!(json.contains(r#""availability":"available""#), "{json}");
