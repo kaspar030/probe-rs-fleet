@@ -4513,6 +4513,52 @@ mod tests {
         assert_eq!(grant.board.org, org("org-a"));
     }
 
+    /// `ctl list` / `ctl who` carry the org path and the holder's username
+    /// for display; the keys stay the identities.
+    #[tokio::test]
+    async fn board_list_and_who_carry_display_names() {
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[board("org-a", "b1", "node-a")],
+            &[("org-a", "alice", FleetRole::Admin)],
+        )
+        .await;
+        let alice = user("org-a", "alice");
+        grant_lease(&coord, &alice, "b1").await;
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+
+        coord
+            .handle_sidecar_message(
+                &alice,
+                SidecarToCoord::ListBoards,
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::BoardList(boards) => {
+                assert_eq!(boards.len(), 1);
+                assert_eq!(boards[0].org_name.as_deref(), Some("org-a"));
+                assert_eq!(boards[0].holder_display.as_deref(), Some("alice"));
+            }
+            other => panic!("expected BoardList, got {other:?}"),
+        }
+
+        coord
+            .handle_sidecar_message(&alice, SidecarToCoord::Who, &tx, RequesterId::DETACHED)
+            .await
+            .unwrap();
+        match rx.recv().await.unwrap() {
+            CoordToSidecar::LeaseTable(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].holder_display.as_deref(), Some("alice"));
+            }
+            other => panic!("expected LeaseTable, got {other:?}"),
+        }
+    }
+
     /// Cross-org: a member of another org sees nothing and can do nothing.
     /// (A user who is a member of *both* orgs reaches both: access is the
     /// union of memberships, not the org a request names.)
@@ -4572,28 +4618,8 @@ mod tests {
         match rx.recv().await.unwrap() {
             CoordToSidecar::LeaseTable(rows) => {
                 assert_eq!(rows.len(), 1);
-                // The display name rides along; the key stays the identity.
-                assert_eq!(rows[0].holder_display.as_deref(), Some("alice"));
             }
             other => panic!("expected LeaseTable, got {other:?}"),
-        }
-        // `ctl list` for org A names the org and the holder readably.
-        coord
-            .handle_sidecar_message(
-                &alice_a,
-                SidecarToCoord::ListBoards,
-                &tx,
-                RequesterId::DETACHED,
-            )
-            .await
-            .unwrap();
-        match rx.recv().await.unwrap() {
-            CoordToSidecar::BoardList(boards) => {
-                assert_eq!(boards.len(), 1);
-                assert_eq!(boards[0].org_name.as_deref(), Some("org-a"));
-                assert_eq!(boards[0].holder_display.as_deref(), Some("alice"));
-            }
-            other => panic!("expected BoardList, got {other:?}"),
         }
 
         // Lease verbs on the other org's lease are indistinguishable from
