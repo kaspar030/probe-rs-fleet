@@ -152,6 +152,48 @@ test('devices renders a missing board model as a dash', () => {
   assert.ok(!textOf(tree).includes('nrf52840dk'));
 });
 
+test('devices offers Edit tags only when the server says the board is editable', () => {
+  assert.ok(!labels(devices.render({ boards: [{ ...BOARD, tags_editable: false }], session: MEMBER })).includes('Edit tags'));
+  assert.ok(!labels(devices.render({ boards: [BOARD], session: ADMIN })).includes('Edit tags'), 'role alone is not enough');
+  assert.ok(labels(devices.render({ boards: [{ ...BOARD, tags_editable: true }], session: MEMBER })).includes('Edit tags'));
+});
+
+test('devices edits a board\'s tags inline, with reset only for an override', () => {
+  const b = { ...BOARD, tags_editable: true };
+  const tree = devices.render({ boards: [b], session: MEMBER, editing: b.board.key });
+  const inputs = findAll(tree, (n) => n.tag === 'input');
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].attrs.name, 'tags');
+  assert.equal(inputs[0].attrs.value, 'lab, nrf');
+  assert.ok(labels(tree).includes('Save'));
+  assert.ok(labels(tree).includes('Cancel'));
+  assert.ok(!labels(tree).includes("Reset to node's tags"));
+  assert.match(textOf(tree), /replace the tags the node reports/);
+
+  const over = { ...b, tags_overridden: true, reported_tags: ['probe'] };
+  const t2 = devices.render({ boards: [over], session: MEMBER, editing: b.board.key });
+  assert.ok(labels(t2).includes("Reset to node's tags"));
+  assert.match(textOf(t2), /node reports: probe/);
+
+  // Not editable: no form even if asked.
+  const t3 = devices.render({ boards: [BOARD], session: MEMBER, editing: b.board.key });
+  assert.equal(find(t3, (n) => n.tag === 'input'), null);
+});
+
+test('devices marks UI-set tags and renders hostile tags as text', () => {
+  const evil = '<img src=x onerror=alert(1)>';
+  const b = { ...BOARD, tags: [evil], tags_overridden: true, reported_tags: ['nrf'] };
+  const tree = devices.render({ boards: [b], session: MEMBER });
+  assert.match(textOf(tree), /\(set in UI\)/);
+  assert.ok(textOf(tree).includes(evil));
+  assert.equal(find(tree, (n) => n.tag === 'img'), null);
+  assert.ok(!textOf(devices.render({ boards: [BOARD], session: MEMBER })).includes('set in UI'));
+});
+
+test('devices addresses a board through its node-local node name', () => {
+  assert.equal(devices.nodeName(BOARD), 'rpi-1');
+});
+
 test('agents offers tags and adopt, never a rename', () => {
   const node = {
     id: `${ORG}/rpi-1`, name: 'rpi-1', tags: ['lab'], adopt: 'declared',

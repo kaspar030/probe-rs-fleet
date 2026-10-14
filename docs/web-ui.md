@@ -546,12 +546,35 @@ deliberate follow-up that moves all three.
 
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
-| `GET /api/v1/boards` | — | `[BoardSummary]` | `Coordinator::list_boards_core` | anyone with non-empty `Access` |
+| `GET /api/v1/boards` | — | `[BoardSummary]` + `tags_overridden`, `reported_tags`, `tags_editable` | `Coordinator::list_boards_core` (+ `board_tag_view_info`) | anyone with non-empty `Access` |
+| `PATCH /api/v1/nodes/{name}/boards/{board}` | `{"tags":[…]}` (required) | `{"board","tags","reported_tags","overridden"}` | `Coordinator::set_board_tags_core` → `OrgDb::set_board_tags` + scheduler | owner of the board's node, or admin |
+| `DELETE /api/v1/nodes/{name}/boards/{board}/tags` | — | as above | `Coordinator::set_board_tags_core` → `OrgDb::clear_board_tags` + scheduler | owner of the board's node, or admin |
 | `POST /api/v1/boards/power-cycle` | `{"board":"<name or qualified>"}` | `{"board":"…"}` | `Coordinator::operator_power_cycle_core` | `board_access` + `AllowedOp::PowerCycle` for a grantee |
 | `GET /api/v1/leases` | — | `[LeaseHolderSummary]` | `Coordinator::who_core` | anyone with non-empty `Access` |
 | `DELETE /api/v1/leases/{lease_id}` | — | `{"lease":N}` | `Coordinator::release_lease_core` | lease holder, or org admin |
 
 There is no `POST /api/v1/leases` (D4).
+
+**Board tags.** A board's tags normally come from its node (`boards.toml`, or
+inferred for an adopted probe). The Devices page's **Edit tags** sets a
+coordinator-held override (`board_tag_override`) that **replaces** them: the
+override is the board's effective tag set — what `tag=` lease selectors,
+`tag=`-scoped grants and `ctl list` see — and the reported tags are ignored
+while it exists. **Reset to node's tags** drops it. It is never pushed to the
+node, so it works for an offline node, survives every reconnect and inventory
+report (reconciliation re-applies it), and survives an adopted probe being
+unplugged and replugged — which makes UI tags the way to make auto-adopted
+boards matchable without touching the machine. `board.tags` keeps the reported
+tags; `GET /api/v1/boards` returns `tags_overridden` and, while overridden,
+`reported_tags`, so the page can say "(set in UI)". `tags_editable` is an
+advisory flag (owner of the node or org admin, acting org only); the server
+re-checks on every edit. Boards are addressed **through their node** because a
+`BoardRef` contains slashes; only the acting org's boards are editable, and
+another org's resolves to `404`. Tags are validated with `valid_tags` (`400`
+otherwise), and every change is audited (`board.tags`, `board.tags.reset`,
+`board.tags.denied`). Retagging changes which `tag=`-scoped grants cover a
+board — within the org's own authority, the same power `boards.toml` already
+gives whoever controls the node.
 
 A `lease_id` is a `u64`, which is why it is the one identifier on this surface
 that may live in a path at all: unlike a `BoardRef` or a node id it contains no
@@ -718,6 +741,7 @@ against the *target object's* org through the existing evaluator —
 | pending-node approve / deny | membership | §6.4, `decide_pending_node` (there is no listing; see §3/§4) |
 | node list | membership | new |
 | node tags / adopt / delete | **owner (`node.owner_user_id`), or admin** | **new policy, fixed here** (rename is refused; see §3) |
+| board tags (set / reset) | **owner of the board's node, or admin** | same rule as node tags (`authorize_node_mutation`) |
 
 Three notes on that table.
 
@@ -777,7 +801,10 @@ org's boards to an outsider, and mint an auth key. That is what justifies the
 strict CSP, no inline script, no CDN, and the shown-once auth-key panel. Every
 piece of attacker-controlled text this UI renders — node names, tags,
 `user_code`, grant subjects, audit details — is server-side charset-validated
-(as §6.4 already requires) *and* inserted as text, never as HTML.
+(as §6.4 already requires) *and* inserted as text, never as HTML. (Board tags
+*reported* by a node are not charset-validated — `boards.toml` is agent-side —
+which is why text-only rendering is the control that matters; tags set in the
+UI are validated.)
 
 **No capability token ever reaches the browser.** A capability token is a
 signed, offline-verifiable bearer credential that the coordinator cannot revoke

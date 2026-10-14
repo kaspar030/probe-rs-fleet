@@ -120,6 +120,48 @@ async fn a_member_cannot_mutate_a_node_it_does_not_own() {
     assert!(response.contains("invalid_request"), "{response}");
 }
 
+/// A member may not retag a board on a node it does not own, whatever the
+/// devices page drew (it hides the Edit tags control via `tags_editable`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_cannot_edit_tags_of_a_board_on_a_node_it_does_not_own() {
+    let fleet = TestCoordinator::start().await;
+    fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let bob = fleet.seed_session("acme", "bob", FleetRole::Member).await;
+    fleet
+        .seed_owned_node("acme", "rpi-1", "alice", AdoptPolicy::Declared)
+        .await;
+    let org = fleet.org("acme").await;
+    fleet.seed_board(&org, "rpi-1", "dk-3", &["nrf52"]).await;
+
+    let (status, response) = as_browser(
+        &fleet,
+        "PATCH",
+        "/api/v1/nodes/rpi-1/boards/dk-3?org=acme",
+        &bob,
+        Some(r#"{"tags":["mine-now"]}"#),
+    )
+    .await;
+    assert_eq!(status, 403, "a non-owner retagged a board: {response}");
+    let (status, response) = as_browser(
+        &fleet,
+        "DELETE",
+        "/api/v1/nodes/rpi-1/boards/dk-3/tags?org=acme",
+        &bob,
+        None,
+    )
+    .await;
+    assert_eq!(status, 403, "a non-owner reset a board's tags: {response}");
+
+    let (_, body) = as_browser(&fleet, "GET", "/api/v1/boards?org=acme", &bob, None).await;
+    let boards: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        boards[0]["tags"],
+        serde_json::json!(["nrf52"]),
+        "tags unchanged"
+    );
+    assert_eq!(boards[0]["tags_editable"], false);
+}
+
 /// A stranger cannot release somebody else's lease, and gets the answer a
 /// nonexistent lease would produce.
 ///
@@ -231,6 +273,8 @@ async fn every_action_the_ui_performs_needs_the_csrf_header() {
         ("PATCH", "/api/v1/nodes/rpi-1", r#"{"tags":[]}"#),
         ("DELETE", "/api/v1/nodes/rpi-1", "{}"),
         ("POST", "/api/v1/nodes/rpi-1/move", r#"{"to_org":"x"}"#),
+        ("PATCH", "/api/v1/nodes/rpi-1/boards/dk-3", r#"{"tags":[]}"#),
+        ("DELETE", "/api/v1/nodes/rpi-1/boards/dk-3/tags", "{}"),
         (
             "POST",
             "/api/v1/nodes/pending/ABCD-1234",

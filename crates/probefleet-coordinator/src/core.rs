@@ -56,6 +56,12 @@ use forgs::UserId;
 pub struct Coordinator {
     config: CoordinatorConfig,
     scheduler: Mutex<Scheduler>,
+    /// Serialises UI board-tag edits against inventory reconciliation. Lock
+    /// order is **`board_tags` → `scheduler`**. Without it a reconcile could
+    /// read the overrides, a concurrent edit update the scheduler, and the
+    /// reconcile then upsert the stale tags — which, since unchanged
+    /// inventories are not re-reported, could persist indefinitely.
+    board_tags: Mutex<()>,
     db: Db,
     signer: Ed25519Signer,
     nodes: NodeRegistry,
@@ -169,6 +175,32 @@ pub(crate) enum OrgAdminError {
     Internal(crate::error::CoordinatorError),
 }
 
+/// What [`Coordinator::set_board_tags_core`] did.
+#[derive(Debug)]
+pub(crate) struct BoardTagsOutcome {
+    /// The board.
+    pub board: BoardRef,
+    /// Its effective tags now.
+    pub tags: Vec<String>,
+    /// The tags its node reports (`board.tags`); empty if it has no row.
+    pub reported_tags: Vec<String>,
+    /// Whether a UI override is now in effect.
+    pub overridden: bool,
+}
+
+/// See [`Coordinator::board_tag_view_info`].
+#[derive(Debug, Default)]
+pub(crate) struct BoardTagViewInfo {
+    /// The acting org the rest describes; `None` means "nothing known".
+    pub org: Option<OrgId>,
+    /// Nodes (of `org`) whose boards the caller may retag.
+    pub editable_nodes: std::collections::HashSet<NodeId>,
+    /// UI overrides, keyed by `(node id, board name)`.
+    pub overrides: std::collections::HashMap<(String, String), Vec<String>>,
+    /// Reported tags, keyed likewise (filled only when overrides exist).
+    pub reported: std::collections::HashMap<(String, String), Vec<String>>,
+}
+
 /// Why [`Coordinator::move_node_core`] refused.
 ///
 /// Distinct codes, unlike [`OpError`]: the caller is already an admin of
@@ -273,6 +305,7 @@ impl Coordinator {
         Ok(Self {
             config,
             scheduler: Mutex::new(scheduler),
+            board_tags: Mutex::new(()),
             db,
             signer,
             nodes: NodeRegistry::new(),
@@ -551,6 +584,15 @@ impl Coordinator {
     ///
     /// Returns the number of online boards and the number of rows pruned.
     ///
+    /// # UI tag overrides
+    ///
+    /// A board with a `board_tag_override` row (set from the Devices page,
+    /// [`Coordinator::set_board_tags_core`]) enters the scheduler with the
+    /// override's tags **instead of** the reported ones, so `tag=` selectors,
+    /// grants and `ctl list` all see the effective set. The `board` row keeps
+    /// the reported tags. Overrides are keyed by board name and outlive the
+    /// row, so a pruned adopted probe gets them back when it is replugged.
+    ///
     /// This is the only place a [`BoardRef`] is minted from node input: the
     /// node supplies a node-local [`BoardName`] and the coordinator attaches the
     /// org of the authenticated connection, so cross-org board injection is not
@@ -592,6 +634,13 @@ impl Coordinator {
         }
 
         let mut online = 0usize;
+        // UI-set tag overrides (`board_tag_override`). Held under `board_tags`
+        // through the scheduler section so a concurrent edit cannot be
+        // overwritten with what was read here (lock order: board_tags →
+        // scheduler). Best-effort like the rest: a read failure applies the
+        // reported tags this once, and the next report retries.
+        let _tags_guard = self.board_tags.lock().await;
+        let overrides = Self::load_tag_overrides(&scoped, node_id).await;
         // Boards to persist, paired with the presence to record them under.
         let mut boards_to_record: Vec<(Board, BoardPresence)> = Vec::new();
         // The node-local names whose rows survive this report.
@@ -653,7 +702,14 @@ impl Coordinator {
                 };
                 if status.presence == BoardPresence::Online {
                     online += 1;
-                    sched.upsert_board(board.clone());
+                    // The scheduler gets the *effective* tags (an override
+                    // replaces the reported ones); the `board` row below keeps
+                    // the reported tags, which is the UI's provenance.
+                    let mut effective = board.clone();
+                    if let Some(tags) = overrides.get(&status.board.0) {
+                        effective.tags.clone_from(tags);
+                    }
+                    sched.upsert_board(effective);
                 } else {
                     // An offline board is dropped from the scheduler unless it
                     // is currently leased (an in-flight lease is preserved).
@@ -721,6 +777,21 @@ impl Coordinator {
             }
         };
         ReconcileOutcome { online, pruned }
+    }
+
+    /// A node's UI tag overrides for [`Coordinator::reconcile_inventory`];
+    /// a read failure is logged and yields none (the next report retries).
+    async fn load_tag_overrides(
+        scoped: &crate::state::OrgDb<'_>,
+        node_id: &NodeId,
+    ) -> std::collections::HashMap<String, Vec<String>> {
+        scoped
+            .board_tag_overrides(node_id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(node = %node_id, error = %e, "failed to load board tag overrides");
+                std::collections::HashMap::new()
+            })
     }
 
     /// Mark a board as faulted in the scheduler (best-effort).
@@ -1980,7 +2051,158 @@ impl Coordinator {
         Ok((boards, revoked))
     }
 
-    /// The owner-or-admin check shared by the two node-mutation cores.
+    /// Set (`Some`) or reset (`None`) the UI tag override of one board of the
+    /// caller's acting org, addressed by node name and node-local board name.
+    ///
+    /// **New surface, no wire counterpart.** Semantics are **replace**: an
+    /// override *is* the board's effective tag set, the reported
+    /// `boards.toml` / inferred tags are ignored while it exists, and a reset
+    /// reverts to them. The override is stored in the coordinator
+    /// (`board_tag_override`), never pushed to the node, so it works for an
+    /// offline node and survives every inventory report
+    /// ([`Coordinator::reconcile_inventory`] re-applies it).
+    ///
+    /// # Authorization
+    ///
+    /// Exactly [`Coordinator::update_node_core`]'s: the node's owner or an org
+    /// admin, `owner_user_id = NULL` meaning admin-only; a refusal writes a
+    /// `board.tags.denied` audit row. Editing tags changes which `tag=`-scoped
+    /// grants cover the board — within the org's own authority, the same power
+    /// `boards.toml` already gives whoever controls the node.
+    ///
+    /// # Errors
+    ///
+    /// [`OpError::Denied`] / [`OpError::NotFound`] as
+    /// [`Coordinator::update_node_core`]; [`OpError::NotFound`] also when the
+    /// node has no such board (for a set: no `board` row; for a reset: no row
+    /// and no override); [`OpError::Internal`] on a database failure.
+    pub(crate) async fn set_board_tags_core(
+        &self,
+        subject: &Subject,
+        node_name: &str,
+        board: &str,
+        tags: Option<&[String]>,
+    ) -> std::result::Result<BoardTagsOutcome, OpError> {
+        let Some(org) = subject.org().cloned() else {
+            return Err(OpError::Denied);
+        };
+        let row = self
+            .authorize_node_mutation(subject, node_name, "board.tags.denied")
+            .await?;
+        let scoped = self.db.scoped(org.clone());
+        let not_found = || OpError::NotFound(format!("no board named {board} on {node_name}"));
+        let reported = scoped
+            .board_reported_tags(&row.id, board)
+            .await
+            .map_err(OpError::Internal)?;
+
+        let board_ref = BoardRef::new(org.clone(), row.id.clone(), board.to_owned());
+        let effective = {
+            let _guard = self.board_tags.lock().await;
+            let effective = if let Some(tags) = tags {
+                if reported.is_none() {
+                    return Err(not_found());
+                }
+                scoped
+                    .set_board_tags(
+                        &row.id,
+                        board,
+                        tags,
+                        Some(&subject.key().to_string()),
+                        self.now_i64(),
+                    )
+                    .await
+                    .map_err(OpError::Internal)?;
+                tags.to_vec()
+            } else {
+                let cleared = scoped
+                    .clear_board_tags(&row.id, board)
+                    .await
+                    .map_err(OpError::Internal)?;
+                if !cleared && reported.is_none() {
+                    return Err(not_found());
+                }
+                reported.clone().unwrap_or_default()
+            };
+            // Take effect now, not at the next report: `upsert_board` keeps
+            // any live lease state. An offline board is not in the scheduler
+            // and picks the override up when it comes back.
+            let mut sched = self.scheduler.lock().await;
+            if let Some(existing) = sched.board(&board_ref).cloned() {
+                sched.upsert_board(Board {
+                    tags: effective.clone(),
+                    ..existing
+                });
+            }
+            effective
+        };
+
+        let action = if tags.is_some() {
+            "board.tags"
+        } else {
+            "board.tags.reset"
+        };
+        self.audit(
+            &org,
+            action,
+            Some(&subject.key().to_string()),
+            Some(&row.id.0),
+            Some(board),
+            None,
+            Some(&format!("tags={}", effective.join(","))),
+        )
+        .await
+        .map_err(OpError::Internal)?;
+
+        Ok(BoardTagsOutcome {
+            board: board_ref,
+            tags: effective,
+            reported_tags: reported.unwrap_or_default(),
+            overridden: tags.is_some(),
+        })
+    }
+
+    /// Advisory per-board tag information for the Devices page, over the
+    /// caller's **acting org** only: which boards carry a UI override (with
+    /// the reported tags for provenance), and on which nodes the caller may
+    /// edit tags (owner or org admin — the rule
+    /// [`Coordinator::set_board_tags_core`] enforces). Boards of other orgs
+    /// (reached by grant) are absent and so read as not editable.
+    ///
+    /// Best-effort: a database failure yields empty information (the page
+    /// then shows no edit control and no provenance), never an error, since
+    /// this only decorates a list the caller is already allowed to see.
+    pub(crate) async fn board_tag_view_info(&self, subject: &Subject) -> BoardTagViewInfo {
+        let mut info = BoardTagViewInfo::default();
+        let Some(org) = subject.org().cloned() else {
+            return info;
+        };
+        if authz::require_role(&self.db, subject, &org, FleetRole::Member)
+            .await
+            .is_err()
+        {
+            return info;
+        }
+        let scoped = self.db.scoped(org.clone());
+        let admin = authz::is_org_admin(&self.db, subject).await;
+        if let Ok(nodes) = scoped.list_nodes().await {
+            for n in nodes {
+                let owned = n.owner_user_id.is_some() && n.owner_user_id == subject.user_id();
+                if admin || owned {
+                    info.editable_nodes.insert(n.id);
+                }
+            }
+        }
+        info.overrides = scoped.org_board_tag_overrides().await.unwrap_or_default();
+        if !info.overrides.is_empty() {
+            info.reported = scoped.org_board_reported_tags().await.unwrap_or_default();
+        }
+        info.org = Some(org);
+        info
+    }
+
+    /// The owner-or-admin check shared by the node-mutation cores (node
+    /// update/delete, board tags).
     ///
     /// Returns the node row, so the caller does not re-read it and cannot
     /// accidentally act on a different one. Membership is checked first, for
@@ -6608,5 +6830,186 @@ mod tests {
             .await
             .contains(&"lease.revoke".to_owned()));
         let _ = grant;
+    }
+
+    async fn tags_of(c: &Coordinator, key: &BoardRef) -> Option<Vec<String>> {
+        c.scheduler.lock().await.board(key).map(|b| b.tags.clone())
+    }
+
+    /// UI board-tag overrides: applied on report and not clobbered by a
+    /// re-report, effective in the scheduler at once, preserved across an
+    /// adopted board's prune and replug, matched by `tag=`, kept on a leased
+    /// board without disturbing the lease, and owner-or-admin only.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn board_tag_overrides_replace_reported_tags_and_survive_reports() {
+        use probefleet_proto::node_api::ProbeInventory;
+        let clock = Arc::new(TestClock(AtomicU64::new(1000)));
+        let coord = coordinator_with(
+            clock,
+            &[],
+            &[
+                (DEFAULT_ORG_ID, "alice", FleetRole::Member),
+                (DEFAULT_ORG_ID, "bob", FleetRole::Member),
+                (DEFAULT_ORG_ID, "op", FleetRole::Admin),
+            ],
+        )
+        .await;
+        let node = node_id(DEFAULT_ORG_ID, "laptop");
+        coord
+            .db()
+            .register_node_full(
+                &org(DEFAULT_ORG_ID),
+                "laptop",
+                "hash",
+                &[],
+                Some(testkit::user_id("alice")),
+                AdoptPolicy::Auto,
+                1000,
+            )
+            .await
+            .unwrap();
+        let report = |presence| {
+            let mut st = status("j-link", "ABC", presence, "", true);
+            st.tags = vec!["probe".to_owned()];
+            NodeReport::Inventory(ProbeInventory {
+                boards: vec![st],
+                unknown: vec![],
+            })
+        };
+        let key = board_ref(DEFAULT_ORG_ID, "laptop", "j-link");
+        let alice = user(DEFAULT_ORG_ID, "alice");
+        let bob = user(DEFAULT_ORG_ID, "bob");
+        let lab = vec!["lab".to_owned()];
+
+        // Not yet reported: there is no board to tag.
+        assert!(matches!(
+            coord
+                .set_board_tags_core(&alice, "laptop", "j-link", Some(&lab))
+                .await,
+            Err(OpError::NotFound(_))
+        ));
+        coord
+            .handle_node_report(&node, report(BoardPresence::Online))
+            .await
+            .unwrap();
+        assert_eq!(tags_of(&coord, &key).await, Some(vec!["probe".to_owned()]));
+
+        // A non-owner member is refused, and audited.
+        assert!(matches!(
+            coord
+                .set_board_tags_core(&bob, "laptop", "j-link", Some(&lab))
+                .await,
+            Err(OpError::Denied)
+        ));
+        assert!(audit_actions(&coord, DEFAULT_ORG_ID)
+            .await
+            .contains(&"board.tags.denied".to_owned()));
+
+        // The owner sets it: effective immediately, row keeps the reported.
+        let out = coord
+            .set_board_tags_core(&alice, "laptop", "j-link", Some(&lab))
+            .await
+            .unwrap_or_else(|_| panic!("set_board_tags_core failed"));
+        assert!(out.overridden);
+        assert_eq!(out.reported_tags, ["probe"]);
+        assert_eq!(tags_of(&coord, &key).await, Some(lab.clone()));
+        let scoped = coord.db().scoped(org(DEFAULT_ORG_ID));
+        assert_eq!(
+            scoped.board_reported_tags(&node, "j-link").await.unwrap(),
+            Some(vec!["probe".to_owned()])
+        );
+
+        // A re-report does not clobber it.
+        coord
+            .handle_node_report(&node, report(BoardPresence::Online))
+            .await
+            .unwrap();
+        assert_eq!(tags_of(&coord, &key).await, Some(lab.clone()));
+        assert_eq!(
+            scoped.board_reported_tags(&node, "j-link").await.unwrap(),
+            Some(vec!["probe".to_owned()])
+        );
+
+        // Unplugged (adopted → pruned) and replugged: the override comes back.
+        coord
+            .handle_node_report(&node, report(BoardPresence::Offline))
+            .await
+            .unwrap();
+        assert_eq!(tags_of(&coord, &key).await, None);
+        assert_eq!(
+            scoped.board_reported_tags(&node, "j-link").await.unwrap(),
+            None
+        );
+        coord
+            .handle_node_report(&node, report(BoardPresence::Online))
+            .await
+            .unwrap();
+        assert_eq!(tags_of(&coord, &key).await, Some(lab.clone()));
+
+        // Reset (by an admin) restores the reported tags at once.
+        let op = user(DEFAULT_ORG_ID, "op");
+        let out = coord
+            .set_board_tags_core(&op, "laptop", "j-link", None)
+            .await
+            .unwrap_or_else(|_| panic!("set_board_tags_core failed"));
+        assert!(!out.overridden);
+        assert_eq!(out.tags, ["probe"]);
+        assert_eq!(tags_of(&coord, &key).await, Some(vec!["probe".to_owned()]));
+        coord
+            .set_board_tags_core(&op, "laptop", "j-link", Some(&lab))
+            .await
+            .unwrap_or_else(|_| panic!("set_board_tags_core failed"));
+        let actions = audit_actions(&coord, DEFAULT_ORG_ID).await;
+        assert!(actions.contains(&"board.tags".to_owned()), "{actions:?}");
+        assert!(
+            actions.contains(&"board.tags.reset".to_owned()),
+            "{actions:?}"
+        );
+
+        // `tag=` matches the edited tag and no longer the removed reported one.
+        let lease_by_tag = |tag: &str| LeaseRequest {
+            select: Constraint::Tags(vec![tag.to_owned()]),
+            duration_secs: 600,
+            priority: Priority::Interactive,
+        };
+        let (tx, mut rx) = mpsc::channel::<CoordToSidecar>(16);
+        coord
+            .handle_sidecar_message(
+                &bob,
+                SidecarToCoord::Lease(lease_by_tag("probe")),
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(rx.recv().await.unwrap(), CoordToSidecar::Lease(_)),
+            "a removed reported tag must not match"
+        );
+        coord
+            .handle_sidecar_message(
+                &bob,
+                SidecarToCoord::Lease(lease_by_tag("lab")),
+                &tx,
+                RequesterId::DETACHED,
+            )
+            .await
+            .unwrap();
+        let CoordToSidecar::Lease(grant) = rx.recv().await.unwrap() else {
+            panic!("tag=lab should lease the retagged board");
+        };
+        assert_eq!(grant.board, key);
+
+        // Retagging a leased board keeps the lease.
+        let desk = vec!["desk".to_owned()];
+        coord
+            .set_board_tags_core(&alice, "laptop", "j-link", Some(&desk))
+            .await
+            .unwrap_or_else(|_| panic!("set_board_tags_core failed"));
+        let sched = coord.scheduler.lock().await;
+        let b = sched.board(&key).unwrap();
+        assert_eq!(b.tags, desk);
+        assert!(matches!(b.state, BoardState::Leased { .. }));
     }
 }

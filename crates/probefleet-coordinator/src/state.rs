@@ -729,6 +729,16 @@ impl Db {
             .bind(old.as_str())
             .execute(&mut *tx)
             .await?;
+        // UI-set board tags travel with their boards (same deferred-FK
+        // reasoning as `board`).
+        sqlx::query(
+            "UPDATE board_tag_override SET node_id = ?1, ns_node_id = ?2 WHERE node_id = ?3",
+        )
+        .bind(new.0.as_str())
+        .bind(to.0.as_str())
+        .bind(old.as_str())
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(NodeMove::Moved(new))
     }
@@ -1084,6 +1094,152 @@ impl OrgDb<'_> {
         .fetch_optional(self.db.pool())
         .await?;
         Ok(row.is_some())
+    }
+
+    /// The **reported** tags of one board of this org — `board.tags`, i.e.
+    /// what the node's latest inventory declared — or `None` if this org has
+    /// no `board` row by that key. UI overrides are not applied here; see
+    /// [`OrgDb::board_tag_overrides`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn board_reported_tags(
+        &self,
+        node: &NodeId,
+        name: &str,
+    ) -> Result<Option<Vec<String>>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT tags FROM board WHERE ns_node_id = ?1 AND node_id = ?2 AND name = ?3",
+        )
+        .bind(self.org.0.as_str())
+        .bind(node.0.as_str())
+        .bind(name)
+        .fetch_optional(self.db.pool())
+        .await?;
+        Ok(row.map(|(t,)| split_tags(&t)))
+    }
+
+    /// The reported tags of every board row in this org, keyed by
+    /// `(node id, board name)` — for the Devices page's provenance display.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn org_board_reported_tags(
+        &self,
+    ) -> Result<std::collections::HashMap<(String, String), Vec<String>>> {
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT node_id, name, tags FROM board WHERE ns_node_id = ?1")
+                .bind(self.org.0.as_str())
+                .fetch_all(self.db.pool())
+                .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(node, name, tags)| ((node, name), split_tags(&tags)))
+            .collect())
+    }
+
+    /// The UI-set tag overrides of one node's boards, keyed by node-local
+    /// board name.
+    ///
+    /// An override **replaces** the board's reported tags; it is kept in its
+    /// own table (`board_tag_override`) so it survives the `board` row being
+    /// upserted on every report or pruned when an adopted probe is unplugged.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn board_tag_overrides(
+        &self,
+        node: &NodeId,
+    ) -> Result<std::collections::HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, tags FROM board_tag_override WHERE ns_node_id = ?1 AND node_id = ?2",
+        )
+        .bind(self.org.0.as_str())
+        .bind(node.0.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, tags)| (name, split_tags(&tags)))
+            .collect())
+    }
+
+    /// Every UI-set tag override in this org, keyed by `(node id, board name)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the query fails.
+    pub async fn org_board_tag_overrides(
+        &self,
+    ) -> Result<std::collections::HashMap<(String, String), Vec<String>>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT node_id, name, tags FROM board_tag_override WHERE ns_node_id = ?1",
+        )
+        .bind(self.org.0.as_str())
+        .fetch_all(self.db.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(node, name, tags)| ((node, name), split_tags(&tags)))
+            .collect())
+    }
+
+    /// Set (insert or replace) the UI tag override of one board.
+    ///
+    /// The caller validates `tags` (`crate::http::valid_tags`) and checks the
+    /// board exists; this only writes. `by` is the editor's subject key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the write fails (including the node
+    /// foreign key, for a node this org does not have).
+    pub async fn set_board_tags(
+        &self,
+        node: &NodeId,
+        name: &str,
+        tags: &[String],
+        by: Option<&str>,
+        now: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO board_tag_override (ns_node_id, node_id, name, tags, updated_by, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(ns_node_id, node_id, name) DO UPDATE SET
+                tags = excluded.tags,
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at",
+        )
+        .bind(self.org.0.as_str())
+        .bind(node.0.as_str())
+        .bind(name)
+        .bind(tags.join("\n"))
+        .bind(by)
+        .bind(now)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Remove the UI tag override of one board, reverting it to its reported
+    /// tags. Returns `true` if an override existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a database error if the delete fails.
+    pub async fn clear_board_tags(&self, node: &NodeId, name: &str) -> Result<bool> {
+        let n = sqlx::query(
+            "DELETE FROM board_tag_override WHERE ns_node_id = ?1 AND node_id = ?2 AND name = ?3",
+        )
+        .bind(self.org.0.as_str())
+        .bind(node.0.as_str())
+        .bind(name)
+        .execute(self.db.pool())
+        .await?
+        .rows_affected();
+        Ok(n > 0)
     }
 
     /// Record a newly granted lease.
@@ -1456,6 +1612,12 @@ impl OrgDb<'_> {
             return Ok(false);
         };
         sqlx::query("DELETE FROM board WHERE ns_node_id = ?1 AND node_id = ?2")
+            .bind(self.org.0.as_str())
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+        // Explicit rather than relying on the `ON DELETE CASCADE` alone.
+        sqlx::query("DELETE FROM board_tag_override WHERE ns_node_id = ?1 AND node_id = ?2")
             .bind(self.org.0.as_str())
             .bind(id.as_str())
             .execute(&mut *tx)
@@ -2025,6 +2187,58 @@ mod tests {
             .unwrap()
             .len();
         assert_eq!(violations, 0, "foreign keys hold after the move");
+    }
+
+    /// Overrides round-trip, are org-fenced, survive `record_board` and
+    /// `prune_boards`, and go with the node.
+    #[tokio::test]
+    async fn board_tag_overrides_round_trip_and_survive_reports() {
+        let db = testkit::db().await;
+        let o = seeded(&db, "acme", "rpi-1").await;
+        let other = seeded(&db, "other", "rpi-1").await;
+        let s = db.scoped(o.clone());
+        let n = node_id_for(&o, "rpi-1");
+        let b = board_in(&o, "rpi-1", "dk");
+        s.record_board(&b, BoardPresence::Online, 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.board_reported_tags(&n, "dk").await.unwrap(),
+            Some(vec!["nrf52".to_owned(), "ble".to_owned()])
+        );
+        assert!(s.board_tag_overrides(&n).await.unwrap().is_empty());
+
+        let tags = vec!["lab".to_owned(), "desk".to_owned()];
+        s.set_board_tags(&n, "dk", &tags, Some("user:x"), 1000)
+            .await
+            .unwrap();
+        assert_eq!(s.board_tag_overrides(&n).await.unwrap()["dk"], tags);
+        assert_eq!(
+            s.org_board_tag_overrides().await.unwrap()[&(n.0.clone(), "dk".to_owned())],
+            tags
+        );
+        // Org fence: the other org sees nothing, even for the same node id.
+        let so = db.scoped(other.clone());
+        assert!(so.org_board_tag_overrides().await.unwrap().is_empty());
+        assert!(so.board_tag_overrides(&n).await.unwrap().is_empty());
+        assert!(!so.clear_board_tags(&n, "dk").await.unwrap());
+
+        // A re-report rewrites the reported tags, never the override.
+        s.record_board(&b, BoardPresence::Online, 2000)
+            .await
+            .unwrap();
+        assert_eq!(s.board_tag_overrides(&n).await.unwrap()["dk"], tags);
+        // A prune deletes the row but not the override.
+        s.prune_boards(&n, &[]).await.unwrap();
+        assert_eq!(s.board_reported_tags(&n, "dk").await.unwrap(), None);
+        assert_eq!(s.board_tag_overrides(&n).await.unwrap()["dk"], tags);
+
+        // Clear, then set again and delete the node: the override goes too.
+        assert!(s.clear_board_tags(&n, "dk").await.unwrap());
+        assert!(!s.clear_board_tags(&n, "dk").await.unwrap());
+        s.set_board_tags(&n, "dk", &tags, None, 3000).await.unwrap();
+        assert!(s.delete_node("rpi-1").await.unwrap());
+        assert!(s.org_board_tag_overrides().await.unwrap().is_empty());
     }
 
     #[tokio::test]

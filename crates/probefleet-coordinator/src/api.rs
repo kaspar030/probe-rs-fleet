@@ -63,6 +63,10 @@
 //!   leases, the scheduler and the node's connection; see [`delete_node`].
 //! * `POST /api/v1/nodes/{name}/move` — move a node and its boards to another
 //!   org the caller is a member of (admin of the source); see [`move_node`].
+//! * `PATCH /api/v1/nodes/{name}/boards/{board}` /
+//!   `DELETE /api/v1/nodes/{name}/boards/{board}/tags` — replace a board's
+//!   tags with a coordinator-held override, or reset it to the node's
+//!   reported tags (owner of the node or admin); see [`update_board_tags`].
 //! * `POST /api/v1/nodes/pending/{code}` — inspect / approve / deny a pending
 //!   node registration, cashing in `docs/architecture.md` §4.2's promise that a
 //!   cookie-authenticated handler would call the *same*
@@ -179,6 +183,14 @@ pub(crate) fn router() -> Router<Arc<Coordinator>> {
             axum::routing::patch(update_node).delete(delete_node),
         )
         .route("/api/v1/nodes/{name}/move", post(move_node))
+        .route(
+            "/api/v1/nodes/{name}/boards/{board}",
+            axum::routing::patch(update_board_tags),
+        )
+        .route(
+            "/api/v1/nodes/{name}/boards/{board}/tags",
+            delete(reset_board_tags),
+        )
         .route("/api/v1/nodes/pending/{code}", post(decide_pending))
         .route("/api/v1/boards", get(boards))
         .route("/api/v1/boards/power-cycle", post(power_cycle))
@@ -469,6 +481,16 @@ struct BoardView {
     expires: Option<u64>,
     /// Names of the board's USB serial ports (`ctl serial <board> --port`).
     serial_ports: Vec<String>,
+    /// `true` when `tags` is a UI-set override rather than what the node
+    /// reports (acting-org boards only).
+    tags_overridden: bool,
+    /// The node-reported tags, present only while an override is active, so
+    /// the page can say where the tags came from.
+    reported_tags: Option<Vec<String>>,
+    /// Whether the caller may edit this board's tags (owner of its node, or
+    /// an admin of its org — acting org only). **Advisory UX**: the server
+    /// re-checks on every edit.
+    tags_editable: bool,
 }
 
 impl From<BoardSummary> for BoardView {
@@ -495,6 +517,9 @@ impl From<BoardSummary> for BoardView {
             lease: b.lease.map(|l| l.0),
             expires: b.expires,
             serial_ports: b.serial_ports.into_iter().map(|p| p.name).collect(),
+            tags_overridden: false,
+            reported_tags: None,
+            tags_editable: false,
         }
     }
 }
@@ -1604,7 +1629,123 @@ async fn boards(
         Err(response) => return response,
     };
     match coord.list_boards_core(&subject).await {
-        Ok(rows) => Json(rows.into_iter().map(BoardView::from).collect::<Vec<_>>()).into_response(),
+        Ok(rows) => {
+            let info = coord.board_tag_view_info(&subject).await;
+            let views = rows
+                .into_iter()
+                .map(|b| {
+                    let own = info.org.as_ref() == Some(&b.board.org);
+                    let key = (b.board.node.0.clone(), b.board.name.clone());
+                    let editable = own && info.editable_nodes.contains(&b.board.node);
+                    let overridden = own && info.overrides.contains_key(&key);
+                    let mut view = BoardView::from(b);
+                    view.tags_editable = editable;
+                    if overridden {
+                        view.tags_overridden = true;
+                        view.reported_tags =
+                            Some(info.reported.get(&key).cloned().unwrap_or_default());
+                    }
+                    view
+                })
+                .collect::<Vec<_>>();
+            Json(views).into_response()
+        }
+        Err(e) => op_error(&e),
+    }
+}
+
+/// The body of `PATCH /api/v1/nodes/{name}/boards/{board}`: the full
+/// replacement tag list. Required, and `deny_unknown_fields`, for the same
+/// reason as [`NodePatch`].
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoardTagsPatch {
+    tags: Vec<String>,
+}
+
+/// The response of both board-tag routes.
+#[derive(Debug, Serialize)]
+struct BoardTagsView {
+    board: BoardKeyView,
+    tags: Vec<String>,
+    reported_tags: Vec<String>,
+    overridden: bool,
+}
+
+impl From<crate::core::BoardTagsOutcome> for BoardTagsView {
+    fn from(o: crate::core::BoardTagsOutcome) -> Self {
+        Self {
+            board: BoardKeyView::from(&o.board),
+            tags: o.tags,
+            reported_tags: o.reported_tags,
+            overridden: o.overridden,
+        }
+    }
+}
+
+/// `PATCH /api/v1/nodes/{name}/boards/{board}` — replace a board's tags.
+///
+/// The board is addressed **through its node** (by node name within the
+/// acting org, then node-local board name), because a `BoardRef` contains
+/// slashes and is never put in a URL path ([`BoardKeyView`]). So only the
+/// acting org's own boards are editable; another org's resolves to `404`.
+///
+/// The tags become a coordinator-held override that **replaces** what the
+/// node's `boards.toml` reports, survives every inventory report, and is what
+/// `tag=` selectors match. Owner-of-the-node or admin, exactly as node tags;
+/// the rule lives in [`Coordinator::set_board_tags_core`]. Tags go through
+/// [`crate::http::valid_tags`], so unlike reported tags an override is always
+/// charset-validated.
+async fn update_board_tags(
+    State(coord): State<Arc<Coordinator>>,
+    Path((name, board)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+    body: axum::body::Bytes,
+) -> Response {
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    let Ok(patch) = serde_json::from_slice::<BoardTagsPatch>(&body) else {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    if !valid_tags(&patch.tags) {
+        return reject(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    match coord
+        .set_board_tags_core(&subject, &name, &board, Some(&patch.tags))
+        .await
+    {
+        Ok(out) => Json(BoardTagsView::from(out)).into_response(),
+        Err(e) => op_error(&e),
+    }
+}
+
+/// `DELETE /api/v1/nodes/{name}/boards/{board}/tags` — drop a board's UI
+/// tag override, reverting to the tags its node reports. Same addressing and
+/// authorization as [`update_board_tags`].
+async fn reset_board_tags(
+    State(coord): State<Arc<Coordinator>>,
+    Path((name, board)): Path<(String, String)>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let ApiCall { subject, .. } =
+        match mutating_auth(&coord, &method, &uri, &headers, query.as_deref()).await {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+    match coord
+        .set_board_tags_core(&subject, &name, &board, None)
+        .await
+    {
+        Ok(out) => Json(BoardTagsView::from(out)).into_response(),
         Err(e) => op_error(&e),
     }
 }

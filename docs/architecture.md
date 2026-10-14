@@ -746,7 +746,10 @@ a lease selector names that id. Its tags are the probe type plus a literal
 `probe-rs list` reports the probe and neither the target attached to it nor the
 board it is wired to; the honest consequence is that neither `ctl lease
 chip=…` nor `ctl lease board=<model>` will match an adopted board until
-`boards.toml` annotates it. Two probes are never adopted: one that is `inaccessible` (the
+`boards.toml` annotates it. Its tags can, however, be **replaced from the web
+UI** (Devices → Edit tags) with a coordinator-held override that survives the
+probe being unplugged and replugged — the way to make an adopted board
+`tag=`-matchable without touching the machine (see §8). Two probes are never adopted: one that is `inaccessible` (the
 lease would fail at `probe-rs serve` spawn time) and one reporting no serial
 (which can be neither stably named nor fenced with `ProbeAccess::Allow`).
 
@@ -953,6 +956,8 @@ node      { id "<org id>/<name>", ns_node_id → forgs_ns_node,
             owner_user_id → forgs_user NULL, name, tags, token_hash,
             token_issued_at, adopt_policy, last_seen }   UNIQUE (ns_node_id, name)
 board     { ns_node_id, node_id → node, name, chip, model, tags, … }
+board_tag_override { ns_node_id, node_id → node, name, tags, updated_by,
+            updated_at }   -- 0002; UI-set tags, no FK to board (outlives a prune)
 leases    { lease, ns_node_id, node_id, board_name, holder (subject key), … }
 audit_log { ts, ns_node_id NOT NULL, subject, action, node_id, board, lease, detail }
 ```
@@ -1462,8 +1467,10 @@ the boards and select the tag (`--select lab`); `ctl list` shows what you can
 reach — instead of parsing into a tag nothing carries and surfacing as a message
 about board contention. Tag values are otherwise free-form: general charset
 validation was declined because `boards.toml` tags are unvalidated agent-side, so
-such a rule would reject working configs at selection time, far from the file. A
-CI auth key's tags *are* charset-validated at mint, since redemption turns them
+such a rule would reject working configs at selection time, far from the file.
+Tags set from the web UI (a coordinator-side override that replaces a board's
+reported tags, §8) *are* charset-validated, since they never pass through the
+file. A CI auth key's tags *are* charset-validated at mint, since redemption turns them
 into a selector.
 
 **Evaluation is a pure value object** (`probefleet_core::access::Access`): ownership
@@ -2227,6 +2234,15 @@ file is annotation and override — stable ids, power wiring, curated tags —
 rather than admission control. `id` is unique **within its node**, not globally
 (§6.1); auto-adoption is exactly the case where a global id space breaks, since
 two laptops can each plug in an nRF52840-DK.
+
+**UI tag overrides.** An owner of the node or an org admin can replace a
+board's tags from the web UI (`docs/web-ui.md` §3, "Board tags"). The override
+is stored by the coordinator (`board_tag_override`), never written back to this
+file: it **replaces** the tags reported from here for as long as it exists, is
+re-applied on every inventory report, and is what `tag=` selectors and
+`tag=`-scoped grants see — so retagging can widen or narrow which grants cover
+a board, within the org's own authority. Resetting it reverts to this file's
+tags. The `board` table keeps the reported tags for provenance.
 
 A declaration always beats an adoption for the same probe, and the agent
 enforces that in one place (its board lookup consults `boards.toml` first), so
