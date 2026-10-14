@@ -75,7 +75,7 @@ fn asset_prefix(shell: &str) -> String {
 async fn the_shell_is_served_with_the_hardening_headers_and_no_cache() {
     let fleet = TestCoordinator::start().await;
 
-    let (status, headers, body) = fleet.http_full("GET", "/ui/", &[], None).await;
+    let (status, headers, body) = fleet.http_full("GET", "/", &[], None).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         header(&headers, "content-type"),
@@ -91,16 +91,16 @@ async fn the_shell_is_served_with_the_hardening_headers_and_no_cache() {
     assert_eq!(header(&headers, "set-cookie"), None);
 }
 
-/// `/` and a bare `/ui` both land on the canonical path, so relative asset
-/// URLs resolve. The callback's existing `302 /ui` keeps working through this.
+/// `/` is the landing page (the shell), and the old UI root — bare `/ui` or
+/// `/ui/`, which old bookmarks and callbacks name — redirects to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_root_and_bare_ui_redirect_to_the_canonical_path() {
+async fn the_old_ui_root_redirects_to_the_landing_page() {
     let fleet = TestCoordinator::start().await;
 
-    for path in ["/", "/ui"] {
+    for path in ["/ui", "/ui/"] {
         let (status, headers, _) = fleet.http_full("GET", path, &[], None).await;
         assert_eq!(status, 302, "{path}");
-        assert_eq!(header(&headers, "location"), Some("/ui/"), "{path}");
+        assert_eq!(header(&headers, "location"), Some("/"), "{path}");
         assert_hardened(&headers, path);
     }
 }
@@ -109,7 +109,7 @@ async fn the_root_and_bare_ui_redirect_to_the_canonical_path() {
 async fn hashed_assets_are_immutable_and_typed_by_extension() {
     let fleet = TestCoordinator::start().await;
 
-    let (_, _, shell) = fleet.http_full("GET", "/ui/", &[], None).await;
+    let (_, _, shell) = fleet.http_full("GET", "/", &[], None).await;
     let prefix = asset_prefix(&shell);
 
     for (path, content_type) in [
@@ -153,10 +153,11 @@ async fn a_stale_hash_still_serves_current_bytes() {
 }
 
 /// Every client-side route answers with the *same* shell, so a deep link and a
-/// reload both work — in **both** spellings.
+/// reload both work — in **both** spellings, at `/<org>/<page>` for any org
+/// segment and at the legacy `/ui/<page>` (which the client rewrites).
 ///
 /// `web/router.mjs` strips a trailing slash, so once the shell is loaded
-/// `/ui/devices/` is the devices page; the bug this pins is that a *cold* load
+/// `/alice/devices/` is the devices page; the bug this pins is that a *cold* load
 /// of the slashed form never reached the shell that would have normalised it.
 /// The two spellings are one page and must be indistinguishable over the wire,
 /// headers included.
@@ -164,12 +165,20 @@ async fn a_stale_hash_still_serves_current_bytes() {
 async fn client_side_routes_all_render_the_shell() {
     let fleet = TestCoordinator::start().await;
 
-    let (_, _, canonical) = fleet.http_full("GET", "/ui/", &[], None).await;
+    let (_, _, canonical) = fleet.http_full("GET", "/", &[], None).await;
     let pages = probefleet_coordinator::assets::shell_pages();
     assert!(!pages.is_empty(), "there is at least one client-side page");
 
     for page in pages {
-        for path in [format!("/ui/{page}"), format!("/ui/{page}/")] {
+        for path in [
+            format!("/alice/{page}"),
+            format!("/alice/{page}/"),
+            format!("/acme-labs/{page}"),
+            // An id is a valid segment: the client canonicalises it.
+            format!("/01J0000000000000000000ORG2/{page}"),
+            format!("/ui/{page}"),
+            format!("/ui/{page}/"),
+        ] {
             let (status, headers, body) = fleet.http_full("GET", &path, &[], None).await;
             assert_eq!(status, 200, "{path}");
             assert_eq!(
@@ -179,7 +188,7 @@ async fn client_side_routes_all_render_the_shell() {
             );
             assert_hardened(&headers, &path);
             assert_eq!(header(&headers, "set-cookie"), None, "{path}");
-            assert_eq!(body, canonical, "{path} must be byte-identical to /ui/");
+            assert_eq!(body, canonical, "{path} must be byte-identical to /");
         }
     }
 }
@@ -231,7 +240,7 @@ fn the_rust_and_javascript_page_lists_agree() {
 async fn an_unknown_asset_path_is_a_404_and_never_the_shell() {
     let fleet = TestCoordinator::start().await;
 
-    let (_, _, shell) = fleet.http_full("GET", "/ui/", &[], None).await;
+    let (_, _, shell) = fleet.http_full("GET", "/", &[], None).await;
     let prefix = asset_prefix(&shell);
 
     for path in [
@@ -243,6 +252,19 @@ async fn an_unknown_asset_path_is_a_404_and_never_the_shell() {
         "/ui/nope/".to_owned(),
         "/ui/devices/extra".to_owned(),
         "/ui/devices//".to_owned(),
+        "/alice/nope".to_owned(),
+        "/alice/nope/".to_owned(),
+        "/alice/devices/extra".to_owned(),
+        "/alice/devices//".to_owned(),
+        "/alice/app.mjs".to_owned(),
+        "/alice".to_owned(),
+        "/alice/".to_owned(),
+        // Not an org segment: a dot (or its encoding), an odd byte, too long.
+        "/a.b/devices".to_owned(),
+        "/%2e%2e/devices".to_owned(),
+        "/a%2Fb/devices".to_owned(),
+        "/a_b/devices".to_owned(),
+        format!("/{}/devices", "a".repeat(65)),
         format!("{prefix}/nope.mjs"),
         format!("{prefix}/pages/nope.mjs"),
     ] {
@@ -257,7 +279,7 @@ async fn an_unknown_asset_path_is_a_404_and_never_the_shell() {
 async fn traversal_out_of_the_asset_tree_is_refused() {
     let fleet = TestCoordinator::start().await;
 
-    let (_, _, shell) = fleet.http_full("GET", "/ui/", &[], None).await;
+    let (_, _, shell) = fleet.http_full("GET", "/", &[], None).await;
     let prefix = asset_prefix(&shell);
 
     for suffix in [
@@ -306,6 +328,28 @@ async fn the_ui_swallows_no_other_prefix() {
         let (status, _, body) = fleet.http_full("GET", path, &[], None).await;
         assert_eq!(status, 404, "{path}");
         assert!(body.is_empty(), "{path} answered with a body: {body}");
+    }
+
+    // A fixed prefix is never an org: `/{org}/<page>` would match `/api/devices`,
+    // so the shell handler refuses every reserved name, in any case, with the
+    // same empty 404 as an unknown path. (`/ui/<page>` is the one exception:
+    // the legacy routes, which are static and win.)
+    for reserved in probefleet_coordinator::state::RESERVED_NAMES {
+        if *reserved == "ui" {
+            continue;
+        }
+        for page in probefleet_coordinator::assets::shell_pages() {
+            for name in [reserved.to_string(), reserved.to_ascii_uppercase()] {
+                let path = format!("/{name}/{page}");
+                let (status, _, body) = fleet.http_full("GET", &path, &[], None).await;
+                assert!(!body.contains("<main"), "{path} must not be the shell");
+                // `/node/approve` is a real static page; everything else here
+                // is no route at all.
+                if path != "/node/approve" {
+                    assert_ne!(status, 200, "{path}: {body}");
+                }
+            }
+        }
     }
 
     // The control-plane upgrades still refuse a plain GET their own way.
@@ -511,4 +555,23 @@ fn resolve(dir: &str, spec: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+/// Every first path segment the coordinator routes is a reserved name, so no
+/// org or user can be named after it and `/<org>/<page>` can never shadow it.
+///
+/// Hand-listed from `src/http.rs`, `src/api.rs`, `src/assets.rs` and forgs'
+/// `/auth` router. **Adding a top-level route means adding its prefix here and
+/// to `state::RESERVED_NAMES`.**
+#[test]
+fn every_top_level_route_prefix_is_a_reserved_name() {
+    for prefix in [
+        "api", "auth", "ui", "agent", "client", "delegate", "healthz", "node",
+    ] {
+        assert!(
+            probefleet_coordinator::state::RESERVED_NAMES.contains(&prefix),
+            "`/{prefix}` is a route prefix but not in RESERVED_NAMES: an org named \
+             {prefix} would shadow (or be shadowed by) it"
+        );
+    }
 }

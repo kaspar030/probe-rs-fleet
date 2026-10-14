@@ -8,9 +8,10 @@
 // `personal` marks the user's personal org, which follows the username and
 // cannot be renamed or deleted as an org.
 //
-// `org` is the org this session is acting in (the `?org=` the request carried,
-// default the personal org), with the caller's role *there*; it is `null` when
-// the requested org is not one the user belongs to. Every helper here is UX
+// `org` is the org this session is acting in (the `?org=` the request carried —
+// the UI sends the `<org>` segment of its `/<org>/<page>` URL — default the
+// personal org), with the caller's role *there*; it is `null` when the
+// requested org does not exist or is not one the user belongs to. Every helper here is UX
 // only: the server checks role and ownership on every request.
 
 /** The signed-in user's immutable id (ULID), or null. */
@@ -48,4 +49,14 @@ export function orgLabel(org) {
 export function orgName(session, id) {
   const hit = memberships(session).find((m) => m.id === id);
   return hit ? orgLabel(hit) : id || '—';
+}
+
+/** An org's URL segment (`/<path>/<page>`): its path, else its id. */
+export function orgPath(org) {
+  return (org && (org.name || org.id)) || null;
+}
+
+/** The user's personal org membership, or null. */
+export function personalOrg(session) {
+  return memberships(session).find((m) => m.personal) || null;
 }

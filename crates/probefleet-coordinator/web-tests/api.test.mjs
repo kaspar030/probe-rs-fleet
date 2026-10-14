@@ -118,3 +118,15 @@ test('every /api/v1 call carries the acting org, and only /api/v1 calls do', asy
   assert.equal(f.calls[0].path, '/api/v1/session', 'no org: the server default (personal org)');
   assert.equal(withOrg('/api/v1/x', null), '/api/v1/x');
 });
+
+test('the acting org may be an org path, as the /<org>/<page> URL carries it', async () => {
+  setOrg('acme-labs');
+  try {
+    const f = fakeFetch({ status: 200, body: '{}' });
+    await request('GET', '/api/v1/session', null, { fetch: f, jar: JAR });
+    assert.equal(f.calls[0].path, '/api/v1/session?org=acme-labs');
+  } finally {
+    setOrg(null);
+  }
+  assert.equal(withOrg('/api/v1/boards?x=1', 'alice'), '/api/v1/boards?x=1&org=alice');
+});

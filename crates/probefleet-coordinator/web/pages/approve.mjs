@@ -16,8 +16,8 @@
 //
 // The **target org** is chosen here, before anything is looked up: a session
 // is not bound to one org, and approving grants the machine hardware access
-// in whichever org the request acts in (`?org=<id>`). The picker lists the
-// session's memberships and defaults to the org the UI is acting in; the
+// in whichever org the request acts in (`?org=<id>`, sent per call). The
+// picker lists the session's memberships and defaults to the org the UI is acting in; the
 // inspect call already carries the choice, so the server's `org` field — shown
 // in the table and in the confirmation — is the org the approval would bind.
 // Changing the org drops a looked-up registration: its collision check and
@@ -117,9 +117,10 @@ export function render(state) {
 export async function load(ctx) {
   const { api, session } = ctx;
   const orgs = memberships(session);
-  // Default: the org the UI is acting in; else the session's; else the first.
+  // Default: the org the UI is acting in; else the first membership.
   if (!ctx.targetOrg || !orgs.some((m) => m.id === ctx.targetOrg)) {
-    const acting = (api.currentOrg && api.currentOrg()) || (session && session.org && session.org.id) || null;
+    // By id: `api.currentOrg()` is the URL's org *path*, the options are ids.
+    const acting = (session && session.org && session.org.id) || null;
     ctx.targetOrg = orgs.some((m) => m.id === acting) ? acting : orgs.length > 0 ? orgs[0].id : acting;
   }
   const state = {

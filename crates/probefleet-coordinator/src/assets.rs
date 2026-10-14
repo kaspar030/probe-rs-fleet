@@ -48,20 +48,45 @@
 //! serves current bytes. 404ing a mismatched hash would break a page mid-session
 //! across a coordinator restart that changed the assets.
 //!
+//! # Page URLs: `/<org>/<page>`
+//!
+//! A page lives at `/<org>/<page>`, where `<org>` is the acting org's path
+//! (its human-readable name; for a personal org, the username), e.g.
+//! `/alice/devices`. The org path is the *only* place the acting org is
+//! chosen for the UI: the client reads it from `location.pathname` and sends
+//! it to the API as `?org=<path>` (`http::acting_subject` resolves a path or an
+//! id).
+//!
+//! The page routes are **unauthenticated, static and identical for every
+//! org**: [`org_shell`] checks the segment's *syntax* only and never touches
+//! the database, so the bytes for an org you are not in and for an org that
+//! does not exist are the same — no existence oracle. Membership is decided by
+//! the API on the client's first `/api/v1/session?org=<path>` call (the session
+//! cookie is only a credential under `/api/v1/`, so a page route *could not*
+//! check it without a carrier change).
+//!
+//! `/` serves the shell, which `replaceState`s to the caller's personal org.
+//! The old `/ui/<page>?org=<id>` URLs still serve the shell and are redirected
+//! **client-side** (id → path via the session API) for the same reason: a
+//! server-side lookup would be an unauthenticated oracle.
+//!
 //! # There is no global fallback, and please do not add one
 //!
-//! Every catch-all this module registers is scoped under `/ui/`. There is no
-//! `Router::fallback` anywhere in the coordinator, so the SPA shell cannot
-//! swallow `/api/*`, `/agent`, `/client`, `/delegate`, `/healthz` or
-//! `/node/approve` — not merely "does not today", but *cannot*, which is a
-//! property a test can only sample and a router shape can guarantee. The
-//! instinct when a client-side route 404s is to add `.fallback(shell)`; the
-//! answer is to add the page to [`PAGES`] instead, which registers both its
-//! bare and its trailing-slash spelling.
+//! The catch-all asset route is scoped under `/ui/`, and the org page routes
+//! are one explicit `/{org}/<page>` pair per entry in [`PAGES`]. There is no
+//! `Router::fallback` anywhere in the coordinator. The router prefers static
+//! routes, so `/api/*`, `/agent`, `/client`, `/delegate`, `/healthz` and
+//! `/node/approve` keep their own answers; and since `/{org}/devices` *would*
+//! match `/api/devices`, [`org_shell`] refuses every segment in
+//! [`crate::state::RESERVED_NAMES`] — the same list forgs refuses as an org or
+//! user name, so no real org can ever be shadowed by (or shadow) a fixed
+//! route. The instinct when a client-side route 404s is to add
+//! `.fallback(shell)`; the answer is to add the page to [`PAGES`] instead,
+//! which registers both its bare and its trailing-slash spelling.
 //!
 //! # Headers
 //!
-//! Every `/ui*` response carries the strict CSP D3 fixes, plus `nosniff` and
+//! Every response this module produces carries the strict CSP D3 fixes, plus `nosniff` and
 //! `no-referrer`, applied in one helper so a route cannot ship without them:
 //!
 //! ```text
@@ -101,9 +126,10 @@ static ASSETS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/web");
 
 /// The client-side pages the shell answers, as bare page names.
 ///
-/// Listed explicitly rather than "anything under `/ui/`" so that a typo'd asset
+/// Listed explicitly rather than "anything under `/<org>/`" so that a typo'd
 /// URL is a 404 rather than an HTML document parsed as JavaScript. [`router`]
-/// derives *both* spellings of each page — `/ui/devices` and `/ui/devices/` —
+/// derives *both* spellings of each page — `/<org>/devices` and
+/// `/<org>/devices/`, plus the legacy `/ui/devices` pair —
 /// from this one list, because `web/router.mjs` treats them as the same page
 /// (it strips trailing slashes) and a cold load of the slashed form must not
 /// 404 before the shell that would have normalised it is even served.
@@ -135,31 +161,64 @@ const ASSET_CACHE: &str = "public, max-age=31536000, immutable";
 /// Note what is *not* here: a `fallback`. See the module documentation.
 pub(crate) fn router() -> Router<Arc<Coordinator>> {
     let mut router = Router::new()
-        // A bare `/ui` (which is what `/auth/github/callback` redirects to)
-        // and the site root both land on the shell's canonical path, so
-        // relative asset URLs resolve against `/ui/` rather than against `/`.
-        .route("/", get(|| async { redirect_to_ui() }))
-        .route("/ui", get(|| async { redirect_to_ui() }))
-        .route("/ui/a/{hash}/{*path}", get(asset))
-        .route("/ui/", get(shell));
+        // The landing page: the shell, which moves itself to
+        // `/<personal-org>/devices` once the session is known. Asset URLs in
+        // the shell are absolute (`/ui/a/{hash}/…`), so any page path works.
+        .route("/", get(shell))
+        // The old canonical UI root (and a bare `/ui`) land on `/`.
+        .route("/ui", get(|| async { redirect_to_root() }))
+        .route("/ui/", get(|| async { redirect_to_root() }))
+        .route("/ui/a/{hash}/{*path}", get(asset));
     for page in PAGES {
         // Both spellings, from one list: axum matches paths literally, so
-        // `/ui/devices` and `/ui/devices/` are distinct routes, and only the
-        // pair keeps a hand-typed or link-mangled trailing slash working on a
-        // cold load.
+        // `/alice/devices` and `/alice/devices/` are distinct routes, and only
+        // the pair keeps a hand-typed or link-mangled trailing slash working
+        // on a cold load.
+        router = router.route(&format!("/{{org}}/{page}"), get(org_shell));
+        router = router.route(&format!("/{{org}}/{page}/"), get(org_shell));
+        // Legacy `/ui/<page>?org=<id>` URLs: the shell, which rewrites them
+        // to `/<org>/<page>` client-side (see the module documentation).
+        // These static routes win over `/{org}/<page>` in the router.
         router = router.route(&format!("/ui/{page}"), get(shell));
         router = router.route(&format!("/ui/{page}/"), get(shell));
     }
     router
 }
 
-/// `302` to the UI's canonical path.
-fn redirect_to_ui() -> Response {
+/// `302` to the site root.
+fn redirect_to_root() -> Response {
     let mut response = StatusCode::FOUND.into_response();
     response
         .headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_static("/ui/"));
+        .insert(header::LOCATION, HeaderValue::from_static("/"));
     harden(response)
+}
+
+/// Whether `segment` may be the `<org>` of a `/<org>/<page>` URL.
+///
+/// A syntax check, never a lookup: 1–64 bytes of `[A-Za-z0-9-]` (an org path,
+/// or a ULID id for a hand-written link) and not a reserved name. Reserved
+/// names are compared case-insensitively, so `/API/devices` is refused as
+/// firmly as `/api/devices`; those prefixes belong to fixed routes and forgs
+/// will never let an org or user take them.
+fn org_segment_ok(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= 64
+        && segment.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !crate::state::RESERVED_NAMES
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(segment))
+}
+
+/// `GET /{org}/<page>` — the shell, for any syntactically valid org segment.
+///
+/// No database access, so the answer cannot depend on whether the org exists
+/// or whom it admits (see the module documentation).
+async fn org_shell(Path(org): Path<String>) -> Response {
+    if !org_segment_ok(&org) {
+        return harden(StatusCode::NOT_FOUND.into_response());
+    }
+    shell().await
 }
 
 /// Attach the CSP and hardening headers.
@@ -183,7 +242,7 @@ fn harden(mut response: Response) -> Response {
     response
 }
 
-/// `GET /ui/` and every client-side route — the rendered shell.
+/// `GET /`, every `/<org>/<page>` and legacy `/ui/<page>` — the rendered shell.
 async fn shell() -> Response {
     let mut response = (
         StatusCode::OK,
@@ -393,6 +452,25 @@ mod tests {
         assert_eq!(content_type("logo.svg"), "image/svg+xml");
         assert_eq!(content_type("weird.xyz"), "application/octet-stream");
         assert_eq!(content_type("noextension"), "application/octet-stream");
+    }
+
+    /// The `<org>` segment guard: org paths and ids pass, reserved prefixes
+    /// (any case) and anything with a dot, slash or odd byte do not.
+    #[test]
+    fn org_segments_are_screened_by_syntax_and_reserved_names() {
+        for ok in ["alice", "acme-labs", "a", "01J0000000000000000000ORG2", &"a".repeat(64)] {
+            assert!(org_segment_ok(ok), "{ok} must be accepted");
+        }
+        for reserved in crate::state::RESERVED_NAMES {
+            assert!(!org_segment_ok(reserved), "{reserved} is reserved");
+            assert!(
+                !org_segment_ok(&reserved.to_ascii_uppercase()),
+                "{reserved} is reserved in any case"
+            );
+        }
+        for bad in ["", "..", ".", "a.b", "a/b", "a b", "a_b", "\u{e9}", "a\0", &"a".repeat(65)] {
+            assert!(!org_segment_ok(bad), "{bad:?} must be refused");
+        }
     }
 
     /// A 16-hex-character digest, stable across calls.

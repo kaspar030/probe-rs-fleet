@@ -48,7 +48,7 @@ pub const CSRF_HEADER: &str = "x-fleet-csrf";
 /// The only prefix under which the session cookie is a credential.
 pub const COOKIE_API_PREFIX: &str = "/api/v1/";
 /// Where a browser lands after login.
-pub const POST_LOGIN_REDIRECT: &str = "/ui/";
+pub const POST_LOGIN_REDIRECT: &str = "/";
 
 /// API-key purpose: enroll a node (`POST /node/enroll`).
 pub const PURPOSE_NODE: &str = "node";

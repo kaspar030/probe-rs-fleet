@@ -247,8 +247,8 @@ export async function load(ctx) {
       await ctx.reload();
       return;
     }
-    if (created && created.id && typeof ctx.switchOrg === 'function') {
-      await ctx.switchOrg(created.id);
+    if (created && (created.name || created.id) && typeof ctx.switchOrg === 'function') {
+      await ctx.switchOrg(created.name || created.id);
     } else {
       await ctx.reload();
     }
@@ -270,9 +270,10 @@ export async function load(ctx) {
       return;
     }
     ctx.orgNotice = `Renamed the org to ${(renamed && renamed.name) || name}.`;
-    // The acting org may have been held by its old name: re-select it by id.
-    if (renamed && renamed.id && typeof ctx.switchOrg === 'function') {
-      await ctx.switchOrg(renamed.id);
+    // The URL holds the old name, which no longer resolves: move to the new
+    // one (old links to the old name stop working; see docs/web-ui.md).
+    if (typeof ctx.switchOrg === 'function') {
+      await ctx.switchOrg((renamed && (renamed.name || renamed.id)) || name);
     } else {
       await ctx.reload();
     }

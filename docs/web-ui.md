@@ -13,8 +13,8 @@ Login, signup, cookies and CSRF are
 see `docs/architecture.md` §6). fleet's side lives in
 `crates/probefleet-coordinator/src/identity.rs` (the `AuthContext`: cookie brand
 `prfs`, CSRF header `x-fleet-csrf`, cookie prefix `/api/v1/`, post-login
-redirect `/ui/`), `src/api.rs` (the `/api/v1` handlers), `src/assets.rs` (the
-asset routes) and `web/` (the UI itself). Where this
+redirect `/`), `src/api.rs` (the `/api/v1` handlers), `src/assets.rs` (the
+asset and page routes) and `web/` (the UI itself). Where this
 document and the code disagree, the code is the fact and this document is the
 bug.
 
@@ -63,11 +63,13 @@ The browser surface is forgs' generic one. What the page does:
 
 - The login page lists the configured providers from `GET /auth/providers`
   (JSON; forgs also renders an HTML list at `GET /auth/login`) and links each
-  to `GET /auth/{provider}/start?return_to=/ui/`. There is **no in-page device
+  to `GET /auth/{provider}/start?return_to=<page>`, where `<page>` is the
+  `/<org>/<page>` the login page was reached from (a deep link survives
+  sign-in), else `/`. There is **no in-page device
   fallback**: every provider has an authorization-code flow, and the
   device flow is the CLI's.
 - `GET /auth/{provider}/callback` either sets the session cookies and
-  redirects to `/ui/` (a known identity) or, on **first login**, redirects to
+  redirects to `return_to`, default `/` (a known identity) or, on **first login**, redirects to
   forgs' signup page (`/auth/signup`), where the user chooses a username. The
   ticket rides a sealed `HttpOnly` cookie; signup creates the user, the
   identity, the personal org and the admin membership in one transaction and
@@ -94,7 +96,7 @@ any case — CLI login also completes in the browser — and the architecture
 **The seam this uses already exists, by design.** `http.rs::decide_pending_node`
 takes an *already-resolved* subject precisely so a cookie-authenticated handler
 can call the same function as the CLI route; the web approval flow
-(`/ui/approve`) does exactly that.
+(`/<org>/approve`) does exactly that.
 
 **`redirect_uri` is derived from `public_url`, never from the request.** Not
 `Host`, not `X-Forwarded-Host`. The coordinator runs behind a reverse proxy
@@ -134,6 +136,46 @@ acts in the user's personal org. Membership is checked there, and an org you
 do not belong to answers exactly like one that does not exist (`403`). When
 `GET /api/v1/session` lists more than one membership, the UI shows an **org
 switcher** in the header and appends the chosen org to every call.
+
+**Page URLs name the org: `/<org>/<page>`.** `<org>` is the acting org's path
+(for a personal org, the username), e.g. `/alice/devices`, `/acme/keys`. The
+UI reads it from the URL and sends it to every `/api/v1` call as
+`?org=<path>`; nothing else picks the UI's acting org.
+
+- **Landing.** `GET /` serves the shell, which resolves the session (default:
+  the personal org) and `replaceState`s to `/<personal>/devices`. The
+  post-login redirect is `/`.
+- **Switching.** The header's org picker navigates to `/<other>/<same page>`.
+  After renaming an org the UI moves to `/<new-name>/org`; after deleting one,
+  to the personal org.
+- **No oracle.** The page routes are static: the server serves byte-identical
+  shell bytes for any syntactically valid org segment (1–64 bytes of
+  `[A-Za-z0-9-]`, not a reserved name) without touching the database — it
+  could not check membership anyway, because the session cookie is a
+  credential only under `/api/v1/`. Membership is decided by
+  `GET /api/v1/session?org=<path>`, which returns `org: null` for a
+  nonexistent org and a non-member alike; the UI then renders one page, "No
+  such org, or you are not a member", with a link to the personal org.
+- **Reserved names.** `/{org}/<page>` would otherwise match `/api/devices`, so
+  the page handler refuses every name in `state::RESERVED_NAMES` (any case) —
+  the list forgs already refuses as an org or user name, which holds every
+  fixed top-level prefix (`api`, `auth`, `ui`, `node`, `agent`, `client`,
+  `delegate`, `healthz`, …). Static routes win in the router regardless. A new
+  top-level route prefix must be added to that list; `tests/ui_assets.rs`
+  checks the coordinator's prefixes against it.
+- **Canonical spelling.** An id or a differently-cased path that resolves is
+  rewritten (`replaceState`) to `/<name>/<page>`.
+- **Legacy URLs.** `/ui` and `/ui/` redirect to `/`. `/ui/<page>?org=<id>`
+  still serves the shell, and the client rewrites it to `/<name>/<page>` once
+  the session API has resolved the id (no `?org=`: the personal org). This is
+  client-side on purpose: a server-side id → path redirect would need either
+  an unauthenticated lookup (an existence oracle) or the cookie on a non-API
+  path (a carrier change). `/node/approve` still links to `/ui/approve` and
+  reaches the approve page through this rewrite.
+- **Renames.** Renaming an org makes links to its old path stop resolving;
+  they show the uniform no-access page. That is accepted: forgs tombstones a
+  released name, so nobody else can take it over, and a redirect would need an
+  old-name table that does not exist.
 
 **CSRF.** Two independent controls:
 
@@ -217,7 +259,8 @@ the binary. No npm, no bundler, no TypeScript compile, no build step at all.**
 - Source lives in `crates/probefleet-coordinator/web/` — not a `web/` at the repo
   root, not a `fleet-web` crate. The assets are part of the binary that serves
   them.
-- Embedded with `include_dir!`, served under `GET /ui/*`. The coordinator stays
+- Embedded with `include_dir!`; assets are served under `GET /ui/a/*`, pages
+  at `/<org>/<page>`. The coordinator stays
   a single cross-compilable binary behind a reverse proxy (§3.5).
 - **A `cargo build` with no node/npm installed keeps working — structurally, not
   as a fallback.** There is no build script, no generated artifact, nothing to
@@ -242,17 +285,19 @@ carries the same notes at the call site):
    hash and break its invalidation silently. The hash segment is a **cache key,
    not a check** — a stale hash still serves current bytes, because 404ing it
    would break an open page across a restart that changed the assets.
-2. **No global `Router::fallback`, anywhere.** Every catch-all is scoped under
-   `/ui/`, and the client-side routes are listed explicitly. That is what makes
+2. **No global `Router::fallback`, anywhere.** The asset catch-all is scoped
+   under `/ui/`, and the client-side routes are listed explicitly — one
+   `/{org}/<page>` pair per page, refusing reserved org segments. That is what makes
    "the shell cannot swallow `/api/*`, `/agent`, `/client`, `/delegate`,
    `/healthz` or `/node/approve`" a property of the router's *shape* rather than
    of a test that samples it, and it is why an unknown top-level path is an
    empty 404. The instinct when a new client-side route 404s is to add
    `.fallback(shell)`; the answer is to add the page to `PAGES` in
-   `src/assets.rs`, from which the router derives both the bare `/ui/<page>` and
-   the trailing-slash `/ui/<page>/` spelling. Both are registered because the
+   `src/assets.rs`, from which the router derives both the bare `/<org>/<page>` and
+   the trailing-slash `/<org>/<page>/` spelling (plus the legacy `/ui/<page>`
+   pair). Both are registered because the
    client router strips a trailing slash, so serving only the bare form made a
-   *cold* load of `/ui/devices/` a 404 that navigation within the shell never
+   *cold* load of `/alice/devices/` a 404 that navigation within the shell never
    reproduced.
 3. **Every frontend module is `.mjs`, and there is no `package.json`.** A `.js`
    module is resolved as CommonJS by node < 22.7 and by any node whose upward
@@ -364,8 +409,8 @@ Login itself is forgs' (D1); these are the routes the UI touches.
 | Method + path | Request | Response | Calls | Who |
 |---|---|---|---|---|
 | `GET /auth/providers` | — | the configured provider names (JSON) | forgs | anyone (reveals only which logins this deployment offers) |
-| `GET /auth/{provider}/start?return_to=/ui/` | — | `302` to the provider; `state` (+ PKCE verifier) in a sealed `HttpOnly` flow cookie | forgs | anyone |
-| `GET /auth/{provider}/callback?code&state` | — | known identity: `302 /ui/`, `Set-Cookie: prfs_session`, `Set-Cookie: prfs_csrf`; first login: `302 /auth/signup` with a sealed ticket cookie | forgs | anyone with a valid `state` |
+| `GET /auth/{provider}/start?return_to=/<org>/<page>` | — | `302` to the provider; `state` (+ PKCE verifier) in a sealed `HttpOnly` flow cookie | forgs | anyone |
+| `GET /auth/{provider}/callback?code&state` | — | known identity: `302` to `return_to` (default `/`), `Set-Cookie: prfs_session`, `Set-Cookie: prfs_csrf`; first login: `302 /auth/signup` with a sealed ticket cookie | forgs | anyone with a valid `state` |
 | `GET`/`POST /auth/signup` | username | forgs' HTML form; on success the cookies above | forgs | holder of a signup ticket |
 | `GET /api/v1/session[?org=]` | — | `{"user_id","username","memberships":[{"id","name","role"}],"org":{"id","name","role"}\|null,"expires","can_create_orgs"}` | forgs store | any session |
 | `POST /api/v1/session/logout` | `{}` | `204`, cookies cleared | `forgs_http::session::logout` | any session |
@@ -615,14 +660,17 @@ first reviewer of the UI does not read "audit log" and expect one.
 
 | Method + path | Response |
 |---|---|
-| `GET /` , `GET /ui` | `302` → `/ui/`, so relative asset URLs resolve against the canonical path |
-| `GET /ui/` and each client-side route, with or without a trailing slash (`/ui/devices`, `/ui/devices/`, … for `devices`, `agents`, `approve`, `access`, `keys`, `audit`) | the shell, `Cache-Control: no-cache` |
+| `GET /` | the shell (the landing page; the client moves to `/<personal>/devices`), `Cache-Control: no-cache` |
+| `GET /<org>/<page>`, with or without a trailing slash (`/alice/devices`, `/alice/devices/`, … for `devices`, `agents`, `approve`, `access`, `keys`, `org`, `audit`) | the shell, byte-identical for every org segment; `404` if the segment is not 1–64 bytes of `[A-Za-z0-9-]` or is a reserved name |
+| `GET /ui`, `GET /ui/` | `302` → `/` |
+| `GET /ui/<page>[/]` (legacy, `?org=<id>`) | the shell, which rewrites the URL to `/<org>/<page>` client-side |
 | `GET /ui/a/{tree-hash}/{path}` | one embedded asset, `public, max-age=31536000, immutable` |
-| `GET /node/approve` | unchanged URL, unchanged reflection-free page, plus one static link to `/ui/approve` |
+| `GET /node/approve` | unchanged URL, unchanged reflection-free page, plus one static link to `/ui/approve` (legacy; rewritten client-side) |
 
 All of them carry the CSP and hardening headers above, authenticate nothing and
 set no cookies — the shell has to load before a session exists, because login is
-a page inside it. A `/ui/` path whose last segment has an extension is a `404`
+a page inside it. A page path that is not a known page (e.g. `/alice/app.mjs`, `/ui/nope.mjs`)
+is a `404`
 rather than the shell, which is what makes a typo'd `import` surface as a broken
 import instead of as HTML parsed as JavaScript.
 

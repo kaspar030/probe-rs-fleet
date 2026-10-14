@@ -75,10 +75,14 @@ const labels = (tree) => findAll(tree, (n) => n.tag === 'button').map((n) => n.c
 
 // ---------------------------------------------------------------------------
 
-test('login links every provider the deployment reports, returning to /ui/', () => {
+test('login links every provider the deployment reports, returning to / by default', () => {
   const tree = login.render({ providers: ['github', 'oidc'] });
   const hrefs = findAll(tree, (n) => n.tag === 'a').map((n) => n.attrs.href);
-  assert.deepEqual(hrefs, ['/auth/github/start?return_to=%2Fui%2F', '/auth/oidc/start?return_to=%2Fui%2F']);
+  assert.deepEqual(hrefs, ['/auth/github/start?return_to=%2F', '/auth/oidc/start?return_to=%2F']);
+
+  // A deep link survives sign-in.
+  const deep = login.render({ providers: ['github'], returnTo: '/acme/keys' });
+  assert.equal(find(deep, (n) => n.tag === 'a').attrs.href, '/auth/github/start?return_to=%2Facme%2Fkeys');
 
   // No in-page device flow and no signup form: forgs owns both.
   assert.equal(find(tree, (n) => n.tag === 'button' || n.tag === 'form' || n.tag === 'input'), null);
@@ -86,6 +90,14 @@ test('login links every provider the deployment reports, returning to /ui/', () 
 
   const none = login.render({ providers: [] });
   assert.match(textOf(none), /coordinator user-token/);
+});
+
+test('login returns to the org page it was reached from, else /', () => {
+  assert.equal(login.returnTo('/acme/keys'), '/acme/keys');
+  assert.equal(login.returnTo('/acme/keys/'), '/acme/keys');
+  for (const path of ['/', '/ui/', '/ui/devices', '/acme/nope', '/a.b/devices']) {
+    assert.equal(login.returnTo(path), '/', path);
+  }
 });
 
 test('a hostile provider name is encoded into one path segment and rendered as text', () => {
@@ -106,7 +118,7 @@ test('login loads providers from /auth/providers', async () => {
   };
   const tree = await login.load({ api });
   assert.deepEqual(seen, ['/auth/providers']);
-  assert.equal(find(tree, (n) => n.tag === 'a').attrs.href, '/auth/github/start?return_to=%2Fui%2F');
+  assert.equal(find(tree, (n) => n.tag === 'a').attrs.href, '/auth/github/start?return_to=%2F');
 });
 
 test('devices renders the inventory and gates its actions by role', () => {

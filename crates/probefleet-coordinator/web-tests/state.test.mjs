@@ -51,7 +51,8 @@ function makeCtx(page, responses) {
         if (!(path in responses)) throw new Error(`unstubbed POST ${path}`);
         return typeof responses[path] === 'function' ? responses[path](body, options) : responses[path];
       },
-      currentOrg: () => ORG,
+      // The acting org as `app.mjs` sets it: the URL's org *path*, not an id.
+      currentOrg: () => 'alice',
       patch: async () => ({}),
       del: async () => null,
       describe: (e) => String(e && e.message ? e.message : e),
@@ -256,7 +257,7 @@ test('org actions post the contract bodies and switch into a created org', async
     const create = find(ctx.tree, (n) => n.tag === 'form' && n.attrs.name === 'create-org');
     await create.on.submit({ preventDefault() {}, target: { elements: { name: { value: 'team' } } } });
     assert.deepEqual(ctx.api.posts.at(-1), { path: '/api/v1/orgs', body: { name: 'team' }, options: { org: null } });
-    assert.deepEqual(switched, [null, TEAM]);
+    assert.deepEqual(switched, [null, 'team'], 'a created org is switched to by path');
   } finally {
     globalThis.window = prevWindow;
   }
@@ -281,13 +282,13 @@ test('org rename posts the new name and delete drops back to the default org', a
     const rename = find(tree, (n) => n.tag === 'form' && n.attrs.name === 'rename-org');
     await rename.on.submit({ preventDefault() {}, target: { elements: { name: { value: ' acme2 ' } } } });
     assert.deepEqual(ctx.api.posts.at(-1), { path: '/api/v1/org/rename', body: { name: 'acme2' }, options: undefined });
-    assert.deepEqual(switched, [TEAM]);
+    assert.deepEqual(switched, ['acme2'], 'a renamed org is switched to by its new path');
 
     const del = find(ctx.tree, (n) => n.tag === 'button' && n.attrs.name === 'delete-org');
     await del.on.click();
     assert.match(confirmed.at(-1), /acme/);
     assert.deepEqual(deleted, ['/api/v1/org']);
-    assert.deepEqual(switched, [TEAM, null]);
+    assert.deepEqual(switched, ['acme2', null]);
 
     // Declining the confirm does nothing.
     globalThis.window = { confirm: () => false };

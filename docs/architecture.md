@@ -137,13 +137,15 @@ Routes:
 | `POST /node/self-register` | org members (session) | register the calling machine (`share`) |
 | `GET /node/approve` | anyone | static page: what to run to approve one (and a link to `/ui/approve`) |
 | `GET /api/v1/*` | a browser session, or a bearer | the browser-facing JSON API (`docs/web-ui.md` §3) |
-| `GET /` , `GET /ui` | a browser | 302 to `/ui/` |
-| `GET /ui/` and each client-side route, with or without a trailing slash | a browser | the web UI's shell, embedded in the binary (`docs/web-ui.md` D3) |
+| `GET /` | a browser | the web UI's shell (landing; moves to `/<personal>/devices`) |
+| `GET /<org>/<page>`, with or without a trailing slash | a browser | the web UI's shell, embedded in the binary (`docs/web-ui.md` D3); reserved names as `<org>` are a 404 |
+| `GET /ui`, `GET /ui/` | a browser | 302 to `/` |
+| `GET /ui/<page>[/]` | a browser | legacy: the shell, rewriting `?org=<id>` to `/<org>/<page>` client-side |
 | `GET /ui/a/{hash}/*` | a browser | one embedded asset, immutably cacheable |
 | `GET /healthz` | proxy | liveness |
 
 The browser pages under `/auth/*` (login, callback, signup, device
-verification), `/api/v1/*` and `/ui*` are the **browser surface**, added by
+verification), `/api/v1/*`, `/`, `/<org>/<page>` and `/ui*` are the **browser surface**, added by
 `docs/web-ui.md` and designed there rather than here — named by prefix rather
 than by position, so the next row anyone adds to this table does not silently
 leave this sentence pointing at the wrong rows. Three properties of it belong
@@ -161,11 +163,14 @@ here rather than only in that document:
   Every mutating `/api/v1` route (logout, the node verbs, grants, auth keys,
   orgs and members, power-cycle, lease release) sits behind that same single
   check.
-* **The `/ui*` routes authenticate nothing and there is no global router
-  fallback.** The shell has to load before a session exists, since login is a
+* **The page and `/ui*` routes authenticate nothing and there is no global
+  router fallback.** The shell has to load before a session exists, since login is a
   page inside it, so the asset routes are unauthenticated and set no cookies;
-  they serve only bytes compiled into the binary. Every catch-all is scoped
-  under `/ui/`, which is what makes "the UI cannot swallow another prefix" a
+  they serve only bytes compiled into the binary — the same shell for every
+  `/<org>/<page>`, so a page URL is no org-existence oracle. The asset
+  catch-all is scoped under `/ui/`, each page is an explicit `/{org}/<page>`
+  route, and that handler refuses every `RESERVED_NAMES` entry (which holds
+  every fixed top-level prefix; a new prefix must be added there), which is what makes "the UI cannot swallow another prefix" a
   property of the router's shape rather than of a test — an unknown top-level
   path is an empty 404. Please do not add `.fallback(...)` to fix a
   client-side route that 404s; add the page to `PAGES` in
@@ -665,7 +670,8 @@ weaker:
 
 * **`GET /node/approve` has no form.** It is informational and reflects
   nothing — no code in the URL, no query parameter echoed — so it cannot become
-  a confused-deputy surface; it links to `/ui/approve`, which is where the form
+  a confused-deputy surface; it links to `/ui/approve` (rewritten client-side to `/<org>/approve`),
+  which is where the form
   lives.
 * **There is no pending-registration listing.** A pending row's namespace is
   `NULL` until approval binds it, so a listing could only show every live
@@ -1147,7 +1153,7 @@ credential is derived from that authority.
 | **User**, browser | `/auth/login` → any configured provider (authorization-code flow) | browser |
 | **User**, CLI (`login`) | forgs' own device flow: a code confirmed in a browser logged in with any provider | browser, once |
 | **Node, user present** | `share` → `POST /node/self-register` with the session | zero extra steps |
-| **Node, headless** | `node up` prints a URL + code; a member runs `node approve <code>` (or `/ui/approve`) | no token copy-paste |
+| **Node, headless** | `node up` prints a URL + code; a member runs `node approve <code>` (or `/<org>/approve`) | no token copy-paste |
 | **Node, unattended** | an API key of purpose `node` redeemed at `POST /node/enroll` | one paste, revocable |
 | **CI worker** | GH Actions workload OIDC exchanged at `POST /auth/token`, plus a per-repo grant (§6.7) | zero secrets |
 | **CI worker, no workload identity** | an API key of purpose `ci` redeemed at `POST /auth/token` (§6.7, the weak path) | one paste, revocable |
@@ -1182,7 +1188,7 @@ The browser flow (all forgs routes, merged into fleet's router):
 ```
 GET /auth/login  (or GET /auth/providers → JSON)  → pick a provider
 GET /auth/{p}/start       → 302 to the provider; state in a sealed HttpOnly flow cookie
-GET /auth/{p}/callback    → identity known?  yes → session cookies, 302 /ui/
+GET /auth/{p}/callback    → identity known?  yes → session cookies, 302 return_to (default /)
                                              no  → pending signup (sealed ticket cookie)
 GET/POST /auth/signup     → choose a username (policy + reserved names + tombstones)
                           → ONE transaction: user, identity, email, personal org,
@@ -1231,7 +1237,7 @@ whose JSON payload is the requested `{node_name, tags, adopt}` (charset-validate
 before it is stored, since it is unauthenticated and rendered to a human); the
 machine prints a ~40-bit Crockford-base32 `user_code` (`ABCD-1234`) and polls
 `/node/register/poll` with its device secret. A member runs `probefleet
-node approve ABCD-1234 [--org O]` (or uses `/ui/approve`), which calls
+node approve ABCD-1234 [--org O]` (or uses `/<org>/approve`), which calls
 `/node/register/approve` → forgs' `decide`, binding the row to the approver
 and the chosen org. fleet's `PendingApprovalHook` (`identity::FleetNodeApprovals`)
 is where fleet's policy lives:

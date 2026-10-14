@@ -10,43 +10,66 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { route, PAGES, NAV } from '../web/router.mjs';
+import { route, PAGES, NAV, pagePath } from '../web/router.mjs';
 
-test('the landing paths resolve to devices', () => {
-  for (const path of ['/', '/ui', '/ui/']) {
-    assert.equal(route(path).page, 'devices', path);
-  }
+test('the root is the landing page, with no org', () => {
+  assert.deepEqual(route('/'), { page: 'landing', org: null, legacy: false, params: {} });
 });
 
-test('every page has a route, and every route a nav entry', () => {
+test('every page is routed at /<org>/<page>, in both spellings', () => {
   for (const page of PAGES) {
-    assert.equal(route(`/ui/${page}`).page, page);
-    // A trailing slash is the same page: a user who types one should not 404.
-    assert.equal(route(`/ui/${page}/`).page, page);
+    for (const path of [`/alice/${page}`, `/alice/${page}/`]) {
+      const r = route(path);
+      assert.equal(r.page, page, path);
+      assert.equal(r.org, 'alice', path);
+      assert.equal(r.legacy, false, path);
+    }
   }
+  // An id is a valid segment too (a hand-written link); the app canonicalises it.
+  assert.equal(route('/01J0000000000000000000ORG2/keys').org, '01J0000000000000000000ORG2');
+  assert.equal(route('/acme-labs/org').org, 'acme-labs');
+});
+
+test('every page has a nav entry, and nav links are pagePath', () => {
   assert.deepEqual(
     NAV.map((n) => n.page),
     PAGES,
     'the nav bar and the page list must not drift',
   );
   for (const entry of NAV) {
-    assert.equal(route(entry.path).page, entry.page);
+    const path = pagePath('acme', entry.page);
+    assert.equal(path, `/acme/${entry.page}`);
+    assert.deepEqual(route(path), { page: entry.page, org: 'acme', legacy: false, params: {} });
+  }
+  assert.ok(!NAV.some((n) => 'path' in n), 'nav entries carry no org-less path');
+});
+
+test('pagePath encodes the org into one segment', () => {
+  assert.equal(pagePath('a/b?c', 'devices'), '/a%2Fb%3Fc/devices');
+});
+
+test('legacy /ui URLs are recognised so the app can rewrite them', () => {
+  for (const [path, page] of [['/ui', 'devices'], ['/ui/', 'devices'], ['/ui/devices', 'devices'], ['/ui/approve/', 'approve']]) {
+    assert.deepEqual(route(path), { page, org: null, legacy: true, params: {} }, path);
   }
 });
 
 test('the org page is routed and in the nav', () => {
   assert.ok(PAGES.includes('org'));
-  assert.equal(route('/ui/org').page, 'org');
-  const entry = NAV.find((n) => n.page === 'org');
-  assert.deepEqual(entry, { page: 'org', path: '/ui/org', label: 'Org' });
+  assert.equal(route('/alice/org').page, 'org');
+  assert.deepEqual(NAV.find((n) => n.page === 'org'), { page: 'org', label: 'Org' });
 });
 
 test('an unknown path is the not-found page, never a real one', () => {
-  for (const path of ['/ui/nope', '/ui/devices/extra', '/healthz', '/api/v1/session']) {
+  for (const path of [
+    '/ui/nope', '/alice/nope', '/alice/devices/extra', '/alice', '/alice/', '/healthz',
+    '/api/v1/session', '/a.b/devices', '/%2e%2e/devices', '/a%2Fb/devices', '//devices',
+  ]) {
     assert.equal(route(path).page, 'notfound', path);
+    assert.equal(route(path).org, null, path);
   }
 });
 
 test('the not-found result carries the path it could not resolve', () => {
-  assert.equal(route('/ui/nope').params.path, '/ui/nope');
+  assert.equal(route('/alice/nope').params.path, '/alice/nope');
 });

@@ -74,6 +74,13 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 /// Root names no org (and hence no username, since personal orgs share the
 /// root name space) may take: the coordinator's own path prefixes, the
 /// reserved `gha` workload namespace, and a few operator-confusing words.
+///
+/// Also the guard on the web UI's `/<org>/<page>` routes (`assets.rs`): a
+/// reserved word is never served as an org page, so a fixed top-level route
+/// cannot be shadowed. **Every new top-level route prefix must be added
+/// here**; `tests/ui_assets.rs` checks the coordinator's prefixes against it.
+/// Adding a word an existing org already uses would orphan that org
+/// (`resolve_org` refuses reserved names), so check first.
 pub const RESERVED_NAMES: &[&str] = &[
     "gha", "api", "auth", "ui", "admin", "login", "system", "node", "agent", "client", "delegate",
     "healthz",

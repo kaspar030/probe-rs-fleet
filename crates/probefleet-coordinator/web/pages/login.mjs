@@ -4,9 +4,11 @@
 // `GET /auth/providers` (`{"providers": ["github", …]}`), never from a
 // build-time branch — there is no build (docs/web-ui.md D3), and the answer is
 // a property of the deployment's config. Each provider is a plain link to
-// `/auth/{name}/start?return_to=/ui/`: a link and not a fetch, because the flow
-// is a browser navigation that ends in a redirect back to `/ui/` with cookies
-// attached, and XHR would swallow it. Account creation (signup) is rendered by
+// `/auth/{name}/start?return_to=<this page>`: a link and not a fetch, because
+// the flow is a browser navigation that ends in a redirect back to that page
+// with cookies attached, and XHR would swallow it. `return_to` is the current
+// `/<org>/<page>` when the login page was reached from one (a deep link
+// survives sign-in), else `/`, which lands in the personal org. Account creation (signup) is rendered by
 // forgs on that same path; this page offers none of its own.
 //
 // Provider names are server strings, so they go through `dom.mjs` as text and
@@ -17,13 +19,20 @@
 // a session with `coordinator user-token` for CLI use.
 
 import { h, errorBox } from '../dom.mjs';
+import { route, pagePath } from '../router.mjs';
 
-/** Where the UI wants to land after a provider's callback. */
-export const RETURN_TO = '/ui/';
+/**
+ * Where the UI wants to land after a provider's callback: the org page
+ * `pathname` names (canonically re-spelled), else `/`.
+ */
+export function returnTo(pathname) {
+  const r = route(pathname === undefined && typeof window !== 'undefined' ? window.location.pathname : pathname);
+  return r.org && !r.legacy ? pagePath(r.org, r.page) : '/';
+}
 
-/** The start URL for provider `name`. */
-export function startHref(name) {
-  return `/auth/${encodeURIComponent(name)}/start?return_to=${encodeURIComponent(RETURN_TO)}`;
+/** The start URL for provider `name`, returning to `back` (default `/`). */
+export function startHref(name, back = '/') {
+  return `/auth/${encodeURIComponent(name)}/start?return_to=${encodeURIComponent(back)}`;
 }
 
 /** A provider name, for display. */
@@ -34,6 +43,7 @@ function label(name) {
 
 export function render(state) {
   const { providers, error } = state;
+  const back = state.returnTo || '/';
   const children = [h('h1', {}, 'Sign in')];
   if (error) children.push(errorBox(error));
 
@@ -52,7 +62,7 @@ export function render(state) {
       h(
         'div',
         { class: 'row' },
-        providers.map((name) => h('a', { class: 'button', href: startHref(name) }, `Continue with ${label(name)}`)),
+        providers.map((name) => h('a', { class: 'button', href: startHref(name, back) }, `Continue with ${label(name)}`)),
       ),
     );
   }
@@ -61,7 +71,7 @@ export function render(state) {
 
 export async function load(ctx) {
   const { api } = ctx;
-  const state = { providers: null, error: null };
+  const state = { providers: null, error: null, returnTo: returnTo() };
   try {
     const body = await api.get('/auth/providers', { quiet: true });
     const list = body && Array.isArray(body.providers) ? body.providers : [];

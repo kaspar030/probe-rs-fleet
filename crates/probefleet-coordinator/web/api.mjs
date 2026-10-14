@@ -17,8 +17,9 @@
 //     none of them out.
 //
 // The acting org. A session is not bound to one org: the user acts in their
-// personal org by default, or in any org they are a member of via `?org=<id>`
-// on every `/api/v1` call (`src/http.rs` `acting_subject`). The choice lives in
+// personal org by default, or in any org they are a member of via
+// `?org=<path-or-id>` on every `/api/v1` call (`src/http.rs` `acting_subject`).
+// The UI sends the org *path* from its `/<org>/<page>` URL. The choice lives in
 // this module (set by `app.mjs` from the page URL) and is appended here, in
 // the one place every call passes through, so no page can forget it. The
 // server re-checks membership on every request; this is plumbing, not policy.
@@ -39,9 +40,9 @@ export function cookie(name, jar) {
 
 let actingOrg = null;
 
-/** Set the org every `/api/v1` call acts in (`null`: the server's default, the personal org). */
-export function setOrg(id) {
-  actingOrg = id ? String(id) : null;
+/** Set the org (path or id) every `/api/v1` call acts in (`null`: the server's default, the personal org). */
+export function setOrg(org) {
+  actingOrg = org ? String(org) : null;
 }
 
 /** The org `/api/v1` calls currently act in, or null. */
@@ -49,7 +50,7 @@ export function currentOrg() {
   return actingOrg;
 }
 
-/** `path` with `org=<id>` appended to its query, or unchanged when `org` is empty. */
+/** `path` with `org=<path-or-id>` appended to its query, or unchanged when `org` is empty. */
 export function withOrg(path, org) {
   if (!org) return path;
   const sep = path.includes('?') ? '&' : '?';

@@ -14,7 +14,7 @@
 //! | `POST /node/self-register` | org members (session) | register the calling machine (`share`) |
 //! | `GET /node/approve` | anyone | a static page saying what to run |
 //! | `/api/v1/*` | browser sessions (+ `X-Fleet-Csrf`), or a bearer | the JSON API ([`crate::api`]) |
-//! | `/`, `/ui*` | anyone | the UI shell and assets ([`crate::assets`]) |
+//! | `/`, `/<org>/<page>`, `/ui*` | anyone | the UI shell (any org path; reserved names refused) and assets ([`crate::assets`]) |
 //!
 //! **This router has no global fallback and must not grow one.**
 //!

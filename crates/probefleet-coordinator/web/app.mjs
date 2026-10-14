@@ -7,8 +7,8 @@
 
 import * as api from './api.mjs';
 import { h, mount, errorBox } from './dom.mjs';
-import { route, NAV } from './router.mjs';
-import { memberships, orgLabel, userId, role } from './session.mjs';
+import { route, NAV, PAGES, pagePath } from './router.mjs';
+import { memberships, orgLabel, orgPath, personalOrg, userId, role } from './session.mjs';
 
 import * as login from './pages/login.mjs';
 import * as devices from './pages/devices.mjs';
@@ -25,19 +25,25 @@ const PAGE_MODULES = { devices, agents, approve, access, keys, org: orgPage, aud
 // touched anywhere in this tree (see api.mjs).
 let session = null;
 
-// The acting org lives in the page URL (`/ui/devices?org=<id>`), not in any
-// storage: it survives a reload, is shareable, and every client-side
-// navigation carries it forward. Absent, the server's default applies (the
-// personal org). `api.mjs` appends it to every `/api/v1` call.
-function orgFromUrl() {
-  const org = new URLSearchParams(window.location.search).get('org');
-  return org && org.trim() ? org.trim() : null;
+// The acting org lives in the page *path* (`/<org>/devices`), not in any
+// storage or query string: it survives a reload, is shareable, and every
+// client-side navigation carries it forward. `api.mjs` sends it to every
+// `/api/v1` call as `?org=<path>`; the server resolves a path or an id and
+// re-checks membership every time.
+//
+// `noAccess` is set when the URL names an org the session cannot act in —
+// nonexistent, not a member, or renamed away. Those cases are deliberately
+// one page with one sentence: the API cannot tell them apart either.
+let noAccess = false;
+
+/** The page a URL shows, as a real page name (landing and not-found → devices). */
+function pageOf(r) {
+  return PAGES.includes(r.page) ? r.page : 'devices';
 }
 
-/** `path` (no query) with the acting org carried forward. */
-function withOrgQuery(path) {
-  const org = api.currentOrg();
-  return org ? `${path}?org=${encodeURIComponent(org)}` : path;
+/** The acting org's URL segment, or null before a session resolves one. */
+function actingPath() {
+  return session && session.org ? orgPath(session.org) : null;
 }
 
 // The live page's own scratch object: which node is being edited, the pending
@@ -77,6 +83,27 @@ async function draw() {
   }
   const { page } = route(window.location.pathname);
   renderChrome(page);
+  if (noAccess) {
+    mounted = null;
+    pageState = {};
+    const home = personalOrg(session);
+    mount(
+      app,
+      h(
+        'section',
+        {},
+        h('h1', {}, 'No access'),
+        h('p', {}, 'No such org, or you are not a member.'),
+        home
+          ? h('p', {}, h('a', {
+              href: pagePath(orgPath(home), 'devices'),
+              on: { click: (e) => { e.preventDefault(); void switchOrg(orgPath(home)); } },
+            }, 'Go to your personal org'))
+          : null,
+      ),
+    );
+    return;
+  }
   const mod = PAGE_MODULES[page];
   if (!mod) {
     mounted = null;
@@ -105,15 +132,18 @@ function renderChrome(current) {
   // Mounted as a list, not wrapped in a single element: `nav` is a flex
   // container and its `gap` only spaces sibling items, so a wrapper would
   // leave one flex item and run the labels together. Do not reintroduce one.
+  // The org the links point into: the acting one, else the one the URL names
+  // (so the nav of the no-access page still reads as that org's).
+  const linkOrg = actingPath() || route(window.location.pathname).org;
   mount(
     nav,
-    NAV.map((entry) =>
+    (linkOrg ? NAV : []).map((entry) =>
       h(
         'a',
         {
-          href: withOrgQuery(entry.path),
+          href: pagePath(linkOrg, entry.page),
           class: entry.page === current ? 'active' : '',
-          on: { click: (e) => { e.preventDefault(); navigate(entry.path); } },
+          on: { click: (e) => { e.preventDefault(); navigate(entry.page); } },
         },
         entry.label,
       ),
@@ -122,9 +152,10 @@ function renderChrome(current) {
   const orgs = memberships(session);
   const acting = session.org;
   // The switcher only exists when there is something to switch between. Its
-  // options are the server's membership list, rendered as text.
+  // options are the server's membership list, rendered as text; their values
+  // are org paths, since switching navigates to `/<org>/<same page>`.
   const orgPart =
-    orgs.length > 1
+    orgs.length > 1 || (!acting && orgs.length > 0)
       ? h(
           'select',
           {
@@ -132,9 +163,12 @@ function renderChrome(current) {
             title: 'Acting org',
             on: { change: (e) => switchOrg(e.target.value) },
           },
-          orgs.map((m) =>
-            h('option', { value: m.id, selected: Boolean(acting && acting.id === m.id) }, `${orgLabel(m)} (${m.role})`),
-          ),
+          [
+            acting ? null : h('option', { value: '', selected: true, disabled: true }, '— choose an org —'),
+            ...orgs.map((m) =>
+              h('option', { value: orgPath(m), selected: Boolean(acting && acting.id === m.id) }, `${orgLabel(m)} (${m.role})`),
+            ),
+          ],
         )
       : h('span', {}, acting ? orgLabel(acting) : '—');
   mount(
@@ -154,23 +188,26 @@ function renderChrome(current) {
 }
 
 /**
- * Act in another org: re-resolve the session there (for the role), keep the
- * choice in the URL, and re-render the current page from scratch — whatever
- * the page held belonged to the previous org.
+ * Act in another org: navigate to `/<path>/<same page>`, re-resolve the
+ * session there (for the role), and re-render the current page from scratch —
+ * whatever the page held belonged to the previous org. `null` is the personal
+ * org.
  */
-async function switchOrg(id) {
-  api.setOrg(id || null);
-  const { pathname } = window.location;
-  window.history.pushState({}, '', withOrgQuery(pathname));
+async function switchOrg(path) {
+  const page = pageOf(route(window.location.pathname));
+  const home = personalOrg(session);
+  const target = path || (home ? orgPath(home) : null);
+  window.history.pushState({}, '', target ? pagePath(target, page) : '/');
   await loadSession();
   mounted = null;
   pageState = {};
   await draw();
 }
 
-/** Client-side navigation. */
-export function navigate(path) {
-  window.history.pushState({}, '', path.includes('?') ? path : withOrgQuery(path));
+/** Client-side navigation to `page`, in the acting org. */
+export function navigate(page) {
+  const org = actingPath() || route(window.location.pathname).org;
+  window.history.pushState({}, '', org ? pagePath(org, page) : '/');
   void draw();
 }
 
@@ -187,37 +224,52 @@ async function signOut() {
   // Everything the last page held, including a minted auth key, goes with it.
   mounted = null;
   pageState = {};
-  window.history.pushState({}, '', '/ui/');
+  noAccess = false;
+  window.history.pushState({}, '', '/');
   void draw();
 }
 
-/** Resolve the session, or leave it null (the login page). */
+/**
+ * Resolve the session for the org the URL names, or leave it null (the login
+ * page), then make the URL canonical.
+ *
+ * - `/<org>/<page>`: act in that org. If the server resolves it under another
+ *   spelling (an id, different case), `replaceState` to `/<name>/<page>`; if
+ *   it does not resolve at all, `noAccess`.
+ * - `/` (landing): the server's default, the personal org →
+ *   `/<personal>/devices`.
+ * - legacy `/ui/<page>?org=<id>`: resolve the id → `/<name>/<page>`. Done
+ *   here rather than as a server redirect because only the API can tell a
+ *   member which org an id is, and it tells a non-member nothing.
+ */
 async function loadSession() {
+  const r = route(window.location.pathname);
+  let requested = r.org;
+  if (r.legacy) {
+    const q = new URLSearchParams(window.location.search).get('org');
+    requested = q && q.trim() ? q.trim() : null;
+  }
+  noAccess = false;
+  api.setOrg(requested);
   try {
     session = await api.get('/api/v1/session', { quiet: true });
   } catch {
     session = null;
     return;
   }
-  // `org` is null when the requested org is not one of the user's (a stale
-  // link, a revoked membership). Fall back to the default rather than render
-  // a UI whose every call will 403.
-  if (session && !session.org && api.currentOrg()) {
-    api.setOrg(null);
-    window.history.replaceState({}, '', window.location.pathname);
-    try {
-      session = await api.get('/api/v1/session', { quiet: true });
-    } catch {
-      session = null;
-    }
+  if (!session) return;
+  if (!session.org) {
+    // Nonexistent, not a member, renamed away: one answer for all of them,
+    // and the URL is left as the user typed it.
+    noAccess = true;
+    return;
   }
-  // Pin the acting org explicitly once known, so every call names it, and
-  // make the URL say so too (history `back` then restores the right org).
-  if (session && session.org) {
-    api.setOrg(session.org.id);
-    if (orgFromUrl() !== session.org.id) {
-      window.history.replaceState({}, '', withOrgQuery(window.location.pathname));
-    }
+  const path = orgPath(session.org);
+  // Pin the acting org explicitly once known, so every call names it.
+  api.setOrg(path);
+  if (r.page === 'notfound') return;
+  if (r.legacy || r.page === 'landing' || r.org !== path) {
+    window.history.replaceState({}, '', pagePath(path, pageOf(r)));
   }
 }
 
@@ -230,9 +282,9 @@ api.setUnauthorizedHandler(() => {
 
 window.addEventListener('popstate', () => {
   void (async () => {
-    const org = orgFromUrl();
-    if (session && org !== api.currentOrg()) {
-      api.setOrg(org);
+    const r = route(window.location.pathname);
+    const current = actingPath();
+    if (session && (r.legacy || r.page === 'landing' || (r.org && r.org !== current) || (noAccess && r.org))) {
       await loadSession();
       mounted = null;
       pageState = {};
@@ -242,7 +294,6 @@ window.addEventListener('popstate', () => {
 });
 
 void (async () => {
-  api.setOrg(orgFromUrl());
   await loadSession();
   await draw();
 })();

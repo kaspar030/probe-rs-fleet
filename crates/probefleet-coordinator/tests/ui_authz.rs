@@ -291,3 +291,76 @@ async fn a_refresh_token_reaches_no_api_route_over_either_carrier() {
         );
     }
 }
+
+/// The `/<org>/<page>` URLs are no existence oracle.
+///
+/// The page routes are static: the shell for an org the caller is not in, for
+/// an org that does not exist and for one they are in are byte-identical, with
+/// or without a session cookie. Membership is decided by the API the shell
+/// then calls, `GET /api/v1/session?org=<path>` — which answers `org: null` to
+/// a non-member and to a nonexistent org alike (by path *or* by id, the legacy
+/// `/ui/<page>?org=<id>` rewrite's input), and data calls refuse both with the
+/// same 403. A member resolves the same org by path and by id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn org_page_urls_leak_no_org_existence() {
+    let fleet = TestCoordinator::start().await;
+    fleet.seed_session("acme", "alice", FleetRole::Admin).await;
+    let alice = fleet.session_for("alice").await;
+    let (bob, _, _) = fleet.seed_user("bob").await;
+    let acme = fleet.org("acme").await;
+    let (cookie, csrf) = fleet.browser_session(&bob);
+    let carrier = [("cookie", cookie.as_str()), ("x-fleet-csrf", csrf.as_str())];
+
+    // The shell: identical for a real org bob is not in, a nonexistent one,
+    // his own, and with no cookie at all.
+    let (_, _, reference) = fleet.http_full("GET", "/", &[], None).await;
+    for org in ["acme", "no-such-org", "bob", acme.0.as_str()] {
+        let path = format!("/{org}/devices");
+        for headers in [&carrier[..], &[]] {
+            let (status, response_headers, body) =
+                fleet.http_full("GET", &path, headers, None).await;
+            assert_eq!(status, 200, "{path}");
+            assert_eq!(body, reference, "{path} must be byte-identical to /");
+            assert!(
+                !response_headers
+                    .iter()
+                    .any(|(k, _)| k.eq_ignore_ascii_case("set-cookie")),
+                "{path}"
+            );
+        }
+    }
+
+    // The session API: `org: null` for every org bob cannot act in, by path
+    // or id, and byte-identical answers.
+    let mut sessions = Vec::new();
+    for org in ["acme", "no-such-org", acme.0.as_str(), "01ARZ3NDEKTSV4RRFFQ69G5FAV"] {
+        let path = format!("/api/v1/session?org={org}");
+        let (status, body) = as_browser(&fleet, "GET", &path, &bob, None).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["org"].is_null(), "{path}: {body}");
+        sessions.push(v);
+    }
+    assert!(sessions.windows(2).all(|w| w[0] == w[1]), "{sessions:?}");
+
+    // A data call: the same 403, byte for byte.
+    let mut refusals = Vec::new();
+    for org in ["acme", "no-such-org"] {
+        let path = format!("/api/v1/boards?org={org}");
+        let (status, body) = as_browser(&fleet, "GET", &path, &bob, None).await;
+        assert_eq!(status, 403, "{path}: {body}");
+        refusals.push(body);
+    }
+    assert_eq!(refusals[0], refusals[1]);
+
+    // A member: path and id are the same org, and the session names it by
+    // path — which is what the client puts in the URL.
+    for org in ["acme", acme.0.as_str()] {
+        let path = format!("/api/v1/session?org={org}");
+        let (status, body) = as_browser(&fleet, "GET", &path, &alice, None).await;
+        assert_eq!(status, 200, "{path}: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["org"]["id"], acme.0, "{path}: {body}");
+        assert_eq!(v["org"]["name"], "acme", "{path}: {body}");
+    }
+}
