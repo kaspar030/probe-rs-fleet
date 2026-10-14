@@ -67,6 +67,20 @@ Those are tokens rustfmt newly emitted when splitting expressions (`)`, `],`,
 `;`, `0,`); they have no earlier author to fall back to, so crediting the
 reformat is correct. Expected residue, not a failure.
 
+## The forgs dependency
+
+Identity and auth come from [forgs](https://github.com/kaspar030/forgs), a
+git dependency pinned by `rev` in the root `Cargo.toml` (all five `forgs*`
+crates share one rev). A plain clone builds as-is; no sibling checkout is
+needed.
+
+- **Bumping forgs:** change the `rev` on all five entries, then
+  `cargo build --workspace` to refresh `Cargo.lock`.
+- **Co-developing forgs and fleet:** check forgs out next to this repo
+  (`../forgs`) and uncomment the `[patch."https://github.com/kaspar030/forgs"]`
+  block at the end of the root `Cargo.toml`. Do not commit it uncommented;
+  push the forgs change and bump the rev instead.
+
 ## Before you open a PR
 
 ```sh
@@ -75,5 +89,6 @@ cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
-Only the first of these is gated in CI today; the other two are what reviewers
-expect to have been run.
+CI gates formatting (`fmt.yml`) and builds the workspace plus runs the
+`fleet-coordinator` and `fleet-bin` tests (`ci.yml`). Clippy and the full
+`cargo test --workspace` are not gated; reviewers expect them to have been run.

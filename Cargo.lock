@@ -908,6 +908,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 [[package]]
 name = "forgs"
 version = "0.1.0"
+source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
 dependencies = [
  "async-trait",
  "base64",
@@ -922,6 +923,7 @@ dependencies = [
 [[package]]
 name = "forgs-client"
 version = "0.1.0"
+source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
 dependencies = [
  "forgs",
  "http",
@@ -941,6 +943,7 @@ dependencies = [
 [[package]]
 name = "forgs-http"
 version = "0.1.0"
+source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
 dependencies = [
  "async-trait",
  "axum",
@@ -962,6 +965,7 @@ dependencies = [
 [[package]]
 name = "forgs-idp"
 version = "0.1.0"
+source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
 dependencies = [
  "async-trait",
  "base64",
@@ -986,6 +990,7 @@ dependencies = [
 [[package]]
 name = "forgs-store"
 version = "0.1.0"
+source = "git+https://github.com/kaspar030/forgs?rev=c1f7c8294810347ce417d60797972ed0c2431b04#c1f7c8294810347ce417d60797972ed0c2431b04"
 dependencies = [
  "async-trait",
  "forgs",

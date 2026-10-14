@@ -1,0 +1,43 @@
+# Build + test gate.
+#
+# Builds the whole workspace and runs the coordinator and CLI test suites.
+# Separate from fmt.yml on purpose, so a formatting nit never masks (or is
+# masked by) a compile failure.
+#
+# This job is possible because forgs is a pinned git dependency
+# (github.com/kaspar030/forgs, public) rather than a path dep into a sibling
+# checkout; cargo fetches it like any other crate. `--locked` makes a stale
+# Cargo.lock a failure instead of a silent re-resolve.
+#
+# No system packages are needed: the tree is pure Rust (sqlite is bundled).
+# `ui_js.rs` runs the frontend's JS unit tests with `node` if it is on PATH
+# (the hosted runner ships it) and skips loudly otherwise.
+#
+# Local equivalent:
+#
+#     cargo build --workspace --locked
+#     cargo test -p fleet-coordinator -p fleet-bin --locked
+#
+# See CONTRIBUTING.md.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test -p fleet-coordinator -p fleet-bin --locked
