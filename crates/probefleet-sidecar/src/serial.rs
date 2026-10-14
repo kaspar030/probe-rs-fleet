@@ -264,8 +264,15 @@ impl Pty {
         termios::tcsetattr(&slave, OptionalActions::Now, &t)?;
         let flags = rustix::fs::fcntl_getfl(&master)?;
         rustix::fs::fcntl_setfl(&master, flags | rustix::fs::OFlags::NONBLOCK)?;
+        // `AsyncFd::new` is deprecated since tokio 1.53 in favour of the
+        // `unsafe fn register`, but the workspace forbids `unsafe_code`.
+        // The deprecation is about I/O safety of arbitrary `AsRawFd` types;
+        // an `OwnedFd` owns its descriptor for its whole lifetime, so the
+        // `register` safety contract is upheld and the safe call is sound.
+        #[allow(deprecated)]
+        let master = AsyncFd::new(master)?;
         Ok(Self {
-            master: AsyncFd::new(master)?,
+            master,
             slave,
             slave_path,
         })
