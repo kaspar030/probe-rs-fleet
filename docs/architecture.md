@@ -1918,8 +1918,8 @@ old — produces a **new subject and a new grant row**: the audit trail forks, t
 per-subject concurrency cap resets, and the old grant lingers. A long-running
 agent or CI runner has no persistent identity at all.
 
-`auth-key create --purpose ci --name <name>` gives it one. (`--as` is still accepted as a
-deprecated alias.) The name is stored in
+`auth-key create --purpose ci --name <name>` gives it one (`--as` is still
+accepted as a deprecated alias). The name is stored in
 `forgs_api_key.subject_name` (NULL, not `''`, means "no name"), and redemption
 then builds the subject `<org>/workload:agent:<name>` and a grant id derived
 from `(org, subject)`. Because the upsert is keyed on the grant id, a re-minted key with the same `--name`

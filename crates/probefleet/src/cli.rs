@@ -3347,9 +3347,8 @@ mod tests {
     }
 
     /// `--name` maps to the `subject_name` field (the wire name; `--as` is kept
-    /// as a hidden, deprecated alias), and `--purpose agent` parses — it is the third
-
-    /// accepted *spelling*, normalised to `ci` before anything is stored.
+    /// as a hidden, deprecated alias), and `--purpose agent` parses — it is the
+    /// third accepted *spelling*, normalised to `ci` before anything is stored.
     #[test]
     fn auth_key_create_parses_an_identity_name_and_the_agent_purpose() {
         let cli = Cli::parse_from(os(&[
