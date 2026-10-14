@@ -42,11 +42,11 @@ probefleet-sidecar = { version = "0.1.0", path = "crates/probefleet-sidecar" }
 # identity / auth (forgs), from crates.io. Bump all five together. For local
 # co-development against a sibling forgs checkout, see the commented-out
 # [patch.crates-io] block at the end of this file.
-forgs = "0.1.0"
-forgs-store = "0.1.0"
-forgs-http = "0.1.0"
-forgs-idp = "0.1.0"
-forgs-client = "0.1.0"
+forgs = "0.1.1"
+forgs-store = "0.1.1"
+forgs-http = "0.1.1"
+forgs-idp = "0.1.1"
+forgs-client = "0.1.1"
 
 # rpc / wire
 postcard-rpc = { version = "0.12", features = ["use-std"] }
@@ -110,7 +110,7 @@ subtle = "2"
 include_dir = "0.7"
 
 # storage
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
 # cli / config / errors / logging
 clap = { version = "4", features = ["derive", "env"] }

@@ -103,6 +103,15 @@ host-header-injection route to an attacker-controlled OAuth redirect. The
 callback path is fixed (`/auth/{provider}/callback`) and the origin is
 configuration. `return_to` is accepted only as a same-origin path.
 
+**The signup POST is Origin-checked against `public_url`'s origin.** forgs
+reduces `public_url` to bare `scheme://host[:port]` first, so a trailing slash
+or a path (`https://fleet.example/sub/`) is fine. A foreign `Origin` or
+`Sec-Fetch-Site: cross-site` gets 403. `Origin: null` is accepted only together
+with `Sec-Fetch-Site: same-origin`. forgs ≥ 0.1.1 serves its pages with
+`Referrer-Policy: same-origin`, so browsers send the real Origin. Under 0.1.0's
+`no-referrer` they sent `null`, and every browser signup failed with 403
+(regression test: `crates/probefleet-coordinator/tests/signup_origin.rs`).
+
 **`Secure` is unconditional.** Browsers treat `http://localhost` and
 `http://127.0.0.1` as secure contexts, so local development still works. Any
 *other* plain-HTTP deployment is **unsupported for the UI** rather than
