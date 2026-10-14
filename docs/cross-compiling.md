@@ -95,14 +95,13 @@ proxies). The result is a static `probe-rs` that runs on the Pi.
   group/world access. (A proper packaged install should ship this.)
 - The agent needs `probe-rs` on its `PATH` (e.g. install to `/usr/local/bin`).
 
-## The WebSocket stack (architecture revision 2)
+## The WebSocket stack
 
-Revision 2 moved the control plane from a bespoke length-prefixed TCP protocol
-to **binary WebSocket messages over HTTPS** (§3.5), so it can sit behind an
-ordinary reverse proxy. That drags a whole HTTP stack into a binary whose job is
-to run on diverse ARM Pis, which is exactly the constraint that forced `ring`
-over `aws-lc-rs` in the first place — so it was verified before any of the code
-was written, and re-verified before hand-off.
+The control plane is **binary WebSocket messages over HTTPS** (architecture
+§3.5), so it can sit behind an ordinary reverse proxy. That drags a whole HTTP
+stack into a binary whose job is to run on diverse ARM Pis, which is exactly
+the constraint that forced `ring` over `aws-lc-rs` in the first place — so the
+stack below was verified to cross-compile.
 
 **Result: a statically linked 32-bit ARM ELF with zero `aws-lc-rs`.**
 
@@ -164,8 +163,7 @@ cargo tree -p fleet-bin --target armv7-unknown-linux-musleabihf --edges normal \
 link only the client half. `crates/fleet-agent/tests/no_http_server_dep.rs`
 enforces this.
 
-**The same test fences identity.** Since the forgs switch there is no
-`fleet-auth` crate; identity lives in the forgs workspace
+**The same test fences identity.** Identity lives in the forgs workspace
 ([github.com/kaspar030/forgs](https://github.com/kaspar030/forgs), a pinned
 git dependency), and its crates are split exactly along this line:
 

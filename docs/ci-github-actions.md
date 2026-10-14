@@ -239,13 +239,10 @@ changes that: the fleet relays bytes, it does not interpret them.
 | `ACTIONS_ID_TOKEN_REQUEST_URL is not set` | the job has no workload identity | add `permissions: id-token: write` to the job |
 
 The flat `401` is deliberate. Expiry, wrong audience, wrong issuer, bad
-signature, a missing claim, an unknown key id — and, since the forgs switch, a
-verified token for a repo with no live grant — all answer identically, so the
+signature, a missing claim, an unknown key id — and a verified token for a
+repo with no live grant — all answer identically, so the
 endpoint is not an oracle. The reason is recorded coordinator-side with a
 stable label (`oidc.reject.*`, `workload.reject.no_grant`).
-
-(Revision 2 answered the grantless case with a distinguishable `403 no_grant`;
-forgs folds it into the `401` and keeps the distinction in the audit row.)
 
 ### Telling "fork denied" apart from everything else
 

@@ -26,9 +26,9 @@
 # ANNOTATION AND OVERRIDE, not admission control (architecture §8)
 # ---------------------------------------------------------------------------
 #
-# Revision 1 made every probe wait for a declaration here. That is right for a
-# lab and pure friction for a laptop, so it is now this node's `adopt` policy
-# (see examples/node.toml) that decides:
+# Making every probe wait for a declaration here is right for a lab and pure
+# friction for a laptop, so this node's `adopt` policy (see examples/node.toml)
+# decides:
 #
 #   adopt = "auto"     — undeclared probes are adopted automatically, with a
 #                        derived id and inferred tags. This file is then where

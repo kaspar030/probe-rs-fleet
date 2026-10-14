@@ -129,12 +129,11 @@ username = "kaspar"
 expires = 1788600000
 
 # The refresh token that renews the session above, written by `login` if the
-# coordinator issued one. OPTIONAL: a fleet file without it is valid and is what
-# every file written before this feature existed looks like — the session then
-# simply stops at its expiry and you re-run `login`, the old behaviour.
+# coordinator issued one. OPTIONAL: a fleet file without it is valid — the
+# session then simply stops at its expiry and you re-run `login`.
 #
 # With it, `ctl` and the `probe-rs` shim renew the session themselves, so a
-# workstation that only ever runs builds stops hitting a login cliff every 12
+# workstation that only ever runs builds does not hit a login cliff every 12
 # hours. Redemption is non-rotating, so this value stays valid and concurrent
 # processes do not race each other for it.
 #

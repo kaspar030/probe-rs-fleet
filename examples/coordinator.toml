@@ -34,8 +34,8 @@
 # There are no client certificates, no private CA, and no mTLS.
 #
 # The expected deployment puts an HTTPS reverse proxy in front: it terminates
-# TLS and routes by path, which is exactly what the WebSocket transport bought
-# (the pre-revision-2 length-prefixed TCP protocol could not be proxied at all).
+# TLS and routes by path, which is why the transport is WebSocket rather than
+# a bespoke TCP protocol.
 # The coordinator then listens on loopback and speaks plain HTTP. Set `[tls]`
 # below only when you are self-hosting with no proxy.
 #
@@ -58,17 +58,18 @@
 #      (prints an auth key; needs only a login, no shell on this host)
 #      on the node: node up --fleet-url <url> --auth-key <key>
 #
-# Bootstrap without GitHub (air-gapped, or development):
-#   coordinator user-token --username <you> (prints a session token) [INTERIM]
+# Bootstrap without a login provider (air-gapped, or development):
+#   coordinator user-token --username <you> (prints a session token)
 #   probe-rs-fleet login --fleet-url <url> --token <token>
 #   coordinator auth-key                    (prints an auth key)
 #
-# `coordinator auth-key` is the shell-on-this-host variant of step 5. It is no
-# longer needed for the normal path, but it works with no login at all and it is
-# the only way to mint a key that never expires (`--ttl 0`).
+# `coordinator auth-key` is the shell-on-this-host variant of step 5. The
+# normal path does not need it, but it works with no login at all and it is
+# the only way to mint a key that never expires (`--ttl 0`): `auth-key create`
+# over the API caps keys at 30 days.
 #
-# `user-token` is INTERIM: it creates a credential from a shell on this host,
-# bypassing any login flow. It creates (or reuses) a LOCAL user with that
+# `user-token` is the air-gapped / bootstrap escape hatch: it creates a
+# credential from a shell on this host, bypassing any login flow. It creates (or reuses) a LOCAL user with that
 # username, one with no linked provider identity, and makes it a member of
 # `--org` (default: default_org below). It is the escape hatch, not the front
 # door — as is `coordinator org create`: team orgs are normally created by any
@@ -193,7 +194,7 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # max_pending_nodes = 256
 
 # The NAME of the deployment's shared org, created at startup, and the org the
-# INTERIM admin verbs (`auth-key`, `user-token`) default to when the operator
+# host-shell admin verbs (`auth-key`, `user-token`) default to when the operator
 # names none. Default: "default".
 #
 # This is NOT consulted when a connection authenticates: a node's org comes from
@@ -260,9 +261,8 @@ max_duration_ci = 3600
 # Maximum lease duration (seconds) for `interactive` requests. Default: 14400.
 max_duration_interactive = 14400
 # Maximum number of concurrently-held leases per subject. Default: 2.
-# (Renamed from `max_concurrent_per_principal` in architecture revision 2: the
-# cap is keyed by the subject's (org, kind, id), so two same-named users in
-# different orgs have independent budgets.)
+# The cap is keyed by the subject's (org, kind, id), so two same-named users in
+# different orgs have independent budgets.
 max_concurrent_per_subject = 2
 # Default TTL (seconds) applied when a request omits a duration. Default: 900.
 default_ttl_secs = 900

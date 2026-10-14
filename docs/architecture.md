@@ -1,23 +1,19 @@
 # probe-rs-fleet — Architecture
 
-Status: **accepted; scaffolding**. Decision log: myelin dropped — single-stack
-postcard-rpc for both data and control planes (§3). **Revision 2 (this
-document): the private-CA / mTLS credential model is withdrawn and replaced by
-GitHub-rooted identity with bearer tokens over WSS (§3.5, §6), the fleet becomes
-multi-tenant with orgs/users/nodes as first-class subjects (§6.1), and
-enrollment is re-rooted on the user rather than the coordinator operator
-(§6.4).** This document records the agreed shape of the system and the decisions
-still open. It is deliberately concrete about how the pieces map onto the real
-`probe-rs` CLI surface that
+Status: **accepted; scaffolding**. The system is single-stack postcard-rpc for
+both data and control planes (§3), carried over WebSocket behind an HTTPS
+reverse proxy (§3.5). Callers authenticate with bearer tokens; identity, login,
+sessions, orgs and API keys live in [forgs](https://github.com/kaspar030/forgs)
+(§6). The fleet is multi-tenant, with orgs, users and nodes as first-class
+subjects (§6.1), and enrollment is rooted on the user rather than the
+coordinator operator (§6.4). This document records the agreed shape of the
+system and the decisions still open. It is deliberately concrete about how the
+pieces map onto the real `probe-rs` CLI surface that
 [ariel-os / laze](../../ariel-os/laze-project.yml) emits.
 
-> **What revision 2 supersedes.** Everything about a coordinator-run client CA,
-> CSR issuance, client certificates, cert-fingerprint pinning, `agent_pins`, and
-> the `coordinator enroll` → `agent init` / `ctl init` token dance is **dropped**
-> (`ctl init` is deleted; `login` replaces it),
-> not amended. Where an older section is preserved below for its probe-rs ground
-> truth (notably §4.2), only its credential wiring changes. Capability tokens
-> (§6.3) are **unchanged** — they were always orthogonal to connection auth.
+There is no private CA and no mTLS: client certificates, CSR issuance and
+cert-fingerprint pinning of clients were withdrawn in favour of bearer tokens
+(§6.2). Capability tokens (§6.3) are orthogonal to connection auth.
 
 
 ## 1. Problem
@@ -77,8 +73,8 @@ seam we build on. It splits the problem cleanly into two planes:
 ### Data plane — opaque WebSocket-over-TCP tunnel
 
 The sidecar speaks **vanilla probe-rs**. In probe-rs 0.31/0.32 the client/server
-link is a **WebSocket** (route `/worker`) over TCP (see §4.2 / corrected by
-#1965, re-verified against v0.32.0 by #3322). We do **not** parse or re-implement
+link is a **WebSocket** (route `/worker`) over TCP (see §4.2; verified against
+the probe-rs sources, upstream analysis in #1965 / #3322). We do **not** parse or re-implement
 it — we tunnel the raw bytes of that
 connection:
 
@@ -101,12 +97,11 @@ Small typed request/response + a few server→client pushes.
 > connection; the opaque data channel is multiplexed over the same pipe.
 > Revisit only if control ergonomics force it.
 
-### 3.5 WebSocket over HTTPS (revision 2, decided)
+### 3.5 WebSocket over HTTPS (decided)
 
-Revision 1 ran a bespoke TCP protocol — `u32`-LE length prefix + postcard body
-(`fleet-wire`) — with rustls terminated by the coordinator itself on port 7000.
-**That is replaced by the same postcard frames carried as WebSocket binary
-messages over HTTPS.** Drivers, in order of force:
+The postcard frames (`fleet-wire`) are carried as **WebSocket binary messages
+over HTTPS**, not over a bespoke length-prefixed TCP protocol. Drivers, in
+order of force:
 
 1. **Deployment behind an HTTPS reverse proxy is a requirement.** A proxy cannot
    route a bespoke TCP protocol; it would need `stream`-mode passthrough on a
@@ -121,10 +116,9 @@ messages over HTTPS.** Drivers, in order of force:
 5. **probe-rs already speaks WebSocket** (`/worker`), so the whole stack becomes
    one protocol family.
 
-What changes: the length prefix disappears (WebSocket already delimits
-messages), and `fleet-wire`'s codec becomes a thin adapter over WS binary
-payloads. What does **not** change: the `fleet-wire` envelopes, the relay, the
-byte-opaque splice, and every `fleet-proto` payload type.
+WebSocket delimits messages, so there is no length prefix: `fleet-wire`'s codec
+is a thin adapter over WS binary payloads carrying the `fleet-wire` envelopes,
+the relay's byte-opaque splice, and every `fleet-proto` payload type.
 
 Routes:
 
@@ -162,12 +156,9 @@ here rather than only in that document:
 * Mutating `/api/v1` calls whose credential arrived in a cookie must also carry
   an `X-Fleet-Csrf` header, and the coordinator emits **no CORS headers
   anywhere**, which is what makes that header a second independent control.
-  Phase 1a shipped exactly one mutating route (`POST /api/v1/session/logout`),
-  so the machinery was exercised before there was anything worth abusing
-  through it; phase 1b added the node verbs (`PATCH` / `DELETE
-  /api/v1/nodes/{name}`, `POST /api/v1/nodes/pending/{code}`) and phase 1c the
-  outward-pointing ones (grants, auth keys, power-cycle, lease release) behind
-  the same single check.
+  Every mutating `/api/v1` route (logout, the node verbs, grants, auth keys,
+  orgs and members, power-cycle, lease release) sits behind that same single
+  check.
 * **The `/ui*` routes authenticate nothing and there is no global router
   fallback.** The shell has to load before a session exists, since login is a
   page inside it, so the asset routes are unauthenticated and set no cookies;
@@ -204,11 +195,10 @@ same constraint that forced `ring` over `aws-lc-rs`.
 In the hosted deployment the reverse proxy terminates TLS and the coordinator
 speaks plain HTTP on loopback; in a self-hosted deployment the coordinator may
 terminate TLS itself. Either way the framing above is unchanged. `fleet-tls`
-shrinks to client-side trust configuration: normal WebPKI roots by default,
+is only client-side trust configuration: normal WebPKI roots by default,
 plus an optional pinned server-cert fingerprint for local/self-hosted
-deployments with no public DNS (§10). Everything to do with **client**
-certificates — CA loading, CSR signing, `PinnedServerCertVerifier` as a
-bootstrap mechanism, `principal_from_cert`, `node_id_from_cert` — is deleted.
+deployments with no public DNS (§10). There are no **client** certificates
+anywhere in the system.
 
 ## 4. Roles
 
@@ -218,7 +208,7 @@ Central daemon, single node, sqlite (via `sqlx`) for state. Responsibilities:
 - **Inventory:** reconcile board reports from all agents into one fleet view.
 - **Scheduling & leases:** match constraint requests to idle boards; queue when
   none free; lease TTL + heartbeat renewal; fairness/quotas.
-- **Auth:** authenticate bearer tokens → a [`Subject`](#61-identity-model-revision-2);
+- **Auth:** authenticate bearer tokens → a [`Subject`](#61-identity-model);
   evaluate grants; issue per-lease capability tokens.
 - **Relay (data plane):** splice a sidecar's probe-rs session to the owning
   agent. The coordinator does **not** parse probe-rs traffic; it forwards
@@ -250,16 +240,11 @@ database default to `~/.local/share/probe-rs-fleet/coordinator/`.
   or development): nobody can log in through a browser or `login`, and
   `coordinator user-token --username X` remains the bootstrap path.
 
-It no longer generates a client CA, a server cert, or a server key: TLS is the
-reverse proxy's job (§3.5). `init` refuses to overwrite existing files unless
-`--force` is passed.
+It generates no CA, server cert or server key: TLS is the reverse proxy's job
+(§3.5). `init` refuses to overwrite existing files unless `--force` is passed.
 
-**`coordinator enroll` is demoted.** It survives only as the **auth-key minter**
-for unattended nodes (§6.4) and as an admin escape hatch; it is no longer on the
-normal path for either users or CI. Its old CSR-issuing behaviour is gone.
-
-Since `/auth/keys` landed, minting an API key **no longer requires a shell
-on the coordinator host at all**: any org member mints one with
+Minting an API key **does not require a shell on the coordinator host**: any
+org member mints one with
 `probe-rs-fleet auth-key create [--org O]`, authenticated by their `[user]` session. The
 `coordinator auth-key` / `auth-keys` / `auth-key-revoke` verbs remain for the
 self-hosted operator, for the air-gapped case, and for the one thing the API
@@ -269,15 +254,11 @@ refuses — a key that never expires. `coordinator auth-key` takes the same
 redemption synthesises is still capped at 30 days and renewed on each
 redemption, so a perpetual key is a rolling share, not a perpetual one.
 
-#### Per-fleet config layout (revision 2)
+#### Per-fleet config layout
 
-Revision 1 organised client config **per role, then per profile**
-(`<config>/agent/<profile>/`, `<config>/client/<profile>/`). That is the direct
-cause of the laptop dual-role conflict (§6.4): a machine that is both a user and
-a node had to be enrolled twice, into two unrelated identities, in two trees,
-each separately told the coordinator address and trust material.
-
-**Config is now per *fleet*, not per role:**
+**Config is per *fleet*, not per role.** A machine that is both a user and a
+node (the laptop dual-role case, §6.4) holds both credentials in one file,
+told the coordinator address and trust material once:
 
 ```
 ~/.config/probe-rs-fleet/fleets/<name>.toml
@@ -313,8 +294,7 @@ expires = 1788999999   # required here, so staleness is knowable offline
 the org named by `--org` (a name or id), defaulting to the user's personal org
 (§6.1). Ids are immutable ULIDs and names are handles, so nothing stored here
 goes stale when a user or org is renamed, and nothing is keyed on a provider
-login — revision 2's `gh-<github id>` scheme, and the login-reuse takeover it
-guarded against, are gone with it.
+login.
 
 A laptop that both consumes and provides simply has **both tables**. A headless
 Pi has only `[node]`. A CI runner has neither (it exchanges a workload token per
@@ -323,20 +303,19 @@ job). A persistent sandbox has `[agent]` (§6.7). `--fleet <name>` /
 is used otherwise. Credentials are stored `0600`; the two tokens stay **distinct**
 by design (§6.4).
 
-This replaces `agent.toml` and `client.toml` entirely — both files are deleted.
-`AgentConfig` is no longer a file format at all: the `node run` role assembles it
-from the fleet file's `[node]` table plus node-local settings.
+There is no separate `agent.toml` / `client.toml`: `AgentConfig` is not a file
+format at all; the `node run` role assembles it from the fleet file's `[node]`
+table plus node-local settings.
 
-Node-local, non-credential settings move to `~/.config/probe-rs-fleet/node/`
+Node-local, non-credential settings live in `~/.config/probe-rs-fleet/node/`
 (`node.toml` for boards path / heartbeat / erase-on-release, `boards.toml` for
 the inventory). They describe the *machine*, not the fleet, so they are not
 per-fleet and are not duplicated when a machine joins a second one.
 
-Credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`; the selector
-vars (`PROBE_RS_FLEET_BOARD` — a board **model** — `PROBE_RS_FLEET_ID` and
-`_SELECT`) keep their names (`sidecar --board` / `--id` / `--select` override
-them, §7). `PROBE_RS_FLEET_PROFILE`
-is gone, replaced by `PROBE_RS_FLEET` (a fleet name).
+The credential env var is a single `PROBE_RS_FLEET_TOKEN`; the selector
+vars are `PROBE_RS_FLEET_BOARD` (a board **model**), `PROBE_RS_FLEET_ID` and
+`PROBE_RS_FLEET_SELECT` (`sidecar --board` / `--id` / `--select` override
+them, §7). `PROBE_RS_FLEET` selects a fleet by name.
 
 **Writers are read-modify-write plus atomic rename.** A laptop has two
 independent writers — `login` refreshing `[user]`, a running agent persisting a
@@ -362,12 +341,11 @@ buy correctness that is not at stake. Correspondingly there is no
 `previous_workload_token` mirroring `[node]`'s: that field exists because
 rotation can lose an ack, and nothing here is ever invalidated.
 
-There is **no migration path** from the revision-1 trees, nor from revision 2's
-pre-forgs database: both switches wiped the database. The documented upgrade is
-to delete `~/.config/probe-rs-fleet/{agent,client}/` (revision 1), and to
-re-`login` and re-enroll every node after the forgs switch.
+Config and database formats carry no migration path from earlier layouts: an
+upgrade across an identity-model change means re-`login` and re-enrolling
+every node.
 
-#### End-to-end deployment flow (revision 2)
+#### End-to-end deployment flow
 
 ```sh
 # 1. On the coordinator host: scaffold signing key, CSRF secret + config.
@@ -400,7 +378,7 @@ probe-rs-fleet share
 
 # 4. Use the fleet.
 probe-rs-fleet ctl list
-probe-rs-fleet ctl lease --select 'tag=nrf52'
+probe-rs-fleet ctl lease 'tag=nrf52'
 
 # 5. A headless Pi in the lab: prints a URL + code; a colleague approves it
 #    from a machine where they are logged in.
@@ -428,13 +406,6 @@ probe-rs-fleet ctl delegate --select 'tag=nrf52' --ops flash,attach --ttl 2h
 #    → prints a lease-bound capability token; nothing else is granted.
 ```
 
-> **Superseded.** The revision-1 bootstrap-token flow (`coordinator enroll`
-> minting a single-use secret → `agent init` / `ctl init` redeeming it over a
-> pinned bootstrap TLS connection for a CA-signed client certificate), the
-> optional-client-auth listener branch, and the revision-1 deployment flow that
-> went with them are **withdrawn** — see §6.2 and §6.4 for what replaces them,
-> and the deployment flow above for the current commands. `enroll` survives
-> only as the auth-key minter.
 
 
 ### 4.2 `node` (Raspberry Pi)
@@ -449,25 +420,16 @@ Owns local probes. Reconciles discovered probes against `boards.toml`.
 > current verb under it; what is hidden is the deprecated bare `agent` and
 > `agent up`.
 
-> **Updated by investigation (tasks #1710, #1965 — verified against the real
-> probe-rs 0.31.0 source; re-verified line-by-line against v0.32.0 by #3322,
-> which found no change to any of it):** The server is `probe-rs serve`. It
-> takes **no `--probe` / `--chip`** — it exposes *all* local probes and the
+> **Ground truth (verified against the real probe-rs 0.31.0 source and
+> re-verified line-by-line against v0.32.0):** The server is `probe-rs serve`.
+> It takes **no `--probe` / `--chip`** — it exposes *all* local probes and the
 > connecting client selects probe + chip **in-band**. So there is **no CLI
-> injection point** for the agent; the earlier "agent injects `--probe`" model
-> is dropped.
+> injection point** for the agent. The genuine `probe-rs serve`:
 >
-> **Correction (#1965):** the #1710 model of `serve` as a *Unix-socket, raw
-> `u32-LE postcard`, `address="socket://…"`, server config via `--config`*
-> transport was **inaccurate** for probe-rs 0.31 (and still is for 0.32). The
-> genuine `probe-rs serve`:
->
-> - **Binds TCP**, default `0.0.0.0:3000` (`TcpListener::bind`). *(0.32 update:
->   an `address = "socket://<path>"` Unix-socket scheme **does** now exist, so
->   the "no `socket://` scheme" wording above was true for 0.31 only. We
->   deliberately keep the loopback-TCP model. That is a **recorded decision,
->   not an unexamined default** — see *Rejected: `socket://` Unix-socket serve*
->   below, which closes issue #297.)*
+> - **Binds TCP**, default `0.0.0.0:3000` (`TcpListener::bind`). (0.32 also has
+>   an `address = "socket://<path>"` Unix-socket scheme; we deliberately keep
+>   the loopback-TCP model — see *Rejected: `socket://` Unix-socket serve*
+>   below.)
 > - **Speaks WebSocket** at route `/worker` (axum), with **challenge/token**
 >   auth (`Probe-Rs-Challenge` header; client replies `sha512(challenge||token)`).
 > - Has **no `--config` flag**. `ServerConfig` is the `server` field of the
@@ -478,7 +440,7 @@ Owns local probes. Reconciles discovered probes against `boards.toml`.
 > - The client honours `PROBE_RS_REMOTE_HOST` (a **`ws://` base URL** — the
 >   client appends `/worker`) and `PROBE_RS_REMOTE_TOKEN`.
 
-Decided agent model (per #1710, corrected by #1965):
+Decided agent model:
 
 - **Byte-proxy `probe-rs serve`, one server per board.** The agent spawns a
   `probe-rs serve` per board listening on a **loopback TCP port** (ephemeral,
@@ -491,9 +453,8 @@ Decided agent model (per #1710, corrected by #1965):
   parsing** (the relay stays byte-opaque; it just carries WS-over-TCP bytes).
   Per-board and **actually reused across a holder's many invocations**, recycled
   on release, fault or power-cycle. This matches time-based sharing (§6).
-  - **Reuse is what the process model is for, and since #512 it is what the
-    code does** (it was previously only the intent: the node spawned a server
-    per *channel*, and the second invocation against a board died in `nusb`
+  - **Reuse is what the process model is for.** (A server per *channel* would
+    make the second invocation against a board die in `nusb`
     with `interface is busy`, `errno 16`). Upstream `serve`'s `run_tcp` accepts
     connections in a **loop**, building a per-connection `RpcApp` over one
     shared `ProbeBroker` — the type whose job is "grant exclusive use of a probe
@@ -616,11 +577,11 @@ handshake, or `SO_PEERCRED`). Until then, loopback TCP stands. The negative
 assertions in `probers.rs`'s `rendered_config_is_server_table_with_access` pin
 the decision in code.
 
-#### Config & scaffolding (`node up`, revision 2)
+#### Config & scaffolding (`node up`)
 
-The node's credential lives in the **per-fleet config** (§4.1); `agent.toml` is
-deleted. Node-local settings live at `~/.config/probe-rs-fleet/node/`
-(`node.toml`, `boards.toml`) — they describe the machine, not the fleet.
+The node's credential lives in the **per-fleet config** (§4.1). Node-local
+settings live at `~/.config/probe-rs-fleet/node/` (`node.toml`, `boards.toml`)
+— they describe the machine, not the fleet.
 
 `probe-rs-fleet node up` registers this machine as a node and starts serving.
 It obtains a node token by whichever of these applies, in order:
@@ -637,84 +598,64 @@ It obtains a node token by whichever of these applies, in order:
    `POST /node/enroll`) — org-scoped, expiring, optionally single-use,
    carrying default tags in its payload. This is the unattended/image path.
 
-> **Implementation status (task 3451).** All four rungs ship. Rung 3's approval
-> was a **CLI verb, not a browser form**, and that was a decision rather than an
-> unfinished edge: `login` was then the brokered GitHub *device* flow, which had no
-> `redirect_uri` and no cookie session (§6.4), so a page served by the
-> coordinator could not know who was looking at it. Building one would have
-> meant an OAuth redirect flow plus cookies in the coordinator, which
-> contradicted §6.4 and reopened §10 Q6. `GET /node/approve` was therefore an
-> *informational* page that says what to run.
+**Rung 3 approves from the CLI or the browser.** Approval is keyed by
+`user_code` and is a pure function of `(code, decision, authenticated user)`:
+`probe-rs-fleet node approve` and the web UI's `POST
+/api/v1/nodes/pending/{code}` (session cookie, `docs/web-ui.md`) both resolve
+their subject their own way and call the same `http::decide_pending_node`, with
+the same membership check and the same `node.approve.*` audit rows. The
+node-side wire contract (`start` / `poll`) never learns which mechanism
+approved it. Three things are pinned so the browser cannot quietly make rung 3
+weaker:
+
+* **`GET /node/approve` has no form.** It is informational and reflects
+  nothing — no code in the URL, no query parameter echoed — so it cannot become
+  a confused-deputy surface; it links to `/ui/approve`, which is where the form
+  lives.
+* **There is no pending-registration listing.** A pending row's namespace is
+  `NULL` until approval binds it, so a listing could only show every live
+  code in the deployment: a cross-tenant index that would turn §6.4's
+  "guess ~40 bits" into "read the list". Approval stays code-driven
+  (`docs/web-ui.md` §3/§4).
+* **The phishing warning travels with the response.** Because nothing lists
+  pending rows, the approver has only what `inspect` returns; the sentence the
+  CLI prints — you cannot see this machine, approve only an enrollment you
+  started — is a server-sent field on that response, not frontend copy.
+
+The cross-tenant code-enumeration risk below is the same on both paths: same
+handler, same entropy, same TTL, same audit row, same "the enrolling machine
+prints which org it landed in" control.
 >
-> The design deliberately did not foreclose a real browser flow later.
-> Approval is keyed by `user_code` and is a pure function of `(code, decision,
-> authenticated user)`, factored so that a future cookie-authenticated handler
-> resolves its subject its own way and calls the same function; the node-side
-> wire contract (`start` / `poll`) never learns which mechanism approved it, so
-> adding one is additive and deployed agents keep working; and the page that
-> would grow the form already exists at the URL agents already print.
->
-> **That later arrived (task 3573, `docs/web-ui.md` phase 1b), and the
-> commitment held exactly as written.** The coordinator now has an OAuth
-> redirect flow and a cookie session — `docs/web-ui.md` D1 reverses §6.4's
-> "no browser session" premise and records what it costs — and
-> `POST /api/v1/nodes/pending/{code}` approves from the browser. It resolves its
-> subject from the session cookie and calls **the same**
-> `http::decide_pending_node`, with no schema change and no second binding site;
-> it shares the CLI route's membership check and writes the same
-> `node.approve.*` audit rows. Three things about it are worth pinning here,
-> because each is a place the browser could have quietly made rung 3 weaker:
->
-> * **`GET /node/approve` did not grow the form.** It stays informational and
->   reflects nothing — no code in the URL, no query parameter echoed — so it
->   cannot become a confused-deputy surface, and the URL every deployed agent
->   prints keeps meaning what it meant. Phase 2 added a static link from it to
->   `/ui/approve`, which is where the form lives.
-> * **There is no pending-registration listing.** A pending row's namespace is
->   `NULL` until approval binds it, so a listing could only show every live
->   code in the deployment: a cross-tenant index that would turn §6.4's
->   "guess ~40 bits" into "read the list". Approval stays code-driven
->   (`docs/web-ui.md` §3/§4).
-> * **The phishing warning travels with the response.** Because nothing lists
->   pending rows, the approver has only what `inspect` returns; the sentence the
->   CLI prints — you cannot see this machine, approve only an enrollment you
->   started — is a server-sent field on that response, not frontend copy.
->
-> The cross-tenant code-enumeration risk below is **unchanged** by the browser
-> path: same handler, same entropy, same TTL, same audit row, same "the
-> enrolling machine prints which org it landed in" control.
->
-> **The rung is gated on there being a human.** `--interactive` /
-> `--no-interactive`, defaulting to whether stdout is a terminal: a service unit
-> with no tty fails fast with remediation instead of printing a code into its
-> journal and blocking for fifteen minutes on nobody. It is also tried **last**
-> among the bootstrapping rungs, for the same reason in reverse — anything that
-> can succeed without a human should.
->
-> **User-mintable auth keys (task 3454) changed rung 3's urgency, not its
-> value.** Rung 4's key no longer requires a shell on the coordinator, so
-> headless enrollment was already possible for a hosted customer without rung 3.
-> What rung 3 buys that a key does not: nothing long-lived is copy-pasted, and
-> the credential is bound at approval time rather than minted in advance and
-> carried around. That property is why it was built.
->
-> One **deliberate deviation** from the order above: an explicit `--auth-key`
-> beats an existing `[user]` session. Passing it is a deliberate act — a
-> provisioning script run on a developer's own laptop should enroll the node it
-> was told to, not the one the laptop's owner implies. An existing `[node]`
-> credential still wins over everything, and is reused rather than replaced.
->
-> `share` is `node up`'s rung 2 as a standalone verb, and does **not** start
-> the node: it writes the credential and the node-local settings, and its
-> summary points at `probe-rs-fleet node run`.
+**The rung is gated on there being a human.** `--interactive` /
+`--no-interactive`, defaulting to whether stdout is a terminal: a service unit
+with no tty fails fast with remediation instead of printing a code into its
+journal and blocking for fifteen minutes on nobody. It is also tried **last**
+among the bootstrapping rungs, for the same reason in reverse — anything that
+can succeed without a human should.
+
+**Why rung 3 exists next to auth keys.** Rung 4's key needs no shell on the
+coordinator (any member mints one), so headless enrollment works without
+rung 3. What rung 3 adds: nothing long-lived is copy-pasted, and the
+credential is bound at approval time rather than minted in advance and
+carried around.
+
+One **deliberate deviation** from the order above: an explicit `--auth-key`
+beats an existing `[user]` session. Passing it is a deliberate act — a
+provisioning script run on a developer's own laptop should enroll the node it
+was told to, not the one the laptop's owner implies. An existing `[node]`
+credential still wins over everything, and is reused rather than replaced.
+
+`share` is `node up`'s rung 2 as a standalone verb, and does **not** start
+the node: it writes the credential and the node-local settings, and its
+summary points at `probe-rs-fleet node run`.
 
 The node token is long-lived but **rotating**: the coordinator can issue a
 replacement over the established connection, so a leaked token has bounded
 value and revocation is a `DELETE` in the `node` table rather than a CRL.
 
-**Probe adoption is now per-node policy, not a global gate.** Revision 1 made
-every probe wait for a `boards.toml` declaration, which is right for a lab and
-pure friction for a laptop:
+**Probe adoption is per-node policy, not a global gate.** Making every probe
+wait for a `boards.toml` declaration is right for a lab and pure friction for a
+laptop:
 
 - `adopt = "auto"` (default for nodes created by `share`): discovered probes are
   adopted into the owning org automatically, with tags inferred from the probe.
@@ -723,7 +664,7 @@ pure friction for a laptop:
   reported but not leasable until declared, so CI gets stable ids and no
   surprises.
 
-`boards.toml` therefore becomes **annotation and override** — stable ids, power
+`boards.toml` is therefore **annotation and override** — stable ids, power
 wiring, curated tags — rather than admission control.
 
 **Where the policy lives, and which copy wins.** It is recorded in two places
@@ -794,8 +735,8 @@ delta, so `Coordinator::reconcile_inventory` treats it as a **set**:
 The invariant: the DB set is the scheduler set plus declared-but-offline boards,
 and nothing else. The browser UI's Agents page counts rows and Devices lists the
 scheduler, so Agents ≥ Devices, and they differ *only* by unplugged declared
-boards. Before the set difference existed, board rows were only ever written and
-never deleted, so every rename leaked a row — and, within one coordinator
+boards. Without the set difference, board rows would only ever be written and
+never deleted, so every rename would leak a row — and, within one coordinator
 lifetime, a leasable phantom.
 
 
@@ -818,27 +759,24 @@ as / dispatches on a binary named `probe-rs` on `PATH` (argv0 dispatch). It:
    SIGINT/SIGTERM *unless* the lease is shared with the next invocation, which
    §6.6 explains.
 
-#### Credentials (revision 2)
+#### Credentials
 
 ctl and the sidecar both read the **`[user]` session** from the per-fleet config
-(§4.1) — or, in CI, a token exchanged from a workload OIDC credential. The
-revision-1 arrangement (a shared client certificate, discovered through two
-different sets of env var names, bridged by the shim) is deleted along with the
-rest of the client-cert model.
+(§4.1) — or, in CI, a token exchanged from a workload OIDC credential. There
+is no client certificate.
 
 Resolution precedence is **explicit flag / env var > fleet config**. The
-credential env vars collapse to a single `PROBE_RS_FLEET_TOKEN`. The *selector*
-vars (`PROBE_RS_FLEET_BOARD` / `_ID` / `_SELECT`) keep their names but are no
-longer the only mechanism: `sidecar --board` / `--id` / `--select` override them
-(§7).
+credential env var is a single `PROBE_RS_FLEET_TOKEN`. The *selector* vars
+(`PROBE_RS_FLEET_BOARD` / `_ID` / `_SELECT`) are overridden by
+`sidecar --board` / `--id` / `--select` (§7).
 
 **A sandboxed agent is never given these credentials.** It receives a
 lease-bound capability token instead (`ctl delegate`, §6.5).
 
-**Both renew their own session.** `ctl` always did; the shim did not, which is
-why a workstation whose only fleet use was `laze` → shim → `probe-rs` hit a
-12-hour cliff regardless of how heavily it was used. It now renews through the
-same `ensure_fresh_session`, using the `[user].refresh_token` written by
+**Both renew their own session.** Without that, a workstation whose only fleet
+use is `laze` → shim → `probe-rs` would hit a 12-hour cliff regardless of how
+heavily it was used. Both renew through the same `ensure_fresh_session`, using
+the `[user].refresh_token` written by
 `login`. That is safe on a per-invocation hot path only because redemption is
 non-rotating — see §6.4's "A self-renewing user session", which also states
 what that costs. Two consequences worth naming here:
@@ -911,23 +849,21 @@ The server→client direction rides the same WebSocket: the coordinator writes
 command frames down the node's dial-out connection, multiplexed with the opaque
 data channel by the `fleet-wire` envelopes.
 
-## 6. Identity, auth & leases (revision 3: on forgs)
+## 6. Identity, auth & leases (on forgs)
 
-Revision 1 had authentication (mTLS client cert → `Principal`) and **no
-authorization**. Revision 2 replaced the credential model with bearer tokens,
-rooted user identity in GitHub, and added the missing authorization layer.
-Revision 3 (task 3892) moves every generic piece of that — users, orgs,
-memberships, sessions, refresh tokens, API keys, workload tokens, grants, the
-device flow, browser login, cookies and CSRF — into **forgs**
-([github.com/kaspar030/forgs](https://github.com/kaspar030/forgs),
-`docs/design.md` there), and keeps in fleet only what is about
-hardware: nodes, boards, leases, capability tokens, the board selector and op
-vocabulary, and the two hooks through which forgs asks fleet a question.
+Authentication is by bearer token, user identity is rooted in a login provider,
+and there is an authorization layer over every board. Every generic piece of
+that — users, orgs, memberships, sessions, refresh tokens, API keys, workload
+tokens, grants, the device flow, browser login, cookies and CSRF — lives in
+**forgs** ([github.com/kaspar030/forgs](https://github.com/kaspar030/forgs),
+`docs/design.md` there), a git dependency of this workspace. fleet keeps only
+what is about hardware: nodes, boards, leases, capability tokens, the board
+selector and op vocabulary, and the two hooks through which forgs asks fleet a
+question.
 
-**There is no migration.** The switch wiped the database: migrations
-0001–0011 were deleted and replaced by a fresh `0001_fleet.sql` holding fleet's
-four tables. Pre-forgs tokens (`gh-…` ids, old sessions, auth keys, node
-tokens) are all invalid; every user logs in again and every node re-enrolls.
+fleet's own schema is a single `0001_fleet.sql` holding its tables; there is
+no migration from databases that predate forgs, so such a deployment starts
+fresh (every user logs in again and every node re-enrolls).
 
 ### 6.1 Identity model
 
@@ -968,8 +904,7 @@ The decisions that are load-bearing:
   handle is resolved to an id **once**, where the reference is written (e.g.
   `grant bob …` resolves `bob` at grant creation). A released name is
   tombstoned forever, so a rename cannot hand the old path to a squatter.
-  `OrgId` in `fleet-proto` keeps its name but now carries the ns-node ULID
-  text; there is no `gh-<id>` anywhere any more.
+  `OrgId` in `fleet-proto` carries the ns-node ULID text.
 - **A login provider proves who you are; it does not name you.** Providers
   (GitHub, Codeberg/Forgejo, GitLab, generic OIDC — §6.4) supply
   `(provider, immutable subject id, verified email)`. The identity is keyed on
@@ -1020,8 +955,8 @@ The decisions that are load-bearing:
   is enough to add a node, use the org's boards and mint an API key; admin is
   needed to create grants, read the audit log, manage members and act on
   others' objects.
-- **The acting org is chosen per request.** A session is no longer bound to
-  one org at mint time. A user request names its org — `/client?org=<path or
+- **The acting org is chosen per request.** A session is not bound to one org
+  at mint time. A user request names its org — `/client?org=<path or
   id>`, `/api/v1/…?org=`, an `org` field in `SelfRegister` /
   `NodeApprovalRequest`, `--org` on the CLI — defaulting to the user's
   personal org, and membership is checked there (`http::acting_subject`). An
@@ -1065,9 +1000,9 @@ constant rather than repeating a literal.
 
 ### 6.2 Connection auth: bearer tokens
 
-**The private CA and mTLS are withdrawn** (revision 2) — deleted: client CA,
-CSR signing, cert pinning, the `agent_pins` table. Under bearer tokens
-revocation is a row delete, which the CA never offered.
+**There is no private CA and no mTLS** — no client CA, CSR signing, client
+cert pinning or `agent_pins` table. Under bearer tokens revocation is a row
+delete, which a CA never offered.
 
 Every credential is a **prefix-typed opaque token**, minted by forgs'
 `TokenFormat` with fleet's brand `prf` plus one app kind:
@@ -1093,8 +1028,8 @@ nothing but the exchange that redeems it.
 kind's prefix; the lookup is fleet's `tokens::NodeTokens`, an
 `AppTokenLookup` over `node.token_hash` that answers the subject
 `<org id>/node:<node id>`. The org comes from the node **row**, which is what
-stops a node token being replayed into another tenant. Rotation over the
-node's WebSocket (`node_token_rotate_secs`) is unchanged.
+stops a node token being replayed into another tenant. Node tokens rotate over
+the node's WebSocket (`node_token_rotate_secs`).
 
 **There is exactly one place a credential becomes a subject:**
 `forgs_http::authenticate_request` (and its `Authenticated` extractor).
@@ -1127,7 +1062,7 @@ what else must be proven:
   non-`HttpOnly` `prfs_csrf` cookie. Nothing is stored. The key comes from a
   **dedicated injected secret** (`csrf_secret_path`, ≥ 32 bytes, written as
   `csrf.secret` by `coordinator init`), domain-separated by the app label
-  `probe-rs-fleet`. It is **no longer derived from the capability-signing
+  `probe-rs-fleet`. It is **not derived from the capability-signing
   seed**: one secret per job, so rotating either does not silently rotate the
   other. A bearer-authenticated `/api/v1` call needs no CSRF header;
 * no route emits CORS headers, which makes the mandatory custom header a
@@ -1137,14 +1072,14 @@ what else must be proven:
 with a credential that can power-cycle real hardware; `Authorization: Bearer`
 from JavaScript was rejected for exactly that reason (`docs/web-ui.md` §5).
 
-### 6.3 Capability tokens (unchanged)
+### 6.3 Capability tokens
 
 The coordinator mints an ed25519-signed `CapabilityToken { lease, board,
 allowed_ops, expires }` per lease; the node verifies the signature **locally**
 with the coordinator's public key, so there is no per-operation round trip.
 This is orthogonal to connection auth and did not move to forgs: it is the
 attenuated, lease-bound, expiring credential the sandboxed-agent story needs
-(§6.5). Its seed (`signing.seed`) now signs only capability tokens and derives
+(§6.5). Its seed (`signing.seed`) signs only capability tokens and derives
 the serve token; it keys nothing else.
 
 ### 6.4 Bootstrapping: one ceremony, several flavours
@@ -1213,7 +1148,7 @@ GET/POST /auth/signup     → choose a username (policy + reserved names + tombs
 
 #### CLI login is forgs' own device flow
 
-fleet no longer brokers GitHub's device flow (not every provider has one).
+fleet does not broker a provider's device flow (not every provider has one).
 forgs is itself the device authorization server:
 
 ```
@@ -1252,7 +1187,7 @@ is where fleet's policy lives:
   `prfn1_` token through the same `register_node_and_mint` every enrollment
   path uses, so the resulting row is identical.
 
-Three decisions and three accepted risks carry over unchanged:
+Three decisions and three accepted risks:
 
 - **Approval is a CLI verb and a browser form** (`POST /api/v1/nodes/pending/{code}`
   calls the same `http::decide_pending_node`). `GET /node/approve` stays
@@ -1311,7 +1246,7 @@ widened. The rules, all enforced by forgs' `/auth/keys` (and by
 A session lives `session_ttl_secs` (12h). The `probe-rs` shim, `ctl`, `share`
 and friends renew it with `ensure_fresh_session` from the `[user]
 refresh_token` (`POST /auth/token`, `grant_type: refresh_token`), so a
-workstation whose only fleet use is `laze` → shim → `probe-rs` no longer hits
+workstation whose only fleet use is `laze` → shim → `probe-rs` does not hit
 a 12-hour cliff.
 
 - **What it can do:** mint session tokens for its user. **What it cannot:**
@@ -1384,14 +1319,12 @@ The switch was a move, not a rewrite; these properties (forgs
 * grants: admin to create, must expire (≤ 365 days), namespace fence in every
   check, canonical selector stored.
 
-### 6.5 Authorization (new)
+### 6.5 Authorization
 
-Revision 1 shipped **no authorization**. Concretely, any holder of any valid
-client cert could `open_channel` on **another principal's lease** (the handler
-took `_principal` unused, looked the board up by lease id, and minted a
-capability token for it), extend or release anyone's lease, power-cycle any
-board, and read the entire audit log. These are fixed as part of the subject
-model, not as separate work.
+Authentication alone is not enough: without an authorization layer, any holder
+of any valid credential could open a channel on **another subject's lease**,
+extend or release anyone's lease, power-cycle any board, and read the entire
+audit log. The subject model closes all of these.
 
 The model, deliberately minimal:
 
@@ -1416,9 +1349,9 @@ The model, deliberately minimal:
 - **Delegation to a sandbox** is *not* a grant and creates no principal:
   `ctl delegate` leases a board as you and hands out only the **capability
   token** for that lease — narrow, expiring, revocable by releasing the lease.
-  The crypto for this already exists (§6.3); only the command is new.
+  The crypto is the capability token of §6.3.
 
-#### What shipped (grants, ACL evaluation, `ctl delegate`)
+#### Grants, ACL evaluation, `ctl delegate`
 
 **One selector grammar, one reading of every term.** `id=<name>`,
 `board=<model>`, `chip=<c>`, `tag=<t>`, and `a && b` conjunctions of tags,
@@ -1464,8 +1397,8 @@ table-driven unit test. `Access { member_of: Vec<OrgId>, grants }` is built
 per request from the user's forgs memberships plus `grants_for_subject`
 mapped to fleet `GrantScope`s; a grant row whose selector or ops will not
 re-parse is dropped **closed**. Ownership is `board.org ∈ member_of` (a session
-is no longer bound to one org). The tenancy fence **moved rather than
-weakened**: board matching is org-blind, and the org comparison lives in
+is not bound to one org). The tenancy fence is not weakened by that:
+board matching is org-blind, and the org comparison lives in
 exactly one place, `grant.org == board.id.org` — forgs' namespace fence. A
 grant issued in org A saying `tag=nrf52` therefore cannot reach org C's
 identically tagged board.
@@ -1707,8 +1640,7 @@ lookup in the tree that is deliberately subject-scoped rather than org-scoped.
 (`extend_lease`, `tear_down_lease`) it uses the **board's** org, falling back
 to the acting org only when there is one, and otherwise skips the row rather
 than inventing a namespace — so no org-scoped
-row is ever keyed on `gha`. (Revision 2 needed a `system` org row for this;
-the forgs switch removed it.)
+row is ever keyed on `gha`.
 
 A subject id containing a slash round-trips because `SubjectKey::parse` splits
 at the first `/` only if it precedes the first `:`, so
@@ -1777,11 +1709,11 @@ Every verification failure — expiry, audience, issuer, signature, missing clai
 unknown `kid` — answers the same flat `401`, with the reason in the audit log
 and never in the body. No oracle.
 
-**Changed by the forgs switch:** revision 2 answered a grantless repo with a
-distinguishable `403 no_grant`. forgs folds it into the flat `401` and records
+A grantless repo is deliberately not distinguishable from the outside either:
+it gets the same flat `401`, and the coordinator records
 `workload.reject.no_grant` with the repo and the owner beside it, so the "but I
-granted the org!" case is still one audit line to diagnose — but the operator
-has to read the coordinator's audit/log to tell it from a signing problem.
+granted the org!" case is one audit line to diagnose — but the operator has to
+read the coordinator's audit/log to tell it from a signing problem.
 
 #### Token TTL, and the bound with no refresh path
 
@@ -2267,55 +2199,44 @@ workspace (github.com/kaspar030/forgs, a pinned git dependency;
 
 ## 10. Open questions / decisions to confirm
 
-**Resolved (revision 1):**
+**Resolved:**
 
 - *probe-rs transport* = postcard-rpc 0.12 (confirmed from source). Data plane
   tunnels opaque postcard-rpc frames (§3).
 - *"time-based"* = time-based **sharing**: extendable board claims across many
   probe-rs invocations, not lease-per-run (§6.6).
 - *myelin* is **dropped**: postcard for both planes (§3).
-
-**Resolved (revision 2):**
-
 - *Deployment model* = **hosted, multi-tenant**, behind an HTTPS reverse proxy.
-- *Transport* = **WebSocket over HTTPS**, replacing the bespoke length-prefixed
-  TCP protocol (§3.5).
-- *Connection auth* = **bearer tokens**; the private CA, CSR issuance, client
-  certs and cert pinning are **deleted** (§6.2).
-- *Identity root* = **GitHub only** at v1 — OAuth2 device flow for users, GH
-  Actions workload OIDC for CI (§6.4). *Superseded by revision 3* below.
-- *Tenancy* = every subject and object is org-scoped; a **personal org is
-  auto-created on first login** (§6.1). The DB is **wiped**, not migrated.
-- *Node registration* = **self-approving on membership**; no admin approval step
-  at v1 (§6.4).
-- *Probe adoption* = per-node policy, `auto` for personal nodes, `declared` for
-  lab nodes (§4.2, §8).
-- *Capability tokens* are unchanged and remain the sandbox-delegation mechanism
-  (§6.3, §6.5).
-
-**Resolved (revision 3 — identity on forgs, task 3892):**
-
+- *Transport* = **WebSocket over HTTPS** (§3.5).
+- *Connection auth* = **bearer tokens**; no private CA, CSR issuance, client
+  certs or client cert pinning (§6.2).
 - *Identity* = **forgs**. Login providers (GitHub, Codeberg/Forgejo, GitLab,
   generic OIDC) prove identity with a verified email; the username is chosen
-  at signup; ids are immutable ULIDs (§6.1).
+  at signup; ids are immutable ULIDs (§6.1). GitHub Actions workload OIDC for
+  CI (§6.7).
 - *CLI login* = forgs' own device flow, provider-agnostic (§6.4).
+- *Tenancy* = every subject and object is org-scoped; a **personal org is
+  created at signup** (§6.1); team orgs are self-service (§6.1).
 - *Org choice* = per request (`--org` / `?org=`), default the personal org.
-- The DB is **wiped** again; no migration.
+- *Node registration* = **self-approving on membership**; no admin approval step
+  (§6.4).
+- *Probe adoption* = per-node policy, `auto` for personal nodes, `declared` for
+  lab nodes (§4.2, §8).
+- *Capability tokens* remain the sandbox-delegation mechanism (§6.3, §6.5).
 
 **Still open:**
 
 1. **Self-hosted TLS story.** A self-hosted coordinator without public DNS
    cannot get a publicly trusted certificate, so `fleet-tls` keeps an optional
    **pinned server-cert fingerprint** (`server_cert_sha256` in the fleet
-   config) — the one surviving remnant of the deleted pinning code. Whether we
+   config). Whether we
    also ship a self-hosting story beyond dev use is a **product** question, not
    an architectural one; keeping the coordinator a self-hostable artifact is
    cheap now and expensive to retrofit (NDA-bound customers may be structurally
    unable to point lab hardware at a third-party control plane).
-2. **Does probe-rs's postcard-rpc server already expose remote probe/chip
-   selection over the wire?** If yes, plain proxying is sufficient and the agent
-   only manages process lifecycle + `--probe`. If not, file tasks against
-   probe-rs (or myelin, per your offer). Needs a look at probe-rs's server impl.
+2. **Remote probe/chip selection.** *Resolved:* `probe-rs serve` exposes all
+   local probes and the client selects probe + chip in-band; the fleet fences
+   each per-board server with `ProbeAccess::Allow` (§4.2).
 3. **gdb / TCP tunneling.** *Resolved (v1):* `probe-rs gdb` is not
    remote-capable in 0.31 or 0.32, so the agent runs `probe-rs gdb` locally and
    its raw gdbremote TCP is tunneled as a **second relay channel** (`ChannelKind::Gdb`),
@@ -2331,10 +2252,10 @@ workspace (github.com/kaspar030/forgs, a pinned git dependency;
    probe-rs feature request to make `gdb` drive a remote `Session` over
    postcard-rpc would let gdb ride the existing data plane and drop this bespoke
    tunnel.
-4. **probe-rs process lifecycle.** Decided-ish: **one server process per board**,
-   possibly per lease for isolation. Confirm per-lease vs per-board-reused.
-5. **Sidecar install UX.** argv0 `probe-rs` shim on PATH vs explicit
-   `fleet sidecar run -- …` wrapper. Which install story do you want?
+4. **probe-rs process lifecycle.** *Resolved:* one server process per board,
+   reused across a holder's invocations and recycled per lease (§4.2).
+5. **Sidecar install UX.** *Resolved:* the binary dispatches on argv0, so a
+   `probe-rs` symlink on `PATH` is the shim (§4.3).
 6. **Where the hosted control plane runs.** Still open. Browser login and CLI
    login both need the coordinator's browser-reachable `public_url` (the OAuth
    callback is `<public_url>/auth/<provider>/callback`), but that is

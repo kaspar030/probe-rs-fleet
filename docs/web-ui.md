@@ -1,14 +1,14 @@
 # probe-rs-fleet — coordinator web UI and browser-facing HTTP API
 
-Status: **implemented; phases 1–4 shipped.** This document fixes the shape of
-a browser surface for the coordinator: how a browser authenticates, what the
+Status: **implemented.** This document describes the shape of the
+browser surface of the coordinator: how a browser authenticates, what the
 JSON API looks like, who may call each endpoint, how the assets are served, and
 what the first version deliberately does not do. It is written in the register
 of `docs/architecture.md` — decisions *with their costs*, accepted risks
 recorded rather than fixed, and explicit "please do not 'fix' this" notes where
 a future reader would otherwise undo something deliberate.
 
-Since the forgs switch (task 3892) login, signup, cookies and CSRF are
+Login, signup, cookies and CSRF are
 **forgs'** (`forgs-http`, merged into the coordinator's router under `/auth/*`;
 see `docs/architecture.md` §6). fleet's side lives in
 `crates/fleet-coordinator/src/identity.rs` (the `AuthContext`: cookie brand
@@ -16,13 +16,12 @@ see `docs/architecture.md` §6). fleet's side lives in
 redirect `/ui/`), `src/api.rs` (the `/api/v1` handlers), `src/assets.rs` (the
 asset routes) and `web/` (the UI itself). Where this
 document and the code disagree, the code is the fact and this document is the
-bug; the sections below were amended as each phase landed rather than left as
-the older plan.
+bug.
 
-**It reverses a recorded decision.** See [D1](#d1-browser-identity) — the
-reversal is named there, with the file and section it reverses, because a silent
-contradiction is the one outcome that would make this tree's documentation
-untrustworthy.
+**It reverses an earlier design choice** (no browser session on the
+coordinator). See [D1](#d1-browser-identity) — the reversal is named there,
+because a silent contradiction is the one outcome that would make this tree's
+documentation untrustworthy.
 
 Read `docs/architecture.md` §3.5 (routes, reverse proxy), §6.1 (identity model),
 §6.2 (bearer tokens), §6.4 (bootstrapping, device flow), §6.5 (authorization)
@@ -30,13 +29,12 @@ first. This document assumes them and does not restate them.
 
 ---
 
-## 1. What existed before this shipped
+## 1. The CLI surface the UI mirrors
 
-The starting point this design reacted to, kept because [D1](#d1-browser-identity)'s
-recorded reversal is only legible against it. Every management operation was
-CLI-only:
+Every management operation is available from the CLI; the UI covers the same
+ground in a browser:
 
-| what | before |
+| what | CLI |
 |---|---|
 | inventory, leases, logs | `ctl list` / `ctl who` / `ctl logs` |
 | board actions | `ctl lease` / `ctl release` / `ctl power-cycle` / `ctl delegate` |
@@ -44,15 +42,12 @@ CLI-only:
 | credentials | `auth-key create` / `auth-key list` / `auth-key revoke` |
 | enrollment | `share`, `node up`, `node approve <code>` |
 
-The only browser surface the coordinator had was `GET /node/approve`
+Besides `/ui` and `/api/v1`, the coordinator serves `GET /node/approve`
 (`crates/fleet-coordinator/src/http.rs`, `NODE_APPROVE_PAGE`): a static,
-reflects-nothing page that tells you which command to run. It is still there and
-still informational (see [§7](#7-changes-required-in-existing-files)), but `/ui`
-and the `/api/v1` surface now sit alongside it. Users had asked for a web UI
-where they could see their devices and agents, approve machines, and hand out
-access. This document is the design for that; the code it produced is the
-`api.rs` / `assets.rs` / `web/` set named in the preamble (the original
-`browser_auth.rs` moved into forgs).
+reflects-nothing page that tells you which command to run and links to
+`/ui/approve` (see [§3](#3-endpoint-table)). The UI lets
+users see their devices and agents, approve machines, hand out access and
+manage their orgs.
 
 ---
 
@@ -64,16 +59,12 @@ access. This document is the design for that; the code it produced is the
 session is carried by an `HttpOnly` cookie holding the same `prfs1_` session
 token the CLI uses.**
 
-History, kept because the reversal below is only legible against it: revision
-2 offered GitHub's authorization-code flow at `/auth/github/{start,callback}`
-with an in-page device-code fallback, implemented in fleet's own
-`browser_auth.rs`. The forgs switch (task 3892) replaced all of it with forgs'
-generic browser surface. What the page does now:
+The browser surface is forgs' generic one. What the page does:
 
 - The login page lists the configured providers from `GET /auth/providers`
   (JSON; forgs also renders an HTML list at `GET /auth/login`) and links each
   to `GET /auth/{provider}/start?return_to=/ui/`. There is **no in-page device
-  fallback** any more: every provider has an authorization-code flow, and the
+  fallback**: every provider has an authorization-code flow, and the
   device flow is the CLI's.
 - `GET /auth/{provider}/callback` either sets the session cookies and
   redirects to `/ui/` (a known identity) or, on **first login**, redirects to
@@ -91,21 +82,19 @@ generic browser surface. What the page does now:
   same credential, not a second credential kind**: `forgs_http::authenticate_request`
   resolves it exactly as it resolves the `Authorization` header.
 
-**The reversal, stated loudly.** Before this UI, the architecture said "no
-callback origin is involved", node approval was a CLI verb *because* "a page
-served by the coordinator cannot know who is looking at it", and the module
-documentation of `crates/fleet-coordinator/src/http.rs` said not to bolt a
-session onto the coordinator. That instruction was **correct for a coordinator
-with no web UI**, and this document changed it. The cost is one
-per-deployment setup step per provider: registering
-`<public_url>/auth/<name>/callback` in its OAuth app. Since the forgs switch
-that step is no longer optional — CLI login also completes in the browser —
-and the architecture (§6.4) says so.
+**The reversal, stated loudly.** A coordinator with no web UI needs no
+callback origin, and node approval could only be a CLI verb *because* "a page
+served by the coordinator cannot know who is looking at it"; not bolting a
+session onto the coordinator was correct then. The UI changes that. The cost
+is one per-deployment setup step per provider: registering
+`<public_url>/auth/<name>/callback` in its OAuth app. That step is required in
+any case — CLI login also completes in the browser — and the architecture
+(§6.4) says so.
 
 **The seam this uses already exists, by design.** `http.rs::decide_pending_node`
 takes an *already-resolved* subject precisely so a cookie-authenticated handler
-can call the same function as the CLI route. The web approval flow in
-[phase 2](#6-phased-plan) is that commitment being cashed in.
+can call the same function as the CLI route; the web approval flow
+(`/ui/approve`) does exactly that.
 
 **`redirect_uri` is derived from `public_url`, never from the request.** Not
 `Host`, not `X-Forwarded-Host`. The coordinator runs behind a reverse proxy
@@ -149,8 +138,8 @@ switcher** in the header and appends the chosen org to every call.
 
 `k` comes from a **dedicated secret** (`csrf_secret_path`, ≥ 32 bytes, written
 as `csrf.secret` by `coordinator init`), domain-separated by the app label.
-Revision 2 derived it from the capability-signing seed; the forgs switch gave it
-its own file so rotating one secret does not silently rotate the other. It is
+It is not derived from the capability-signing seed, so rotating one secret
+does not silently rotate the other. It is
 **not** a per-process random: that would log every open tab out on every
 restart. (A coordinator built without one — tests only — does get a random
 key; `fleet-bin` refuses to start without the file.)
@@ -230,9 +219,8 @@ the binary. No npm, no bundler, no TypeScript compile, no build step at all.**
   plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. No
   inline script, no CDN.
 
-**What shipped, and the four things the implementation had to decide** (phase 2;
-`crates/fleet-coordinator/src/assets.rs` carries the same notes at the call
-site):
+**Four implementation decisions** (`crates/fleet-coordinator/src/assets.rs`
+carries the same notes at the call site):
 
 1. **One tree hash, not per-file hashes.** Nothing hashes filenames at build
    time, because there is no build. Assets are served under
@@ -278,24 +266,22 @@ site):
 outgrows it, adding a bundled TypeScript build later does not move the API — the
 seam is the JSON contract, and the endpoints in §3 do not change.
 
-**CI.** The repository has **no `.github/workflows/` at all** today, and
-`docs/ci-github-actions.md` is the *consumer* workload-identity guide, not a
-build-pipeline document. So "how the frontend is built in CI" has nowhere to
-land — and with a zero-build frontend there is nothing to add. This is recorded
-rather than silently omitted, and phase 2 deliberately did **not** touch that
-file. If D3 is ever revisited, the revisit has to bring
+**CI.** `.github/workflows/ci.yml` builds the workspace and runs the
+coordinator and CLI test suites; with a zero-build frontend there is no
+frontend build step to add. If D3 is ever revisited, the revisit has to bring
 a pipeline with it: a bundled frontend means a build step whose output must be
 in the binary, which means either a checked-in artifact (drifts) or a `cargo
 build` that needs node (breaks the cross-compilation story in
-`docs/cross-compiling.md`).
+`docs/cross-compiling.md`). (`docs/ci-github-actions.md` is the *consumer*
+workload-identity guide, not a build-pipeline document.)
 
-The one wrinkle phase 2 *did* add: the frontend's unit tests
+The frontend's unit tests
 (`crates/fleet-coordinator/web-tests/*.test.mjs`, node's built-in runner, zero
 npm dependencies) want `node` on `PATH`. `tests/ui_js.rs` runs them when it is
 there and prints a loud skip when it is not, so neither `cargo build` nor `cargo
 test` requires a JavaScript toolchain — at the honest cost that on a machine
-without node that coverage silently disappears. **A pipeline that ever exists
-should install node**: one line, no npm, no network. Note also that
+without node that coverage silently disappears. The hosted runner `ci.yml`
+uses ships node, so CI runs them. Note also that
 `include_dir!` embeds the *whole* subtree, which is why those tests live in
 `web-tests/` beside `web/` rather than inside it — anything under `web/` ships in
 the binary and is publicly served.
@@ -318,7 +304,7 @@ member management (add, change role, remove).
   a holding/extending/expiring UI (heartbeats come from the sidecar; a browser
   tab that closes leaves a board held until TTL), a way to hand the lease to a
   sidecar, and a story for what a queued request looks like in a page that is
-  not polling. Phase 1 should not grow that. Deliberately unscheduled, not
+  not polling. Deliberately unscheduled, not
   refused forever.
 - **No data-plane or board console.** Nothing relays probe-rs traffic to a
   browser. That would mean a second relay ingress with a browser-shaped
@@ -459,8 +445,8 @@ what can be leased right now — so the Agents count is legitimately ≥ the Dev
 list, differing exactly by the declared-but-offline boards. The field carries no
 per-board presence; adding it would widen this payload for a display nicety.
 
-There is deliberately **no** `GET /api/v1/nodes/pending`. An earlier revision of
-this table had one; it is dropped, for the reason §4 now records:
+There is deliberately **no** `GET /api/v1/nodes/pending`, for the reason §4
+records:
 a pending row's namespace is `NULL` until an approval binds it, so there is no
 attribution to filter a listing on, and a member-visible list of live codes
 would be exactly the cross-tenant index §4 forbids. Approval stays code-driven.
@@ -632,10 +618,10 @@ rather than the shell, which is what makes a typo'd `import` surface as a broken
 import instead of as HTML parsed as JavaScript.
 
 `/node/approve` keeps its path because deployed agents print it. The page's
-"reflects nothing" property survived phase 2 intact: it grew a static paragraph
+"reflects nothing" property holds: it has a static paragraph
 linking to `/ui/approve`, where the same JSON endpoint is driven from a real
-form, and it still reads no query parameter and renders byte-identically
-whatever the query string. It did **not** grow the form itself — that would put
+form, and it reads no query parameter and renders byte-identically
+whatever the query string. The form itself is deliberately not there — that would put
 attacker-supplied text on an unauthenticated page.
 
 ---
@@ -768,99 +754,30 @@ not smuggled in with a UI.
 
 ---
 
-## 6. Phased plan
+## 6. Where it lives
 
-All four phases have shipped. The API phases (1a–1c below, tracked as tasks
-#3572/#3573/#3574) landed first, and the UI that consumes them landed as one
-deliverable (#3540) once every endpoint it needed existed — which is the order
-the fence below was designed to produce.
-
-**Phase 1 — read-only inventory.** *Shipped.* Login (D1), `/ui`, boards + leases
-+ nodes list, `GET /api/v1/session` / `org` / `org/members`, audit log for
-admins. **No mutating endpoint at all**, so the cookie, CSP and CSRF machinery
-shipped and got exercised before anything existed that could be abused through
-them.
-
-**Phase 2 — node management and pending approvals.** *Shipped.* `PATCH` /
-`DELETE` on nodes and `POST /api/v1/nodes/pending/{code}` — the §4.2 commitment
-cashed in, calling the existing `decide_pending_node`. (`/node/approve` growing
-a real form behind the session is *not* part of it: the browser approves through
-the JSON API, and that page stays informational and reflection-free.)
-
-**Phase 3 — grants and auth keys.** *Shipped.* The admin-gated,
-outward-pointing verbs, and the shown-once auth-key panel. Deliberately after
-phase 2: these are the two surfaces where a mistake hands hardware to someone
-else.
-
-**Phase 4 — board actions.** *Shipped.* Power-cycle, and admin release of
-someone else's lease.
-
-**Phase 5 — orgs and members.** *Shipped.* Self-service team-org creation
-(`POST /api/v1/orgs`, `can_create_orgs`) and admin member management
-(`POST`/`DELETE /api/v1/org/members`), with the CLI's `org create` / `org
-members` verbs alongside. Admins rename and delete team orgs
-(`POST /api/v1/org/rename`, `DELETE /api/v1/org`; CLI `org rename` / `org
-delete`).
+- **`crates/fleet-coordinator/src/api.rs`** — the `/api/v1/*` handlers. They
+  authenticate through forgs' `authenticate_request` with the cookie carrier
+  allowlisted for this prefix only, and call the same coordinator methods the
+  CLI's routes do.
+- **`crates/fleet-coordinator/src/identity.rs`** — the forgs `AuthContext`
+  (cookie brand, CSRF header, cookie prefix, post-login redirect) and fleet's
+  hooks.
+- **`crates/fleet-coordinator/src/http.rs`** — `/node/*`, including the
+  informational `GET /node/approve`; the browser approves through
+  `POST /api/v1/nodes/pending/{code}`, which calls the same
+  `decide_pending_node` and shares its membership check.
+- **`crates/fleet-coordinator/src/authz.rs`** — the authorization rules. If an
+  endpoint seems to need a new rule, that is the signal to re-read §6.5 of the
+  architecture, not to add one; node mutation (owner-or-admin) composes
+  `node_owner` with `is_org_admin` at the call site.
+- **`crates/fleet-coordinator/web/`** — the asset tree (D3), served by
+  `src/assets.rs`. A four-line `build.rs` emits `cargo:rerun-if-changed=web`
+  (`include_dir!` rebuilds on a file's *contents* changing but not on one being
+  added). The frontend's own tests live in `web-tests/`, **beside** `web/` and
+  not inside it, because `include_dir!` embeds and serves the whole subtree.
+- Any new dependency is bound by the cross-compilation constraint: `ring`, no C
+  toolchain, `armv7-musl` (see `docs/cross-compiling.md`).
 
 **Deliberately unscheduled:** lease acquisition, delegation, board console,
 and invites / join requests.
-
----
-
-## 7. Changes required in existing files
-
-Named so follow-up tasks could be scoped precisely; all of them have now been
-made. Retained as the record of what each phase was expected to touch — and, at
-the bottom, of the one item that was deliberately *not* touched. (The forgs
-switch later moved the login routes, cookies and CSRF out of `http.rs` /
-`browser_auth.rs` into forgs, and replaced the `[github]` table with
-`[[auth.providers]]`; the entries below describe the original UI work.)
-
-- **`crates/fleet-coordinator/src/http.rs`** — the new `/api/v1/*` and
-  `/auth/github/*` routes; a cookie-aware sibling of `authenticate_request`
-  (same `Subject` construction, one extra credential *carrier*, not a new
-  credential *kind*), with the carrier allowlisted per route; the CSRF
-  derivation and check. **The module doc's "please do not bolt a session onto
-  the coordinator" paragraph must be rewritten, not quietly contradicted.**
-  (`/node/approve` stays informational: the browser approves through
-  `POST /api/v1/nodes/pending/{code}`, which calls the same
-  `decide_pending_node` and shares its membership check.)
-- **`crates/fleet-coordinator/src/core.rs`** — operator methods (`list_boards`,
-  `who`, `logs`, `operator_power_cycle`, `grant_create`, `grant_list`,
-  `grant_revoke`, `release_lease`) become `pub(crate)`; new methods for node
-  list / update / delete-with-cascade and member list.
-- **`crates/fleet-coordinator/src/state.rs`** — new `OrgDb` queries for the
-  same: node listing / lookup by name / update / delete-with-board-cascade, and
-  member listing.
-- **`crates/fleet-coordinator/src/authz.rs`** — expected to need **no change**.
-  If an endpoint seems to need a new rule, that is the signal to re-read §6.5,
-  not to add one. The one genuinely new policy (node mutation = owner-or-admin)
-  composes `node_owner` with `is_org_admin` at the call site.
-- **`crates/fleet-coordinator/src/config.rs`** and **`examples/coordinator.toml`**
-  — a `[github]` addition enabling the browser callback (the operator asserting
-  that `<public_url>/auth/github/callback` is registered), which is what
-  `GET /api/v1/auth/methods` reports.
-- **`crates/fleet-coordinator/Cargo.toml`** — `include_dir`, plus whatever the
-  cookie/CSRF helper needs (`hmac` is already in the lock file transitively;
-  prefer reusing `sha2` over adding a cookie framework). The
-  cross-compilation constraint applies to any new dependency: `ring`, no C
-  toolchain, `armv7-musl` (see `docs/cross-compiling.md`).
-- **`crates/fleet-coordinator/web/`** — new asset tree (D3), plus
-  `src/assets.rs` to serve it and a four-line `build.rs` whose only job is
-  `cargo:rerun-if-changed=web` (`include_dir!` rebuilds on a file's *contents*
-  changing but not on one being added, and a contributor who hits that concludes
-  the embedding is broken). The frontend's own tests live in `web-tests/`,
-  **beside** `web/` and not inside it, because `include_dir!` embeds and serves
-  the whole subtree.
-- **`docs/ci-github-actions.md`** — deliberately **not** touched, and that is
-  the answer rather than an omission: it is the consumer workload-identity
-  guide, not a build-pipeline document, and this repository has no
-  `.github/workflows/` at all. The one CI-relevant fact the UI introduces — the
-  JavaScript tests want `node` while `cargo build` and `cargo test` never do —
-  is recorded in D3 above, in `src/assets.rs` and in `tests/ui_js.rs`.
-- **`docs/architecture.md`** — §3.5's route table, §6.2's carrier description,
-  and §6.4's "no callback origin is involved" paragraph, plus §4.2's "approval
-  is a CLI verb, not a browser form" note. Amendments the implementation must
-  carry; see D1.
-- **`crates/fleet-proto/src/admin.rs`** — only if a DTO needs a JSON-friendly
-  view. Prefer not to touch it: a view struct belongs in the coordinator.
