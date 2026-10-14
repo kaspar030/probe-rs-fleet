@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum AdoptPolicy {
     /// Adopt discovered probes automatically, with tags inferred from the
-    /// probe. The default for nodes created by `probe-rs-fleet share`: plug in
+    /// probe. The default for nodes created by `probefleet share`: plug in
     /// a board and it is usable.
     Auto,
     /// Report undeclared probes but keep them unleasable until they are

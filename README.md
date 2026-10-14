@@ -1,13 +1,13 @@
-# probe-rs-fleet
+# probefleet
 
-probe-rs-fleet shares embedded debug probes and the boards attached to them
+probefleet shares embedded debug probes and the boards attached to them
 across a team and its CI. Boards stay plugged into lab machines or Raspberry
 Pis; a central coordinator knows which boards exist, who may use them, and who
 holds one right now. A developer runs `probe-rs` as usual, and the fleet
 transparently leases a matching remote board, relays the session to it, and
 releases it afterwards. Build recipes such as laze need no changes.
 
-Everything ships as one binary, `probe-rs-fleet`, with the role chosen by
+Everything ships as one binary, `probefleet`, with the role chosen by
 subcommand. The coordinator schedules leases, relays probe traffic, and serves
 a web UI; it runs behind an HTTPS reverse proxy. A node runs next to the
 probes, dials out to the coordinator over WebSocket (no inbound ports), and
@@ -22,16 +22,16 @@ Codeberg, GitLab or any OIDC provider.
 
 ```sh
 # On the coordinator host (configure a login provider in coordinator.toml first):
-probe-rs-fleet coordinator init --public-url https://fleet.example
-probe-rs-fleet coordinator
+probefleet coordinator init --public-url https://fleet.example
+probefleet coordinator
 
 # On a machine with probes attached:
-probe-rs-fleet login --fleet-url https://fleet.example
-probe-rs-fleet node up
+probefleet login --fleet-url https://fleet.example
+probefleet node up
 
 # On any logged-in machine:
-probe-rs-fleet ctl list
-probe-rs-fleet ctl lease id=<board>
+probefleet ctl list
+probefleet ctl lease id=<board>
 ```
 
 `examples/coordinator.toml` documents the login provider setup and every

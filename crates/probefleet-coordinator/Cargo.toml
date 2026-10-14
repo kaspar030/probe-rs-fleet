@@ -12,7 +12,7 @@ readme = false
 # Package contents for crates.io: sources plus the assets embedded at compile
 # time (web UI, migrations) — no tests, fixtures or scratch dirs.
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE", "build.rs", "migrations/**", "web/**"]
-description = "Coordinator role implementation for probe-rs-fleet."
+description = "Coordinator role implementation for probefleet."
 
 [dependencies]
 probefleet-proto.workspace = true

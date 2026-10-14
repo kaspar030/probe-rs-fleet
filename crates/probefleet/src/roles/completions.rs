@@ -1,4 +1,4 @@
-//! `probe-rs-fleet completions <shell>` — tell the user how to turn completion
+//! `probefleet completions <shell>` — tell the user how to turn completion
 //! on.
 //!
 //! Completion itself is **dynamic** (see [`crate::completion`]): the shell
@@ -8,7 +8,7 @@
 //! editing somebody's `~/.bashrc` behind their back is not this program's
 //! business.
 //!
-//! `--print` emits the stub itself (what `COMPLETE=<shell> probe-rs-fleet`
+//! `--print` emits the stub itself (what `COMPLETE=<shell> probefleet`
 //! would print), for a packager who wants to ship it in
 //! `/usr/share/bash-completion/completions/`. That is explicitly the
 //! *discouraged* path — a shipped stub can drift out of step with the binary
@@ -22,7 +22,7 @@ use crate::cli::CompletionsArgs;
 use crate::completion::CompletionShell;
 
 /// The binary name the printed instructions refer to.
-const BIN: &str = "probe-rs-fleet";
+const BIN: &str = "probefleet";
 
 /// Print completion setup instructions, or the stub itself with `--print`.
 ///

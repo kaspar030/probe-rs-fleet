@@ -1,4 +1,4 @@
-//! `probe-rs-fleet node approve`: let a machine that printed a short code join
+//! `probefleet node approve`: let a machine that printed a short code join
 //! your org (architecture §4.2 rung 3, §6.4).
 //!
 //! # Why this is a CLI verb and not a web page
@@ -49,7 +49,7 @@ use crate::cli::NodeApproveArgs;
 use crate::fleet_config::{self, FleetFile};
 use crate::roles::node_setup;
 
-/// Run `probe-rs-fleet node approve <CODE>`.
+/// Run `probefleet node approve <CODE>`.
 ///
 /// # Errors
 ///
@@ -135,14 +135,14 @@ async fn session_for(
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
             "loading fleet config {} — log in first with \
-             `probe-rs-fleet login --fleet {fleet} --fleet-url <url>`",
+             `probefleet login --fleet {fleet} --fleet-url <url>`",
             fleet_path.display()
         )
     })?;
     anyhow::ensure!(
         file.user.is_some(),
         "fleet `{fleet}` has no [user] credential on this machine; \
-         run `probe-rs-fleet login --fleet {fleet}` first. Approving is an \
+         run `probefleet login --fleet {fleet}` first. Approving is an \
          authenticated act: the node joins *your* org."
     );
     let session = fleet_config::ensure_fresh_session(fleet, &file)
@@ -352,7 +352,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
             "you are not a member of the org you named (or your personal org), so you \
              cannot approve a node into it"
         }
-        "unauthorized" => "your session was refused. Log in again with `probe-rs-fleet login`",
+        "unauthorized" => "your session was refused. Log in again with `probefleet login`",
         _ => return anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {code}"),
     };
     anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {hint}")

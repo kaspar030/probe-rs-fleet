@@ -1,7 +1,7 @@
 //! The `sidecar` role: forward a probe-rs invocation through the fleet.
 //!
 //! Reached two ways (both funnel here): a `probe-rs` symlink (argv0 dispatch)
-//! or `probe-rs-fleet sidecar -- <args…>`. In both cases `probe_rs_args` holds
+//! or `probefleet sidecar -- <args…>`. In both cases `probe_rs_args` holds
 //! only the probe-rs arguments *after* the program name; we prepend a synthetic
 //! `probe-rs` program token to form the full argv that
 //! [`probefleet_sidecar::run_async`] expects (its parser treats `argv[0]` as the
@@ -10,7 +10,7 @@
 //! # Selecting the board
 //!
 //! The board selector normally comes from the environment
-//! (`PROBE_RS_FLEET_BOARD` / `_ID` / `_SELECT`), which is what laze and CI use.
+//! (`PROBEFLEET_BOARD` / `_ID` / `_SELECT`), which is what laze and CI use.
 //! The explicit subcommand additionally accepts `--board <MODEL>` /
 //! `--id <NAME>` / `--select <EXPR>`; a flag **beats** the environment and
 //! replaces *all three* selector variables (see
@@ -59,7 +59,7 @@ impl SelectorFlags {
     /// Validate a `--select` expression eagerly, so a typo names the *flag*.
     ///
     /// [`probefleet_sidecar::selector::resolve`] would reject it too, but its error
-    /// talks about `PROBE_RS_FLEET_SELECT`, which is confusing when the value
+    /// talks about `PROBEFLEET_SELECT`, which is confusing when the value
     /// came from the command line.
     fn validate(&self) -> Result<()> {
         if let Some(expr) = &self.select {
@@ -79,8 +79,8 @@ impl SelectorFlags {
 ///
 /// An explicit flag beats the environment, and *replaces all three* selector
 /// variables rather than adding another one — so `--select` alongside a stale
-/// `PROBE_RS_FLEET_BOARD` is not `AmbiguousSelector`, it is just the flag.
-/// Every other key (including `PROBE_RS_FLEET_CAPABILITY`) falls through
+/// `PROBEFLEET_BOARD` is not `AmbiguousSelector`, it is just the flag.
+/// Every other key (including `PROBEFLEET_CAPABILITY`) falls through
 /// untouched, so `resolve` still refuses a selector next to a capability token
 /// (`CapabilityWithSelector`): the board is inside the token.
 ///
@@ -129,7 +129,7 @@ pub async fn run(
     flags.validate()?;
 
     // Discover the coordinator endpoint + user credential from the selected
-    // fleet file (written by `probe-rs-fleet login`) and inject them into the
+    // fleet file (written by `probefleet login`) and inject them into the
     // process environment for any keys the user has NOT already set. This lets
     // one `login` configure both `ctl` and this shim.
     //
@@ -182,7 +182,7 @@ pub async fn run(
 /// build tool. The heaviest user of the fleet was the only one that could not
 /// keep its own credential alive.
 ///
-/// Both branches skip the round trip entirely when `PROBE_RS_FLEET_TOKEN` is
+/// Both branches skip the round trip entirely when `PROBEFLEET_TOKEN` is
 /// already set: an explicit env token wins at `set_env_if_absent` anyway, so
 /// renewing a credential we would then discard is pure churn.
 ///
@@ -193,11 +193,11 @@ async fn resolve_client_config(fleet: &str) -> Option<(String, String, Option<St
     let file = crate::fleet_config::load_named_opt(fleet)?;
     let pin = file.server_cert_sha256.clone();
 
-    // An explicit `PROBE_RS_FLEET_TOKEN` wins anyway (`set_env_if_absent`), so
+    // An explicit `PROBEFLEET_TOKEN` wins anyway (`set_env_if_absent`), so
     // renewing for a token we would then discard is pure churn — and it would
     // make every shim invocation on a machine with an exported token do a round
     // trip for nothing.
-    let token_already_set = std::env::var_os("PROBE_RS_FLEET_TOKEN").is_some_and(|v| !v.is_empty());
+    let token_already_set = std::env::var_os("PROBEFLEET_TOKEN").is_some_and(|v| !v.is_empty());
 
     if let Some(user) = file.user.as_ref() {
         if token_already_set {
@@ -254,10 +254,10 @@ fn inject_client_config_env(resolved: Option<&(String, String, Option<String>)>)
         return;
     };
 
-    set_env_if_absent("PROBE_RS_FLEET_COORDINATOR", url);
-    set_env_if_absent("PROBE_RS_FLEET_TOKEN", token);
+    set_env_if_absent("PROBEFLEET_COORDINATOR", url);
+    set_env_if_absent("PROBEFLEET_TOKEN", token);
     if let Some(pin) = pin {
-        set_env_if_absent("PROBE_RS_FLEET_SERVER_CERT_SHA256", pin);
+        set_env_if_absent("PROBEFLEET_SERVER_CERT_SHA256", pin);
     }
 }
 
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn set_env_if_absent_respects_existing_value() {
-        let key = "PROBE_RS_FLEET_TEST_INJECT_EXISTING";
+        let key = "PROBEFLEET_TEST_INJECT_EXISTING";
         // SAFETY of correctness: a unique key only this test touches.
         std::env::set_var(key, "user-set");
         set_env_if_absent(key, "injected");
@@ -325,7 +325,7 @@ mod tests {
 
     #[test]
     fn set_env_if_absent_sets_when_unset() {
-        let key = "PROBE_RS_FLEET_TEST_INJECT_UNSET";
+        let key = "PROBEFLEET_TEST_INJECT_UNSET";
         std::env::remove_var(key);
         set_env_if_absent(key, "injected");
         assert_eq!(std::env::var(key).unwrap(), "injected");
@@ -350,7 +350,7 @@ mod tests {
         }
     }
 
-    /// A credential environment with `PROBE_RS_FLEET_SELECT` set, so `resolve`
+    /// A credential environment with `PROBEFLEET_SELECT` set, so `resolve`
     /// gets past the coordinator / token checks and down to the selector.
     const ENV_WITH_SELECT: [(&str, &str); 3] = [
         (env::COORDINATOR, "https://fleet.example"),
@@ -403,7 +403,7 @@ mod tests {
     }
 
     /// `--board` is the **model** selector, matching the `board=` term and
-    /// `PROBE_RS_FLEET_BOARD`.
+    /// `PROBEFLEET_BOARD`.
     #[test]
     fn board_flag_selects_a_model() {
         let flags = SelectorFlags::new(Some("nrf52840dk".to_owned()), None, None);
@@ -415,7 +415,7 @@ mod tests {
         );
     }
 
-    /// `--id` is the instance selector, and beats a stale `PROBE_RS_FLEET_ID`.
+    /// `--id` is the instance selector, and beats a stale `PROBEFLEET_ID`.
     #[test]
     fn id_flag_selects_one_board_and_beats_the_env() {
         const ENV_WITH_ID: [(&str, &str); 3] = [
@@ -509,7 +509,7 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("--select"), "{msg}");
-        assert!(!msg.contains("PROBE_RS_FLEET_SELECT"), "{msg}");
+        assert!(!msg.contains("PROBEFLEET_SELECT"), "{msg}");
     }
 
     /// `sidecar --select '*'` is its own surface (its error names the *flag*,

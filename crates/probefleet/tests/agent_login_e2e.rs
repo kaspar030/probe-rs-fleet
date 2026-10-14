@@ -1,9 +1,9 @@
-//! `probe-rs-fleet agent login` end to end, through the CLI's own code paths.
+//! `probefleet agent login` end to end, through the CLI's own code paths.
 //!
 //! The story this task exists for: a persistent sandbox with concurrent users
 //! is handed a `--purpose agent --as <name> --multi-use` key once, and from
 //! then on holds a **self-renewing** fleet session — no cron job, no hourly
-//! `eval "$(probe-rs-fleet ci login …)"`, and no per-process wrapper.
+//! `eval "$(probefleet ci login …)"`, and no per-process wrapper.
 //!
 //! Modelled on `auth_key_e2e.rs` + `ci_e2e.rs`: an in-process coordinator on
 //! loopback, driving the role functions rather than a subprocess. Everything

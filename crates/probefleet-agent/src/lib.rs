@@ -1,4 +1,4 @@
-//! Agent role implementation for probe-rs-fleet (the Raspberry Pi side).
+//! Agent role implementation for probefleet (the Raspberry Pi side).
 //!
 //! The agent owns the locally attached probes. It reconciles discovered probes
 //! against an agent-local `boards.toml` (architecture §8), dials **out** to the

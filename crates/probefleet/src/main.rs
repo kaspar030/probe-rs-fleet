@@ -1,4 +1,4 @@
-//! Single multi-role binary for probe-rs-fleet.
+//! Single multi-role binary for probefleet.
 //!
 //! One binary, four roles selected by clap subcommand —
 //! `coordinator`, `agent`, `sidecar`, `ctl` (see `docs/architecture.md` §2).

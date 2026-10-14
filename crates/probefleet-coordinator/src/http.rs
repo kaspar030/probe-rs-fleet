@@ -428,13 +428,13 @@ const NODE_APPROVE_PAGE: &str = concat!(
     "<p>A machine has asked to join a fleet org as a node, and printed a short\n",
     "code on its own terminal. Approving happens from a machine where you are\n",
     "already logged in:</p>\n",
-    "<pre>probe-rs-fleet node approve &lt;your code&gt;</pre>\n",
+    "<pre>probefleet node approve &lt;your code&gt;</pre>\n",
     "<p>It will show you the machine&#39;s requested name, tags and source\n",
     "address, and ask you to confirm. Approve only if you started that\n",
     "enrollment: approving grants the machine access to hardware in your org,\n",
     "and you cannot see it from here.</p>\n",
     "<p>Not logged in yet?</p>\n",
-    "<pre>probe-rs-fleet login</pre>\n",
+    "<pre>probefleet login</pre>\n",
     "<p>Or approve it in the web UI: <a href=\"/ui/approve\">/ui/approve</a></p>\n",
     "<p>This page is informational: nothing you do here approves anything.</p>\n",
     "</body>\n</html>\n",
@@ -821,7 +821,7 @@ async fn node_enroll(
 }
 
 /// `POST /node/self-register` — register the calling machine as a node of
-/// an org the session user is a member of (`probe-rs-fleet share`).
+/// an org the session user is a member of (`probefleet share`).
 ///
 /// **Self-approving: membership is sufficient**, and checked. The audit
 /// subject is the user, whose authority created the node.

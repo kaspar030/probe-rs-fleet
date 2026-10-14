@@ -1,4 +1,4 @@
-//! Core domain types and shared logic for probe-rs-fleet.
+//! Core domain types and shared logic for probefleet.
 //!
 //! This crate is the pure heart of the fleet: domain types plus the
 //! deterministic lease [`Scheduler`]. It performs no I/O, no async, and never

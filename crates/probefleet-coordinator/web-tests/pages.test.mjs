@@ -247,7 +247,7 @@ test('the selector is the canonical string a CLI would send', () => {
   assert.equal(access.selectorString([{ kind: 'tag', value: '  ' }]), '');
   // A CI repo grantee needs the prefix `resolve_grantee` matches; a bare
   // owner/name resolves to nothing at all.
-  assert.equal(access.granteeString('repo', 'ariel-os/probe-rs-fleet'), 'repo:ariel-os/probe-rs-fleet');
+  assert.equal(access.granteeString('repo', 'kaspar030/probefleet'), 'repo:kaspar030/probefleet');
   assert.equal(access.granteeString('login', 'alice'), 'alice');
 });
 

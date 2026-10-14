@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 readme = false
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
-description = "Sidecar role implementation for probe-rs-fleet."
+description = "Sidecar role implementation for probefleet."
 
 [dependencies]
 probefleet-proto = { workspace = true }

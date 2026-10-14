@@ -2,7 +2,7 @@
 //! `auth-key-revoke`, `user-token` and `org create`.
 //!
 //! All of them work from a shell on the coordinator host, bypassing the login
-//! flow. Now that `probe-rs-fleet login`, `share` and `auth-key create` exist
+//! flow. Now that `probefleet login`, `share` and `auth-key create` exist
 //! they are the **unattended / air-gapped escape hatch**, not the front door.
 //! They stay for the self-hosted operator, for the air-gapped case, and for
 //! the one thing the API refuses — a key that never expires, including a
@@ -73,7 +73,7 @@ impl Admin {
             .context("resolving the org")?
             .with_context(|| {
                 format!(
-                    "no org `{raw}`; create it with `probe-rs-fleet coordinator org create \
+                    "no org `{raw}`; create it with `probefleet coordinator org create \
                      {raw} --admin <username>`"
                 )
             })?;
@@ -130,8 +130,8 @@ pub async fn auth_key(args: AuthKeyArgs) -> Result<()> {
     warn!(
         "`coordinator auth-key` mints a node-enrollment credential from a shell \
          on this host. It is the self-hosted / air-gapped escape hatch, not the \
-         normal path: a member with a login runs `probe-rs-fleet auth-key \
-         create`, and a machine with a login runs `probe-rs-fleet share`."
+         normal path: a member with a login runs `probefleet auth-key \
+         create`, and a machine with a login runs `probefleet share`."
     );
 
     // Everything that can be judged from the arguments alone is judged *before*
@@ -285,7 +285,7 @@ fn print_auth_key(
     println!();
     if purpose == PURPOSE_CI {
         println!("Use it on a CI runner with no workload identity of its own:");
-        println!("  probe-rs-fleet ci login --fleet-url <url> --auth-key <key>");
+        println!("  probefleet ci login --fleet-url <url> --auth-key <key>");
         println!();
         println!("Redeeming it creates a GRANT in this org selecting the tagged boards,");
         println!("so revoking the key also tears down whatever it is holding — not just");
@@ -306,7 +306,7 @@ fn print_auth_key(
         println!("hash). Copy it now; anyone holding it can use it.");
     } else {
         println!("Enroll a node with it:");
-        println!("  probe-rs-fleet node up --fleet-url <url> --auth-key <key>");
+        println!("  probefleet node up --fleet-url <url> --auth-key <key>");
         println!();
         println!("This key is a bearer credential and is not stored anywhere (only its");
         println!("hash). Copy it now; anyone holding it can enroll a node into this org.");
@@ -376,7 +376,7 @@ pub async fn auth_keys(args: crate::cli::AuthKeysArgs) -> Result<()> {
     }
     println!();
     println!("Revoke one with:");
-    println!("  probe-rs-fleet coordinator auth-key-revoke <hash-prefix> --org {org}");
+    println!("  probefleet coordinator auth-key-revoke <hash-prefix> --org {org}");
     if keys.iter().any(|k| k.subject_name.is_some()) {
         println!();
         println!("Keys sharing an IDENTITY share ONE grant, so revoking any one of them takes");
@@ -492,7 +492,7 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     warn!(
         "`coordinator user-token` mints a session from a shell on this host, \
          bypassing any login flow. It is the air-gapped / bootstrap escape hatch; \
-         `probe-rs-fleet login` is the front door."
+         `probefleet login` is the front door."
     );
 
     let admin = open(args.config_dir).await?;
@@ -554,12 +554,12 @@ pub async fn user_token(args: UserTokenArgs) -> Result<()> {
     println!("  {refresh}");
     println!();
     println!("Point `ctl` and the probe-rs shim at the fleet with both:");
-    println!("  probe-rs-fleet login --fleet-url <url> \\");
+    println!("  probefleet login --fleet-url <url> \\");
     println!("      --token <session token> --refresh-token <refresh token> --org {org}");
     println!();
     println!("The refresh token can do exactly one thing: mint session tokens for this");
     println!("user. It opens no connection and enrolls nothing, and");
-    println!("`probe-rs-fleet logout --all` revokes it.");
+    println!("`probefleet logout --all` revokes it.");
     println!();
     println!("Both are bearer credentials and are not stored anywhere (only their");
     println!("hashes). Copy them now.");

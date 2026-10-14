@@ -1,4 +1,4 @@
-//! `probe-rs-fleet logout`: revoke this machine's fleet credentials.
+//! `probefleet logout`: revoke this machine's fleet credentials.
 //!
 //! # Why this verb exists
 //!
@@ -40,7 +40,7 @@ use anyhow::{Context, Result};
 use crate::cli::LogoutArgs;
 use crate::fleet_config;
 
-/// Run `probe-rs-fleet logout`.
+/// Run `probefleet logout`.
 ///
 /// # Errors
 ///
@@ -116,7 +116,7 @@ pub async fn run(args: LogoutArgs) -> Result<()> {
     }
     if !all {
         println!();
-        println!("If a machine was lost, revoke everywhere: probe-rs-fleet logout --all");
+        println!("If a machine was lost, revoke everywhere: probefleet logout --all");
     }
     Ok(())
 }

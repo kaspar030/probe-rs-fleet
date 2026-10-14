@@ -3,7 +3,7 @@
 The fleet **agent** runs on Raspberry Pis. Many Pis are 32-bit ARMv7 (Pi 2,
 older 3) and/or run musl-based distros (Alpine), for which **probe-rs ships no
 prebuilt binary** (upstream releases cover only `x86_64`/`aarch64` **gnu**). So
-both `probe-rs-fleet` and `probe-rs` itself must be cross-compiled.
+both `probefleet` and `probe-rs` itself must be cross-compiled.
 
 Verified target: **Raspberry Pi 2 Model B, Alpine 3.23, `armv7l` / musl**, with
 an nRF52840-DK (SEGGER J-Link) attached.
@@ -25,7 +25,7 @@ export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-Ctarget-feature=+
 cargo build -p probefleet --release --target armv7-unknown-linux-musleabihf
 ```
 
-Produces a **statically linked** `probe-rs-fleet`. Copy it (and a
+Produces a **statically linked** `probefleet`. Copy it (and a
 cross-built `probe-rs`, below) to the Pi.
 
 ## Why `ring`, not `aws-lc-rs`
@@ -127,7 +127,7 @@ export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUSTFLAGS="-Ctarget-feature=+
 
 cargo build -p probefleet --release --target armv7-unknown-linux-musleabihf
 
-file target/armv7-unknown-linux-musleabihf/release/probe-rs-fleet
+file target/armv7-unknown-linux-musleabihf/release/probefleet
 #   ELF 32-bit LSB executable, ARM, EABI5 … statically linked
 
 # The regression check that matters. Expect NO output:

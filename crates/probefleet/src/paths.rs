@@ -7,7 +7,7 @@
 //! with **one file per fleet**:
 //!
 //! ```text
-//! ~/.config/probe-rs-fleet/
+//! ~/.config/probefleet/
 //!   fleets/<name>.toml     # url, pin, optional [user], optional [node]
 //!   node/                  # node-local, non-credential settings
 //!     node.toml
@@ -25,12 +25,12 @@
 //! The two credentials stay in **separate tables and are never merged**: a
 //! compromised Pi must not be equivalent to a compromised user.
 //!
-//! Selection precedence: `--fleet <name>` > `PROBE_RS_FLEET` > [`DEFAULT_FLEET`].
+//! Selection precedence: `--fleet <name>` > `PROBEFLEET` > [`DEFAULT_FLEET`].
 //!
-//! - **config root** → `$XDG_CONFIG_HOME/probe-rs-fleet/`
-//!   (default `~/.config/probe-rs-fleet/`)
-//! - **data root** → `$XDG_DATA_HOME/probe-rs-fleet/`
-//!   (default `~/.local/share/probe-rs-fleet/`)
+//! - **config root** → `$XDG_CONFIG_HOME/probefleet/`
+//!   (default `~/.config/probefleet/`)
+//! - **data root** → `$XDG_DATA_HOME/probefleet/`
+//!   (default `~/.local/share/probefleet/`)
 //!
 //! Resolution is delegated to the [`directories`] crate, which honours the XDG
 //! Base Directory environment variables on Linux and falls back to the
@@ -41,20 +41,20 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use directories::{BaseDirs, ProjectDirs};
 
-/// The fleet selected when neither `--fleet` nor `PROBE_RS_FLEET` is set.
+/// The fleet selected when neither `--fleet` nor `PROBEFLEET` is set.
 pub const DEFAULT_FLEET: &str = "default";
 
 /// Application qualifier / organisation / name used to derive the project dirs.
 ///
-/// On Linux `ProjectDirs::from("", "", "probe-rs-fleet")` yields
-/// `~/.config/probe-rs-fleet` and `~/.local/share/probe-rs-fleet`, matching the
+/// On Linux `ProjectDirs::from("", "", "probefleet")` yields
+/// `~/.config/probefleet` and `~/.local/share/probefleet`, matching the
 /// XDG paths documented above.
 fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("", "", "probe-rs-fleet")
+    ProjectDirs::from("", "", "probefleet")
         .context("could not determine a home directory for XDG config/data paths")
 }
 
-/// The fleet config root: `$XDG_CONFIG_HOME/probe-rs-fleet/`.
+/// The fleet config root: `$XDG_CONFIG_HOME/probefleet/`.
 ///
 /// # Errors
 ///
@@ -63,7 +63,7 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(project_dirs()?.config_dir().to_path_buf())
 }
 
-/// The fleet data root: `$XDG_DATA_HOME/probe-rs-fleet/`.
+/// The fleet data root: `$XDG_DATA_HOME/probefleet/`.
 ///
 /// # Errors
 ///
@@ -285,42 +285,42 @@ mod tests {
 
         assert_eq!(
             config_dir().unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet")
+            PathBuf::from("/tmp/fleet-xdg-config/probefleet")
         );
         assert_eq!(
             data_dir().unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-data/probe-rs-fleet")
+            PathBuf::from("/tmp/fleet-xdg-data/probefleet")
         );
 
         // The coordinator keeps its own subdirectory: it is a host-level daemon,
         // not a per-fleet client.
         assert_eq!(
             coordinator_config_path().unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/coordinator/coordinator.toml")
+            PathBuf::from("/tmp/fleet-xdg-config/probefleet/coordinator/coordinator.toml")
         );
         assert_eq!(
             coordinator_data_dir().unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-data/probe-rs-fleet/coordinator")
+            PathBuf::from("/tmp/fleet-xdg-data/probefleet/coordinator")
         );
 
         // One file per fleet.
         assert_eq!(
             fleet_config_path("default").unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/fleets/default.toml")
+            PathBuf::from("/tmp/fleet-xdg-config/probefleet/fleets/default.toml")
         );
         assert_eq!(
             fleet_config_path("lab1").unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/fleets/lab1.toml")
+            PathBuf::from("/tmp/fleet-xdg-config/probefleet/fleets/lab1.toml")
         );
 
         // Node-local settings are not per-fleet.
         assert_eq!(
             node_boards_path().unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/node/boards.toml")
+            PathBuf::from("/tmp/fleet-xdg-config/probefleet/node/boards.toml")
         );
         assert_eq!(
             node_config_path().unwrap(),
-            PathBuf::from("/tmp/fleet-xdg-config/probe-rs-fleet/node/node.toml")
+            PathBuf::from("/tmp/fleet-xdg-config/probefleet/node/node.toml")
         );
 
         match prev_config {

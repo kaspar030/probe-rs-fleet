@@ -7,7 +7,7 @@
 //!
 //! * the selected **fleet file**'s `[node]` table — the credential, the node id
 //!   and the coordinator's token-signing pubkey (0600);
-//! * `~/.config/probe-rs-fleet/node/node.toml` — the machine's own settings
+//! * `~/.config/probefleet/node/node.toml` — the machine's own settings
 //!   (boards path, heartbeat, erase-on-release), which are true of the machine
 //!   whichever fleet it belongs to.
 //!
@@ -224,16 +224,16 @@ pub async fn run(fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
             "loading fleet config {} — register this node with \
-             `probe-rs-fleet node up --fleet {fleet}` (after `login`), or \
-             `probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>`",
+             `probefleet node up --fleet {fleet}` (after `login`), or \
+             `probefleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>`",
             fleet_path.display()
         )
     })?;
     let node = file.node.clone().with_context(|| {
         format!(
             "fleet `{fleet}` has no [node] credential on this machine; run \
-             `probe-rs-fleet share --fleet {fleet}` (if you have logged in), or \
-             `probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>`"
+             `probefleet share --fleet {fleet}` (if you have logged in), or \
+             `probefleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>`"
         )
     })?;
 
@@ -266,8 +266,7 @@ pub async fn run(fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
 
     // The node's probe-rs backend spawns `probe-rs` server processes and
     // writes their socket/config files under a per-process runtime directory.
-    let runtime_dir =
-        std::env::temp_dir().join(format!("probe-rs-fleet-agent-{}", std::process::id()));
+    let runtime_dir = std::env::temp_dir().join(format!("probefleet-agent-{}", std::process::id()));
     let backend = Arc::new(ProcessBackend::new(runtime_dir));
 
     let node =

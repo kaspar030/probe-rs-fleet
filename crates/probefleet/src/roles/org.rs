@@ -1,4 +1,4 @@
-//! `probe-rs-fleet org {create,list,members,rename,delete}`: self-service team orgs and
+//! `probefleet org {create,list,members,rename,delete}`: self-service team orgs and
 //! their membership, with the login you already have.
 //!
 //! Before this existed a team org could only be made from a shell on the
@@ -69,7 +69,7 @@ struct SessionBody {
     memberships: Vec<Membership>,
 }
 
-/// Run `probe-rs-fleet org <verb>`: do the work, then print it.
+/// Run `probefleet org <verb>`: do the work, then print it.
 ///
 /// # Errors
 ///
@@ -82,8 +82,8 @@ pub async fn run(args: OrgCliArgs) -> Result<()> {
             let name = created.name.as_deref().unwrap_or(&created.id);
             println!("Created org '{name}' ({}); you are its admin.", created.id);
             println!();
-            println!("Act in it with `--org {name}` (or `probe-rs-fleet login --org {name}`).");
-            println!("Add people with `probe-rs-fleet org members add <username> --org {name}`.");
+            println!("Act in it with `--org {name}` (or `probefleet login --org {name}`).");
+            println!("Add people with `probefleet org members add <username> --org {name}`.");
         }
         OrgCliCommand::List(args) => {
             let (orgs, acting) = list(&args).await?;
@@ -331,15 +331,15 @@ async fn session(args: &OrgSessionArgs) -> Result<OrgContext> {
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
             "loading fleet config {} — log in first with \
-             `probe-rs-fleet login --fleet {fleet} --fleet-url <url>`",
+             `probefleet login --fleet {fleet} --fleet-url <url>`",
             fleet_path.display()
         )
     })?;
     anyhow::ensure!(
         file.user.is_some(),
         "fleet `{fleet}` has no [user] credential on this machine; \
-         run `probe-rs-fleet login --fleet {fleet}` first. \
-         (With a shell on the coordinator host, `probe-rs-fleet coordinator \
+         run `probefleet login --fleet {fleet}` first. \
+         (With a shell on the coordinator host, `probefleet coordinator \
          org create` is the self-hosted escape hatch.)"
     );
     let session = fleet_config::ensure_fresh_session(fleet, &file)
@@ -405,7 +405,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         }
         "org_creation_disabled" => {
             "this coordinator does not allow creating orgs over the API; ask its \
-             operator (`probe-rs-fleet coordinator org create` on the host)"
+             operator (`probefleet coordinator org create` on the host)"
         }
         "personal_org" => {
             "your personal org follows your username; it cannot be renamed or \
@@ -414,7 +414,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         "org_not_empty" => {
             "the org still has hardware or sharing. Remove its nodes (web UI, \
              Devices page), release its leases and revoke its grants \
-             (`probe-rs-fleet grant revoke`) first"
+             (`probefleet grant revoke`) first"
         }
         "org_limit_reached" => {
             "you have created as many orgs as this coordinator allows \
@@ -423,7 +423,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         "invalid_request" | "bad_request" => {
             "the request was refused as malformed (check the role: member or admin)"
         }
-        "unauthorized" => "your session was refused. Log in again with `probe-rs-fleet login`",
+        "unauthorized" => "your session was refused. Log in again with `probefleet login`",
         _ => return anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {code}"),
     };
     anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {hint}")

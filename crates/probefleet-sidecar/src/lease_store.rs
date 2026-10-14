@@ -2,7 +2,7 @@
 //!
 //! [`crate::lease_cache`] is pure logic with an injected clock and deliberately
 //! no persistence. This module is the persistence layer layered *on top* of it:
-//! a small JSON file under `$XDG_RUNTIME_DIR/probe-rs-fleet/leases.json` that
+//! a small JSON file under `$XDG_RUNTIME_DIR/probefleet/leases.json` that
 //! lets successive `probe-rs` invocations reuse one lease instead of leasing and
 //! releasing on every command (architecture §6.6). The validity/expiry
 //! judgement itself is still `lease_cache`'s — a loaded record is fed through
@@ -170,7 +170,7 @@ mod unix_imp {
     const FORMAT_VERSION: u32 = 3;
 
     /// The runtime sub-directory everything lives in.
-    const DIR_NAME: &str = "probe-rs-fleet";
+    const DIR_NAME: &str = "probefleet";
 
     /// The store file, inside [`DIR_NAME`].
     const FILE_NAME: &str = "leases.json";
@@ -562,7 +562,7 @@ mod unix_imp {
         )
     }
 
-    /// Resolve the runtime directory: `$XDG_RUNTIME_DIR/probe-rs-fleet`, or a
+    /// Resolve the runtime directory: `$XDG_RUNTIME_DIR/probefleet`, or a
     /// uid-scoped fallback under the system temp directory when it is unset
     /// (some CI images and bare `su` sessions have no runtime dir).
     fn runtime_dir(env: &impl EnvSource) -> PathBuf {

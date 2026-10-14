@@ -1,4 +1,4 @@
-//! Client-side TLS trust configuration for probe-rs-fleet.
+//! Client-side TLS trust configuration for probefleet.
 //!
 //! Architecture revision 2 (§3.5, §6.2) deletes the private CA: there are no
 //! client certificates, no CSRs, no fingerprint pinning of *agents*. Connection

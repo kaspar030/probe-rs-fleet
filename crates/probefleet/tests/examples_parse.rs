@@ -80,7 +80,7 @@ fn the_fleet_example_states_the_agent_tables_two_preconditions() {
     // laxer fallback would make this check pass on prose that had lost the
     // rule entirely.
     assert!(
-        text.contains("`probe-rs-fleet ci login` writes\n# NOTHING here"),
+        text.contains("`probefleet ci login` writes\n# NOTHING here"),
         "the shipped example must keep stating that `ci login` persists nothing"
     );
     assert!(

@@ -1,4 +1,4 @@
-# probe-rs-fleet — Architecture
+# probefleet — Architecture
 
 Status: **accepted; scaffolding**. The system is single-stack postcard-rpc for
 both data and control planes (§3), carried over WebSocket behind an HTTPS
@@ -57,7 +57,7 @@ Key constraints that drove this shape:
 - **One host may hold several roles at once.** A laptop is routinely both a
   *user* (leasing fleet boards) and a *node* (offering its own probes). The
   credential model must express that without two disjoint enrollments (§6.4).
-- **Single multi-role binary** (`probe-rs-fleet`), role chosen by subcommand:
+- **Single multi-role binary** (`probefleet`), role chosen by subcommand:
   `node`, `coordinator`, `sidecar`, `ctl`, plus the user verbs `login`,
   `share`, `grant`.
 
@@ -221,11 +221,11 @@ Does **not** touch USB.
 #### Config & scaffolding (`coordinator init`)
 
 The coordinator reads a TOML config, discovered at the XDG path
-`~/.config/probe-rs-fleet/coordinator/coordinator.toml`; `--config` /
-`PROBE_RS_FLEET_CONFIG` override it. Generated key material and the SQLite
-database default to `~/.local/share/probe-rs-fleet/coordinator/`.
+`~/.config/probefleet/coordinator/coordinator.toml`; `--config` /
+`PROBEFLEET_CONFIG` override it. Generated key material and the SQLite
+database default to `~/.local/share/probefleet/coordinator/`.
 
-`probe-rs-fleet coordinator init` scaffolds a ready-to-run coordinator:
+`probefleet coordinator init` scaffolds a ready-to-run coordinator:
 
 - generates a fresh ed25519 capability-token signing seed
   (`signing.seed`, 64 hex chars, `0600`);
@@ -245,7 +245,7 @@ It generates no CA, server cert or server key: TLS is the reverse proxy's job
 
 Minting an API key **does not require a shell on the coordinator host**: any
 org member mints one with
-`probe-rs-fleet auth-key create [--org O]`, authenticated by their `[user]` session. The
+`probefleet auth-key create [--org O]`, authenticated by their `[user]` session. The
 `coordinator auth-key` / `auth-keys` / `auth-key-revoke` verbs remain for the
 self-hosted operator, for the air-gapped case, and for the one thing the API
 refuses — a key that never expires. `coordinator auth-key` takes the same
@@ -261,7 +261,7 @@ node (the laptop dual-role case, §6.4) holds both credentials in one file,
 told the coordinator address and trust material once:
 
 ```
-~/.config/probe-rs-fleet/fleets/<name>.toml
+~/.config/probefleet/fleets/<name>.toml
 ```
 
 ```toml
@@ -299,7 +299,7 @@ login.
 A laptop that both consumes and provides simply has **both tables**. A headless
 Pi has only `[node]`. A CI runner has neither (it exchanges a workload token per
 job). A persistent sandbox has `[agent]` (§6.7). `--fleet <name>` /
-`PROBE_RS_FLEET` select among several fleets; `default`
+`PROBEFLEET` select among several fleets; `default`
 is used otherwise. Credentials are stored `0600`; the two tokens stay **distinct**
 by design (§6.4).
 
@@ -307,15 +307,15 @@ There is no separate `agent.toml` / `client.toml`: `AgentConfig` is not a file
 format at all; the `node run` role assembles it from the fleet file's `[node]`
 table plus node-local settings.
 
-Node-local, non-credential settings live in `~/.config/probe-rs-fleet/node/`
+Node-local, non-credential settings live in `~/.config/probefleet/node/`
 (`node.toml` for boards path / heartbeat / erase-on-release, `boards.toml` for
 the inventory). They describe the *machine*, not the fleet, so they are not
 per-fleet and are not duplicated when a machine joins a second one.
 
-The credential env var is a single `PROBE_RS_FLEET_TOKEN`; the selector
-vars are `PROBE_RS_FLEET_BOARD` (a board **model**), `PROBE_RS_FLEET_ID` and
-`PROBE_RS_FLEET_SELECT` (`sidecar --board` / `--id` / `--select` override
-them, §7). `PROBE_RS_FLEET` selects a fleet by name.
+The credential env var is a single `PROBEFLEET_TOKEN`; the selector
+vars are `PROBEFLEET_BOARD` (a board **model**), `PROBEFLEET_ID` and
+`PROBEFLEET_SELECT` (`sidecar --board` / `--id` / `--select` override
+them, §7). `PROBEFLEET` selects a fleet by name.
 
 **Writers are read-modify-write plus atomic rename.** A laptop has two
 independent writers — `login` refreshing `[user]`, a running agent persisting a
@@ -349,16 +349,16 @@ every node.
 
 ```sh
 # 1. On the coordinator host: scaffold signing key, CSRF secret + config.
-probe-rs-fleet coordinator init --public-url https://fleet.example.com
+probefleet coordinator init --public-url https://fleet.example.com
 #    Register an OAuth app with any provider (GitHub, Codeberg, GitLab, OIDC)
 #    whose callback is <public_url>/auth/<name>/callback, add it as an
 #    [[auth.providers]] entry in coordinator.toml, then start the
 #    coordinator behind your HTTPS reverse proxy.
-probe-rs-fleet coordinator
+probefleet coordinator
 
 # 2. On your laptop: log in. Opens a browser (or prints a URL + code when
 #    headless); log in with any provider, choose a username the first time.
-probe-rs-fleet login --fleet-url https://fleet.example.com
+probefleet login --fleet-url https://fleet.example.com
 #    → personal org created at signup; session cached in fleets/default.toml
 
 # 2b. Optional: a team org. Any logged-in user can create one and becomes its
@@ -366,43 +366,43 @@ probe-rs-fleet login --fleet-url https://fleet.example.com
 #     coordinator.toml); add colleagues once they have logged in once.
 #     `coordinator org create <name> --admin <user>` on the host is the
 #     escape hatch and ignores both keys.
-probe-rs-fleet org create lab
-probe-rs-fleet org members add alice --org lab --role member
+probefleet org create lab
+probefleet org members add alice --org lab --role member
 #     Admins can later rename or delete it (an empty org only):
-#     probe-rs-fleet org rename lab2 --org lab
-#     probe-rs-fleet org delete --org lab2
+#     probefleet org rename lab2 --org lab
+#     probefleet org delete --org lab2
 
 # 3. Offer this machine's probes to the fleet. No token, no out-of-band step:
 #    it reuses the session from step 2.
-probe-rs-fleet share
+probefleet share
 
 # 4. Use the fleet.
-probe-rs-fleet ctl list
-probe-rs-fleet ctl lease 'tag=nrf52'
+probefleet ctl list
+probefleet ctl lease 'tag=nrf52'
 
 # 5. A headless Pi in the lab: prints a URL + code; a colleague approves it
 #    from a machine where they are logged in.
-#      probe-rs-fleet node up --fleet-url <url>       (on the Pi)
-#      probe-rs-fleet node approve ABCD-1234           (on their laptop)
+#      probefleet node up --fleet-url <url>       (on the Pi)
+#      probefleet node approve ABCD-1234           (on their laptop)
 #    Nothing long-lived is copy-pasted, and the credential is bound at
 #    approval time. For an unattended image, use 5b instead.
-probe-rs-fleet node up --fleet-url https://fleet.example.com
+probefleet node up --fleet-url https://fleet.example.com
 
 # 5b. …or, for an unattended image, a pre-minted `node` API key. Mint it on
 #     your laptop with the login from step 2 — no shell on the coordinator:
-probe-rs-fleet auth-key create --org acme --tag lab --tag nrf52 --ttl 24h
-probe-rs-fleet node up --auth-key prfk1_…
+probefleet auth-key create --org acme --tag lab --tag nrf52 --ttl 24h
+probefleet node up --auth-key prfk1_…
 #     Self-hosted, or air-gapped, or for a key that never expires, the same
 #     thing from a shell on the coordinator host:
-probe-rs-fleet coordinator auth-key --org acme --tag lab --ttl 24h
+probefleet coordinator auth-key --org acme --tag lab --ttl 24h
 #     Same verb, same flags as the API path, for a CI key that never expires:
-probe-rs-fleet coordinator auth-key --org acme --tag lab --purpose ci --ttl 0
+probefleet coordinator auth-key --org acme --tag lab --purpose ci --ttl 0
 
 # 6. Give a colleague access to some of your boards (by their username).
-probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
+probefleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
 
 # 7. Hand a sandboxed agent one board, with no fleet identity of its own.
-probe-rs-fleet ctl delegate --select 'tag=nrf52' --ops flash,attach --ttl 2h
+probefleet ctl delegate --select 'tag=nrf52' --ops flash,attach --ttl 2h
 #    → prints a lease-bound capability token; nothing else is granted.
 ```
 
@@ -580,10 +580,10 @@ the decision in code.
 #### Config & scaffolding (`node up`)
 
 The node's credential lives in the **per-fleet config** (§4.1). Node-local
-settings live at `~/.config/probe-rs-fleet/node/` (`node.toml`, `boards.toml`)
+settings live at `~/.config/probefleet/node/` (`node.toml`, `boards.toml`)
 — they describe the machine, not the fleet.
 
-`probe-rs-fleet node up` registers this machine as a node and starts serving.
+`probefleet node up` registers this machine as a node and starts serving.
 It obtains a node token by whichever of these applies, in order:
 
 1. **An existing `[node]` credential** in the fleet config — just reconnect.
@@ -591,7 +591,7 @@ It obtains a node token by whichever of these applies, in order:
    silently against your org. This is what `share` does; membership is
    sufficient, no admin approval (decided).
 3. **Interactive approval** — print a URL + short code; a human approves from a
-   machine where they are already logged in (`probe-rs-fleet node approve
+   machine where they are already logged in (`probefleet node approve
    ABCD-1234`). This is the headless-Pi path, and it replaces the copy-paste of
    a bootstrap token.
 4. **An API key of purpose `node`** (`--auth-key`, redeemed at
@@ -600,7 +600,7 @@ It obtains a node token by whichever of these applies, in order:
 
 **Rung 3 approves from the CLI or the browser.** Approval is keyed by
 `user_code` and is a pure function of `(code, decision, authenticated user)`:
-`probe-rs-fleet node approve` and the web UI's `POST
+`probefleet node approve` and the web UI's `POST
 /api/v1/nodes/pending/{code}` (session cookie, `docs/web-ui.md`) both resolve
 their subject their own way and call the same `http::decide_pending_node`, with
 the same membership check and the same `node.approve.*` audit rows. The
@@ -647,7 +647,7 @@ credential still wins over everything, and is reused rather than replaced.
 
 `share` is `node up`'s rung 2 as a standalone verb, and does **not** start
 the node: it writes the credential and the node-local settings, and its
-summary points at `probe-rs-fleet node run`.
+summary points at `probefleet node run`.
 
 The node token is long-lived but **rotating**: the coordinator can issue a
 replacement over the established connection, so a leaked token has bounded
@@ -766,8 +766,8 @@ ctl and the sidecar both read the **`[user]` session** from the per-fleet config
 is no client certificate.
 
 Resolution precedence is **explicit flag / env var > fleet config**. The
-credential env var is a single `PROBE_RS_FLEET_TOKEN`. The *selector* vars
-(`PROBE_RS_FLEET_BOARD` / `_ID` / `_SELECT`) are overridden by
+credential env var is a single `PROBEFLEET_TOKEN`. The *selector* vars
+(`PROBEFLEET_BOARD` / `_ID` / `_SELECT`) are overridden by
 `sidecar --board` / `--id` / `--select` (§7).
 
 **A sandboxed agent is never given these credentials.** It receives a
@@ -781,7 +781,7 @@ the `[user].refresh_token` written by
 non-rotating — see §6.4's "A self-renewing user session", which also states
 what that costs. Two consequences worth naming here:
 
-* an explicit `PROBE_RS_FLEET_TOKEN` short-circuits the whole thing, since it
+* an explicit `PROBEFLEET_TOKEN` short-circuits the whole thing, since it
   wins by precedence anyway and renewing a credential we would discard is pure
   churn; and
 * a renewal failure is a warning and a fall back to the stored token, never an
@@ -794,9 +794,9 @@ what that costs. Two consequences worth naming here:
 ### 4.4 Shell completion (dynamic)
 
 The binary completes its own command line. `clap_complete`'s **dynamic** engine
-(`COMPLETE=<shell> probe-rs-fleet`) installs a small shell stub that calls back
+(`COMPLETE=<shell> probefleet`) installs a small shell stub that calls back
 into the binary on every Tab; the binary answers with candidates computed *at
-that moment*. `probe-rs-fleet completions <shell>` prints the one line that
+that moment*. `probefleet completions <shell>` prints the one line that
 installs the stub.
 
 A statically generated script was rejected: the completions that matter here
@@ -918,7 +918,7 @@ The decisions that are load-bearing:
   Signup creates the user's personal org, named like the username, with the
   user as `admin`, in the same transaction. Team orgs sit beside personal ones
   in the same root name space (so a user and an org cannot share a name).
-  Any logged-in user can create one — `probe-rs-fleet org create <name>` or
+  Any logged-in user can create one — `probefleet org create <name>` or
   the web UI's Org page (`POST /api/v1/orgs`) — and becomes its admin; the
   creation is audited as `org.create` in the new org. Two coordinator.toml
   keys gate it: `allow_org_creation` (default `true`; `false` → `403
@@ -928,13 +928,13 @@ The decisions that are load-bearing:
   org_limit_reached`). A name colliding with an org, a username or
   a tombstoned name is `409 name_taken`. `coordinator org create <name>
   --admin <username>` stays as the host-shell escape hatch and ignores both
-  keys. Admins manage members with `probe-rs-fleet org members
+  keys. Admins manage members with `probefleet org members
   add|set-role|remove` (forgs' `/auth/members`) or the web UI
   (`forgs_http::members::{set,remove}`, audited `member.set` /
   `member.remove`); removing or demoting the last admin is `409 last_admin`.
-  Admins rename a team org with `probe-rs-fleet org rename <new>` or the web
+  Admins rename a team org with `probefleet org rename <new>` or the web
   UI (`POST /api/v1/org/rename`, audited `org.rename`; the old name is
-  tombstoned) and delete one with `probe-rs-fleet org delete` (`DELETE
+  tombstoned) and delete one with `probefleet org delete` (`DELETE
   /api/v1/org`, audited `org.delete`). Personal orgs are refused (`409
   personal_org`); delete is refused while nodes, boards, open leases or live
   grants reference the org (`409 org_not_empty`), and purges the org's closed
@@ -1062,7 +1062,7 @@ what else must be proven:
   non-`HttpOnly` `prfs_csrf` cookie. Nothing is stored. The key comes from a
   **dedicated injected secret** (`csrf_secret_path`, ≥ 32 bytes, written as
   `csrf.secret` by `coordinator init`), domain-separated by the app label
-  `probe-rs-fleet`. It is **not derived from the capability-signing
+  `probefleet`. It is **not derived from the capability-signing
   seed**: one secret per job, so rotating either does not silently rotate the
   other. A bearer-authenticated `/api/v1` call needs no CSRF header;
 * no route emits CORS headers, which makes the mandatory custom header a
@@ -1175,7 +1175,7 @@ machine rather than a human. `POST /node/register/start` stores a pending row
 whose JSON payload is the requested `{node_name, tags, adopt}` (charset-validated
 before it is stored, since it is unauthenticated and rendered to a human); the
 machine prints a ~40-bit Crockford-base32 `user_code` (`ABCD-1234`) and polls
-`/node/register/poll` with its device secret. A member runs `probe-rs-fleet
+`/node/register/poll` with its device secret. A member runs `probefleet
 node approve ABCD-1234 [--org O]` (or uses `/ui/approve`), which calls
 `/node/register/approve` → forgs' `decide`, binding the row to the approver
 and the chosen org. fleet's `PendingApprovalHook` (`identity::FleetNodeApprovals`)
@@ -1262,7 +1262,7 @@ a 12-hour cliff.
   redemptions all succeed. **The cost:** a leaked refresh token is usable for
   its whole TTL (30 days), with no reuse detection; it is bounded only by the
   TTL and by revocation.
-- **Revocation:** `probe-rs-fleet logout` → `POST /auth/logout` deletes the
+- **Revocation:** `probefleet logout` → `POST /auth/logout` deletes the
   presented session and its refresh token; `--all` deletes every session and
   refresh token of the user, on every machine — the lost-machine answer.
 - **CLI only.** Refresh tokens come from the device flow and `coordinator
@@ -1279,7 +1279,7 @@ A laptop is routinely both a user and a node:
 - **The two credentials stay distinct.** The node token is machine-scoped and
   long-lived; the session is human-scoped and short-lived. Merging them would
   make a compromised Pi equivalent to a compromised you.
-- **One command:** `probe-rs-fleet share` → `POST /node/self-register`, in the
+- **One command:** `probefleet share` → `POST /node/self-register`, in the
   org named by `--org` (default: personal). Membership there is *checked*; a
   non-member is a `403`.
 
@@ -1356,14 +1356,14 @@ The model, deliberately minimal:
 **One selector grammar, one reading of every term.** `id=<name>`,
 `board=<model>`, `chip=<c>`, `tag=<t>`, and `a && b` conjunctions of tags,
 parsed by a single function in `probefleet-proto`. The sidecar's
-`PROBE_RS_FLEET_SELECT`, `ctl lease <sel>`, `ctl delegate --select` and
+`PROBEFLEET_SELECT`, `ctl lease <sel>`, `ctl delegate --select` and
 `grant --select` are thin delegates with **no per-surface dialect**: a bare word
 is a *tag* everywhere (so `ctl lease nrf52840-dk-3` is a tag selector and the
 board is named `ctl lease id=nrf52840-dk-3`).
 
 The word "board" means the board **model** — the board type a developer asks
 for ("I need an nrf52840dk") — on every surface: the `board=` term, the
-`sidecar --board` flag and `PROBE_RS_FLEET_BOARD`. It is *not* the chip: a
+`sidecar --board` flag and `PROBEFLEET_BOARD`. It is *not* the chip: a
 Nordic DK and a custom nRF52840 board share `nRF52840_xxAA` and are not
 interchangeable. The model is declared per board in `boards.toml`; the agent
 cannot infer it, so a board with no declared model (in particular every
@@ -1534,7 +1534,7 @@ because `probe-rs serve` is now reused across a holder's invocations (§4.2):
   before it acts. This is authorization, and it stays exactly where it was.
 - `ChannelOpened { serve_token }` / `OpenSession { serve_token }` — the
   **`probe-rs serve` user token**: a lease-scoped hex secret the coordinator
-  derives as `HMAC-SHA256(signing seed, "probe-rs-fleet/serve-token/v1" ‖ lease ‖
+  derives as `HMAC-SHA256(signing seed, "probefleet/serve-token/v1" ‖ lease ‖
   board)`, the node writes into the board's `.probe-rs.toml`, and the sidecar
   exports verbatim as `PROBE_RS_REMOTE_TOKEN`. It authenticates the agent's own
   loopback splice, not the remote user; per-channel attenuation stays at the
@@ -1744,7 +1744,7 @@ The clamp orders contention; it does not make contention painless. A workload
 whose request finds every matching board busy is `Queued` like anybody else, and
 the sidecar now **waits** for its turn rather than failing: it parks on the
 control connection for the coordinator's promotion push, bounded by
-`PROBE_RS_FLEET_QUEUE_WAIT` (client-side, default 300s; `0` restores the old
+`PROBEFLEET_QUEUE_WAIT` (client-side, default 300s; `0` restores the old
 fail-fast behaviour). Only a wait that expires is an error. That is what lets a
 matrix wider than the fleet run to completion instead of failing legs, so
 `max-parallel` is now a throughput knob rather than a correctness requirement.
@@ -1913,7 +1913,7 @@ with lives `workload_token_ttl_secs` (default 1h) and, per the subsection above,
 `ci login` hourly — a cron job or retry wrapper reimplemented per sandbox, which
 does not even propagate between the concurrent processes sharing the machine.
 
-`probe-rs-fleet agent login --fleet-url <url> --auth-key prfk1_… [--as <name>]`
+`probefleet agent login --fleet-url <url> --auth-key prfk1_… [--as <name>]`
 closes that. It stores the durable key in the fleet file's `[agent]` table
 (§4.1), and `ctl` and the `probe-rs` shim re-**redeem** it whenever the stored
 token is within 60s of expiry.
@@ -1987,7 +1987,7 @@ nothing, but the board returns to the pool after one policy TTL instead of the
 hardcoded hour the sidecar used to request.
 
 The *cross-invocation* half: `probefleet_sidecar::lease_store` persists a grant under
-`$XDG_RUNTIME_DIR/probe-rs-fleet/leases.json` (0600, in a 0700 directory,
+`$XDG_RUNTIME_DIR/probefleet/leases.json` (0600, in a 0700 directory,
 written via a temp file + `fsync` + `rename` under a `flock`), and
 `acquire_lease` consults it before leasing. `lease_cache` stays pure logic and is
 unchanged: the store feeds a loaded record through it, so the expiry /
@@ -2012,7 +2012,7 @@ caching. The decisions worth knowing:
   by another one. `fleet ctl release` frees the board immediately; otherwise it
   returns after one policy TTL, the same worst case as a SIGKILLed sidecar. A
   CI (`Workload`) or node holder, the delegated path, and the
-  `PROBE_RS_FLEET_NO_LEASE_CACHE` opt-out all release at exit exactly as before,
+  `PROBEFLEET_NO_LEASE_CACHE` opt-out all release at exit exactly as before,
   so a finished CI job never strands a board.
 - **A stale hit degrades, never errors.** A hit is revalidated with a short
   `Extend` probe first. A refusal drops the entry and leases afresh; an
@@ -2024,7 +2024,7 @@ caching. The decisions worth knowing:
   board, and its `Queued` reply was what prevented this. A hit is only taken if
   the record's use-lock is free; otherwise the invocation falls through to a
   fresh `Lease` and takes the ordinary contention path — which since the queue
-  split means it *waits* for a turn (bounded by `PROBE_RS_FLEET_QUEUE_WAIT`)
+  split means it *waits* for a turn (bounded by `PROBEFLEET_QUEUE_WAIT`)
   rather than erroring immediately. The kernel releases
   the lock when the holder dies, SIGKILL included, so no staleness heuristic is
   needed.
@@ -2081,13 +2081,13 @@ Observations that shape the sidecar:
 
 Proposed selector convention (additive, no laze change required):
 
-- `PROBE_RS_FLEET_BOARD` — board **model**: any idle board of that type
+- `PROBEFLEET_BOARD` — board **model**: any idle board of that type
   (e.g. `nrf52840dk`), or
-- `PROBE_RS_FLEET_ID` — one specific board, by node-local id
+- `PROBEFLEET_ID` — one specific board, by node-local id
   (e.g. `nrf52840-dk-3`), or
-- `PROBE_RS_FLEET_SELECT` — constraint expr (e.g. `tag=nrf52 && bluetooth`).
-- `PROBE_RS_FLEET_TOKEN` / `…_COORDINATOR` — auth + endpoint.
-- `PROBE_RS_FLEET_QUEUE_WAIT` — how many seconds to wait for a queued lease to
+- `PROBEFLEET_SELECT` — constraint expr (e.g. `tag=nrf52 && bluetooth`).
+- `PROBEFLEET_TOKEN` / `…_COORDINATOR` — auth + endpoint.
+- `PROBEFLEET_QUEUE_WAIT` — how many seconds to wait for a queued lease to
   be promoted before giving up (default 300; `0` = do not wait). A client-side
   patience bound, not a coordinator policy knob: how long *this* invocation is
   willing to sit in the queue is the caller's business (§6.6).
@@ -2098,13 +2098,13 @@ Proposed selector convention (additive, no laze change required):
 For interactive use the explicit subcommand also takes the selector as a flag:
 
 ```sh
-probe-rs-fleet sidecar --select 'tag=nrf52840dk' -- list
-probe-rs-fleet sidecar --board nrf52840dk -- run --chip nRF52840_xxAA app.elf
-probe-rs-fleet sidecar --id nrf52840-dk-1 -- run --chip nRF52840_xxAA app.elf
+probefleet sidecar --select 'tag=nrf52840dk' -- list
+probefleet sidecar --board nrf52840dk -- run --chip nRF52840_xxAA app.elf
+probefleet sidecar --id nrf52840-dk-1 -- run --chip nRF52840_xxAA app.elf
 ```
 
 - **Flag > env**, and a flag *replaces all three* selector vars (so `--select`
-  next to a stale `PROBE_RS_FLEET_BOARD` is the flag, not an ambiguity error).
+  next to a stale `PROBEFLEET_BOARD` is the flag, not an ambiguity error).
   It is
   layered over the environment as an `EnvSource` overlay, not written into it.
 - `--board`, `--id` and `--select` are mutually exclusive in clap; a capability
@@ -2153,7 +2153,7 @@ coordinator keep whichever it upserted last while the agent resolved the
 declared one — so a lease taken out for the adopted probe would drive the
 declared board's hardware.
 
-**Declaring a board without hand-editing.** `probe-rs-fleet node board add`
+**Declaring a board without hand-editing.** `probefleet node board add`
 discovers attached probes (the same `probe-rs list` shell-out the agent uses),
 prompts for the values discovery cannot supply, and appends a `[[board]]` table;
 `node board list` shows declared boards against attached-but-undeclared probes,
@@ -2174,7 +2174,7 @@ that the agent must be restarted.
 ## 9. Crate layout (proposed)
 
 ```
-probe-rs-fleet/
+probefleet/
 ├─ Cargo.toml                  # workspace
 ├─ crates/
 │  ├─ probefleet-proto/             # shared wire types + ids / SubjectKey mirror, auth_api (no I/O)

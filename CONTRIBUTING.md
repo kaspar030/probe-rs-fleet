@@ -88,7 +88,7 @@ Nothing has been published yet. Open points before the first release:
 - **Crate names.** The crates were renamed from `fleet-*` to `probefleet-*`
   (`fleet-bin` became `probefleet`), because `fleet-coordinator` is taken on
   crates.io. All eight `probefleet*` names were free when checked (2026-10).
-  The binary is still called `probe-rs-fleet`.
+  The binary is called `probefleet`.
 - **Copyright holder** in `LICENSE-MIT` is to be confirmed.
 
 Every crate's metadata is inherited from `[workspace.package]`; the packaged

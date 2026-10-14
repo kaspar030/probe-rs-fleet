@@ -1,10 +1,10 @@
-# probe-rs-fleet — node.toml reference (node-local, non-credential settings)
+# probefleet — node.toml reference (node-local, non-credential settings)
 #
 # Discovered at
-#   $XDG_CONFIG_HOME/probe-rs-fleet/node/node.toml
-#   (i.e. ~/.config/probe-rs-fleet/node/node.toml)
+#   $XDG_CONFIG_HOME/probefleet/node/node.toml
+#   (i.e. ~/.config/probefleet/node/node.toml)
 #
-# `probe-rs-fleet share` / `node up` scaffold a commented version of this file.
+# `probefleet share` / `node up` scaffold a commented version of this file.
 #
 # ---------------------------------------------------------------------------
 # Why this is NOT per fleet
@@ -16,7 +16,7 @@
 # the copies drift.
 #
 # The node's CREDENTIAL is the opposite: it is per-fleet by definition, and
-# lives in the [node] table of ~/.config/probe-rs-fleet/fleets/<name>.toml
+# lives in the [node] table of ~/.config/probefleet/fleets/<name>.toml
 # (0600). See examples/fleet.toml.
 #
 # There are no credentials in this file, so it is written world-readable.
@@ -42,7 +42,7 @@
 # ADVISORY. The coordinator's `node` row is what actually decides; this setting
 # only governs whether this agent bothers to synthesise board metadata for
 # undeclared probes at all. Editing it here does NOT change what the coordinator
-# will adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `node up
+# will adopt — re-run `probefleet share --adopt <policy>` (or `node up
 # --adopt <policy>`) for that.
 # adopt = "declared"
 
@@ -56,10 +56,10 @@
 # discovery_secs = 30
 
 # Path to this node's board inventory (see examples/boards.toml).
-# Default: ~/.config/probe-rs-fleet/node/boards.toml
+# Default: ~/.config/probefleet/node/boards.toml
 # A leading `~/` in this value is expanded to your home directory; `~user` is
 # not, and is left as a literal path component.
-# boards_path = "/etc/probe-rs-fleet/boards.toml"
+# boards_path = "/etc/probefleet/boards.toml"
 
 # How often (seconds) the agent heartbeats to the coordinator. Default: 15.
 #

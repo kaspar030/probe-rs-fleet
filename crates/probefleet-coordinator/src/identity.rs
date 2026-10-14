@@ -38,7 +38,8 @@ use crate::state::{AuditEntry, Db};
 use crate::subject::{org_of, FleetRole, NODE_KIND};
 
 /// `AuthContext` app label: separates fleet's CSRF / cookie keys from any
-/// other forgs app's.
+/// other forgs app's. Frozen: changing it changes the derived CSRF / cookie
+/// keys.
 pub const APP_LABEL: &str = "probe-rs-fleet";
 /// Cookie brand: `prfs_session`, `prfs_csrf`, …
 pub const COOKIE_BRAND: &str = "prfs";
@@ -322,6 +323,7 @@ fn canonical_tags(tags: &[String]) -> Option<Vec<String>> {
 pub fn ci_grant_id(ns: NsNodeId, subject: &SubjectKey) -> forgs::GrantId {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
+    // Frozen domain label: changing it changes every ci grant id.
     h.update(b"probe-rs-fleet/ci-grant/v1\0");
     h.update(ns.to_string().as_bytes());
     h.update(b"\0");

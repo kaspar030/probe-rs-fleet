@@ -5,14 +5,14 @@
 //! `clap_complete` offers two shapes. The classic one (`aot`) emits a static
 //! script per shell, which the user installs; the script knows the flags that
 //! existed when it was generated and nothing else. The dynamic one — used here
-//! — installs a *stub* that calls back into `probe-rs-fleet` on every Tab, with
+//! — installs a *stub* that calls back into `probefleet` on every Tab, with
 //! the shell's current word buffer, and this process answers.
 //!
 //! For this CLI the second is the only one that can be correct, because the
 //! interesting completions are not static:
 //!
 //! * `--fleet <name>` completes the fleets **this machine has a config for**
-//!   (`~/.config/probe-rs-fleet/fleets/*.toml`);
+//!   (`~/.config/probefleet/fleets/*.toml`);
 //! * `ctl release <board>` / `node board add --serial` complete from local
 //!   state (`boards.toml`, attached probes);
 //! * `--ops` completes the op labels [`probefleet_proto::token::AllowedOp`] actually
@@ -23,7 +23,7 @@
 //! # Activation
 //!
 //! Completion is driven by the `COMPLETE` environment variable, which the shell
-//! stub sets: `COMPLETE=bash probe-rs-fleet` prints the registration script,
+//! stub sets: `COMPLETE=bash probefleet` prints the registration script,
 //! and thereafter each Tab re-enters the binary with `COMPLETE=<shell>` and the
 //! current words. [`try_complete`] must therefore run **before any other
 //! output**, and before the tokio runtime is built — it exits the process when
@@ -32,10 +32,10 @@
 //! Users install it with, e.g.:
 //!
 //! ```bash
-//! echo 'source <(COMPLETE=bash probe-rs-fleet)' >> ~/.bashrc
+//! echo 'source <(COMPLETE=bash probefleet)' >> ~/.bashrc
 //! ```
 //!
-//! `probe-rs-fleet completions <shell>` prints that one-liner (see
+//! `probefleet completions <shell>` prints that one-liner (see
 //! [`crate::roles::completions`]) rather than making people remember it.
 //!
 //! # The `probe-rs` argv0 shim is deliberately excluded
@@ -125,7 +125,7 @@ impl CompletionShell {
         match self {
             CompletionShell::Bash => "~/.bashrc",
             CompletionShell::Zsh => "~/.zshrc",
-            CompletionShell::Fish => "~/.config/fish/completions/probe-rs-fleet.fish",
+            CompletionShell::Fish => "~/.config/fish/completions/probefleet.fish",
             CompletionShell::Elvish => "~/.elvish/rc.elv",
             CompletionShell::Powershell => "$PROFILE",
         }
@@ -364,7 +364,7 @@ fn local_board_ids() -> Vec<String> {
     ids
 }
 
-/// Write the shell stub for `shell` (what `COMPLETE=<shell> probe-rs-fleet`
+/// Write the shell stub for `shell` (what `COMPLETE=<shell> probefleet`
 /// prints) into `buf`.
 ///
 /// Backs `completions --print`. The stub is a function of (shell, binary name)
@@ -411,14 +411,14 @@ mod tests {
     #[test]
     fn install_lines_name_the_binary_and_shell() {
         assert_eq!(
-            CompletionShell::Bash.install_line("probe-rs-fleet"),
-            "source <(COMPLETE=bash probe-rs-fleet)"
+            CompletionShell::Bash.install_line("probefleet"),
+            "source <(COMPLETE=bash probefleet)"
         );
         assert!(CompletionShell::Fish
-            .install_line("probe-rs-fleet")
-            .starts_with("COMPLETE=fish probe-rs-fleet"));
+            .install_line("probefleet")
+            .starts_with("COMPLETE=fish probefleet"));
         assert!(CompletionShell::Powershell
-            .install_line("probe-rs-fleet")
+            .install_line("probefleet")
             .contains("powershell"));
     }
 
@@ -472,7 +472,7 @@ mod tests {
         let prev = std::env::var_os("COMPLETE");
         // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
         std::env::remove_var("COMPLETE");
-        assert!(!try_complete(["probe-rs-fleet", "ctl", "list"]));
+        assert!(!try_complete(["probefleet", "ctl", "list"]));
         if let Some(prev) = prev {
             std::env::set_var("COMPLETE", prev);
         }

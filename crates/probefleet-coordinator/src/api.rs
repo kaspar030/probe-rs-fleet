@@ -1414,7 +1414,7 @@ async fn decide_pending(
 
 /// The verbatim warning an approval form must show; see [`decide_pending`].
 ///
-/// Byte-identical to the sentence `probe-rs-fleet node approve` prints, so the
+/// Byte-identical to the sentence `probefleet node approve` prints, so the
 /// two surfaces of one ceremony say the same thing. Both halves are
 /// load-bearing: the first says what is being granted, the second says the only
 /// safe reason to grant it.

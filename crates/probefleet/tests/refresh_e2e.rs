@@ -111,8 +111,8 @@ async fn the_sidecar_renews_an_expired_user_session_and_persists_it() {
     std::env::set_var("XDG_CONFIG_HOME", tmp.path());
     // ...and the shim skips its refresh entirely when this is set, which would
     // make the test pass for the wrong reason.
-    let prev_token = std::env::var_os("PROBE_RS_FLEET_TOKEN");
-    std::env::remove_var("PROBE_RS_FLEET_TOKEN");
+    let prev_token = std::env::var_os("PROBEFLEET_TOKEN");
+    std::env::remove_var("PROBEFLEET_TOKEN");
 
     let fleet = start_fleet(SEED).await;
     let (expired, refresh) = seed_expired_with_refresh(&fleet, "kaspar").await;
@@ -158,7 +158,7 @@ async fn the_sidecar_renews_an_expired_user_session_and_persists_it() {
         None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
     if let Some(v) = prev_token {
-        std::env::set_var("PROBE_RS_FLEET_TOKEN", v);
+        std::env::set_var("PROBEFLEET_TOKEN", v);
     }
 }
 
@@ -175,8 +175,8 @@ async fn a_file_without_a_refresh_token_behaves_exactly_as_before() {
     let prev = std::env::var_os("XDG_CONFIG_HOME");
     // SAFETY of correctness (not memory): guarded by ENV_LOCK above.
     std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-    let prev_token = std::env::var_os("PROBE_RS_FLEET_TOKEN");
-    std::env::remove_var("PROBE_RS_FLEET_TOKEN");
+    let prev_token = std::env::var_os("PROBEFLEET_TOKEN");
+    std::env::remove_var("PROBEFLEET_TOKEN");
 
     let fleet = start_fleet(SEED).await;
     let (expired, _refresh) = seed_expired_with_refresh(&fleet, "kaspar").await;
@@ -206,7 +206,7 @@ async fn a_file_without_a_refresh_token_behaves_exactly_as_before() {
         None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
     if let Some(v) = prev_token {
-        std::env::set_var("PROBE_RS_FLEET_TOKEN", v);
+        std::env::set_var("PROBEFLEET_TOKEN", v);
     }
 }
 

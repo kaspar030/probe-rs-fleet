@@ -1,6 +1,6 @@
 //! Node enrollment over plain HTTP: `POST /node/enroll` (redeem a `node`
 //! API key) and `POST /node/self-register` (a session registers its own
-//! machine — `probe-rs-fleet share`).
+//! machine — `probefleet share`).
 //!
 //! These replaced the old `/auth/token` grants `auth_key` and
 //! `self_register`; forgs now owns `/auth/token` and its session/refresh
@@ -265,7 +265,7 @@ async fn malformed_enrollments_are_bad_requests_not_credentials() {
 }
 
 // ---------------------------------------------------------------------------
-// POST /node/self-register (`probe-rs-fleet share`, architecture §4.2)
+// POST /node/self-register (`probefleet share`, architecture §4.2)
 // ---------------------------------------------------------------------------
 
 /// The `share` path end to end: a session registers the machine as a node in

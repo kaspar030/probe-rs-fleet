@@ -263,7 +263,7 @@ pub fn default_discovery_secs() -> u64 {
 ///
 /// Revision 2 deleted `agent.toml`: a node's credential now lives in the
 /// `[node]` table of its fleet file and its non-credential settings in
-/// `~/.config/probe-rs-fleet/node/node.toml`, both owned by `probefleet`. This
+/// `~/.config/probefleet/node/node.toml`, both owned by `probefleet`. This
 /// struct is therefore a plain **parameter struct** that `probefleet` assembles,
 /// not something with a `Deserialize` impl and a source path.
 ///

@@ -1,4 +1,4 @@
-//! Shared wire types for probe-rs-fleet.
+//! Shared wire types for probefleet.
 //!
 //! This crate is pure data: no I/O, no async, no transport. It defines the
 //! identifiers, requests, and responses exchanged across the control plane

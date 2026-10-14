@@ -177,7 +177,7 @@ fn render_board_table(draft: &BoardDraft) -> String {
     use std::fmt::Write as _;
 
     let mut out = String::new();
-    out.push_str("# added by `probe-rs-fleet node board add`\n");
+    out.push_str("# added by `probefleet node board add`\n");
     out.push_str("[[board]]\n");
     let _ = writeln!(out, "id        = {}", toml_string(&draft.id));
     let _ = writeln!(out, "serial    = {}", toml_string(&draft.serial));
@@ -325,7 +325,7 @@ async fn add_with(
     print!("{table}");
     println!();
     println!("The node reads boards.toml once at startup, so restart it for this to");
-    println!("take effect (`systemctl --user restart …`, or re-run `probe-rs-fleet node run`).");
+    println!("take effect (`systemctl --user restart …`, or re-run `probefleet node run`).");
     if draft.chip.is_empty() || draft.model.is_none() {
         println!();
         if draft.chip.is_empty() {
@@ -455,7 +455,7 @@ fn render_list(
         out.push_str("Declare one with:\n");
         let _ = writeln!(
             out,
-            "  probe-rs-fleet node board add --serial {}",
+            "  probefleet node board add --serial {}",
             inventory.unknown[0].serial
         );
     }
@@ -792,7 +792,7 @@ mod tests {
     async fn comments_and_existing_entries_survive_the_write() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("boards.toml");
-        let original = "# probe-rs-fleet board inventory\n\
+        let original = "# probefleet board inventory\n\
                         # ANNOTATION AND OVERRIDE, not admission control.\n\
                         \n\
                         [[board]]\n\
@@ -1013,7 +1013,7 @@ mod tests {
         assert!(out.contains("BBB"));
         assert!(out.contains("inaccessible"));
         assert!(
-            out.contains("probe-rs-fleet node board add --serial BBB"),
+            out.contains("probefleet node board add --serial BBB"),
             "the report must be actionable: {out}"
         );
         assert!(

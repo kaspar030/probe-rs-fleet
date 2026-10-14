@@ -1,4 +1,4 @@
-//! `probe-rs-fleet ci login` end to end, through the CLI's own code paths.
+//! `probefleet ci login` end to end, through the CLI's own code paths.
 //!
 //! The story-1 assertion this task exists for, at the CLI seam: a CI job that
 //! holds **no secret** exchanges its runner-provided workload identity for a
@@ -394,13 +394,13 @@ async fn a_ci_job_with_no_secret_exchanges_its_workload_identity() {
     let written = std::fs::read_to_string(&github_env).unwrap();
     let token_line = written
         .lines()
-        .find_map(|l| l.strip_prefix("PROBE_RS_FLEET_TOKEN="))
-        .expect("PROBE_RS_FLEET_TOKEN in $GITHUB_ENV");
+        .find_map(|l| l.strip_prefix("PROBEFLEET_TOKEN="))
+        .expect("PROBEFLEET_TOKEN in $GITHUB_ENV");
     assert!(
         token_line.starts_with("prfw1_"),
         "a workload token, not something else: {token_line}"
     );
-    assert!(written.contains(&format!("PROBE_RS_FLEET_COORDINATOR={}\n", fleet.base_url)));
+    assert!(written.contains(&format!("PROBEFLEET_COORDINATOR={}\n", fleet.base_url)));
 
     // The CLI forwarded the audience it was given, rather than inventing one.
     assert_eq!(
@@ -513,8 +513,8 @@ async fn a_self_hosted_runner_can_use_a_ci_auth_key() {
     let written = std::fs::read_to_string(&github_env).unwrap();
     let token = written
         .lines()
-        .find_map(|l| l.strip_prefix("PROBE_RS_FLEET_TOKEN="))
-        .expect("PROBE_RS_FLEET_TOKEN in $GITHUB_ENV");
+        .find_map(|l| l.strip_prefix("PROBEFLEET_TOKEN="))
+        .expect("PROBEFLEET_TOKEN in $GITHUB_ENV");
     assert!(token.starts_with("prfw1_"), "{token}");
 
     // Redemption synthesised an ordinary grant, which is what makes the key
@@ -546,7 +546,7 @@ async fn a_named_ci_auth_key_authenticates_as_its_identity() {
         .expect("ci login --auth-key");
 
     let written = std::fs::read_to_string(&github_env).unwrap();
-    assert!(written.contains("PROBE_RS_FLEET_TOKEN=prfw1_"), "{written}");
+    assert!(written.contains("PROBEFLEET_TOKEN=prfw1_"), "{written}");
 
     let grants = grants(&fleet).await;
     assert_eq!(grants.len(), 1);

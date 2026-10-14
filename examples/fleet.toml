@@ -1,19 +1,19 @@
-# probe-rs-fleet — fleets/<name>.toml reference (per-fleet configuration)
+# probefleet — fleets/<name>.toml reference (per-fleet configuration)
 #
 # ONE FILE PER FLEET, at
-#   $XDG_CONFIG_HOME/probe-rs-fleet/fleets/<name>.toml
-#   (i.e. ~/.config/probe-rs-fleet/fleets/<name>.toml)
+#   $XDG_CONFIG_HOME/probefleet/fleets/<name>.toml
+#   (i.e. ~/.config/probefleet/fleets/<name>.toml)
 #
-# Select a fleet with `--fleet <name>` or PROBE_RS_FLEET; the default is
-# `default`. `probe-rs-fleet fleets` lists the ones this machine has.
+# Select a fleet with `--fleet <name>` or PROBEFLEET; the default is
+# `default`. `probefleet fleets` lists the ones this machine has.
 #
 # You do not normally write this file by hand. It is managed by:
-#   probe-rs-fleet login       → writes [user]
-#   probe-rs-fleet logout      → clears [user] and revokes it server-side
+#   probefleet login       → writes [user]
+#   probefleet logout      → clears [user] and revokes it server-side
 #                                (--all: every session/refresh token you hold)
-#   probe-rs-fleet share       → writes [node], using the login you already have
-#   probe-rs-fleet node up     → writes [node] (session, or --auth-key)
-#   probe-rs-fleet agent login → writes [agent] (a persistent sandbox session)
+#   probefleet share       → writes [node], using the login you already have
+#   probefleet node up     → writes [node] (session, or --auth-key)
+#   probefleet agent login → writes [agent] (a persistent sandbox session)
 # All of them preserve the others' tables.
 #
 # ---------------------------------------------------------------------------
@@ -36,7 +36,7 @@
 #                         AS YOU, for up to 30 days. It can do nothing else: it
 #                         opens no connection (/agent, /client, /delegate and
 #                         /api/v1 all refuse it) and it enrolls nothing. Revoke
-#                         it with `probe-rs-fleet logout --all`, which kills
+#                         it with `probefleet logout --all`, which kills
 #                         every session and refresh token you hold in the fleet,
 #                         on every machine.
 #
@@ -59,14 +59,14 @@
 #   CI runner  → neither (its token comes from the environment)
 #   sandbox    → [agent] (a persistent machine identity; see below)
 #
-# The CI row is a rule, not an omission. `probe-rs-fleet ci login` writes
+# The CI row is a rule, not an omission. `probefleet ci login` writes
 # NOTHING here: it exchanges the job's workload identity for a token that lives
-# in PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN for one job, and expires
+# in PROBEFLEET_COORDINATOR / PROBEFLEET_TOKEN for one job, and expires
 # with it (architecture §6.7). Persisting a credential to disk on a shared
 # runner is the one durable artefact the whole CI path exists to avoid, and the
 # sidecar reads exactly those two variables, so nothing needs the file.
 #
-# `probe-rs-fleet agent login` is the deliberate, opt-in exception to that rule,
+# `probefleet agent login` is the deliberate, opt-in exception to that rule,
 # and only for the machine it is run on. A persistent single-tenant sandbox with
 # concurrent users cannot re-run `ci login` hourly in every process, so it
 # stores a durable auth key here and re-redeems it as the session nears expiry.
@@ -100,11 +100,11 @@ url = "https://fleet.example.com"
 
 
 # ---------------------------------------------------------------------------
-# [user] — written by `probe-rs-fleet login`
+# [user] — written by `probefleet login`
 # ---------------------------------------------------------------------------
 #
 # Read by `ctl` and by the `probe-rs` sidecar shim. Explicit flags and env vars
-# (PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN) take precedence over it.
+# (PROBEFLEET_COORDINATOR / PROBEFLEET_TOKEN) take precedence over it.
 
 [user]
 # Your bearer session token. Short-lived; `ctl` refreshes it as it nears expiry
@@ -138,17 +138,17 @@ expires = 1788600000
 # processes do not race each other for it.
 #
 # What it can do: mint session tokens for you. That is the whole
-# list. What revokes it: `probe-rs-fleet logout --all`, or its own expiry.
+# list. What revokes it: `probefleet logout --all`, or its own expiry.
 refresh_token = "prfr1_…"
 
 
 # ---------------------------------------------------------------------------
-# [node] — written by `probe-rs-fleet share` / `node up`, refreshed by the agent
+# [node] — written by `probefleet share` / `node up`, refreshed by the agent
 # ---------------------------------------------------------------------------
 #
 # Present only if this machine offers probes to the fleet. Node-local settings
 # that are NOT credentials (board inventory, heartbeat, power wiring) live in
-# ~/.config/probe-rs-fleet/node/ instead — they describe the machine, not the
+# ~/.config/probefleet/node/ instead — they describe the machine, not the
 # fleet, so they are not duplicated when it joins a second one.
 
 [node]
@@ -178,7 +178,7 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 
 
 # ---------------------------------------------------------------------------
-# [agent] — written by `probe-rs-fleet agent login`, refreshed by ctl / the shim
+# [agent] — written by `probefleet agent login`, refreshed by ctl / the shim
 # ---------------------------------------------------------------------------
 #
 # Present only on a PERSISTENT SANDBOX: a long-running, single-tenant machine
@@ -189,12 +189,12 @@ coordinator_token_pubkey = "0123456789abcdef0123456789abcdef0123456789abcdef0123
 # key with `auth-key create --purpose agent --as <name>`), but not a persistent
 # *session*: the workload token it authenticates with lives about an hour and
 # nothing renews it. Without this table every sandbox threads its own hourly
-#   eval "$(probe-rs-fleet ci login …)"
+#   eval "$(probefleet ci login …)"
 # which is a cron job reimplemented per sandbox, and which does not even
 # propagate between the concurrent processes sharing the machine.
 #
 # Written by:
-#   probe-rs-fleet agent login --fleet-url <url> --auth-key prfk1_… --as <name>
+#   probefleet agent login --fleet-url <url> --auth-key prfk1_… --as <name>
 #
 # THE KEY MUST BE `--multi-use`. A single-use key breaks on the second PROCESS,
 # not merely the second hour, so `agent login` refuses one — it detects this by

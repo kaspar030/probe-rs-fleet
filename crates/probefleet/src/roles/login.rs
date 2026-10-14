@@ -1,4 +1,4 @@
-//! `probe-rs-fleet login`: authenticate through the coordinator's forgs
+//! `probefleet login`: authenticate through the coordinator's forgs
 //! device flow and cache a session token in the fleet file.
 //!
 //! # The flow, and why it looks like this
@@ -16,7 +16,7 @@
 //!
 //! # What it writes
 //!
-//! The `[user]` table of `~/.config/probe-rs-fleet/fleets/<name>.toml`, 0600,
+//! The `[user]` table of `~/.config/probefleet/fleets/<name>.toml`, 0600,
 //! **preserving any `[node]` table**: a laptop is legitimately both a user and a
 //! node, and dropping a node credential means a re-enrollment.
 
@@ -28,7 +28,7 @@ use crate::cli::LoginArgs;
 use crate::fleet_config::{self, FleetFile, UserSection};
 use crate::paths;
 
-/// Run `probe-rs-fleet login`.
+/// Run `probefleet login`.
 ///
 /// # Errors
 ///
@@ -116,13 +116,13 @@ fn record_external_token(token: &str, refresh_token: Option<&str>) -> Result<Use
     anyhow::ensure!(
         crate::tokens::is_session(token),
         "--token must be a session token (`prfs1_…`); mint one with \
-         `probe-rs-fleet coordinator user-token --username <name>`"
+         `probefleet coordinator user-token --username <name>`"
     );
     if let Some(refresh) = refresh_token {
         anyhow::ensure!(
             crate::tokens::is_refresh(refresh),
             "--refresh-token must be a refresh token (`prfr1_…`); \
-             `probe-rs-fleet coordinator user-token --username <name>` prints one"
+             `probefleet coordinator user-token --username <name>` prints one"
         );
     }
     Ok(UserSection {
@@ -181,8 +181,8 @@ fn describe_start_error(e: &forgs_client::ClientError) -> anyhow::Error {
     if e.status() == Some(404) {
         return anyhow::anyhow!(
             "this coordinator does not offer device login.\nBootstrap with:\n  \
-             probe-rs-fleet coordinator user-token --username <name>\n  \
-             probe-rs-fleet login --fleet-url <url> --token <token>"
+             probefleet coordinator user-token --username <name>\n  \
+             probefleet login --fleet-url <url> --token <token>"
         );
     }
     anyhow::anyhow!(forgs_client::cli::describe(e, "starting the device login"))
@@ -210,11 +210,11 @@ fn print_summary(fleet: &str, path: &Path, file: &FleetFile) {
         // Only when one was actually stored: a coordinator that minted none
         // must not have this printed about it.
         println!("  this session renews itself — no re-login when it expires");
-        println!("  (`probe-rs-fleet logout --all` revokes it everywhere)");
+        println!("  (`probefleet logout --all` revokes it everywhere)");
     }
     println!();
     println!("Next steps:");
-    println!("  probe-rs-fleet ctl --fleet {fleet} list");
+    println!("  probefleet ctl --fleet {fleet} list");
 }
 
 #[cfg(test)]

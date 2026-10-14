@@ -4,7 +4,7 @@
 //
 // The warning next to the confirm button is the server's `warning` field,
 // rendered **verbatim**. It is `api::APPROVAL_WARNING`, byte-identical to the
-// sentence `probe-rs-fleet node approve` prints, and it ships as a server field
+// sentence `probefleet node approve` prints, and it ships as a server field
 // precisely so a frontend that forgets it shows a visibly empty box rather than
 // silently dropping the mitigation. Do not replace it with a copy of the
 // string: this page must render the field.

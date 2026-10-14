@@ -43,7 +43,7 @@ export function render(state) {
     children.push(
       h('p', {}, 'This coordinator has no login provider configured, so there is no browser sign-in.'),
       h('p', {}, 'An operator can mint a session on the coordinator host:'),
-      h('p', { class: 'mono secret' }, 'probe-rs-fleet coordinator user-token'),
+      h('p', { class: 'mono secret' }, 'probefleet coordinator user-token'),
       h('p', { class: 'hint' }, 'That prints a session token for CLI use; the web UI needs a login provider.'),
     );
   } else {

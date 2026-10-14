@@ -53,7 +53,7 @@ may have CI without browser login, or the reverse.
 ### 2. Grant the repository
 
 ```sh
-probe-rs-fleet grant --org acme --repo ariel-os/ariel-os \
+probefleet grant --org acme --repo ariel-os/ariel-os \
     --select 'tag=nrf52' \
     --ops flash \
     --ttl 30d
@@ -114,12 +114,12 @@ permissions:
 
 steps:
   - run: |
-      probe-rs-fleet ci login \
+      probefleet ci login \
         --fleet-url https://fleet.example \
         --audience  https://fleet.example
   - run: probe-rs run --chip nRF52840_xxAA target/…/my-test
     env:
-      PROBE_RS_FLEET_SELECT: nrf52
+      PROBEFLEET_SELECT: nrf52
 ```
 
 ### No secrets
@@ -143,8 +143,8 @@ coordinator's `audience` is its own `public_url`). A mismatch is a
 
 ### Where the token goes
 
-`ci login` appends `PROBE_RS_FLEET_COORDINATOR`, `PROBE_RS_FLEET_TOKEN` and
-`PROBE_RS_FLEET` to `$GITHUB_ENV` when it is set, so later steps in the same job
+`ci login` appends `PROBEFLEET_COORDINATOR`, `PROBEFLEET_TOKEN` and
+`PROBEFLEET` to `$GITHUB_ENV` when it is set, so later steps in the same job
 see them. **It never prints the token to stdout on that path** — stdout is the
 job log, and a credential in a log is a credential in whatever archives that
 log. Off GitHub Actions (no `$GITHUB_ENV`) it prints `export …` lines for
@@ -176,7 +176,7 @@ The coordinator now answers three different situations differently, and only
 one of them is a wait:
 
 - **every matching board is busy** — the request is queued, and `probe-rs run`
-  **waits** for its turn, up to `PROBE_RS_FLEET_QUEUE_WAIT` (default 300s). If a
+  **waits** for its turn, up to `PROBEFLEET_QUEUE_WAIT` (default 300s). If a
   leg ahead of it finishes inside that window, the coordinator pushes the grant
   down the same connection and the leg proceeds as if it had never queued. Only
   when the wait expires does the step fail:
@@ -199,7 +199,7 @@ So the practical rules are:
 - **Size the wait to the job, not to the fleet.** A leg whose flash-and-test
   cycle is two minutes wants a wait comfortably longer than the legs ahead of
   it; a smoke test that should never queue can set
-  `PROBE_RS_FLEET_QUEUE_WAIT=0` and fail fast, which is exactly the old
+  `PROBEFLEET_QUEUE_WAIT=0` and fail fast, which is exactly the old
   behaviour.
 - **An abandoned leg leaves nothing behind.** When a leg gives up (or is
   cancelled, or the runner dies), its connection closes and the coordinator
@@ -231,7 +231,7 @@ changes that: the fleet relays bytes, it does not interpret them.
 
 | what you see | what happened | what to do |
 |---|---|---|
-| `coordinator declined: still queued at position N after 300s; giving up` | every board matching your selector was busy for the whole wait | raise `PROBE_RS_FLEET_QUEUE_WAIT`, narrow the matrix (`max-parallel`) so fewer legs compete, or ask for a bigger pool. Nothing is left queued behind the failure |
+| `coordinator declined: still queued at position N after 300s; giving up` | every board matching your selector was busy for the whole wait | raise `PROBEFLEET_QUEUE_WAIT`, narrow the matrix (`max-parallel`) so fewer legs compete, or ask for a bigger pool. Nothing is left queued behind the failure |
 | `coordinator declined: no board matches \`<selector>\`; ctl list shows N boards you can reach` | the selector matches nothing you have access to — a typo, or a grant you do not have | run `ctl list` and select from what it shows. Waiting cannot fix this, which is why it fails immediately |
 | `coordinator declined: you already hold N leases (cap max_concurrent_per_subject = N); release one or raise the cap` | your **repo** is at its concurrency cap; the fleet may well be idle | bound the matrix with `max-parallel`, release a lease, or ask the fleet admin to raise the cap for your subject |
 | `401 invalid_grant` | the coordinator refused the credential and will not say why — a bad token, **or a valid token for a repo with no grant** | check that the fleet admin ran `grant --repo <owner>/<name> …` (being under a granted owner is deliberately not enough), then `--audience` against the coordinator's configured one, then the runner's clock; the real reason is in the **coordinator's** audit log |
@@ -270,7 +270,7 @@ Mint the key (any org member can, over the API, with the login they already
 have). It is a forgs API key of purpose `ci`, belonging to the org you name:
 
 ```sh
-probe-rs-fleet auth-key create --org acme --purpose ci \
+probefleet auth-key create --org acme --purpose ci \
     --tag nrf52 \
     --ops flash,attach \
     --ttl 7d
@@ -279,7 +279,7 @@ probe-rs-fleet auth-key create --org acme --purpose ci \
 Then, on the runner:
 
 ```sh
-probe-rs-fleet ci login --fleet-url https://fleet.example --auth-key prfk1_…
+probefleet ci login --fleet-url https://fleet.example --auth-key prfk1_…
 ```
 
 Read the key from the CI system's secret store, not from a literal on the
@@ -315,7 +315,7 @@ runner redeeming the same key is the same subject, so they share one grant row
 (its id is derived deterministically from org and subject) and one concurrency budget.
 
 That grant shows up in `grant list` like any other, and
-`probe-rs-fleet grant revoke <id prefix>` withdraws it — leaving the key itself
+`probefleet grant revoke <id prefix>` withdraws it — leaving the key itself
 valid, so the next runner to redeem it simply recreates the grant. To retire the
 runner's access for good, revoke the **key**: that takes the credential and the
 grant together.
@@ -336,7 +336,7 @@ shape.
 Give it a name instead:
 
 ```sh
-probe-rs-fleet auth-key create --purpose agent --as builder \
+probefleet auth-key create --purpose agent --as builder \
     --tag nrf52 \
     --ops flash,attach \
     --ttl 30d
@@ -351,14 +351,14 @@ and the identity never moves:
 
 ```sh
 # 1. Mint the replacement with the SAME --as.
-probe-rs-fleet auth-key create --purpose agent --as builder \
+probefleet auth-key create --purpose agent --as builder \
     --tag nrf52 --ops flash,attach --ttl 30d
 
 # 2. Deploy the new secret to the runner and restart it.
 
 # 3. Retire the old key, once nothing is using it.
-probe-rs-fleet auth-key list          # find its hash prefix; check the IDENTITY column
-probe-rs-fleet auth-key revoke <prefix>
+probefleet auth-key list          # find its hash prefix; check the IDENTITY column
+probefleet auth-key revoke <prefix>
 ```
 
 Step 1's redemption re-upserts the *same grant row*: same id, same subject, same
@@ -386,7 +386,7 @@ clean revocation either:
 
 Revoking one key of a shared identity is therefore a **disruption, not a
 revocation**. Do step 3 when the old runner is idle. To retire the agent for
-good: revoke *every* key carrying the name, then `probe-rs-fleet grant revoke
+good: revoke *every* key carrying the name, then `probefleet grant revoke
 <id from grant list>`. Tokens already issued expire on their own within the hour.
 
 ### A persistent session, so the sandbox stops re-running `ci login`
@@ -394,7 +394,7 @@ good: revoke *every* key carrying the name, then `probe-rs-fleet grant revoke
 The name above gives a long-running machine a persistent *identity*. It does not
 give it a persistent *session*: the token `ci login` mints lives about an hour
 and there is no refresh for it, so a sandbox has to re-run the command — which
-is how people end up with an hourly cron job, or an `eval "$(probe-rs-fleet ci
+is how people end up with an hourly cron job, or an `eval "$(probefleet ci
 login …)"` wrapper around every invocation that does not even propagate between
 concurrent processes on the same box.
 
@@ -402,11 +402,11 @@ If that machine is a **sandbox you own** rather than a shared runner, hand the
 key over once instead:
 
 ```sh
-probe-rs-fleet agent login --fleet-url https://fleet.example \
-    --auth-key "$PROBE_RS_FLEET_AUTH_KEY" --as builder
+probefleet agent login --fleet-url https://fleet.example \
+    --auth-key "$PROBEFLEET_AUTH_KEY" --as builder
 ```
 
-That stores the key in `~/.config/probe-rs-fleet/fleets/<name>.toml` (0600), and
+That stores the key in `~/.config/probefleet/fleets/<name>.toml` (0600), and
 `ctl` and the `probe-rs` shim re-redeem it as the session nears expiry — no cron
 job, no wrapper, and concurrent processes on the machine share the renewed token
 through that file.

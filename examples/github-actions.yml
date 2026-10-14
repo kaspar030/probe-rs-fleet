@@ -1,4 +1,4 @@
-# probe-rs-fleet — GitHub Actions: flash and test lab hardware with NO secrets
+# probefleet — GitHub Actions: flash and test lab hardware with NO secrets
 #
 # Copy this into .github/workflows/hil.yml and change three things: the
 # coordinator URL, the board selector, and the chip. Nothing else needs editing,
@@ -65,20 +65,20 @@ jobs:
       # and the real probe-rs installed into a directory that is already on
       # PATH behind it.
       # ---------------------------------------------------------------------
-      - name: Install probe-rs-fleet and probe-rs
+      - name: Install probefleet and probe-rs
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.fleet/bin"
 
           # Replace these two with however you distribute the binaries.
-          curl -sSL https://example.invalid/probe-rs-fleet -o "$HOME/.fleet/bin/probe-rs-fleet"
+          curl -sSL https://example.invalid/probefleet -o "$HOME/.fleet/bin/probefleet"
           sudo curl -sSL https://example.invalid/probe-rs  -o /usr/local/bin/probe-rs
-          chmod +x "$HOME/.fleet/bin/probe-rs-fleet"
+          chmod +x "$HOME/.fleet/bin/probefleet"
           sudo chmod +x /usr/local/bin/probe-rs
 
-          # The shim: a `probe-rs` that is really probe-rs-fleet. laze, cargo
+          # The shim: a `probe-rs` that is really probefleet. laze, cargo
           # runners and hand-written scripts all invoke `probe-rs` unmodified.
-          ln -sf "$HOME/.fleet/bin/probe-rs-fleet" "$HOME/.fleet/bin/probe-rs"
+          ln -sf "$HOME/.fleet/bin/probefleet" "$HOME/.fleet/bin/probe-rs"
 
           # Prepended, so the shim wins; /usr/local/bin is already behind it,
           # which is where the shim finds the real client.
@@ -100,14 +100,14 @@ jobs:
       # which is not specific to any service, so a token minted for some other
       # system under the same owner would otherwise be replayable here.
       #
-      # This appends PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN to
+      # This appends PROBEFLEET_COORDINATOR / PROBEFLEET_TOKEN to
       # $GITHUB_ENV for the later steps, and never prints the token — stdout is
       # the job log. It writes nothing to disk: a CI runner's credential lives
       # in the environment for one job.
       # ---------------------------------------------------------------------
       - name: Log in to the fleet
         run: |
-          probe-rs-fleet ci login \
+          probefleet ci login \
             --fleet-url https://fleet.example \
             --audience  https://fleet.example
 
@@ -129,10 +129,10 @@ jobs:
       # (architecture §7), so this step fails when the tests fail and for no
       # other reason. Do not wrap it in `|| true`.
       #
-      # PROBE_RS_FLEET_SELECT is a constraint expression: bare words are tags,
+      # PROBEFLEET_SELECT is a constraint expression: bare words are tags,
       # and `&&` conjoins them (`nrf52 && bluetooth`). The two shorthands are
-      # PROBE_RS_FLEET_BOARD, which names a board MODEL (`nrf52840dk`) and
-      # matches any idle board of that type, and PROBE_RS_FLEET_ID, which names
+      # PROBEFLEET_BOARD, which names a board MODEL (`nrf52840dk`) and
+      # matches any idle board of that type, and PROBEFLEET_ID, which names
       # one specific board (`nrf52840-dk-3`). Setting more than one of the
       # three is refused rather than guessed at.
       #
@@ -141,7 +141,7 @@ jobs:
       # ---------------------------------------------------------------------
       - name: Flash and run the embedded tests
         env:
-          PROBE_RS_FLEET_SELECT: nrf52
+          PROBEFLEET_SELECT: nrf52
         run: |
           probe-rs run --chip nRF52840_xxAA \
             target/thumbv7em-none-eabihf/release/deps/integration-*
@@ -153,13 +153,13 @@ jobs:
       #    every job in this repository authenticates as the same subject
       #    (gha/workload:<owner>/<repo>). So the cap is effectively per repo:
       #    ten legs against a two-board pool are ten requests from ONE subject.
-      #  * a contended leg WAITS, up to PROBE_RS_FLEET_QUEUE_WAIT (default
+      #  * a contended leg WAITS, up to PROBEFLEET_QUEUE_WAIT (default
       #    300s). The coordinator queues the request and pushes the grant down
       #    the same connection when a board frees up, so a leg that gets its
       #    turn inside the window proceeds as if it had never queued. Only an
       #    expired wait fails ("still queued at position N after 300s"). Set
       #    `max-parallel` to bound throughput, not to avoid failures; set
-      #    PROBE_RS_FLEET_QUEUE_WAIT=0 if you would rather fail fast.
+      #    PROBEFLEET_QUEUE_WAIT=0 if you would rather fail fast.
       #  * being at the cap, or naming a board you cannot reach, fails
       #    immediately and says which of the two it was — neither is something
       #    waiting can fix.

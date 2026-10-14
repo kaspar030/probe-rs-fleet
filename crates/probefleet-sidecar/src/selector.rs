@@ -6,12 +6,12 @@
 //!
 //! | variable                          | meaning                                              |
 //! |-----------------------------------|------------------------------------------------------|
-//! | `PROBE_RS_FLEET_BOARD`            | board **model** (e.g. `nrf52840dk`) — any board of that type |
-//! | `PROBE_RS_FLEET_ID`               | one specific board, by node-local id (e.g. `nrf52840-dk-3`) |
-//! | `PROBE_RS_FLEET_SELECT`           | constraint expression (e.g. `tag=nrf52 && bluetooth`)|
-//! | `PROBE_RS_FLEET_COORDINATOR`      | coordinator URL (`https://fleet.example`, or `host:port`) |
-//! | `PROBE_RS_FLEET_TOKEN`            | the bearer session token                             |
-//! | `PROBE_RS_FLEET_SERVER_CERT_SHA256` | optional pinned server-cert hash (self-hosted)     |
+//! | `PROBEFLEET_BOARD`            | board **model** (e.g. `nrf52840dk`) — any board of that type |
+//! | `PROBEFLEET_ID`               | one specific board, by node-local id (e.g. `nrf52840-dk-3`) |
+//! | `PROBEFLEET_SELECT`           | constraint expression (e.g. `tag=nrf52 && bluetooth`)|
+//! | `PROBEFLEET_COORDINATOR`      | coordinator URL (`https://fleet.example`, or `host:port`) |
+//! | `PROBEFLEET_TOKEN`            | the bearer session token                             |
+//! | `PROBEFLEET_SERVER_CERT_SHA256` | optional pinned server-cert hash (self-hosted)     |
 //!
 //! Resolution rules:
 //!
@@ -25,8 +25,8 @@
 //!
 //! # What is deliberately *not* here any more
 //!
-//! Revision 2 deleted `PROBE_RS_FLEET_CLIENT_CERT` / `_CLIENT_KEY` / `_CA` with
-//! the private CA, and `PROBE_RS_FLEET_SUBJECT_ID` with them. That last one was
+//! Revision 2 deleted `PROBEFLEET_CLIENT_CERT` / `_CLIENT_KEY` / `_CA` with
+//! the private CA, and `PROBEFLEET_SUBJECT_ID` with them. That last one was
 //! not merely dead config: it let a client assert its own identity to the
 //! coordinator. The subject now comes from the token and from nowhere else.
 //!
@@ -34,12 +34,12 @@
 //! touch the real process environment.
 //!
 //! That injectability is also how the CLI selector flags work: this crate still
-//! resolves purely from an `EnvSource`, but `probe-rs-fleet sidecar --board` /
+//! resolves purely from an `EnvSource`, but `probefleet sidecar --board` /
 //! `--id` / `--select` layers the flag over the process environment in
 //! `probefleet`
 //! (`roles::sidecar::SelectorFlags`). The flag wins and *replaces all three*
 //! selector variables, so it never produces [`SelectorError::AmbiguousSelector`]
-//! against a stale one; `PROBE_RS_FLEET_CAPABILITY` is not intercepted, so a
+//! against a stale one; `PROBEFLEET_CAPABILITY` is not intercepted, so a
 //! capability token plus a flag is still
 //! [`SelectorError::CapabilityWithSelector`]. The argv0 `probe-rs` shim carries
 //! no flags at all (it forwards every argument verbatim to stay transparent to
@@ -53,26 +53,26 @@ pub mod env {
     /// Board **model** selector: any board of this board type, e.g.
     /// `nrf52840dk`. The word "board" means the model on every surface — this
     /// variable, the `board=` selector term and `sidecar --board`.
-    pub const BOARD: &str = "PROBE_RS_FLEET_BOARD";
+    pub const BOARD: &str = "PROBEFLEET_BOARD";
     /// Explicit board **instance** selector: one board, by node-local id.
-    pub const ID: &str = "PROBE_RS_FLEET_ID";
+    pub const ID: &str = "PROBEFLEET_ID";
     /// Constraint-expression selector.
-    pub const SELECT: &str = "PROBE_RS_FLEET_SELECT";
+    pub const SELECT: &str = "PROBEFLEET_SELECT";
     /// Coordinator base URL (`https://host[:port]`, or a bare `host:port`).
-    pub const COORDINATOR: &str = "PROBE_RS_FLEET_COORDINATOR";
+    pub const COORDINATOR: &str = "PROBEFLEET_COORDINATOR";
     /// The bearer session token.
-    pub const TOKEN: &str = "PROBE_RS_FLEET_TOKEN";
+    pub const TOKEN: &str = "PROBEFLEET_TOKEN";
     /// Optional pinned coordinator server-certificate SHA-256 (64 hex chars),
     /// for a self-hosted deployment with no publicly trusted certificate.
-    pub const SERVER_CERT_SHA256: &str = "PROBE_RS_FLEET_SERVER_CERT_SHA256";
-    /// A **capability token** (hex), from `probe-rs-fleet ctl delegate`.
+    pub const SERVER_CERT_SHA256: &str = "PROBEFLEET_SERVER_CERT_SHA256";
+    /// A **capability token** (hex), from `probefleet ctl delegate`.
     ///
     /// The sandboxed-client credential (architecture §6.5). It is not a fleet
     /// identity: it authorises exactly one lease on exactly one board, expires
     /// with that lease, and can be revoked by releasing it. Setting it selects
     /// the delegated path; a board selector must **not** also be set, because
     /// the board is inside the token.
-    pub const CAPABILITY: &str = "PROBE_RS_FLEET_CAPABILITY";
+    pub const CAPABILITY: &str = "PROBEFLEET_CAPABILITY";
     /// Set to a non-empty value to disable the cross-invocation lease store
     /// ([`crate::lease_store`]) entirely.
     ///
@@ -80,7 +80,7 @@ pub mod env {
     /// board of its own and releases it on the way out, so no board is ever
     /// held between two `probe-rs` commands. The escape hatch for a shared
     /// workstation, or for debugging the cache itself.
-    pub const NO_LEASE_CACHE: &str = "PROBE_RS_FLEET_NO_LEASE_CACHE";
+    pub const NO_LEASE_CACHE: &str = "PROBEFLEET_NO_LEASE_CACHE";
     /// How long, in seconds, to wait for a queued lease request to be promoted
     /// before giving up. Default [`super::DEFAULT_QUEUE_WAIT_SECS`].
     ///
@@ -88,7 +88,7 @@ pub mod env {
     /// invocation is willing to sit in the queue is the caller's business, and
     /// a CI leg, an interactive `probe-rs run` and a script have different
     /// answers. `0` disables waiting, restoring the fail-fast behaviour.
-    pub const QUEUE_WAIT: &str = "PROBE_RS_FLEET_QUEUE_WAIT";
+    pub const QUEUE_WAIT: &str = "PROBEFLEET_QUEUE_WAIT";
 }
 
 /// How long a queued lease request waits for promotion by default: 5 minutes.
@@ -142,10 +142,10 @@ pub struct FleetConfig {
     ///
     /// One credential, whatever the principal is: a user session token, or a
     /// **workload token** exchanged per CI job (architecture §6.7, obtained by
-    /// `probe-rs-fleet ci login`). The coordinator resolves it to a subject;
+    /// `probefleet ci login`). The coordinator resolves it to a subject;
     /// the client has no say in who it is — which is exactly why the CI path
     /// needed no change here at all. A workload token arrives in
-    /// `PROBE_RS_FLEET_TOKEN` like any other.
+    /// `PROBEFLEET_TOKEN` like any other.
     pub token: String,
     /// Which board to lease.
     pub select: Constraint,
@@ -248,8 +248,8 @@ pub enum SelectorError {
     /// A coordinator/selector is configured but no bearer token was provided.
     #[error("no coordinator credential: set {}", env::TOKEN)]
     MissingAuth,
-    /// More than one of `PROBE_RS_FLEET_BOARD`, `PROBE_RS_FLEET_ID` and
-    /// `PROBE_RS_FLEET_SELECT` was set.
+    /// More than one of `PROBEFLEET_BOARD`, `PROBEFLEET_ID` and
+    /// `PROBEFLEET_SELECT` was set.
     #[error(
         "more than one of {}, {} and {} is set — pick one selector",
         env::BOARD,
@@ -265,7 +265,7 @@ pub enum SelectorError {
         env::SELECT
     )]
     MissingSelector,
-    /// The constraint expression in `PROBE_RS_FLEET_SELECT` was malformed.
+    /// The constraint expression in `PROBEFLEET_SELECT` was malformed.
     #[error("invalid {} expression: {reason}", env::SELECT)]
     InvalidSelect { reason: String },
     /// The pinned server-certificate hash was not 64 hex characters.
@@ -391,14 +391,14 @@ pub fn resolve(env: &impl EnvSource) -> Result<Resolution, SelectorError> {
     }))
 }
 
-/// Parse a `PROBE_RS_FLEET_SELECT` constraint expression into a
+/// Parse a `PROBEFLEET_SELECT` constraint expression into a
 /// [`Constraint`].
 ///
 /// A thin delegate to [`probefleet_proto::lease::parse_constraint`], the fleet's one
 /// selector grammar (architecture §6.5), where a bare term is a **tag** —
-/// `PROBE_RS_FLEET_SELECT=nrf52 && bluetooth` describes a set of boards.
+/// `PROBEFLEET_SELECT=nrf52 && bluetooth` describes a set of boards.
 /// `board=<model>` selects any board of a model and `id=<name>` one specific
-/// board; `PROBE_RS_FLEET_BOARD` / `PROBE_RS_FLEET_ID` are the shorthands for
+/// board; `PROBEFLEET_BOARD` / `PROBEFLEET_ID` are the shorthands for
 /// those two.
 fn parse_select(expr: &str) -> Result<Constraint, SelectorError> {
     probefleet_proto::lease::parse_constraint(expr).map_err(|e| SelectorError::InvalidSelect {
@@ -615,7 +615,7 @@ mod tests {
     }
 
     /// The two shorthand variables mean exactly what the corresponding
-    /// expression terms mean; `PROBE_RS_FLEET_SELECT` can spell either.
+    /// expression terms mean; `PROBEFLEET_SELECT` can spell either.
     #[test]
     fn the_shorthand_vars_match_the_expression_terms() {
         assert_eq!(
@@ -628,20 +628,20 @@ mod tests {
         );
     }
 
-    /// The deleted `PROBE_RS_FLEET_SUBJECT_ID` let a client assert its own
+    /// The deleted `PROBEFLEET_SUBJECT_ID` let a client assert its own
     /// identity. Setting it now must have no effect whatsoever — in particular
     /// it must not trip fleet mode on its own, which would be a confusing way to
     /// discover the variable is gone.
     #[test]
     fn the_deleted_subject_id_override_has_no_effect() {
-        let env = MapEnv::new(&[("PROBE_RS_FLEET_SUBJECT_ID", "root")]);
+        let env = MapEnv::new(&[("PROBEFLEET_SUBJECT_ID", "root")]);
         assert_eq!(resolve(&env).unwrap(), Resolution::Local);
 
         let env = MapEnv::new(&[
             (env::BOARD, "nrf52840dk"),
             (env::COORDINATOR, "c:1"),
             (env::TOKEN, "t"),
-            ("PROBE_RS_FLEET_SUBJECT_ID", "root"),
+            ("PROBEFLEET_SUBJECT_ID", "root"),
         ]);
         let Resolution::Fleet(cfg) = resolve(&env).unwrap() else {
             panic!("expected Fleet");
@@ -674,7 +674,7 @@ mod tests {
         ));
     }
 
-    /// The `PROBE_RS_FLEET_SELECT` surface: the wildcard refusal must reach
+    /// The `PROBEFLEET_SELECT` surface: the wildcard refusal must reach
     /// the user through `SelectorError::InvalidSelect`'s reason, not be
     /// flattened into a generic "invalid selector".
     #[test]
@@ -684,9 +684,9 @@ mod tests {
         };
         assert!(reason.contains("no wildcard"), "{reason}");
 
-        let env = MapEnv::new(&[("PROBE_RS_FLEET_SELECT", "*")]);
+        let env = MapEnv::new(&[("PROBEFLEET_SELECT", "*")]);
         let Err(SelectorError::InvalidSelect { reason }) = resolve(&env) else {
-            panic!("`PROBE_RS_FLEET_SELECT=*` should be refused");
+            panic!("`PROBEFLEET_SELECT=*` should be refused");
         };
         assert!(reason.contains("no wildcard"), "{reason}");
     }

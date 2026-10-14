@@ -243,7 +243,7 @@ pub struct CoordinatorConfig {
     /// There is deliberately **no cap** on this value, matching
     /// `session_ttl_secs`: a second capped-vs-uncapped rule with no enforcement
     /// story would be worse than neither. What bounds a leak in practice is
-    /// revocation (`probe-rs-fleet logout --all`), which is why that verb
+    /// revocation (`probefleet logout --all`), which is why that verb
     /// exists.
     pub refresh_token_ttl_secs: u64,
     /// How old (seconds) a node token may get before it is rotated.
@@ -279,7 +279,7 @@ pub struct CoordinatorConfig {
     /// directly (tests) then gets a random per-process secret, so browser
     /// sessions do not survive a restart.
     pub csrf_secret: Option<Vec<u8>>,
-    /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`
+    /// The GitHub Actions OIDC issuer backing `probefleet ci login`
     /// (architecture §6.7).
     ///
     /// `None` is a supported deployment: a fleet with no CI. The exchange then
@@ -287,7 +287,7 @@ pub struct CoordinatorConfig {
     /// `device_flow_unconfigured`, so the CLI can say *why*.
     pub github_actions: Option<GithubActionsConfig>,
     /// Whether a logged-in user may create a team org over the API
-    /// (`POST /api/v1/orgs`, `probe-rs-fleet org create`), becoming its admin.
+    /// (`POST /api/v1/orgs`, `probefleet org create`), becoming its admin.
     ///
     /// Default `true`: self-service is the point. A hosted operator who wants
     /// to provision orgs by hand switches it off; `coordinator org create` on

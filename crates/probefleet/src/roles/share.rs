@@ -1,4 +1,4 @@
-//! `probe-rs-fleet share`: offer this machine's probes to the fleet, using the
+//! `probefleet share`: offer this machine's probes to the fleet, using the
 //! login you already have.
 //!
 //! This is the story-2 payoff (architecture §6.4): "I'm on my laptop, I plug in
@@ -29,7 +29,7 @@ use crate::cli::ShareArgs;
 use crate::fleet_config;
 use crate::roles::node_setup;
 
-/// Run `probe-rs-fleet share`.
+/// Run `probefleet share`.
 ///
 /// # Errors
 ///
@@ -54,15 +54,15 @@ pub async fn run(args: ShareArgs) -> Result<()> {
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
             "loading fleet config {} — log in first with \
-             `probe-rs-fleet login --fleet {fleet} --fleet-url <url>`",
+             `probefleet login --fleet {fleet} --fleet-url <url>`",
             fleet_path.display()
         )
     })?;
     anyhow::ensure!(
         file.user.is_some(),
         "fleet `{fleet}` has no [user] credential on this machine; \
-         run `probe-rs-fleet login --fleet {fleet}` first, or enroll this node \
-         unattended with `probe-rs-fleet node up --auth-key <key>`"
+         run `probefleet login --fleet {fleet}` first, or enroll this node \
+         unattended with `probefleet node up --auth-key <key>`"
     );
 
     // Refresh through the shared path rather than reaching for the raw token: a

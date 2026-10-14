@@ -1,4 +1,4 @@
-//! `node up --interactive` + `probe-rs-fleet node approve` end to end, through
+//! `node up --interactive` + `probefleet node approve` end to end, through
 //! the CLI's own code paths (architecture §4.2 rung 3, §6.4).
 //!
 //! The story this asserts: a headless Pi with **no credential of any kind**

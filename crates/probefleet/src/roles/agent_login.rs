@@ -1,8 +1,8 @@
-//! `probe-rs-fleet agent login`: a persistent, self-renewing sandbox session
+//! `probefleet agent login`: a persistent, self-renewing sandbox session
 //! from a stored auth key (architecture §6.7).
 //!
 //! ```text
-//! probe-rs-fleet agent login --fleet-url https://fleet.example \
+//! probefleet agent login --fleet-url https://fleet.example \
 //!     --auth-key prfk1_… --as desk-bot
 //! ```
 //!
@@ -14,7 +14,7 @@
 //! (`auth-key create --purpose agent --as <name>`), but not a persistent
 //! *session*: the `prfw1_` workload token it authenticates with lives about an
 //! hour and nothing renews it. Without this verb every sandbox threads its own
-//! hourly `eval "$(probe-rs-fleet ci login …)"` — a cron job or retry wrapper
+//! hourly `eval "$(probefleet ci login …)"` — a cron job or retry wrapper
 //! reimplemented per sandbox, which does not even propagate between the
 //! concurrent processes sharing the machine.
 //!
@@ -83,7 +83,7 @@ enum Confirmation {
     Unconfirmed,
 }
 
-/// Run `probe-rs-fleet agent login`.
+/// Run `probefleet agent login`.
 ///
 /// `fleet` and `config_dir` come from the enclosing `agent` group, which
 /// declares them `global = true` — see [`AgentLoginArgs`], which must not
@@ -116,7 +116,7 @@ pub async fn run(args: AgentLoginArgs, fleet: &str, config_dir: Option<PathBuf>)
             format!(
                 "no coordinator URL for fleet `{fleet}`; pass --fleet-url \
                  <https://fleet.example> the first time (or set \
-                 PROBE_RS_FLEET_COORDINATOR)"
+                 PROBEFLEET_COORDINATOR)"
             )
         })?;
     let pin_hex = args
@@ -139,7 +139,7 @@ pub async fn run(args: AgentLoginArgs, fleet: &str, config_dir: Option<PathBuf>)
     anyhow::ensure!(
         crate::tokens::is_api_key(&auth_key),
         "--auth-key must be an auth key (`prfk1_…`); mint one with \
-         `probe-rs-fleet auth-key create --purpose agent --as <name> --multi-use --tag <tag>`"
+         `probefleet auth-key create --purpose agent --as <name> --multi-use --tag <tag>`"
     );
     // Never repaired, only refused: a repaired name is a *different* identity,
     // and this one is only a display value here anyway.
@@ -212,7 +212,7 @@ const SINGLE_USE: &str = "that auth key is single-use, so it cannot back a persi
                           sandbox with concurrent users breaks on the second PROCESS, not merely \
                           the second hour.\nNote the key has now been spent \u{2014} confirming \
                           this costs a redemption, and a single-use key has only one.\nNothing was \
-                          written. Mint a replacement with:\n  probe-rs-fleet auth-key create \
+                          written. Mint a replacement with:\n  probefleet auth-key create \
                           --purpose agent --as <name> --multi-use --tag <tag>";
 
 /// The lines the summary prints, as data.

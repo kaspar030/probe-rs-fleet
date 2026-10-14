@@ -1,6 +1,6 @@
-//! Single multi-role binary for probe-rs-fleet (library surface).
+//! Single multi-role binary for probefleet (library surface).
 //!
-//! The crate ships a single binary (`probe-rs-fleet`), but it also exposes its
+//! The crate ships a single binary (`probefleet`), but it also exposes its
 //! modules as a library so integration tests can exercise the role handlers
 //! in-process (see `tests/bearer_e2e.rs`, which drives `login --token` /
 //! `share` / `node up` against a live coordinator).

@@ -1,19 +1,19 @@
-# probe-rs-fleet — boards.toml reference (agent-local board inventory)
+# probefleet — boards.toml reference (agent-local board inventory)
 #
 # Maps physical probe serials to leasable boards for ONE agent. The agent
 # reconciles discovered probes against these declarations. The default path is
-# ~/.config/probe-rs-fleet/node/boards.toml; override it with `boards_path` in
+# ~/.config/probefleet/node/boards.toml; override it with `boards_path` in
 # node.toml (see examples/node.toml).
 #
-# `probe-rs-fleet share` / `node up` scaffold a commented version of this file.
+# `probefleet share` / `node up` scaffold a commented version of this file.
 #
 # ---------------------------------------------------------------------------
 # You do not have to write this by hand
 # ---------------------------------------------------------------------------
 #
-#   probe-rs-fleet node board list          # declared vs. attached-but-undeclared
-#   probe-rs-fleet node board add           # pick a probe, prompt for id/chip/model
-#   probe-rs-fleet node board add --serial 001050047405 --id nrf52840-dk-1 \
+#   probefleet node board list          # declared vs. attached-but-undeclared
+#   probefleet node board add           # pick a probe, prompt for id/chip/model
+#   probefleet node board add --serial 001050047405 --id nrf52840-dk-1 \
 #       --chip nRF52840_xxAA --model nrf52840dk --tag nrf52    # scriptable
 #
 # `add` **appends** a [[board]] table to this file and never rewrites the rest

@@ -96,15 +96,15 @@ impl CtlConnection {
         let fleet = args.fleet.clone();
         let fleet_url = args.coordinator.or(fb_url).with_context(|| {
             format!(
-                "--coordinator (or PROBE_RS_FLEET_COORDINATOR, or fleets/{fleet}.toml) is \
+                "--coordinator (or PROBEFLEET_COORDINATOR, or fleets/{fleet}.toml) is \
                  required"
             )
         })?;
         let token = args.token.or(fallback_token).with_context(|| {
             format!(
-                "no credential for fleet `{fleet}`; run `probe-rs-fleet login --fleet {fleet}` \
-                 (or, for a persistent sandbox, `probe-rs-fleet agent login --fleet {fleet} \
-                 --auth-key prfk1_\u{2026}`; or pass --token / PROBE_RS_FLEET_TOKEN)"
+                "no credential for fleet `{fleet}`; run `probefleet login --fleet {fleet}` \
+                 (or, for a persistent sandbox, `probefleet agent login --fleet {fleet} \
+                 --auth-key prfk1_\u{2026}`; or pass --token / PROBEFLEET_TOKEN)"
             )
         })?;
         let server_cert_sha256 = args.server_cert_sha256.or(fb_pin);
@@ -135,7 +135,7 @@ impl CtlConnection {
 /// A thin delegate to [`probefleet_proto::lease::parse_constraint`], the fleet's one
 /// selector grammar (architecture §6.5). There is no per-surface dialect: the
 /// same expression means the same thing here, in the sidecar's
-/// `PROBE_RS_FLEET_SELECT` and in `grant --select`.
+/// `PROBEFLEET_SELECT` and in `grant --select`.
 ///
 /// * `id=<name>` — one specific board;
 /// * `board=<model>` — any board of that model, e.g. `board=nrf52840dk`;
@@ -368,10 +368,10 @@ impl CtlClient {
                 let ops = decode_token_ops(&grant.token);
                 println!("# board {} (lease {})", grant.board, grant.lease.0);
                 println!("# expires {} (epoch); ops: {ops}", grant.expires);
-                println!("PROBE_RS_FLEET_COORDINATOR={}", self.conn.fleet_url);
-                println!("PROBE_RS_FLEET_CAPABILITY={token}");
+                println!("PROBEFLEET_COORDINATOR={}", self.conn.fleet_url);
+                println!("PROBEFLEET_CAPABILITY={token}");
                 println!(
-                    "# revoke by releasing the lease: probe-rs-fleet ctl release {}",
+                    "# revoke by releasing the lease: probefleet ctl release {}",
                     grant.board.name
                 );
                 Ok(ExitCode::SUCCESS)

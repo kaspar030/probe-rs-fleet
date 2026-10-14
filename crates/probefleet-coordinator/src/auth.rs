@@ -24,7 +24,8 @@ use probefleet_proto::token::{
 };
 
 /// Domain separator for [`serve_token`], so no other HMAC over the signing seed
-/// can ever collide with it.
+/// can ever collide with it. Frozen wire label: changing it changes every
+/// derived serve token.
 const SERVE_TOKEN_LABEL: &[u8] = b"probe-rs-fleet/serve-token/v1";
 
 /// The `probe-rs serve` user token for one lease's board session:

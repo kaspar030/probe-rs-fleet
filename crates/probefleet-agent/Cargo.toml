@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 readme = false
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
-description = "Agent role implementation for probe-rs-fleet."
+description = "Agent role implementation for probefleet."
 
 [features]
 default = ["gpio"]

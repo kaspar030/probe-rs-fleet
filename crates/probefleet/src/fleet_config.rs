@@ -1,4 +1,4 @@
-//! The per-fleet config file: `~/.config/probe-rs-fleet/fleets/<name>.toml`.
+//! The per-fleet config file: `~/.config/probefleet/fleets/<name>.toml`.
 //!
 //! One file per fleet, holding everything this machine knows about that fleet:
 //! where it is, how to verify it, and whichever credentials this machine holds
@@ -8,18 +8,18 @@
 //! url = "https://fleet.example"
 //! # server_cert_sha256 = "<64 hex>"
 //!
-//! [user]                # written by `probe-rs-fleet login`
+//! [user]                # written by `probefleet login`
 //! session_token = "prfs1_…"
 //! username = "kaspar"
 //! # org = "acme"      # acting org; default: your personal org
 //! refresh_token = "prfr1_…"   # renews the session without a browser
 //!
-//! [node]                # written by `probe-rs-fleet share` / `node up`
+//! [node]                # written by `probefleet share` / `node up`
 //! node_token = "prfn1_…"
 //! node_id = "01J9Z3Q4…/rpi-lab-1"
 //! coordinator_token_pubkey = "<64 hex>"
 //!
-//! [agent]               # written by `probe-rs-fleet agent login`
+//! [agent]               # written by `probefleet agent login`
 //! auth_key = "prfk1_…"         # the durable credential
 //! name = "desk-bot"            # the --as identity, display only
 //! workload_token = "prfw1_…"   # the current short-lived session
@@ -52,7 +52,7 @@
 //!   revoked with `auth-key revoke`;
 //! * `[user].refresh_token` mints *session* tokens for one human in one org —
 //!   it opens nothing itself and enrolls nothing — and is revoked with
-//!   `probe-rs-fleet logout --all`, or by waiting out its 30-day TTL.
+//!   `probefleet logout --all`, or by waiting out its 30-day TTL.
 //!
 //! Both are optional: a file written before either feature existed parses
 //! unchanged, and every code path that reads them treats absence as "fall back
@@ -101,12 +101,12 @@ pub struct FleetFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<NodeSection>,
     /// This machine's *persistent agent* credential for the fleet, if
-    /// `probe-rs-fleet agent login` has run.
+    /// `probefleet agent login` has run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentSection>,
 }
 
-/// The `[user]` table, written by `probe-rs-fleet login`.
+/// The `[user]` table, written by `probefleet login`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSection {
     /// The user's bearer session token (`prfs1_…`). Short-lived, refreshable.
@@ -139,12 +139,12 @@ pub struct UserSection {
     ///
     /// It is **stronger than the `session_token` above it**: it mints, for 30
     /// days. It can do nothing else — it opens no connection and enrolls
-    /// nothing — and `probe-rs-fleet logout --all` revokes it.
+    /// nothing — and `probefleet logout --all` revokes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
 }
 
-/// The `[node]` table, written by `probe-rs-fleet share` / `node up` and refreshed by
+/// The `[node]` table, written by `probefleet share` / `node up` and refreshed by
 /// the running agent when the coordinator rotates its token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSection {
@@ -164,14 +164,14 @@ pub struct NodeSection {
     pub previous_node_token: Option<String>,
 }
 
-/// The `[agent]` table, written by `probe-rs-fleet agent login` and refreshed
+/// The `[agent]` table, written by `probefleet agent login` and refreshed
 /// in place by `ctl` / the `probe-rs` sidecar shim as the workload token nears
 /// expiry.
 ///
 /// This is the *persistent sandbox* case: a long-running, possibly multi-user
 /// machine that holds an identity (`auth-key create --purpose agent --as
 /// <name>`) rather than a human session. The durable credential lives here so
-/// that no cron job or hourly `eval "$(probe-rs-fleet ci login …)"` wrapper has
+/// that no cron job or hourly `eval "$(probefleet ci login …)"` wrapper has
 /// to be reimplemented per sandbox.
 ///
 /// # Why there is no `previous_workload_token`
@@ -212,10 +212,10 @@ pub struct AgentSection {
 }
 
 /// The comment header every rendered fleet file carries.
-const HEADER: &str = r"# probe-rs-fleet — per-fleet configuration
+const HEADER: &str = r"# probefleet — per-fleet configuration
 #
-# One file per fleet, at ~/.config/probe-rs-fleet/fleets/<name>.toml. Select it
-# with `--fleet <name>` or PROBE_RS_FLEET; the default is `default`.
+# One file per fleet, at ~/.config/probefleet/fleets/<name>.toml. Select it
+# with `--fleet <name>` or PROBEFLEET; the default is `default`.
 #
 # THIS FILE HOLDS BEARER CREDENTIALS and is written 0600. [user].session_token
 # lets anyone act as you until it expires; [node].node_token lets anyone act as
@@ -226,14 +226,14 @@ const HEADER: &str = r"# probe-rs-fleet — per-fleet configuration
 #   [agent].auth_key      — mints workload sessions as that machine identity
 #                           until the key is revoked (`auth-key revoke`).
 #   [user].refresh_token  — mints session tokens as YOU until it is revoked
-#                           (`probe-rs-fleet logout --all`) or expires (30d).
+#                           (`probefleet logout --all`) or expires (30d).
 #                           It can do nothing else: it opens no connection and
 #                           enrolls nothing.
 #
 # The tokens are deliberately distinct: merging them would make a compromised
 # node equivalent to a compromised user account.
 #
-# Managed by `probe-rs-fleet login` ([user]), `share` / `node up` ([node]) and
+# Managed by `probefleet login` ([user]), `share` / `node up` ([node]) and
 # `agent login` ([agent], refreshed in place by `ctl` and the probe-rs shim).
 # All of them preserve the others' tables, so one machine can hold all three.
 ";
@@ -262,7 +262,7 @@ pub fn load_named(fleet: &str) -> Result<FleetFile> {
     let path = paths::fleet_config_path(fleet)?;
     anyhow::ensure!(
         path.exists(),
-        "no config for fleet `{fleet}` at {}; run `probe-rs-fleet login --fleet {fleet} \
+        "no config for fleet `{fleet}` at {}; run `probefleet login --fleet {fleet} \
          --fleet-url <url>` first",
         path.display()
     );
@@ -488,12 +488,12 @@ const REFRESH_SKEW_SECS: u64 = 60;
 ///
 /// Returns an error if the fleet file has no `[user]` table, or renewal both
 /// fails and leaves no usable token. The error always names
-/// `probe-rs-fleet login`, never a bare 401.
+/// `probefleet login`, never a bare 401.
 pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<String> {
     let user = file
         .user
         .as_ref()
-        .context("this fleet has no [user] credential; run `probe-rs-fleet login`")?;
+        .context("this fleet has no [user] credential; run `probefleet login`")?;
 
     let now = now_epoch_secs();
     let refresh_token = user
@@ -583,7 +583,7 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
     if user.expires.is_some_and(|expires| expires <= now) {
         return Err(anyhow::anyhow!(
             "the session token for fleet `{fleet}` has expired; run \
-             `probe-rs-fleet login --fleet {fleet}`"
+             `probefleet login --fleet {fleet}`"
         ));
     }
 
@@ -616,7 +616,7 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
                 }
             }
             Err(anyhow::anyhow!(
-                "session token refresh failed ({e}); run `probe-rs-fleet login --fleet {fleet}`"
+                "session token refresh failed ({e}); run `probefleet login --fleet {fleet}`"
             ))
         }
     }
@@ -648,11 +648,11 @@ pub async fn ensure_fresh_session(fleet: &str, file: &FleetFile) -> Result<Strin
 ///
 /// Returns an error if the fleet file has no `[agent]` table, or the redemption
 /// fails and no peer has left a usable token behind. Both name
-/// `probe-rs-fleet agent login` as the fix.
+/// `probefleet agent login` as the fix.
 pub async fn ensure_fresh_agent_session(fleet: &str, file: &FleetFile) -> Result<String> {
     let agent = file.agent.as_ref().with_context(|| {
         format!(
-            "this fleet has no [agent] credential; run `probe-rs-fleet agent login \
+            "this fleet has no [agent] credential; run `probefleet agent login \
              --fleet {fleet} --auth-key prfk1_\u{2026}`"
         )
     })?;
@@ -705,7 +705,7 @@ pub async fn ensure_fresh_agent_session(fleet: &str, file: &FleetFile) -> Result
             }
             Err(anyhow::anyhow!(
                 "redeeming the agent auth key failed ({e}); run \
-                 `probe-rs-fleet agent login --fleet {fleet}`"
+                 `probefleet agent login --fleet {fleet}`"
             ))
         }
     }
@@ -1135,7 +1135,7 @@ mod tests {
             .await
             .expect_err("an expired session with nothing to renew it");
         let text = format!("{err:#}");
-        assert!(text.contains("probe-rs-fleet login"), "got: {text}");
+        assert!(text.contains("probefleet login"), "got: {text}");
         assert!(text.contains("default"), "got: {text}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
@@ -1184,7 +1184,7 @@ mod tests {
             .await
             .expect_err("nothing is listening on 127.0.0.1:1");
         let text = format!("{err:#}");
-        assert!(text.contains("probe-rs-fleet login"), "got: {text}");
+        assert!(text.contains("probefleet login"), "got: {text}");
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "an expired session must not also pay the legacy refresh's timeout"

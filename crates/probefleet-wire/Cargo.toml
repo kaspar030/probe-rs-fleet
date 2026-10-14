@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 readme = false
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
-description = "WebSocket framing + control-plane envelopes for probe-rs-fleet."
+description = "WebSocket framing + control-plane envelopes for probefleet."
 
 [dependencies]
 probefleet-proto.workspace = true

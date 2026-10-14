@@ -1,7 +1,7 @@
-//! `probe-rs-fleet org {create,list,members,rename,delete}` end to end, through the CLI's
+//! `probefleet org {create,list,members,rename,delete}` end to end, through the CLI's
 //! own code paths.
 //!
-//! A user who has only run `probe-rs-fleet login` — no shell on the
+//! A user who has only run `probefleet login` — no shell on the
 //! coordinator host — creates a team org, adds a teammate, promotes them,
 //! and removes them again. Modelled on `auth_key_e2e.rs`: `login --token`
 //! stands in for the device flow, the role functions are driven directly,

@@ -182,11 +182,11 @@ pub fn scaffold_node_dir(
 #[must_use]
 pub fn starter_node_toml(adopt: AdoptPolicy) -> String {
     format!(
-        r#"# probe-rs-fleet node settings
+        r#"# probefleet node settings
 #
 # Node-LOCAL, non-credential settings: facts about this machine, the same
 # whichever fleet it is enrolled in. The node's *credential* lives in
-# ~/.config/probe-rs-fleet/fleets/<name>.toml under [node].
+# ~/.config/probefleet/fleets/<name>.toml under [node].
 
 # What this node does with a probe `boards.toml` does not declare.
 #
@@ -196,13 +196,13 @@ pub fn starter_node_toml(adopt: AdoptPolicy) -> String {
 # ADVISORY. The coordinator's node row is what actually decides; this setting
 # only governs whether this agent bothers to synthesise board metadata for
 # undeclared probes. Editing it here does NOT change what the coordinator will
-# adopt — re-run `probe-rs-fleet share --adopt <policy>` (or `node up --adopt
+# adopt — re-run `probefleet share --adopt <policy>` (or `node up --adopt
 # <policy>`) for that.
 adopt = "{adopt}"
 
 # Path to this node's board inventory. A leading `~/` is expanded to your home
 # directory; `~user` is not.
-# boards_path = "~/.config/probe-rs-fleet/node/boards.toml"
+# boards_path = "~/.config/probefleet/node/boards.toml"
 
 # Heartbeat interval, seconds (default 15).
 # heartbeat_secs = 15
@@ -220,9 +220,9 @@ adopt = "{adopt}"
 /// A commented starter `boards.toml` with one example `[[board]]`.
 #[must_use]
 pub fn starter_boards_toml() -> String {
-    r#"# probe-rs-fleet node board inventory
+    r#"# probefleet node board inventory
 #
-# Easiest way to add an entry: `probe-rs-fleet node board add`, which discovers
+# Easiest way to add an entry: `probefleet node board add`, which discovers
 # attached probes and APPENDS a [[board]] table here (your comments survive;
 # editing and removing are still hand-edits).
 #
@@ -321,14 +321,14 @@ pub fn print_summary(e: &Enrollment<'_>) {
             println!("Probes you plug in are adopted automatically and become leasable.");
             println!(
                 "Annotate them in {} for a stable id, a chip name, or power wiring \
-                 — or run `probe-rs-fleet node board add`.",
+                 — or run `probefleet node board add`.",
                 boards_path.display()
             );
         }
         AdoptPolicy::Declared => {
             println!(
                 "Undeclared probes are reported but NOT leasable. Declare each board in\n  {}\n\
-                 or run `probe-rs-fleet node board add`, which discovers attached probes\n\
+                 or run `probefleet node board add`, which discovers attached probes\n\
                  and writes the declaration for you.",
                 boards_path.display()
             );
@@ -337,7 +337,7 @@ pub fn print_summary(e: &Enrollment<'_>) {
     if run_hint {
         println!();
         println!("The node is not running yet. Start it with:");
-        println!("       probe-rs-fleet node run --fleet {fleet}");
+        println!("       probefleet node run --fleet {fleet}");
     }
 }
 

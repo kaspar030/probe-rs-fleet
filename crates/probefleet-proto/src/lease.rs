@@ -27,7 +27,7 @@ pub enum Constraint {
     /// A bare name is only unique within one node of one org, so the
     /// coordinator resolves it to a [`BoardRef`] **within the caller's org**
     /// (erroring on ambiguity). This is the instance selector: `id=<name>`,
-    /// `--id`, `PROBE_RS_FLEET_ID`.
+    /// `--id`, `PROBEFLEET_ID`.
     Id(BoardName),
     /// Any idle board of this board *model* (board type), e.g. `nrf52840dk`.
     ///
@@ -76,7 +76,7 @@ pub enum ConstraintParseError {
     /// message therefore names the real answer instead of the grammar.
     #[error(
         "there is no wildcard selector. To reach a set of boards, tag them and \
-         select the tag (`--select lab`); `probe-rs-fleet ctl list` shows what \
+         select the tag (`--select lab`); `probefleet ctl list` shows what \
          you can reach."
     )]
     NoWildcard,
@@ -96,7 +96,7 @@ fn looks_like_a_wildcard(value: &str) -> bool {
 /// Parse a selector expression into a [`Constraint`].
 ///
 /// This is the fleet's **one** selector grammar (architecture §6.5); the
-/// sidecar's `PROBE_RS_FLEET_SELECT`, `ctl lease`, `grant --select` and
+/// sidecar's `PROBEFLEET_SELECT`, `ctl lease`, `grant --select` and
 /// `ctl delegate --select` all funnel through it, with no per-caller dialect.
 ///
 /// Grammar:

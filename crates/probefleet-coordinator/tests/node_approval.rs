@@ -741,7 +741,7 @@ async fn the_approval_page_is_static_and_reflects_nothing() {
 
     let (status, plain) = fleet.http("GET", "/node/approve", None).await;
     assert_eq!(status, 200);
-    assert!(plain.contains("probe-rs-fleet node approve"), "{plain}");
+    assert!(plain.contains("probefleet node approve"), "{plain}");
     assert!(plain.contains("cannot see it from here"), "{plain}");
     // A static link into the web UI, for the human who would rather click
     // than install the CLI. Still no form, still no query parameter read.

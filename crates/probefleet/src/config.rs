@@ -36,7 +36,7 @@ struct TlsToml {
     key: PathBuf,
 }
 
-/// One `[[auth.providers]]` entry: a login provider for `probe-rs-fleet
+/// One `[[auth.providers]]` entry: a login provider for `probefleet
 /// login` and the web UI.
 ///
 /// A provider **proves who you are; it does not name you**: the username is
@@ -133,7 +133,7 @@ impl ProviderToml {
     }
 }
 
-/// The `[github_actions]` table: the OIDC issuer backing `probe-rs-fleet ci
+/// The `[github_actions]` table: the OIDC issuer backing `probefleet ci
 /// login` (architecture §6.7).
 ///
 /// Independent of the login providers: a fleet may have CI without user
@@ -246,7 +246,7 @@ struct CoordinatorConfigToml {
     /// Login providers (`[[auth.providers]]`).
     #[serde(default)]
     auth: AuthToml,
-    /// The GitHub Actions OIDC issuer backing `probe-rs-fleet ci login`.
+    /// The GitHub Actions OIDC issuer backing `probefleet ci login`.
     #[serde(default)]
     github_actions: Option<GithubActionsToml>,
     /// Whether a logged-in user may create a team org over the API.

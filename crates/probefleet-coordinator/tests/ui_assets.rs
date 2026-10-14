@@ -322,7 +322,7 @@ async fn the_ui_swallows_no_other_prefix() {
         header(&headers, "content-type"),
         Some("text/html; charset=utf-8")
     );
-    assert!(body.contains("probe-rs-fleet node approve"), "{body}");
+    assert!(body.contains("probefleet node approve"), "{body}");
 }
 
 // ---------------------------------------------------------------------------

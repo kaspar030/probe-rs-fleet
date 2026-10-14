@@ -1,15 +1,15 @@
-# probe-rs-fleet — coordinator reference config
+# probefleet — coordinator reference config
 #
 # This is a fully-commented reference for the coordinator's TOML config. The
 # coordinator looks for this file at the XDG default path
-#   $XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml
-#   (i.e. ~/.config/probe-rs-fleet/coordinator.toml)
-# unless overridden with `--config` or the PROBE_RS_FLEET_CONFIG env var.
+#   $XDG_CONFIG_HOME/probefleet/coordinator.toml
+#   (i.e. ~/.config/probefleet/coordinator.toml)
+# unless overridden with `--config` or the PROBEFLEET_CONFIG env var.
 #
-# `probe-rs-fleet coordinator init` generates a populated version of this file
+# `probefleet coordinator init` generates a populated version of this file
 # alongside a fresh signing seed under the data dir
-#   $XDG_DATA_HOME/probe-rs-fleet/coordinator/  (i.e.
-#   ~/.local/share/probe-rs-fleet/coordinator/).
+#   $XDG_DATA_HOME/probefleet/coordinator/  (i.e.
+#   ~/.local/share/probefleet/coordinator/).
 #
 # ---------------------------------------------------------------------------
 # Deployment shape (architecture §3.5)
@@ -28,7 +28,7 @@
 #   GET  /auth/{provider}/start, /auth/{provider}/callback
 #                      browser login, one pair per [[auth.providers]] entry
 #   POST /auth/device/{start,poll}
-#                      the CLI's device login (`probe-rs-fleet login`)
+#                      the CLI's device login (`probefleet login`)
 #
 # Every non-browser principal presents `Authorization: Bearer …` on the upgrade.
 # There are no client certificates, no private CA, and no mTLS.
@@ -46,21 +46,21 @@
 #   2. Put it in an [[auth.providers]] entry below.
 #   3. coordinator init && coordinator
 #      (`init` also writes the cookie/CSRF secret — see csrf_secret_path)
-#   4. On your laptop: probe-rs-fleet login --fleet-url <url>
+#   4. On your laptop: probefleet login --fleet-url <url>
 #      → the CLI prints a code and a link; you sign in with the provider in a
 #        browser, pick a username on first login, and get a personal org of
-#        one named after it. Team orgs: `probe-rs-fleet org create <name>`
+#        one named after it. Team orgs: `probefleet org create <name>`
 #        (you become its admin; see allow_org_creation below), then
 #        `org members add <username> --org <name>` and use `--org <name>`.
 #        `coordinator org create <name> --admin <username>` is the
 #        shell-on-this-host escape hatch and ignores those limits.
-#   5. For a node: on your laptop, probe-rs-fleet auth-key create --tag lab
+#   5. For a node: on your laptop, probefleet auth-key create --tag lab
 #      (prints an auth key; needs only a login, no shell on this host)
 #      on the node: node up --fleet-url <url> --auth-key <key>
 #
 # Bootstrap without a login provider (air-gapped, or development):
 #   coordinator user-token --username <you> (prints a session token)
-#   probe-rs-fleet login --fleet-url <url> --token <token>
+#   probefleet login --fleet-url <url> --token <token>
 #   coordinator auth-key                    (prints an auth key)
 #
 # `coordinator auth-key` is the shell-on-this-host variant of step 5. The
@@ -73,7 +73,7 @@
 # username, one with no linked provider identity, and makes it a member of
 # `--org` (default: default_org below). It is the escape hatch, not the front
 # door — as is `coordinator org create`: team orgs are normally created by any
-# logged-in user with `probe-rs-fleet org create` or the web UI's Org page.
+# logged-in user with `probefleet org create` or the web UI's Org page.
 
 # ---------------------------------------------------------------------------
 # Required keys
@@ -102,7 +102,7 @@ listen_addr = "127.0.0.1:7000"
 public_url = "https://fleet.example"
 
 # SQLite database file for fleet state (created on first run).
-sqlite_path = "/var/lib/probe-rs-fleet/coordinator/coordinator.sqlite"
+sqlite_path = "/var/lib/probefleet/coordinator/coordinator.sqlite"
 
 # ---------------------------------------------------------------------------
 # Signing key — set EXACTLY ONE of the following.
@@ -114,7 +114,7 @@ sqlite_path = "/var/lib/probe-rs-fleet/coordinator/coordinator.sqlite"
 # ---------------------------------------------------------------------------
 
 # Option A: path to a file holding the 64-hex-char seed (recommended; 0600).
-signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
+signing_key_path = "/var/lib/probefleet/coordinator/signing.seed"
 
 # Option B: inline the seed directly (mutually exclusive with the path form).
 # signing_key_hex = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -147,7 +147,7 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # How long (seconds) a refresh token is valid.
 #
 # A refresh token (`prfr1_…`) is written into the client's fleet file by
-# `probe-rs-fleet login`, and its only power is minting session tokens for its
+# `probefleet login`, and its only power is minting session tokens for its
 # own user in its own org. It is accepted at POST /auth/token and on no other
 # route — not /agent, not /client, not /delegate, not /api/v1 — and is refused
 # as a connection credential from its prefix alone, before any database access.
@@ -157,7 +157,7 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # session; a rotating token would leave the losers of that race holding a
 # deleted credential mid-build. The cost is that a leaked refresh token is
 # usable for its whole TTL — bounded by this value and by
-# `probe-rs-fleet logout --all`, which deletes every session and refresh token
+# `probefleet logout --all`, which deletes every session and refresh token
 # of the calling user.
 #
 # Default: 2592000 (30 days). Same figure as MAX_API_AUTH_KEY_TTL_SECS, the
@@ -203,7 +203,7 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # cannot be replayed into another tenant.
 # default_org = "default"
 
-# Whether any logged-in user may create a team org (`probe-rs-fleet org
+# Whether any logged-in user may create a team org (`probefleet org
 # create`, the web UI's Org page) and become its admin. Default: true.
 #
 # false refuses self-service creation with 403 `org_creation_disabled`; team
@@ -215,8 +215,8 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 # Counts orgs the user created (not ones they were added to; the personal org
 # does not count). A hard cap, checked in the same transaction as the creation,
 # so concurrent creates cannot overshoot it. At the cap: 403
-# `org_limit_reached`. Deleting an org (`probe-rs-fleet org delete`) frees a
-# slot; renaming one (`probe-rs-fleet org rename`) does not use one.
+# `org_limit_reached`. Deleting an org (`probefleet org delete`) frees a
+# slot; renaming one (`probefleet org rename`) does not use one.
 # `coordinator org create` ignores it.
 # max_orgs_per_user = 10
 
@@ -227,7 +227,7 @@ signing_key_path = "/var/lib/probe-rs-fleet/coordinator/signing.seed"
 #
 # Commented here only because the path must exist for the file to load: a
 # config naming a missing secret refuses to start rather than inventing one.
-# csrf_secret_path = "/var/lib/probe-rs-fleet/coordinator/csrf.secret"
+# csrf_secret_path = "/var/lib/probefleet/coordinator/csrf.secret"
 
 # ---------------------------------------------------------------------------
 # Coordinator-terminated TLS (optional; self-hosted only)
@@ -268,7 +268,7 @@ max_concurrent_per_subject = 2
 default_ttl_secs = 900
 
 # ---------------------------------------------------------------------------
-# Login providers (optional): what backs `probe-rs-fleet login` and the web UI
+# Login providers (optional): what backs `probefleet login` and the web UI
 # ---------------------------------------------------------------------------
 #
 # Omitting every provider is a SUPPORTED deployment, not a broken one: an
@@ -300,7 +300,7 @@ default_ttl_secs = 900
 # client_id = "Iv1.0123456789abcdef"
 # # The client secret. Prefer the path form, which keeps it out of this file;
 # # set exactly one of the two.
-# client_secret_path = "/var/lib/probe-rs-fleet/coordinator/github.secret"
+# client_secret_path = "/var/lib/probefleet/coordinator/github.secret"
 # # client_secret = "…"
 # # `oidc`: the issuer (REQUIRED). `codeberg` / `gitlab`: overrides the public
 # # instance. `github`: a GitHub Enterprise origin.
@@ -329,7 +329,7 @@ default_ttl_secs = 900
 # A verified token proves "a job in repo owner/name". Reaching hardware
 # additionally needs an explicit PER-REPO grant:
 #
-#   probe-rs-fleet grant --repo owner/name --select 'tag=nrf52' --ops flash
+#   probefleet grant --repo owner/name --select 'tag=nrf52' --ops flash
 #
 # The owner is deliberately NOT sufficient — a fork, or a new repo under a
 # granted owner, is a different subject and matches no grant. It is refused

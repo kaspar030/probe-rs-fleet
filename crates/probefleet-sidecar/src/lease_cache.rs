@@ -11,7 +11,7 @@
 //! subject key is `(org, kind, id)`, so two same-named users in different orgs
 //! never collide either. The
 //! cache is pure logic with an injected clock; persistence (e.g. a file under
-//! `$XDG_RUNTIME_DIR/probe-rs-fleet/leases`) is a separate concern layered on
+//! `$XDG_RUNTIME_DIR/probefleet/leases`) is a separate concern layered on
 //! top and is intentionally not implemented here.
 
 use std::collections::HashMap;

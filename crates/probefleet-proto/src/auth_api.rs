@@ -13,7 +13,7 @@
 //! * `POST /node/enroll` → [`NodeEnrollRequest`] / [`NodeTokenResponse`]
 //!   (redeem a `node`-purpose API key);
 //! * `POST /node/self-register` → [`SelfRegisterRequest`] /
-//!   [`NodeTokenResponse`] (a user session; `probe-rs-fleet share`).
+//!   [`NodeTokenResponse`] (a user session; `probefleet share`).
 //!
 //! Defined once and shared by the coordinator handler and the CLI, so the
 //! contract cannot drift between the two ends. JSON (not postcard) because
@@ -162,7 +162,7 @@ impl fmt::Debug for NodeEnrollRequest {
 
 /// Register the calling machine as a node, proving membership with a user
 /// session (`POST /node/self-register`, `Authorization: Bearer <session>`).
-/// This is what `probe-rs-fleet share` sends.
+/// This is what `probefleet share` sends.
 ///
 /// Self-approving: **membership of the target org is sufficient**.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

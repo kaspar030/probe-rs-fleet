@@ -1,4 +1,4 @@
-//! Coordinator role implementation for probe-rs-fleet.
+//! Coordinator role implementation for probefleet.
 //!
 //! The coordinator is the fleet's single publicly reachable, listening node
 //! (architecture §4.1). It owns inventory, scheduling/leases (delegated to the

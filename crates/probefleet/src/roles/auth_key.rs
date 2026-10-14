@@ -1,12 +1,12 @@
-//! `probe-rs-fleet auth-key {create,list,revoke}`: mint and manage
+//! `probefleet auth-key {create,list,revoke}`: mint and manage
 //! node-enrollment keys with the login you already have.
 //!
 //! This is the hosted customer's path (architecture §6.4). Before it existed,
-//! auth keys could only be minted by `probe-rs-fleet coordinator auth-key`,
+//! auth keys could only be minted by `probefleet coordinator auth-key`,
 //! which reads `coordinator.toml` and writes the coordinator's `SQLite`
 //! directly
 //! — so it needs **a shell on the coordinator host**. A customer who has only
-//! run `probe-rs-fleet login` has no such shell, and therefore could not enroll
+//! run `probefleet login` has no such shell, and therefore could not enroll
 //! a headless lab Pi at all: the `node up` ladder's rung 2 (`--auth-key`)
 //! required our shell and rung 3 (an existing `[user]` session) requires a human
 //! sitting at the machine.
@@ -86,7 +86,7 @@ pub(crate) fn normalise_identity_name(raw: &str) -> Result<String> {
 /// Mandatory, and the sharpest paragraph either verb prints: the feature's
 /// whole point is that the grant belongs to the **identity**, not to the key,
 /// and that is a security-relevant surprise if it is not said out loud. Shared
-/// between `probe-rs-fleet auth-key create` and `coordinator auth-key` so the
+/// between `probefleet auth-key create` and `coordinator auth-key` so the
 /// two cannot drift into telling operators different things.
 ///
 /// Returns the text rather than printing it, so a test can assert the three
@@ -109,13 +109,13 @@ pub(crate) fn identity_epilogue(org: &str, name: &str) -> String {
          REVOCATION.\n\
          \n\
          To actually retire the agent: revoke every key carrying the name (see the\n\
-         IDENTITY column of `auth-key list`), then `probe-rs-fleet grant revoke <id\n\
+         IDENTITY column of `auth-key list`), then `probefleet grant revoke <id\n\
          from grant list>`. Tokens already issued expire on their own within the\n\
          hour."
     )
 }
 
-/// Run `probe-rs-fleet auth-key <verb>`: do the work, then print it.
+/// Run `probefleet auth-key <verb>`: do the work, then print it.
 ///
 /// # Errors
 ///
@@ -229,7 +229,7 @@ pub async fn create(args: &AuthKeyCreateArgs) -> Result<ApiKeyCreated> {
             "this coordinator does not support `--as`: it minted an UNNAMED key \
              (it echoed identity {:?}, not {:?}). That key works, but its subject and \
              grant are derived from the key hash, so rotating it forks the identity. \
-             Revoke it (`probe-rs-fleet auth-key revoke {}`) and upgrade the coordinator.",
+             Revoke it (`probefleet auth-key revoke {}`) and upgrade the coordinator.",
             created.subject_name.as_deref().unwrap_or("none"),
             subject_name.as_deref().unwrap_or("none"),
             short(&created.key_hash)
@@ -286,15 +286,15 @@ async fn session_for(
     let file = fleet_config::load(&fleet_path).with_context(|| {
         format!(
             "loading fleet config {} — log in first with \
-             `probe-rs-fleet login --fleet {fleet} --fleet-url <url>`",
+             `probefleet login --fleet {fleet} --fleet-url <url>`",
             fleet_path.display()
         )
     })?;
     anyhow::ensure!(
         file.user.is_some(),
         "fleet `{fleet}` has no [user] credential on this machine; \
-         run `probe-rs-fleet login --fleet {fleet}` first. \
-         (With a shell on the coordinator host, `probe-rs-fleet coordinator \
+         run `probefleet login --fleet {fleet}` first. \
+         (With a shell on the coordinator host, `probefleet coordinator \
          auth-key` is the self-hosted escape hatch.)"
     );
     let namespace = acting_org(&file, org).with_context(|| {
@@ -341,7 +341,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
         }
         "ambiguous_prefix" => {
             "that prefix matches more than one auth key in this org. Run \
-             `probe-rs-fleet auth-key list` and use a longer prefix"
+             `probefleet auth-key list` and use a longer prefix"
         }
         "not_found" => "no auth key in this org has a hash starting with that prefix",
         "invalid_request" => {
@@ -351,7 +351,7 @@ fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
              `--purpose ci`/`agent` key, over [a-z0-9._-] starting with a \
              letter or digit"
         }
-        "unauthorized" => "your session was refused. Log in again with `probe-rs-fleet login`",
+        "unauthorized" => "your session was refused. Log in again with `probefleet login`",
         _ => return anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {code}"),
     };
     anyhow::anyhow!("{doing} was rejected by the coordinator ({status}): {hint}")
@@ -372,7 +372,7 @@ fn parse_ttl(raw: &str) -> Result<u64> {
         s != "never" && s != "0",
         "a key minted over the API must expire: pass a TTL like `24h` (max 30d). \
          A never-expiring key is available only from a shell on the coordinator \
-         host, with `probe-rs-fleet coordinator auth-key --ttl 0`."
+         host, with `probefleet coordinator auth-key --ttl 0`."
     );
 
     let (digits, multiplier) = match s.as_bytes().last() {
@@ -434,7 +434,7 @@ fn print_created(created: &ApiKeyCreated) {
     println!();
     if created.purpose == "ci" {
         println!("Use it on a CI runner with no workload identity of its own:");
-        println!("  probe-rs-fleet ci login --fleet-url <url> --auth-key <key>");
+        println!("  probefleet ci login --fleet-url <url> --auth-key <key>");
         println!();
         println!("Redeeming it creates a GRANT in this org selecting the tagged boards,");
         println!("so revoking the key also tears down whatever it is holding — not just");
@@ -447,7 +447,7 @@ fn print_created(created: &ApiKeyCreated) {
         }
     } else {
         println!("Enroll a node with it:");
-        println!("  probe-rs-fleet node up --fleet-url <url> --auth-key <key>");
+        println!("  probefleet node up --fleet-url <url> --auth-key <key>");
     }
     println!();
     println!("This key is a bearer credential and is not stored anywhere (only its");
@@ -498,7 +498,7 @@ fn print_list(list: &ApiKeyList) {
     }
     println!();
     println!("Revoke one with:");
-    println!("  probe-rs-fleet auth-key revoke <hash-prefix>");
+    println!("  probefleet auth-key revoke <hash-prefix>");
     if list.keys.iter().any(|k| k.purpose == "ci") {
         // Said out loud because it is the surprising part: a `ci` key carries a
         // grant, so revoking it releases live leases too.

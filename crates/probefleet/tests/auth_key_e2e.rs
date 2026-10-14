@@ -1,8 +1,8 @@
-//! `probe-rs-fleet auth-key create` end to end, through the CLI's own code
+//! `probefleet auth-key create` end to end, through the CLI's own code
 //! paths.
 //!
 //! The story-1 assertion the task exists for: a customer who has only ever run
-//! `probe-rs-fleet login` — no shell on the coordinator host — mints a key on
+//! `probefleet login` — no shell on the coordinator host — mints a key on
 //! their laptop, and that key enrolls a headless node. Before this verb existed
 //! that was impossible for a hosted customer: `coordinator auth-key` reads
 //! `coordinator.toml` and writes the coordinator's `SQLite` directly.

@@ -1,11 +1,11 @@
-//! `probe-rs-fleet grant`: share a subset of this org's boards with somebody
+//! `probefleet grant`: share a subset of this org's boards with somebody
 //! else, and take it back (architecture §6.5).
 //!
 //! ```text
-//! probe-rs-fleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
-//! probe-rs-fleet grant --repo ariel-os/ariel-os --select 'tag=nrf52' --ops flash
-//! probe-rs-fleet grant list
-//! probe-rs-fleet grant revoke a1b2c3d4
+//! probefleet grant bob --select 'tag=nrf52' --ops flash,attach --until 2026-12-31
+//! probefleet grant --repo ariel-os/ariel-os --select 'tag=nrf52' --ops flash
+//! probefleet grant list
+//! probefleet grant revoke a1b2c3d4
 //! ```
 //!
 //! # `--repo` grants a repository, never its owner
@@ -66,7 +66,7 @@ use crate::roles::ctl::{CtlClient, CtlConnection};
 /// forgotten share lapses.
 const DEFAULT_GRANT_TTL_SECS: u64 = 30 * 24 * 3600;
 
-/// Run `probe-rs-fleet grant <verb>`.
+/// Run `probefleet grant <verb>`.
 ///
 /// # Errors
 ///
@@ -92,8 +92,8 @@ async fn create(args: GrantArgs) -> Result<ExitCode> {
         (Some(repo), _) => format!("repo:{}", repo.trim()),
         (None, Some(subject)) => subject.clone(),
         (None, None) => anyhow::bail!(
-            "who to share with? A person: `probe-rs-fleet grant bob --select 'tag=nrf52'`. \
-             A CI repository: `probe-rs-fleet grant --repo owner/name --select 'tag=nrf52'`."
+            "who to share with? A person: `probefleet grant bob --select 'tag=nrf52'`. \
+             A CI repository: `probefleet grant --repo owner/name --select 'tag=nrf52'`."
         ),
     };
     let selector = args
@@ -146,7 +146,7 @@ async fn create(args: GrantArgs) -> Result<ExitCode> {
             println!("  id      {}", grant.id);
             println!("  ops     {}", render_ops(&grant.ops));
             println!("  expires {expires} (epoch)");
-            println!("  revoke  probe-rs-fleet grant revoke {}", &grant.id[..8]);
+            println!("  revoke  probefleet grant revoke {}", &grant.id[..8]);
             if is_repo {
                 // The subject key printed above is the exact identity a CI job
                 // authenticates as, and the reminder is not decoration: "I

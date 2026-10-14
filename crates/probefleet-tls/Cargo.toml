@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 readme = false
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
-description = "Client-side TLS trust configuration for probe-rs-fleet."
+description = "Client-side TLS trust configuration for probefleet."
 
 [dependencies]
 rustls.workspace = true

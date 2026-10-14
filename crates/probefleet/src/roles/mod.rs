@@ -26,7 +26,7 @@
 //! - [`node_setup`] → the enrollment mechanics [`share`] and [`node_up`] share
 //!
 //! Every client role selects its credentials by **fleet name**
-//! (`--fleet` / `PROBE_RS_FLEET`), resolving to one file per fleet. See
+//! (`--fleet` / `PROBEFLEET`), resolving to one file per fleet. See
 //! [`crate::fleet_config`].
 //!
 //! The daemon roles (`coordinator`, `node_run`) race their service against
@@ -55,7 +55,7 @@ pub mod sidecar;
 use anyhow::Result;
 
 /// Print the fleets this machine has a config for, one per line. Backs
-/// `probe-rs-fleet fleets`.
+/// `probefleet fleets`.
 ///
 /// # Errors
 ///
@@ -63,7 +63,7 @@ use anyhow::Result;
 pub fn list_fleets() -> Result<()> {
     let fleets = crate::paths::list_fleets()?;
     if fleets.is_empty() {
-        println!("(no fleets configured — run `probe-rs-fleet login --fleet-url <url>`)");
+        println!("(no fleets configured — run `probefleet login --fleet-url <url>`)");
     } else {
         for fleet in fleets {
             println!("{fleet}");

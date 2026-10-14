@@ -41,7 +41,7 @@ pub enum AgentError {
     /// gets told what to do about it.
     #[error(
         "node token rejected by the coordinator ({0}); \
-         re-enroll with `probe-rs-fleet node up --fleet-url <url> --auth-key <key>`"
+         re-enroll with `probefleet node up --fleet-url <url> --auth-key <key>`"
     )]
     CredentialRejected(String),
 

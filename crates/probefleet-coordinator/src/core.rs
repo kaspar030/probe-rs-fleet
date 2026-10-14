@@ -830,7 +830,7 @@ impl Coordinator {
 
     /// Resolve a node-local board name to a [`BoardRef`] the caller may reach.
     ///
-    /// The request wire stays node-local (so `PROBE_RS_FLEET_ID=nrf52840-dk-3`
+    /// The request wire stays node-local (so `PROBEFLEET_ID=nrf52840-dk-3`
     /// keeps working); the coordinator is the only thing that turns a name into
     /// a fleet key.
     ///

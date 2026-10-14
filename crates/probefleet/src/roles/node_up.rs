@@ -7,12 +7,12 @@
 //!
 //! 1. an existing `[node]` credential in the fleet file → just reconnect;
 //! 2. `--auth-key` → redeem it (the unattended / disk-image path; the key comes
-//!    from `probe-rs-fleet auth-key create` on a machine that is logged in, or
+//!    from `probefleet auth-key create` on a machine that is logged in, or
 //!    from `coordinator auth-key` on the coordinator host);
 //! 3. an existing `[user]` session → self-register silently (what `share`
 //!    does);
 //! 4. **interactive approval** → print a URL and a short code, and wait for a
-//!    human to run `probe-rs-fleet node approve <code>` on a machine where they
+//!    human to run `probefleet node approve <code>` on a machine where they
 //!    are logged in (§4.2's rung 3);
 //! 5. otherwise → an error naming all of the above.
 //!
@@ -82,7 +82,7 @@ const MAX_TRANSPORT_RETRIES: u32 = 5;
 pub async fn run(args: NodeUpFlags, fleet: &str, config_dir: Option<PathBuf>) -> Result<()> {
     bootstrap(&args, fleet, config_dir.as_deref()).await?;
 
-    // Then be `probe-rs-fleet node run`: one implementation of "load the config
+    // Then be `probefleet node run`: one implementation of "load the config
     // and serve", so `node up` and `node run` cannot drift in how they run.
     crate::roles::node_run::run(fleet, config_dir).await
 }
@@ -183,18 +183,18 @@ pub async fn bootstrap(args: &NodeUpFlags, fleet: &str, config_dir: Option<&Path
         "fleet `{fleet}` has no [node] credential and no way to obtain one on this machine.\n\
          \n\
          Either log in first, then bring the node up:\n\
-         \x20   probe-rs-fleet login --fleet {fleet} --fleet-url <url>\n\
-         \x20   probe-rs-fleet node up --fleet {fleet}\n\
+         \x20   probefleet login --fleet {fleet} --fleet-url <url>\n\
+         \x20   probefleet node up --fleet {fleet}\n\
          \n\
          ...or have somebody approve this machine from theirs. Run this where you\n\
          can read the output, and give them the code it prints:\n\
-         \x20   probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --interactive\n\
+         \x20   probefleet node up --fleet {fleet} --fleet-url <url> --interactive\n\
          \n\
          ...or enroll unattended with a key. Mint one on a machine where you are\n\
          logged in — no shell on the coordinator needed:\n\
-         \x20   probe-rs-fleet auth-key create --tag lab\n\
+         \x20   probefleet auth-key create --tag lab\n\
          ...then, here:\n\
-         \x20   probe-rs-fleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>\n\
+         \x20   probefleet node up --fleet {fleet} --fleet-url <url> --auth-key <key>\n\
          (Self-hosted, with a shell on the coordinator: `coordinator auth-key`.)\n\
          \n\
          {skipped}"
@@ -261,10 +261,7 @@ async fn approval_flow(
     // code in front of them.
     println!();
     println!("  Open       {}", grant.verification_uri);
-    println!(
-        "  Then run   probe-rs-fleet node approve {}",
-        grant.user_code
-    );
+    println!("  Then run   probefleet node approve {}", grant.user_code);
     println!();
     println!("...on a machine where you are logged in. Waiting for approval…");
 
@@ -322,7 +319,7 @@ async fn approval_flow(
 
 /// What to say when nobody approved in time. One sentence, two call sites.
 const EXPIRED: &str = "nobody approved this machine before the code expired; run \
-                       `probe-rs-fleet node up` again for a fresh one";
+                       `probefleet node up` again for a fresh one";
 
 /// Turn a `/node/register/start` failure into remediation-shaped text.
 fn describe_start_error(e: &ClientError) -> anyhow::Error {

@@ -1,4 +1,4 @@
-//! `probe-rs-fleet share` end to end, through the CLI's own code paths.
+//! `probefleet share` end to end, through the CLI's own code paths.
 //!
 //! The story-2 payoff, asserted rather than assumed: on a machine that has
 //! logged in, one command makes it a node — no token, no coordinator shell, no

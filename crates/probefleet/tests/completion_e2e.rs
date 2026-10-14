@@ -35,7 +35,7 @@ const IFS: char = '\u{b}';
 /// static.
 fn config_tree() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("probe-rs-fleet");
+    let root = dir.path().join("probefleet");
     std::fs::create_dir_all(root.join("fleets")).unwrap();
     std::fs::create_dir_all(root.join("node")).unwrap();
     std::fs::write(root.join("fleets/default.toml"), "url = \"https://a\"\n").unwrap();
@@ -76,8 +76,8 @@ fn complete_with(bin: &Path, config_home: &Path, words: &[&str]) -> Vec<String> 
         .env("XDG_CONFIG_HOME", config_home)
         // Neither completer may consult these, but a stray inherited value
         // would make a failure look like a completion bug.
-        .env_remove("PROBE_RS_FLEET")
-        .env_remove("PROBE_RS_FLEET_COORDINATOR")
+        .env_remove("PROBEFLEET")
+        .env_remove("PROBEFLEET_COORDINATOR")
         .output()
         .unwrap();
     assert!(
@@ -94,7 +94,7 @@ fn complete_with(bin: &Path, config_home: &Path, words: &[&str]) -> Vec<String> 
 
 /// Path to the binary under test, as cargo built it.
 fn bin() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_probe-rs-fleet"))
+    Path::new(env!("CARGO_BIN_EXE_probefleet"))
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn an_unknown_shell_is_refused_rather_than_guessed() {
 #[test]
 fn top_level_subcommands_complete() {
     let dir = config_tree();
-    let got = complete_with(bin(), dir.path(), &["probe-rs-fleet", ""]);
+    let got = complete_with(bin(), dir.path(), &["probefleet", ""]);
     for verb in [
         "coordinator",
         "node",
@@ -150,13 +150,13 @@ fn the_agent_group_completes_but_its_deprecated_subcommands_do_not() {
     // the bare `agent` that runs a node) stay hidden — they are deployed service
     // units, so they keep parsing, but nothing should teach them.
     let dir = config_tree();
-    let got = complete_with(bin(), dir.path(), &["probe-rs-fleet", ""]);
+    let got = complete_with(bin(), dir.path(), &["probefleet", ""]);
     assert!(
         got.contains(&"agent".to_owned()),
         "the agent group is current now that `agent login` exists: {got:?}"
     );
 
-    let under_agent = complete_with(bin(), dir.path(), &["probe-rs-fleet", "agent", ""]);
+    let under_agent = complete_with(bin(), dir.path(), &["probefleet", "agent", ""]);
     assert!(
         under_agent.contains(&"login".to_owned()),
         "`agent login` must be offered: {under_agent:?}"
@@ -183,7 +183,7 @@ fn the_agent_group_completes_but_its_deprecated_subcommands_do_not() {
 #[test]
 fn fleet_flag_completes_the_fleets_this_machine_has() {
     let dir = config_tree();
-    let got = complete_with(bin(), dir.path(), &["probe-rs-fleet", "ctl", "--fleet", ""]);
+    let got = complete_with(bin(), dir.path(), &["probefleet", "ctl", "--fleet", ""]);
     assert!(got.contains(&"default".to_owned()), "{got:?}");
     assert!(got.contains(&"lab".to_owned()), "{got:?}");
 }
@@ -191,7 +191,7 @@ fn fleet_flag_completes_the_fleets_this_machine_has() {
 #[test]
 fn board_arguments_complete_from_boards_toml() {
     let dir = config_tree();
-    let got = complete_with(bin(), dir.path(), &["probe-rs-fleet", "ctl", "release", ""]);
+    let got = complete_with(bin(), dir.path(), &["probefleet", "ctl", "release", ""]);
     assert!(got.contains(&"nrf52840-dk-1".to_owned()), "{got:?}");
     assert!(got.contains(&"rpi-pico-2".to_owned()), "{got:?}");
 }
@@ -199,7 +199,7 @@ fn board_arguments_complete_from_boards_toml() {
 #[test]
 fn a_selector_offers_prefixes_and_then_local_values() {
     let dir = config_tree();
-    let got = complete_with(bin(), dir.path(), &["probe-rs-fleet", "ctl", "lease", ""]);
+    let got = complete_with(bin(), dir.path(), &["probefleet", "ctl", "lease", ""]);
     for prefix in ["id=", "board=", "chip=", "tag="] {
         assert!(
             got.contains(&prefix.to_owned()),
@@ -213,11 +213,7 @@ fn a_selector_offers_prefixes_and_then_local_values() {
     // Once a prefix is typed, only that family survives — clap's engine filters
     // on the partial word, so this also proves the candidates carry the prefix
     // rather than being bare values.
-    let narrowed = complete_with(
-        bin(),
-        dir.path(),
-        &["probe-rs-fleet", "ctl", "lease", "chip="],
-    );
+    let narrowed = complete_with(bin(), dir.path(), &["probefleet", "ctl", "lease", "chip="]);
     assert!(narrowed.contains(&"chip=RP2040".to_owned()), "{narrowed:?}");
     assert!(
         !narrowed.contains(&"tag=lab".to_owned()),
@@ -231,7 +227,7 @@ fn ops_complete_from_the_protocol_definition() {
     let got = complete_with(
         bin(),
         dir.path(),
-        &["probe-rs-fleet", "ctl", "delegate", "--ops", ""],
+        &["probefleet", "ctl", "delegate", "--ops", ""],
     );
     for op in probefleet_proto::token::AllowedOp::all() {
         assert!(
@@ -247,7 +243,7 @@ fn tags_and_models_complete_from_the_declared_boards() {
     let tags = complete_with(
         bin(),
         dir.path(),
-        &["probe-rs-fleet", "node", "board", "add", "--tag", ""],
+        &["probefleet", "node", "board", "add", "--tag", ""],
     );
     assert!(tags.contains(&"lab".to_owned()), "{tags:?}");
     assert!(tags.contains(&"nrf".to_owned()), "{tags:?}");
@@ -255,7 +251,7 @@ fn tags_and_models_complete_from_the_declared_boards() {
     let models = complete_with(
         bin(),
         dir.path(),
-        &["probe-rs-fleet", "node", "board", "add", "--model", ""],
+        &["probefleet", "node", "board", "add", "--model", ""],
     );
     assert!(models.contains(&"nrf52840dk".to_owned()), "{models:?}");
 }
@@ -265,16 +261,16 @@ fn a_missing_or_malformed_boards_file_completes_to_nothing_not_an_error() {
     // A machine that has never declared a board is the common case, and a
     // half-written boards.toml is a plausible one. Neither may make Tab fail.
     let dir = tempfile::tempdir().unwrap();
-    let empty = complete_with(bin(), dir.path(), &["probe-rs-fleet", "ctl", "release", ""]);
+    let empty = complete_with(bin(), dir.path(), &["probefleet", "ctl", "release", ""]);
     assert!(
         !empty.iter().any(|c| c.contains("nrf")),
         "unexpected board candidates: {empty:?}"
     );
 
-    let root = dir.path().join("probe-rs-fleet/node");
+    let root = dir.path().join("probefleet/node");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(root.join("boards.toml"), "[[board]\nid = \"broken\"\n").unwrap();
-    let broken = complete_with(bin(), dir.path(), &["probe-rs-fleet", "ctl", "release", ""]);
+    let broken = complete_with(bin(), dir.path(), &["probefleet", "ctl", "release", ""]);
     assert!(
         !broken.contains(&"broken".to_owned()),
         "a malformed file must yield nothing: {broken:?}"
@@ -331,7 +327,7 @@ fn the_completions_verb_prints_an_installable_line() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("source <(COMPLETE=bash probe-rs-fleet)"),
+        stdout.contains("source <(COMPLETE=bash probefleet)"),
         "instructions should carry the exact line to paste: {stdout}"
     );
 

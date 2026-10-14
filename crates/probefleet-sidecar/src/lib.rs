@@ -1,4 +1,4 @@
-//! Sidecar role implementation for probe-rs-fleet.
+//! Sidecar role implementation for probefleet.
 //!
 //! The sidecar runs on developer workstations and CI. It presents a **vanilla
 //! `probe-rs` CLI surface** so that `ariel-os` / `laze` invoke it unmodified

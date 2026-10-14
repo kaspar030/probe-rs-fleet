@@ -1,4 +1,4 @@
-# probe-rs-fleet — coordinator web UI and browser-facing HTTP API
+# probefleet — coordinator web UI and browser-facing HTTP API
 
 Status: **implemented.** This document describes the shape of the
 browser surface of the coordinator: how a browser authenticates, what the
@@ -414,13 +414,13 @@ purge and the namespace delete are two transactions; a node enrolled in
 between fails the delete (`org_not_empty`) and loses only history. The Org
 page shows rename and delete controls to admins of a team org
 (`SessionView` and `GET /api/v1/org` carry `personal`); the CLI has
-`probe-rs-fleet org rename <new>` and `org delete [--yes]`.
+`probefleet org rename <new>` and `org delete [--yes]`.
 
 **Managing members.** Admins get an editable members panel — add by existing
 username with a role dropdown, change a role, remove; non-admins see the same
 list read-only. The mutating routes call `forgs_http::members::{set,remove}`
 directly, the same functions behind forgs' `/auth/members`, so the browser and
-the CLI (`probe-rs-fleet org members …`, which uses `/auth/members` with the
+the CLI (`probefleet org members …`, which uses `/auth/members` with the
 fleet file's session) share one implementation; CSRF is the existing
 double-submit. Errors: `403 forbidden` (not an admin of the acting org),
 `404 not_found` (no such user — they must have logged in once — or no such

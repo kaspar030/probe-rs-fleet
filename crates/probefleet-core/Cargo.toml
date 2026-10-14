@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 readme = false
 include = ["src/**", "Cargo.toml", "LICENSE-MIT", "LICENSE-APACHE"]
-description = "Core domain types and shared logic for probe-rs-fleet."
+description = "Core domain types and shared logic for probefleet."
 
 [dependencies]
 probefleet-proto.workspace = true

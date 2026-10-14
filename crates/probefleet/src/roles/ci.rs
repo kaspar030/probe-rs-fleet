@@ -1,9 +1,9 @@
-//! `probe-rs-fleet ci login`: turn a CI job's workload identity into a
+//! `probefleet ci login`: turn a CI job's workload identity into a
 //! short-lived fleet token (architecture §6.7).
 //!
 //! ```text
-//! probe-rs-fleet ci login --fleet-url https://fleet.example
-//! probe-rs-fleet ci login --fleet-url https://fleet.example --auth-key prfk1_…
+//! probefleet ci login --fleet-url https://fleet.example
+//! probefleet ci login --fleet-url https://fleet.example --auth-key prfk1_…
 //! ```
 //!
 //! # The GitHub Actions path holds no secret
@@ -62,7 +62,7 @@ const ENV_REQUEST_TOKEN: &str = "ACTIONS_ID_TOKEN_REQUEST_TOKEN";
 /// Where GitHub Actions wants environment variables appended.
 const ENV_GITHUB_ENV: &str = "GITHUB_ENV";
 
-/// Run `probe-rs-fleet ci login`.
+/// Run `probefleet ci login`.
 ///
 /// # Errors
 ///
@@ -72,7 +72,7 @@ const ENV_GITHUB_ENV: &str = "GITHUB_ENV";
 pub async fn run(args: CiLoginArgs) -> Result<ExitCode> {
     let url = args.fleet_url.clone().context(
         "no coordinator URL: pass --fleet-url <https://fleet.example> \
-         (or set PROBE_RS_FLEET_COORDINATOR)",
+         (or set PROBEFLEET_COORDINATOR)",
     )?;
     if let Some(pin) = &args.server_cert_sha256 {
         anyhow::ensure!(
@@ -175,12 +175,12 @@ fn emit(
     github_env: Option<&Path>,
 ) -> Result<()> {
     let mut vars = vec![
-        ("PROBE_RS_FLEET_COORDINATOR", url.to_owned()),
-        ("PROBE_RS_FLEET_TOKEN", response.token.clone()),
-        ("PROBE_RS_FLEET", args.fleet.clone()),
+        ("PROBEFLEET_COORDINATOR", url.to_owned()),
+        ("PROBEFLEET_TOKEN", response.token.clone()),
+        ("PROBEFLEET", args.fleet.clone()),
     ];
     if let Some(pin) = &args.server_cert_sha256 {
-        vars.push(("PROBE_RS_FLEET_SERVER_CERT_SHA256", pin.clone()));
+        vars.push(("PROBEFLEET_SERVER_CERT_SHA256", pin.clone()));
     }
 
     if let Some(path) = github_env {
@@ -202,7 +202,7 @@ fn emit(
                 format!("writing ${ENV_GITHUB_ENV} ({})", path.to_string_lossy())
             })?;
         }
-        eprintln!("wrote PROBE_RS_FLEET_COORDINATOR / PROBE_RS_FLEET_TOKEN to ${ENV_GITHUB_ENV}");
+        eprintln!("wrote PROBEFLEET_COORDINATOR / PROBEFLEET_TOKEN to ${ENV_GITHUB_ENV}");
         if !args.export {
             return Ok(());
         }
@@ -246,7 +246,7 @@ pub(crate) fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
             "this repository has no grant on that fleet. Note the grant is \
              PER REPO: being under a granted owner is deliberately not enough, \
              so a fork or a new repo needs its own. Ask the fleet admin to run \
-             `probe-rs-fleet grant --repo <owner>/<name> --select '<selector>' \
+             `probefleet grant --repo <owner>/<name> --select '<selector>' \
              --ops flash`"
         }
         "workload_oidc_unconfigured" | "workload_unconfigured" => {
@@ -263,7 +263,7 @@ pub(crate) fn describe(e: &ClientError, doing: &str) -> anyhow::Error {
              expired or been revoked, or — for a GitHub workload identity — a \
              repository with no grant. That grant is PER REPO: being under a \
              granted owner is deliberately not enough, so a fork or a new repo \
-             needs its own (`probe-rs-fleet grant --repo <owner>/<name> \
+             needs its own (`probefleet grant --repo <owner>/<name> \
              --select '<selector>' --ops flash`)"
         }
         "forbidden" => {
@@ -324,9 +324,9 @@ mod tests {
         let written = std::fs::read_to_string(&path).unwrap();
         // Appended, never truncated: the runner and other steps write here too.
         assert!(written.starts_with("PRE=existing\n"));
-        assert!(written.contains("PROBE_RS_FLEET_COORDINATOR=https://fleet.example\n"));
-        assert!(written.contains("PROBE_RS_FLEET_TOKEN=prfw1_secret\n"));
-        assert!(written.contains("PROBE_RS_FLEET=default\n"));
+        assert!(written.contains("PROBEFLEET_COORDINATOR=https://fleet.example\n"));
+        assert!(written.contains("PROBEFLEET_TOKEN=prfw1_secret\n"));
+        assert!(written.contains("PROBEFLEET=default\n"));
     }
 
     /// With no `$GITHUB_ENV`, the `export …` form goes to stdout for

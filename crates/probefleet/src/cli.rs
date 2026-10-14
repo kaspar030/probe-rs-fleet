@@ -7,7 +7,7 @@
 //!    argument is treated as a probe-rs argument and forwarded to the sidecar
 //!    shim *without* running clap. This makes a `probe-rs` symlink on `PATH`
 //!    route through the fleet transparently.
-//! 2. **explicit subcommands** — `probe-rs-fleet <coordinator|node|sidecar|ctl>`
+//! 2. **explicit subcommands** — `probefleet <coordinator|node|sidecar|ctl>`
 //!    parsed with clap derive.
 
 use std::ffi::{OsStr, OsString};
@@ -19,12 +19,12 @@ use clap::{Args, Parser, Subcommand};
 use crate::roles;
 use crate::roles::sidecar::SelectorFlags;
 
-/// The single multi-role probe-rs-fleet binary.
+/// The single multi-role probefleet binary.
 #[derive(Debug, Parser)]
 #[command(
-    name = "probe-rs-fleet",
+    name = "probefleet",
     version,
-    about = "probe-rs-fleet: coordinator, node, sidecar, and admin CLI in one binary",
+    about = "probefleet: coordinator, node, sidecar, and admin CLI in one binary",
     propagate_version = true
 )]
 pub struct Cli {
@@ -46,7 +46,7 @@ pub enum Command {
     /// Sidecar shim: forward a probe-rs invocation through the fleet.
     ///
     /// Usually reached via a `probe-rs` symlink, but also available explicitly:
-    /// `probe-rs-fleet sidecar -- <probe-rs args…>`.
+    /// `probefleet sidecar -- <probe-rs args…>`.
     Sidecar(SidecarArgs),
     /// Admin / UX CLI: talk to the coordinator over its `/client` WebSocket.
     Ctl(CtlArgs),
@@ -79,7 +79,7 @@ pub enum Command {
     Completions(CompletionsArgs),
 }
 
-/// Arguments for `probe-rs-fleet completions`.
+/// Arguments for `probefleet completions`.
 ///
 /// Completion is **dynamic** — the shell calls back into this binary on every
 /// Tab — so this verb prints the one line that installs the stub rather than a
@@ -99,7 +99,7 @@ pub struct CompletionsArgs {
     pub print: bool,
 }
 
-/// Arguments for `probe-rs-fleet login`.
+/// Arguments for `probefleet login`.
 ///
 /// The coordinator's own **device flow** (forgs): the CLI asks it to start
 /// one, prints the short code and the URL, opens a browser where it can, and
@@ -141,7 +141,7 @@ pub struct LoginArgs {
     #[arg(long)]
     pub org: Option<String>,
     /// The fleet to log in to.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the fleets directory (default: XDG config dir). Test and
@@ -150,7 +150,7 @@ pub struct LoginArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet logout`.
+/// Arguments for `probefleet logout`.
 ///
 /// The revocation half of the refresh-token feature. `login` stores a durable
 /// credential that can mint sessions for up to 30 days; a durable credential
@@ -168,7 +168,7 @@ pub struct LogoutArgs {
     #[arg(long)]
     pub all: bool,
     /// The fleet to log out of.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the fleets directory (default: XDG config dir). Test and
@@ -183,8 +183,8 @@ pub struct CoordinatorArgs {
     /// Path to the coordinator config (TOML).
     ///
     /// When unset, defaults to the XDG path
-    /// `$XDG_CONFIG_HOME/probe-rs-fleet/coordinator.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET_CONFIG", value_hint = clap::ValueHint::FilePath)]
+    /// `$XDG_CONFIG_HOME/probefleet/coordinator.toml`.
+    #[arg(long, env = "PROBEFLEET_CONFIG", value_hint = clap::ValueHint::FilePath)]
     pub config: Option<std::path::PathBuf>,
     /// Optional nested subcommand (e.g. `init`). When absent, the coordinator
     /// daemon runs.
@@ -269,8 +269,8 @@ pub struct InitArgs {
 /// Arguments for `coordinator auth-key`.
 ///
 /// The **self-hosted / air-gapped escape hatch**, not the front door: a laptop
-/// with a login runs `probe-rs-fleet share`, a headless node runs `node up`
-/// with a key its owner minted using `probe-rs-fleet auth-key create`, and
+/// with a login runs `probefleet share`, a headless node runs `node up`
+/// with a key its owner minted using `probefleet auth-key create`, and
 /// neither needs a shell on the coordinator host. What is still only available
 /// here: minting with no login at all, and `--ttl 0` (a key that never
 /// expires), which the API path refuses. Since `--purpose` landed here too,
@@ -453,7 +453,7 @@ pub struct AuthKeyRevokeArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet share`.
+/// Arguments for `probefleet share`.
 ///
 /// "This machine now offers its probes to the fleet", using the login you
 /// already have (architecture §6.4). No token, no coordinator shell, no
@@ -462,7 +462,7 @@ pub struct AuthKeyRevokeArgs {
 #[derive(Debug, Args)]
 pub struct ShareArgs {
     /// The fleet to share this machine with.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// This node's name within its org. Defaults to the machine's hostname.
@@ -489,11 +489,11 @@ pub struct ShareArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet auth-key`.
+/// Arguments for `probefleet auth-key`.
 ///
 /// The **hosted** counterpart of `coordinator auth-key`: it mints over the
 /// authenticated API with the `[user]` session in the fleet file, so a customer
-/// who has only ever run `probe-rs-fleet login` can enroll a headless node
+/// who has only ever run `probefleet login` can enroll a headless node
 /// (architecture §6.4). `coordinator auth-key` remains the self-hosted
 /// operator's shell-on-the-host escape hatch.
 ///
@@ -518,7 +518,7 @@ pub enum AuthKeyCommand {
     Revoke(AuthKeyRevokeCliArgs),
 }
 
-/// Arguments for `probe-rs-fleet auth-key create`.
+/// Arguments for `probefleet auth-key create`.
 ///
 /// Two deliberate deviations from the issue's sketch, both for consistency with
 /// the existing `coordinator auth-key`:
@@ -597,7 +597,7 @@ pub struct AuthKeyCreateArgs {
     #[arg(long)]
     pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the mint.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -606,7 +606,7 @@ pub struct AuthKeyCreateArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet auth-key list`.
+/// Arguments for `probefleet auth-key list`.
 #[derive(Debug, Args)]
 pub struct AuthKeyListArgs {
     /// The org to act in (path or id). Defaults to the fleet file's
@@ -614,7 +614,7 @@ pub struct AuthKeyListArgs {
     #[arg(long)]
     pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the listing.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -623,13 +623,13 @@ pub struct AuthKeyListArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet auth-key revoke`.
+/// Arguments for `probefleet auth-key revoke`.
 ///
 /// Named `…CliArgs` because `AuthKeyRevokeArgs` belongs to
 /// `coordinator auth-key-revoke` and must keep its name.
 #[derive(Debug, Args)]
 pub struct AuthKeyRevokeCliArgs {
-    /// Hash prefix of the key to revoke, from `probe-rs-fleet auth-key list`
+    /// Hash prefix of the key to revoke, from `probefleet auth-key list`
     /// (at least 8 hex characters).
     pub prefix: String,
     /// The org to act in (path or id). Defaults to the fleet file's
@@ -637,7 +637,7 @@ pub struct AuthKeyRevokeCliArgs {
     #[arg(long)]
     pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the revocation.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -646,7 +646,7 @@ pub struct AuthKeyRevokeCliArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet org`.
+/// Arguments for `probefleet org`.
 ///
 /// The **self-service** counterpart of `coordinator org create`: every verb
 /// runs over the authenticated API with the `[user]` session in the fleet
@@ -678,7 +678,7 @@ pub enum OrgCliCommand {
     Delete(OrgDeleteArgs),
 }
 
-/// Arguments for `probe-rs-fleet org rename`.
+/// Arguments for `probefleet org rename`.
 #[derive(Debug, Args)]
 pub struct OrgRenameArgs {
     /// The new name, under the same rules as `org create`.
@@ -691,7 +691,7 @@ pub struct OrgRenameArgs {
     pub session: OrgSessionArgs,
 }
 
-/// Arguments for `probe-rs-fleet org delete`.
+/// Arguments for `probefleet org delete`.
 #[derive(Debug, Args)]
 pub struct OrgDeleteArgs {
     /// Skip the confirmation prompt (required when stdin is not a terminal).
@@ -709,7 +709,7 @@ pub struct OrgDeleteArgs {
 #[derive(Debug, Clone, Args)]
 pub struct OrgSessionArgs {
     /// The fleet whose `[user]` session authorises the request.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         global = true, add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -718,7 +718,7 @@ pub struct OrgSessionArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet org create`.
+/// Arguments for `probefleet org create`.
 #[derive(Debug, Args)]
 pub struct OrgCliCreateArgs {
     /// The org name: one path segment of lowercase letters, digits and `-`
@@ -729,7 +729,7 @@ pub struct OrgCliCreateArgs {
     pub session: OrgSessionArgs,
 }
 
-/// Arguments for `probe-rs-fleet org members`.
+/// Arguments for `probefleet org members`.
 ///
 /// With no verb, lists the members (any member may). `add`, `set-role` and
 /// `remove` are admin only; removing or demoting the last admin is refused.
@@ -757,7 +757,7 @@ pub enum OrgMembersCommand {
     Remove(OrgMemberRemoveArgs),
 }
 
-/// Arguments for `probe-rs-fleet org members add`.
+/// Arguments for `probefleet org members add`.
 #[derive(Debug, Args)]
 pub struct OrgMemberAddArgs {
     /// The username to add.
@@ -767,7 +767,7 @@ pub struct OrgMemberAddArgs {
     pub role: RoleArg,
 }
 
-/// Arguments for `probe-rs-fleet org members set-role`.
+/// Arguments for `probefleet org members set-role`.
 #[derive(Debug, Args)]
 pub struct OrgMemberSetRoleArgs {
     /// The member whose role changes.
@@ -777,14 +777,14 @@ pub struct OrgMemberSetRoleArgs {
     pub role: RoleArg,
 }
 
-/// Arguments for `probe-rs-fleet org members remove`.
+/// Arguments for `probefleet org members remove`.
 #[derive(Debug, Args)]
 pub struct OrgMemberRemoveArgs {
     /// The member to remove.
     pub username: String,
 }
 
-/// Arguments for `probe-rs-fleet node`.
+/// Arguments for `probefleet node`.
 ///
 /// A namespace rather than a bare `node-approve`, because the node-side
 /// operator verbs that will want to live beside it (list pending, revoke) are
@@ -809,14 +809,14 @@ pub enum NodeCommand {
     Run(NodeRunArgs),
 }
 
-/// Arguments for `probe-rs-fleet node up`.
+/// Arguments for `probefleet node up`.
 #[derive(Debug, Args)]
 pub struct NodeUpArgs {
     /// The bootstrap ladder's flags, shared verbatim with `agent up`.
     #[command(flatten)]
     pub flags: NodeUpFlags,
     /// The fleet whose `[node]` credential this node connects with.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -825,14 +825,14 @@ pub struct NodeUpArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet node run`.
+/// Arguments for `probefleet node run`.
 #[derive(Debug, Args)]
 pub struct NodeRunArgs {
     /// The fleet whose `[node]` credential this node connects with.
     ///
-    /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`; the
+    /// Resolves to `~/.config/probefleet/fleets/<name>.toml`; the
     /// node-local settings live in `node/node.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -841,7 +841,7 @@ pub struct NodeRunArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet node board`.
+/// Arguments for `probefleet node board`.
 ///
 /// Under `node` rather than the deprecated `agent` group because it edits
 /// **node-local config**: no fleet connection, no credential, no coordinator.
@@ -866,7 +866,7 @@ pub enum NodeBoardCommand {
     List(NodeBoardListArgs),
 }
 
-/// Arguments for `probe-rs-fleet node board add`.
+/// Arguments for `probefleet node board add`.
 ///
 /// Appends a `[[board]]` table to this node's `boards.toml` for a probe that is
 /// physically attached. With every value given as a flag it needs no terminal,
@@ -949,7 +949,7 @@ impl NodeBoardAddArgs {
     }
 }
 
-/// Arguments for `probe-rs-fleet node board list`.
+/// Arguments for `probefleet node board list`.
 #[derive(Debug, Args)]
 pub struct NodeBoardListArgs {
     /// Read this `boards.toml` instead of the one `node.toml` resolves.
@@ -965,7 +965,7 @@ pub struct NodeBoardListArgs {
     pub probe_rs: String,
 }
 
-/// Arguments for `probe-rs-fleet ci`.
+/// Arguments for `probefleet ci`.
 ///
 /// A namespace for the same reason [`NodeArgs`] is one: `ci status` / `ci
 /// whoami` are obvious follow-ups, and `ci-login` as a single hyphenated verb
@@ -984,7 +984,7 @@ pub enum CiCommand {
     Login(CiLoginArgs),
 }
 
-/// Arguments for `probe-rs-fleet ci login` (architecture §6.7).
+/// Arguments for `probefleet ci login` (architecture §6.7).
 ///
 /// Two paths, and the difference between them is the whole point:
 ///
@@ -999,11 +999,11 @@ pub enum CiCommand {
 #[derive(Debug, Args)]
 pub struct CiLoginArgs {
     /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
-    #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR")]
+    #[arg(long, env = "PROBEFLEET_COORDINATOR")]
     pub fleet_url: Option<String>,
     /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
     /// self-hosted deployment with no publicly trusted certificate.
-    #[arg(long, env = "PROBE_RS_FLEET_SERVER_CERT_SHA256")]
+    #[arg(long, env = "PROBEFLEET_SERVER_CERT_SHA256")]
     pub server_cert_sha256: Option<String>,
     /// The `aud` claim to request from GitHub.
     ///
@@ -1020,7 +1020,7 @@ pub struct CiLoginArgs {
     /// For a runner GitHub does not mint tokens for. Read it from the CI
     /// system's secret store, not from a literal on the command line — argv is
     /// visible to every process on the box.
-    #[arg(long, env = "PROBE_RS_FLEET_AUTH_KEY")]
+    #[arg(long, env = "PROBEFLEET_AUTH_KEY")]
     pub auth_key: Option<String>,
     /// Print `export …` lines on stdout even when `$GITHUB_ENV` is set.
     ///
@@ -1029,8 +1029,8 @@ pub struct CiLoginArgs {
     /// is the job log.
     #[arg(long)]
     pub export: bool,
-    /// The fleet name, for the `PROBE_RS_FLEET` variable it exports.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    /// The fleet name, for the `PROBEFLEET` variable it exports.
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the fleets directory (default: XDG config dir). Test and
@@ -1043,7 +1043,7 @@ pub struct CiLoginArgs {
     pub config_dir: Option<std::path::PathBuf>,
 }
 
-/// Arguments for `probe-rs-fleet node approve`.
+/// Arguments for `probefleet node approve`.
 ///
 /// The approving half of architecture §4.2's rung 3: a headless machine ran
 /// `node up`, printed a URL and a code, and is polling. This verb runs on a
@@ -1083,7 +1083,7 @@ pub struct NodeApproveArgs {
     #[arg(long)]
     pub org: Option<String>,
     /// The fleet whose `[user]` session authorises the approval.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -1126,10 +1126,10 @@ pub struct AgentArgs {
     /// deprecated node spellings, the fleet whose `[node]` credential this node
     /// connects with.
     ///
-    /// Resolves to `~/.config/probe-rs-fleet/fleets/<name>.toml`. There is no
+    /// Resolves to `~/.config/probefleet/fleets/<name>.toml`. There is no
     /// `--config` any more: `agent.toml` is gone, the credential lives in the
     /// fleet file and the node-local settings in `node/node.toml`.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET, global = true,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Override the config directory (default: XDG config dir). Test and
@@ -1155,7 +1155,7 @@ pub enum AgentCommand {
     Up(NodeUpFlags),
 }
 
-/// Arguments for `probe-rs-fleet agent login`.
+/// Arguments for `probefleet agent login`.
 ///
 /// A **separate verb** from both neighbours because the concurrency contract
 /// differs from both. `login` is a rotating credential for a single human;
@@ -1172,18 +1172,18 @@ pub struct AgentLoginArgs {
     /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
     ///
     /// Required the first time; afterwards the fleet file remembers it.
-    #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR")]
+    #[arg(long, env = "PROBEFLEET_COORDINATOR")]
     pub fleet_url: Option<String>,
     /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
     /// self-hosted deployment with no publicly trusted certificate.
-    #[arg(long, env = "PROBE_RS_FLEET_SERVER_CERT_SHA256")]
+    #[arg(long, env = "PROBEFLEET_SERVER_CERT_SHA256")]
     pub server_cert_sha256: Option<String>,
     /// The durable auth key this session is minted from. Must be `--multi-use`.
     ///
     /// Read it from a secret store, not from a literal on the command line —
     /// argv is visible to every process on the box, and this key is the
     /// strongest credential the fleet file can hold.
-    #[arg(long, env = "PROBE_RS_FLEET_AUTH_KEY")]
+    #[arg(long, env = "PROBEFLEET_AUTH_KEY")]
     pub auth_key: String,
     /// The identity name the key was minted with (`auth-key create --as`).
     ///
@@ -1214,7 +1214,7 @@ pub struct NodeUpFlags {
     /// file already knows where the coordinator is.
     #[arg(long)]
     pub fleet_url: Option<String>,
-    /// An auth key from `probe-rs-fleet auth-key create` (or, self-hosted,
+    /// An auth key from `probefleet auth-key create` (or, self-hosted,
     /// `coordinator auth-key`) — the unattended/image path.
     #[arg(long)]
     pub auth_key: Option<String>,
@@ -1245,7 +1245,7 @@ pub struct NodeUpFlags {
     pub force: bool,
     /// Fall back to interactive approval even without a terminal: print a URL
     /// and a short code, and wait for somebody to run
-    /// `probe-rs-fleet node approve`.
+    /// `probefleet node approve`.
     ///
     /// The default is *auto* — on when stdout is a terminal, off otherwise —
     /// so a service unit with no tty fails fast with remediation instead of
@@ -1289,13 +1289,13 @@ impl NodeUpFlags {
 #[derive(Debug, Args)]
 pub struct SidecarArgs {
     /// The fleet whose `[user]` credential the shim connects with.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
     /// Board **model** to lease (e.g. `nrf52840dk`): any idle board of that
     /// type. This is the generic selector — use `--id` for one specific board.
     ///
-    /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
+    /// Overrides `PROBEFLEET_BOARD`, `_ID` and `_SELECT` in the
     /// environment. An empty value is treated as if the flag were absent.
     #[arg(long, conflicts_with_all = ["id", "select"],
         add = crate::completion::model_candidates())]
@@ -1303,7 +1303,7 @@ pub struct SidecarArgs {
     /// Explicit board **id** to lease (e.g. `nrf52840-dk-1`): exactly one
     /// board, by its node-local name.
     ///
-    /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
+    /// Overrides `PROBEFLEET_BOARD`, `_ID` and `_SELECT` in the
     /// environment. An empty value is treated as if the flag were absent.
     #[arg(long, conflicts_with_all = ["board", "select"],
         add = crate::completion::board_id_candidates())]
@@ -1311,7 +1311,7 @@ pub struct SidecarArgs {
     /// Board selector expression: `id=<name>`, `board=<model>`, `chip=<c>`,
     /// `tag=<t> && <t>`, or a bare term (a tag).
     ///
-    /// Overrides `PROBE_RS_FLEET_BOARD`, `_ID` and `_SELECT` in the
+    /// Overrides `PROBEFLEET_BOARD`, `_ID` and `_SELECT` in the
     /// environment. An empty value is treated as if the flag were absent.
     #[arg(long, conflicts_with_all = ["board", "id"],
         add = crate::completion::selector_candidates())]
@@ -1325,18 +1325,18 @@ pub struct SidecarArgs {
 #[derive(Debug, Args)]
 pub struct CtlClientArgs {
     /// Base URL of the coordinator (`https://fleet.example`), or `host:port`.
-    #[arg(long, env = "PROBE_RS_FLEET_COORDINATOR", global = true)]
+    #[arg(long, env = "PROBEFLEET_COORDINATOR", global = true)]
     pub coordinator: Option<String>,
     /// The bearer session token.
-    #[arg(long, env = "PROBE_RS_FLEET_TOKEN", global = true)]
+    #[arg(long, env = "PROBEFLEET_TOKEN", global = true)]
     pub token: Option<String>,
     /// Pinned coordinator server-certificate SHA-256 (64 hex chars), for a
     /// self-hosted deployment with no publicly trusted certificate.
-    #[arg(long, env = "PROBE_RS_FLEET_SERVER_CERT_SHA256", global = true)]
+    #[arg(long, env = "PROBEFLEET_SERVER_CERT_SHA256", global = true)]
     pub server_cert_sha256: Option<String>,
     /// The fleet to talk to. An explicit credential flag takes precedence over
     /// what the fleet file holds.
-    #[arg(long, env = "PROBE_RS_FLEET", default_value = crate::paths::DEFAULT_FLEET, global = true,
+    #[arg(long, env = "PROBEFLEET", default_value = crate::paths::DEFAULT_FLEET, global = true,
         add = crate::completion::fleet_candidates())]
     pub fleet: String,
 }
@@ -1445,7 +1445,7 @@ pub enum CtlCommand {
     },
 }
 
-/// Arguments for `probe-rs-fleet grant`.
+/// Arguments for `probefleet grant`.
 ///
 /// Two shapes in one verb, as `clap`'s `args_conflicts_with_subcommands`
 /// allows: `grant <subject> --select …` creates one, while `grant list` and
@@ -1510,18 +1510,18 @@ pub enum GrantCommand {
     Revoke(GrantRevokeArgs),
 }
 
-/// Arguments for `probe-rs-fleet grant list`.
+/// Arguments for `probefleet grant list`.
 #[derive(Debug, Args)]
 pub struct GrantListArgs {
     #[command(flatten)]
     pub client: CtlClientArgs,
 }
 
-/// Arguments for `probe-rs-fleet grant revoke`.
+/// Arguments for `probefleet grant revoke`.
 #[derive(Debug, Args)]
 pub struct GrantRevokeArgs {
     /// The grant id, or a prefix of at least 8 hex characters, from
-    /// `probe-rs-fleet grant list`.
+    /// `probefleet grant list`.
     ///
     /// A grant synthesised by redeeming a CI auth key is spelled `ci-<hex>`
     /// (architecture §6.7); `ci-` plus 8 hex characters addresses one.
@@ -1623,7 +1623,7 @@ async fn run(dispatch: Dispatch, process_args: Vec<OsString>) -> anyhow::Result<
         Dispatch::Sidecar(probe_rs_args) => {
             // argv0 (`probe-rs` symlink) path: no clap, so read the fleet
             // selector directly from the env (default fleet otherwise).
-            let fleet = std::env::var("PROBE_RS_FLEET")
+            let fleet = std::env::var("PROBEFLEET")
                 .ok()
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| crate::paths::DEFAULT_FLEET.to_owned());
@@ -1789,14 +1789,14 @@ mod tests {
     }
 
     #[test]
-    fn argv0_probe_rs_fleet_uses_clap() {
+    fn argv0_probefleet_uses_clap() {
         let rest = os(&["coordinator", "--config", "x.toml"]);
         assert_eq!(
-            dispatch_from_argv0(OsStr::new("probe-rs-fleet"), &rest),
+            dispatch_from_argv0(OsStr::new("probefleet"), &rest),
             Dispatch::Clap
         );
         assert_eq!(
-            dispatch_from_argv0(OsStr::new("/opt/bin/probe-rs-fleet"), &rest),
+            dispatch_from_argv0(OsStr::new("/opt/bin/probefleet"), &rest),
             Dispatch::Clap
         );
     }
@@ -1817,7 +1817,7 @@ mod tests {
 
     #[test]
     fn parses_coordinator() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "--config", "c.toml"]));
+        let cli = Cli::parse_from(os(&["probefleet", "coordinator", "--config", "c.toml"]));
         match cli.command {
             Command::Coordinator(a) => {
                 assert_eq!(a.config.as_deref(), Some(Path::new("c.toml")));
@@ -1829,7 +1829,7 @@ mod tests {
 
     #[test]
     fn parses_coordinator_without_config() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator"]));
+        let cli = Cli::parse_from(os(&["probefleet", "coordinator"]));
         match cli.command {
             Command::Coordinator(a) => {
                 assert!(a.config.is_none());
@@ -1842,7 +1842,7 @@ mod tests {
     #[test]
     fn parses_coordinator_init() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "init",
             "--public-url",
@@ -1868,7 +1868,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     fn org_verbs_parse() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "org",
             "create",
             "acme",
@@ -1885,14 +1885,14 @@ mod tests {
             },
             other => panic!("expected org, got {other:?}"),
         }
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "list"]));
+        let cli = Cli::parse_from(os(&["probefleet", "org", "list"]));
         assert!(matches!(
             cli.command,
             Command::Org(OrgCliArgs {
                 command: OrgCliCommand::List(_)
             })
         ));
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "members", "--org", "acme"]));
+        let cli = Cli::parse_from(os(&["probefleet", "org", "members", "--org", "acme"]));
         match cli.command {
             Command::Org(OrgCliArgs {
                 command: OrgCliCommand::Members(m),
@@ -1903,7 +1903,7 @@ mod tests {
             other => panic!("expected members, got {other:?}"),
         }
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "org",
             "members",
             "add",
@@ -1930,7 +1930,7 @@ mod tests {
             other => panic!("expected members, got {other:?}"),
         }
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "org",
             "members",
             "set-role",
@@ -1949,7 +1949,7 @@ mod tests {
             },
             other => panic!("expected members, got {other:?}"),
         }
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "members", "remove", "bob"]));
+        let cli = Cli::parse_from(os(&["probefleet", "org", "members", "remove", "bob"]));
         assert!(matches!(
             cli.command,
             Command::Org(OrgCliArgs {
@@ -1960,7 +1960,7 @@ mod tests {
             })
         ));
         assert!(Cli::try_parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "org",
             "members",
             "set-role",
@@ -1969,7 +1969,7 @@ mod tests {
         ]))
         .is_err());
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "org",
             "rename",
             "acme2",
@@ -1985,7 +1985,7 @@ mod tests {
             }
             other => panic!("expected rename, got {other:?}"),
         }
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "delete", "--yes"]));
+        let cli = Cli::parse_from(os(&["probefleet", "org", "delete", "--yes"]));
         match cli.command {
             Command::Org(OrgCliArgs {
                 command: OrgCliCommand::Delete(d),
@@ -1995,7 +1995,7 @@ mod tests {
             }
             other => panic!("expected delete, got {other:?}"),
         }
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "org", "delete"]));
+        let cli = Cli::parse_from(os(&["probefleet", "org", "delete"]));
         assert!(matches!(
             cli.command,
             Command::Org(OrgCliArgs {
@@ -2007,7 +2007,7 @@ mod tests {
     #[test]
     fn parses_auth_key_create_list_revoke() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "auth-key",
             "create",
             "--tag",
@@ -2033,7 +2033,7 @@ mod tests {
             other => panic!("expected auth-key, got {other:?}"),
         }
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "list"]));
+        let cli = Cli::parse_from(os(&["probefleet", "auth-key", "list"]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
                 AuthKeyCommand::List(_) => {}
@@ -2042,7 +2042,7 @@ mod tests {
             other => panic!("expected auth-key, got {other:?}"),
         }
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "revoke", "aabbccdd"]));
+        let cli = Cli::parse_from(os(&["probefleet", "auth-key", "revoke", "aabbccdd"]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
                 AuthKeyCommand::Revoke(r) => assert_eq!(r.prefix, "aabbccdd"),
@@ -2056,7 +2056,7 @@ mod tests {
     /// explicit org (the fleet file's, else the personal org).
     #[test]
     fn auth_key_create_defaults_are_single_use_and_expiring() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
+        let cli = Cli::parse_from(os(&["probefleet", "auth-key", "create"]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
                 AuthKeyCommand::Create(c) => {
@@ -2076,7 +2076,7 @@ mod tests {
     #[test]
     fn auth_key_tags_alias_does_not_split_on_commas() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "auth-key",
             "create",
             "--tags",
@@ -2095,15 +2095,11 @@ mod tests {
     /// is a contradiction clap must catch.
     #[test]
     fn auth_key_single_use_and_multi_use_conflict() {
+        assert!(
+            Cli::try_parse_from(os(&["probefleet", "auth-key", "create", "--single-use",])).is_ok()
+        );
         assert!(Cli::try_parse_from(os(&[
-            "probe-rs-fleet",
-            "auth-key",
-            "create",
-            "--single-use",
-        ]))
-        .is_ok());
-        assert!(Cli::try_parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "auth-key",
             "create",
             "--single-use",
@@ -2114,7 +2110,7 @@ mod tests {
 
     #[test]
     fn parses_agent() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent", "--fleet", "lab1"]));
+        let cli = Cli::parse_from(os(&["probefleet", "agent", "--fleet", "lab1"]));
         match cli.command {
             Command::Agent(a) => {
                 assert_eq!(a.fleet, "lab1");
@@ -2128,7 +2124,7 @@ mod tests {
     /// install needs no flags at all once `login` has run.
     #[test]
     fn fleet_defaults_to_default() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "agent"]));
+        let cli = Cli::parse_from(os(&["probefleet", "agent"]));
         match cli.command {
             Command::Agent(a) => assert_eq!(a.fleet, "default"),
             other => panic!("expected agent, got {other:?}"),
@@ -2138,7 +2134,7 @@ mod tests {
     #[test]
     fn parses_coordinator_auth_key() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "auth-key",
             "--org",
@@ -2169,7 +2165,7 @@ mod tests {
     /// forever should have to be asked for.
     #[test]
     fn auth_key_defaults_are_single_use_and_expiring() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "auth-key"]));
+        let cli = Cli::parse_from(os(&["probefleet", "coordinator", "auth-key"]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
                 Some(CoordinatorCommand::AuthKey(k)) => {
@@ -2191,7 +2187,7 @@ mod tests {
     #[test]
     fn parses_coordinator_auth_key_ci_purpose_and_ops() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "auth-key",
             "--tag",
@@ -2223,7 +2219,7 @@ mod tests {
     fn coordinator_auth_key_rejects_an_unknown_purpose() {
         assert!(
             Cli::try_parse_from(os(&[
-                "probe-rs-fleet",
+                "probefleet",
                 "coordinator",
                 "auth-key",
                 "--purpose",
@@ -2239,7 +2235,7 @@ mod tests {
     #[test]
     fn parses_coordinator_user_token() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "user-token",
             "--username",
@@ -2258,7 +2254,7 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "user-token",
             "--username",
@@ -2283,7 +2279,7 @@ mod tests {
     #[test]
     fn parses_node_up() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "agent",
             "--fleet",
             "lab1",
@@ -2316,10 +2312,7 @@ mod tests {
     /// without the operator knowing they exist.
     #[test]
     fn node_up_needs_no_flags() {
-        for argv in [
-            ["probe-rs-fleet", "node", "up"],
-            ["probe-rs-fleet", "agent", "up"],
-        ] {
+        for argv in [["probefleet", "node", "up"], ["probefleet", "agent", "up"]] {
             let up = match Cli::parse_from(os(&argv)).command {
                 Command::Node(n) => match n.command {
                     NodeCommand::Up(up) => up.flags,
@@ -2360,7 +2353,7 @@ mod tests {
 
         // `node up` carries `--fleet` on the leaf; the deprecated `agent`
         // declares it globally, so it sits before the subcommand there.
-        let mut canonical = vec!["probe-rs-fleet", "node", "up", "--fleet", "lab1"];
+        let mut canonical = vec!["probefleet", "node", "up", "--fleet", "lab1"];
         canonical.extend_from_slice(&flags);
         let (canonical_fleet, canonical_flags) = match Cli::parse_from(os(&canonical)).command {
             Command::Node(n) => match n.command {
@@ -2370,7 +2363,7 @@ mod tests {
             other => panic!("expected node, got {other:?}"),
         };
 
-        let mut alias = vec!["probe-rs-fleet", "agent", "--fleet", "lab1", "up"];
+        let mut alias = vec!["probefleet", "agent", "--fleet", "lab1", "up"];
         alias.extend_from_slice(&flags);
         let (alias_fleet, alias_flags) = match Cli::parse_from(os(&alias)).command {
             Command::Agent(a) => match a.command {
@@ -2396,23 +2389,21 @@ mod tests {
     /// the same role with the same fleet.
     #[test]
     fn node_run_and_bare_agent_agree() {
-        let run = match Cli::parse_from(os(&["probe-rs-fleet", "node", "run", "--fleet", "lab1"]))
-            .command
-        {
-            Command::Node(n) => match n.command {
-                NodeCommand::Run(run) => run.fleet,
-                other => panic!("expected node run, got {other:?}"),
-            },
-            other => panic!("expected node, got {other:?}"),
-        };
-        let bare =
-            match Cli::parse_from(os(&["probe-rs-fleet", "agent", "--fleet", "lab1"])).command {
-                Command::Agent(a) => {
-                    assert!(a.command.is_none());
-                    a.fleet
-                }
-                other => panic!("expected agent, got {other:?}"),
+        let run =
+            match Cli::parse_from(os(&["probefleet", "node", "run", "--fleet", "lab1"])).command {
+                Command::Node(n) => match n.command {
+                    NodeCommand::Run(run) => run.fleet,
+                    other => panic!("expected node run, got {other:?}"),
+                },
+                other => panic!("expected node, got {other:?}"),
             };
+        let bare = match Cli::parse_from(os(&["probefleet", "agent", "--fleet", "lab1"])).command {
+            Command::Agent(a) => {
+                assert!(a.command.is_none());
+                a.fleet
+            }
+            other => panic!("expected agent, got {other:?}"),
+        };
         assert_eq!(run, bare);
         assert_eq!(run, "lab1");
     }
@@ -2447,17 +2438,17 @@ mod tests {
         );
 
         // Every spelling still parses, hidden or not.
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent", "up"])).is_ok());
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent"])).is_ok());
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "up"])).is_ok());
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "run"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probefleet", "agent", "up"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probefleet", "agent"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probefleet", "node", "up"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probefleet", "node", "run"])).is_ok());
     }
 
     /// `agent login` parses with every flag it has.
     #[test]
     fn parses_agent_login_with_all_flags() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "agent",
             "login",
             "--fleet-url",
@@ -2491,7 +2482,7 @@ mod tests {
     #[test]
     fn agent_login_needs_only_the_auth_key() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "agent",
             "login",
             "--auth-key",
@@ -2513,7 +2504,7 @@ mod tests {
     /// without it, and it has no interactive fallback.
     #[test]
     fn agent_login_requires_an_auth_key() {
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "agent", "login"])).is_err());
+        assert!(Cli::try_parse_from(os(&["probefleet", "agent", "login"])).is_err());
     }
 
     /// `--fleet` / `--config-dir` are [`AgentArgs`] **globals**, so they sit
@@ -2525,7 +2516,7 @@ mod tests {
     #[test]
     fn agent_login_inherits_the_groups_global_flags() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "agent",
             "--fleet",
             "lab1",
@@ -2548,7 +2539,7 @@ mod tests {
     /// `share` is the story-2 payoff: one word, no flags.
     #[test]
     fn parses_share_with_no_flags() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "share"]));
+        let cli = Cli::parse_from(os(&["probefleet", "share"]));
         match cli.command {
             Command::Share(s) => {
                 assert_eq!(s.fleet, "default");
@@ -2563,7 +2554,7 @@ mod tests {
     #[test]
     fn parses_share_with_an_explicit_adopt_policy() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "share",
             "--adopt",
             "declared",
@@ -2581,7 +2572,7 @@ mod tests {
 
     #[test]
     fn parses_auth_key_list_and_revoke() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "auth-keys"]));
+        let cli = Cli::parse_from(os(&["probefleet", "coordinator", "auth-keys"]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
                 Some(CoordinatorCommand::AuthKeys(k)) => assert!(k.org.is_none()),
@@ -2591,7 +2582,7 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "auth-key-revoke",
             "deadbeef",
@@ -2608,7 +2599,7 @@ mod tests {
     #[test]
     fn parses_login() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "login",
             "--fleet",
             "ci",
@@ -2632,7 +2623,7 @@ mod tests {
     #[test]
     fn parses_login_with_an_explicit_token() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "login",
             "--fleet-url",
             "https://fleet.example",
@@ -2650,14 +2641,14 @@ mod tests {
 
     #[test]
     fn parses_fleets() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "fleets"]));
+        let cli = Cli::parse_from(os(&["probefleet", "fleets"]));
         assert!(matches!(cli.command, Command::Fleets));
     }
 
     #[test]
     fn sidecar_subcommand_preserves_trailing_args_verbatim() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "sidecar",
             "--",
             "run",
@@ -2682,7 +2673,7 @@ mod tests {
     #[test]
     fn sidecar_select_flag_parses_and_leaves_trailing_args_verbatim() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "sidecar",
             "--select",
             "tag=nrf52",
@@ -2710,7 +2701,7 @@ mod tests {
         // The ergonomic form people actually type: `--` is optional.
         // `--board` is the board MODEL.
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "sidecar",
             "--board",
             "nrf52840dk",
@@ -2731,7 +2722,7 @@ mod tests {
     #[test]
     fn sidecar_id_flag_parses() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "sidecar",
             "--id",
             "nrf52840-dk-1",
@@ -2751,7 +2742,7 @@ mod tests {
     #[test]
     fn sidecar_selector_flags_after_the_double_dash_go_to_probe_rs() {
         // The "flags before `--`" contract: anything after is probe-rs's.
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "sidecar", "--", "--select", "foo"]));
+        let cli = Cli::parse_from(os(&["probefleet", "sidecar", "--", "--select", "foo"]));
         match cli.command {
             Command::Sidecar(a) => {
                 assert_eq!(a.select, None);
@@ -2766,7 +2757,7 @@ mod tests {
         // Once the trailing positional starts, a `--select` belongs to probe-rs
         // — a future `#[arg]` tweak must not start eating it.
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "sidecar",
             "run",
             "--chip",
@@ -2789,7 +2780,7 @@ mod tests {
     #[test]
     fn sidecar_select_and_board_conflict() {
         let err = Cli::try_parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "sidecar",
             "--select",
             "tag=x",
@@ -2810,7 +2801,7 @@ mod tests {
     fn sidecar_id_conflicts_with_board_and_select() {
         for other in [["--board", "nrf52840dk"], ["--select", "tag=x"]] {
             let err = Cli::try_parse_from(os(&[
-                "probe-rs-fleet",
+                "probefleet",
                 "sidecar",
                 "--id",
                 "nrf52840-dk-1",
@@ -2829,7 +2820,7 @@ mod tests {
     #[test]
     fn parses_ctl_delegate() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "ctl",
             "delegate",
             "--select",
@@ -2856,13 +2847,7 @@ mod tests {
     /// not need three flags to be correct.
     #[test]
     fn ctl_delegate_defaults_to_flash_attach_for_two_hours() {
-        let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
-            "ctl",
-            "delegate",
-            "--select",
-            "id=b1",
-        ]));
+        let cli = Cli::parse_from(os(&["probefleet", "ctl", "delegate", "--select", "id=b1"]));
         match cli.command {
             Command::Ctl(a) => match a.command {
                 CtlCommand::Delegate { ops, ttl, .. } => {
@@ -2878,7 +2863,7 @@ mod tests {
     #[test]
     fn parses_grant_create() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "grant",
             "bob",
             "--select",
@@ -2903,12 +2888,12 @@ mod tests {
 
     #[test]
     fn parses_grant_list_and_revoke() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "grant", "list"]));
+        let cli = Cli::parse_from(os(&["probefleet", "grant", "list"]));
         assert!(
             matches!(cli.command, Command::Grant(a) if matches!(a.command, Some(GrantCommand::List(_))))
         );
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "grant", "revoke", "a1b2c3d4"]));
+        let cli = Cli::parse_from(os(&["probefleet", "grant", "revoke", "a1b2c3d4"]));
         match cli.command {
             Command::Grant(a) => match a.command {
                 Some(GrantCommand::Revoke(r)) => assert_eq!(r.id, "a1b2c3d4"),
@@ -2924,7 +2909,7 @@ mod tests {
     #[test]
     fn grant_until_and_ttl_conflict() {
         let e = Cli::try_parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "grant",
             "bob",
             "--select",
@@ -2943,7 +2928,7 @@ mod tests {
     /// subject-key form, which is what the `--help` text tells you to use.
     #[test]
     fn a_user_named_like_a_subcommand_is_shadowed() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "grant", "list"]));
+        let cli = Cli::parse_from(os(&["probefleet", "grant", "list"]));
         match cli.command {
             Command::Grant(a) => {
                 assert!(a.subject.is_none(), "`list` parsed as the subcommand");
@@ -2953,7 +2938,7 @@ mod tests {
         }
         // The unambiguous spellings still reach the creation form.
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "grant",
             "user:01J9Z3Q4ABCDEFGHJKMNPQRSTV",
             "--select",
@@ -2970,28 +2955,28 @@ mod tests {
 
     #[test]
     fn parses_ctl_subcommands() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "list"]));
+        let cli = Cli::parse_from(os(&["probefleet", "ctl", "list"]));
         assert!(
             matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List { json: false }))
         );
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "list", "--json"]));
+        let cli = Cli::parse_from(os(&["probefleet", "ctl", "list", "--json"]));
         assert!(
             matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::List { json: true }))
         );
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "nodes"]));
+        let cli = Cli::parse_from(os(&["probefleet", "ctl", "nodes"]));
         assert!(
             matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::Nodes { json: false }))
         );
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "nodes", "--json"]));
+        let cli = Cli::parse_from(os(&["probefleet", "ctl", "nodes", "--json"]));
         assert!(
             matches!(cli.command, Command::Ctl(a) if matches!(a.command, CtlCommand::Nodes { json: true }))
         );
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "ctl",
             "lease",
             "nrf52840-dk-3",
@@ -3009,7 +2994,7 @@ mod tests {
             other => panic!("expected ctl, got {other:?}"),
         }
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "ctl", "power-cycle", "b1"]));
+        let cli = Cli::parse_from(os(&["probefleet", "ctl", "power-cycle", "b1"]));
         match cli.command {
             Command::Ctl(a) => match a.command {
                 CtlCommand::PowerCycle { board } => assert_eq!(board, "b1"),
@@ -3023,7 +3008,7 @@ mod tests {
     fn ctl_client_flags_parse() {
         let pin = "ab".repeat(32);
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "ctl",
             "--coordinator",
             "https://coord.example",
@@ -3054,7 +3039,7 @@ mod tests {
     #[test]
     fn grant_repo_parses_and_conflicts_with_a_positional_subject() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "grant",
             "--repo",
             "ariel-os/ariel-os",
@@ -3073,13 +3058,7 @@ mod tests {
         }
 
         // The person form still works untouched.
-        let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
-            "grant",
-            "bob",
-            "--select",
-            "tag=nrf52",
-        ]));
+        let cli = Cli::parse_from(os(&["probefleet", "grant", "bob", "--select", "tag=nrf52"]));
         match cli.command {
             Command::Grant(a) => {
                 assert_eq!(a.subject.as_deref(), Some("bob"));
@@ -3090,7 +3069,7 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(os(&[
-                "probe-rs-fleet",
+                "probefleet",
                 "grant",
                 "bob",
                 "--repo",
@@ -3106,7 +3085,7 @@ mod tests {
     #[test]
     fn ci_login_parses_both_paths() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "ci",
             "login",
             "--fleet-url",
@@ -3129,7 +3108,7 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "ci",
             "login",
             "--fleet-url",
@@ -3150,7 +3129,7 @@ mod tests {
     /// board-access credential.
     #[test]
     fn auth_key_purpose_defaults_to_node_and_rejects_junk() {
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
+        let cli = Cli::parse_from(os(&["probefleet", "auth-key", "create"]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
                 AuthKeyCommand::Create(c) => {
@@ -3163,7 +3142,7 @@ mod tests {
         }
 
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "auth-key",
             "create",
             "--purpose",
@@ -3187,7 +3166,7 @@ mod tests {
 
         assert!(
             Cli::try_parse_from(os(&[
-                "probe-rs-fleet",
+                "probefleet",
                 "auth-key",
                 "create",
                 "--purpose",
@@ -3204,7 +3183,7 @@ mod tests {
     #[test]
     fn auth_key_create_parses_an_identity_name_and_the_agent_purpose() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "auth-key",
             "create",
             "--purpose",
@@ -3226,7 +3205,7 @@ mod tests {
         }
 
         // Absent by default, so an existing invocation keeps its meaning.
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "auth-key", "create"]));
+        let cli = Cli::parse_from(os(&["probefleet", "auth-key", "create"]));
         match cli.command {
             Command::AuthKey(a) => match a.command {
                 AuthKeyCommand::Create(c) => assert!(c.subject_name.is_none()),
@@ -3241,7 +3220,7 @@ mod tests {
     #[test]
     fn coordinator_auth_key_parses_an_identity_name_and_the_agent_purpose() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "coordinator",
             "auth-key",
             "--purpose",
@@ -3264,7 +3243,7 @@ mod tests {
             other => panic!("expected coordinator, got {other:?}"),
         }
 
-        let cli = Cli::parse_from(os(&["probe-rs-fleet", "coordinator", "auth-key"]));
+        let cli = Cli::parse_from(os(&["probefleet", "coordinator", "auth-key"]));
         match cli.command {
             Command::Coordinator(a) => match a.command {
                 Some(CoordinatorCommand::AuthKey(k)) => assert!(k.subject_name.is_none()),
@@ -3279,7 +3258,7 @@ mod tests {
     #[test]
     fn parses_node_board_add() {
         let cli = Cli::parse_from(os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "node",
             "board",
             "add",
@@ -3325,8 +3304,8 @@ mod tests {
     /// everything, which is the interactive shape from the spec.
     #[test]
     fn parses_a_bare_node_board_add_and_list() {
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "board", "add"])).is_ok());
-        assert!(Cli::try_parse_from(os(&["probe-rs-fleet", "node", "board", "list"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probefleet", "node", "board", "add"])).is_ok());
+        assert!(Cli::try_parse_from(os(&["probefleet", "node", "board", "list"])).is_ok());
     }
 
     /// Same tri-state convention as `node up`, including the contradiction
@@ -3334,7 +3313,7 @@ mod tests {
     #[test]
     fn node_board_add_interactive_flags_are_a_tri_state() {
         let both = os(&[
-            "probe-rs-fleet",
+            "probefleet",
             "node",
             "board",
             "add",
@@ -3346,7 +3325,7 @@ mod tests {
         let on = ("--interactive", Some(true));
         let off = ("--no-interactive", Some(false));
         for (flag, expected) in [on, off] {
-            let cli = Cli::parse_from(os(&["probe-rs-fleet", "node", "board", "add", flag]));
+            let cli = Cli::parse_from(os(&["probefleet", "node", "board", "add", flag]));
             match cli.command {
                 Command::Node(n) => match n.command {
                     NodeCommand::Board(b) => match b.command {
